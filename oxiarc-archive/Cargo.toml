@@ -1,0 +1,24 @@
+[package]
+name = "oxiarc-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Archive container format support for OxiArc (ZIP, TAR, GZIP, LZH, XZ)"
+keywords = ["archive", "zip", "tar", "gzip", "xz"]
+categories = ["compression", "encoding", "filesystem"]
+
+[dependencies]
+oxiarc-core.workspace = true
+oxiarc-deflate.workspace = true
+oxiarc-lzhuf.workspace = true
+oxiarc-lzma.workspace = true
+oxiarc-lz4.workspace = true
+oxiarc-zstd.workspace = true
+oxiarc-bzip2.workspace = true
+encoding_rs.workspace = true
+
+[lints]
+workspace = true

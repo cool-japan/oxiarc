@@ -1,0 +1,17 @@
+[package]
+name = "oxiarc-lzma"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LZMA/LZMA2 compression for OxiArc (placeholder)"
+keywords = ["lzma", "lzma2", "compression", "7z", "xz"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core.workspace = true
+
+[lints]
+workspace = true

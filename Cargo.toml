@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "oxiarc-core",
+    "oxiarc-deflate",
+    "oxiarc-lzhuf",
+    "oxiarc-bzip2",
+    "oxiarc-lz4",
+    "oxiarc-zstd",
+    "oxiarc-archive",
+    "oxiarc-cli",
+    "oxiarc-lzma",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cool-japan/oxiarc"
+authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
+description = "Pure Rust archive/compression library - The Oxidized Archiver"
+keywords = ["archive", "compression", "zip", "lzh", "deflate"]
+categories = ["compression", "encoding"]
+
+[workspace.dependencies]
+# Internal crates
+oxiarc-core = { version = "0.1.0", path = "oxiarc-core" }
+oxiarc-deflate = { version = "0.1.0", path = "oxiarc-deflate" }
+oxiarc-lzhuf = { version = "0.1.0", path = "oxiarc-lzhuf" }
+oxiarc-lzma = { version = "0.1.0", path = "oxiarc-lzma" }
+oxiarc-bzip2 = { version = "0.1.0", path = "oxiarc-bzip2" }
+oxiarc-lz4 = { version = "0.1.0", path = "oxiarc-lz4" }
+oxiarc-zstd = { version = "0.1.0", path = "oxiarc-zstd" }
+oxiarc-archive = { version = "0.1.0", path = "oxiarc-archive" }
+
+# External dependencies
+thiserror = "2.0.17"
+encoding_rs = "0.8.35"
+clap = { version = "4.5.54", features = ["derive"] }
+indicatif = "0.18.3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

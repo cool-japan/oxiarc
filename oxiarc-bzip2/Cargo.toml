@@ -1,0 +1,23 @@
+[package]
+name = "oxiarc-bzip2"
+description = "Pure Rust BZip2 compression/decompression for OxiArc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["bzip2", "compression", "bwt", "huffman", "mtf"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+
+[dev-dependencies]
+
+[[bench]]
+name = "bwt_bench"
+harness = false
+
+[lints]
+workspace = true

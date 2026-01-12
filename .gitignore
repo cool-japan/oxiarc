@@ -1,0 +1,26 @@
+# Rust
+/target/
+Cargo.lock
+
+# Claude
+**/CLAUDE.md
+**/.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# Debug
+*.pdb

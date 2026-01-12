@@ -1,0 +1,17 @@
+[package]
+name = "oxiarc-zstd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust Zstandard (zstd) compression implementation for OxiArc"
+keywords = ["compression", "zstd", "zstandard", "fse", "huffman"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+
+[lints]
+workspace = true

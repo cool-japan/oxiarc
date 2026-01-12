@@ -1,0 +1,26 @@
+[package]
+name = "oxiarc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface for OxiArc archive operations"
+keywords = ["cli", "archive", "compression", "zip", "lzh"]
+categories = ["command-line-utilities", "compression"]
+
+[[bin]]
+name = "oxiarc"
+path = "src/main.rs"
+
+[dependencies]
+oxiarc-core.workspace = true
+oxiarc-archive.workspace = true
+oxiarc-lzma.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+glob = "0.3"
+
+[lints]
+workspace = true

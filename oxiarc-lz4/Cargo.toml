@@ -1,0 +1,19 @@
+[package]
+name = "oxiarc-lz4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust LZ4 compression implementation with LZ4-HC"
+keywords = ["lz4", "compression", "decompression", "lz4hc", "xxhash"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "oxiarc-deflate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust DEFLATE compression algorithm (RFC 1951) for OxiArc"
+keywords = ["deflate", "compression", "huffman", "lz77", "zlib"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core.workspace = true
+
+[[bench]]
+name = "lz77_bench"
+harness = false
+
+[lints]
+workspace = true
