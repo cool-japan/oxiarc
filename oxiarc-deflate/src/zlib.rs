@@ -432,10 +432,10 @@ mod tests {
         let data = b"Hello, World! Hello, World! Hello, World!";
 
         for level in 1..=9 {
-            let compressed =
-                zlib_compress(data, level).expect(&format!("level {} compress failed", level));
-            let decompressed =
-                zlib_decompress(&compressed).expect(&format!("level {} decompress failed", level));
+            let compressed = zlib_compress(data, level)
+                .unwrap_or_else(|_| panic!("level {} compress failed", level));
+            let decompressed = zlib_decompress(&compressed)
+                .unwrap_or_else(|_| panic!("level {} decompress failed", level));
             assert_eq!(&decompressed[..], &data[..]);
         }
     }

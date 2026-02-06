@@ -294,10 +294,19 @@ impl SequencesDecoder {
 
         let mut reader = FseBitReader::new(data)?;
 
-        // Initialize FSE decoders - use unwrap since we checked above
-        let ll_table = self.ll_table.as_ref().unwrap();
-        let of_table = self.of_table.as_ref().unwrap();
-        let ml_table = self.ml_table.as_ref().unwrap();
+        // Initialize FSE decoders - tables checked above
+        let ll_table = self
+            .ll_table
+            .as_ref()
+            .ok_or_else(|| OxiArcError::corrupted(0, "missing literal length table"))?;
+        let of_table = self
+            .of_table
+            .as_ref()
+            .ok_or_else(|| OxiArcError::corrupted(0, "missing offset table"))?;
+        let ml_table = self
+            .ml_table
+            .as_ref()
+            .ok_or_else(|| OxiArcError::corrupted(0, "missing match length table"))?;
 
         let mut ll_decoder = FseDecoder::new(ll_table, &mut reader);
         let mut of_decoder = FseDecoder::new(of_table, &mut reader);
@@ -455,7 +464,7 @@ fn predefined_ll_table() -> FseTable {
         4i16, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1,
         1, 1, 1, -1, -1, -1, -1,
     ];
-    FseTable::new(6, &probs).unwrap()
+    FseTable::new(6, &probs).expect("Predefined literal length FSE table should always be valid")
 }
 
 /// Create predefined offset FSE table.
@@ -465,7 +474,7 @@ fn predefined_of_table() -> FseTable {
         1i16, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
         -1, -1, -1, -1,
     ];
-    FseTable::new(5, &probs).unwrap()
+    FseTable::new(5, &probs).expect("Predefined offset FSE table should always be valid")
 }
 
 /// Create predefined match length FSE table.
@@ -475,7 +484,7 @@ fn predefined_ml_table() -> FseTable {
         1i16, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
     ];
-    FseTable::new(6, &probs).unwrap()
+    FseTable::new(6, &probs).expect("Predefined match length FSE table should always be valid")
 }
 
 #[cfg(test)]

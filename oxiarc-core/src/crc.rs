@@ -704,8 +704,7 @@ mod tests {
 
         // Each subsequent table is derived from the previous one
         for t in 1..8 {
-            for i in 0..256 {
-                let prev = CRC64_TABLE_SLICE[t - 1][i];
+            for (i, &prev) in CRC64_TABLE_SLICE[t - 1].iter().enumerate() {
                 let expected = CRC64_TABLE[(prev & 0xFF) as usize] ^ (prev >> 8);
                 assert_eq!(
                     CRC64_TABLE_SLICE[t][i], expected,
@@ -759,8 +758,7 @@ mod tests {
 
         // Each subsequent table is derived from the previous one
         for t in 1..8 {
-            for i in 0..256 {
-                let prev = CRC32_TABLE_SLICE[t - 1][i];
+            for (i, &prev) in CRC32_TABLE_SLICE[t - 1].iter().enumerate() {
                 let expected = CRC32_TABLE[(prev & 0xFF) as usize] ^ (prev >> 8);
                 assert_eq!(
                     CRC32_TABLE_SLICE[t][i], expected,

@@ -19,8 +19,13 @@ oxiarc-core.workspace = true
 oxiarc-archive.workspace = true
 oxiarc-lzma.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dialoguer.workspace = true
 glob = "0.3"
+filetime.workspace = true
 
 [lints]
 workspace = true

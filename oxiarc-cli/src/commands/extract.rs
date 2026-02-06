@@ -1,0 +1,687 @@
+//! Extract command implementation.
+
+use crate::commands::OutputFormat;
+use crate::utils::{create_progress_bar, matches_filters};
+use dialoguer::Confirm;
+use filetime::{FileTime, set_file_mtime};
+use oxiarc_archive::{
+    ArchiveFormat, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, ZipReader, ZstdReader,
+};
+use oxiarc_core::Entry;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+/// Overwrite mode for file extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverwriteMode {
+    /// Always overwrite existing files
+    Always,
+    /// Never overwrite existing files (skip them)
+    Never,
+    /// Prompt user for each file
+    Prompt,
+}
+
+/// Check if we should write a file based on overwrite mode.
+/// Returns Ok(true) if we should write, Ok(false) if we should skip.
+fn should_write_file(
+    path: &Path,
+    mode: OverwriteMode,
+    verbose: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // If file doesn't exist, always write
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    // Check if it's a directory
+    if path.is_dir() {
+        return Err(format!("Target path exists and is a directory: {}", path.display()).into());
+    }
+
+    match mode {
+        OverwriteMode::Always => Ok(true),
+        OverwriteMode::Never => {
+            if verbose {
+                eprintln!("  Skipped: {} (already exists)", path.display());
+            }
+            Ok(false)
+        }
+        OverwriteMode::Prompt => {
+            let prompt = format!("Overwrite {}?", path.display());
+            let result = Confirm::new()
+                .with_prompt(&prompt)
+                .default(false)
+                .interact()?;
+            Ok(result)
+        }
+    }
+}
+
+/// Apply metadata (timestamps and permissions) to an extracted file.
+///
+/// # Arguments
+/// * `path` - Path to the extracted file
+/// * `entry` - Archive entry with metadata
+/// * `preserve_timestamps` - Whether to preserve modification time
+/// * `preserve_permissions` - Whether to preserve Unix permissions
+#[allow(unused_variables)]
+fn apply_metadata(
+    path: &Path,
+    entry: &Entry,
+    preserve_timestamps: bool,
+    preserve_permissions: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Preserve timestamps
+    if preserve_timestamps {
+        if let Some(mtime) = entry.modified {
+            let filetime = FileTime::from_system_time(mtime);
+            set_file_mtime(path, filetime)?;
+        }
+    }
+
+    // Preserve permissions (Unix only)
+    if preserve_permissions {
+        if let Some(mode) = entry.attributes.unix_mode {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = fs::Permissions::from_mode(mode);
+                fs::set_permissions(path, permissions)?;
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix systems, just ignore permission preservation
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Filter entries by include/exclude patterns.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_extract(
+    archive: &str,
+    output: &str,
+    files: &[String],
+    include: &[String],
+    exclude: &[String],
+    verbose: bool,
+    progress: bool,
+    format_hint: Option<OutputFormat>,
+    _overwrite: bool,
+    skip_existing: bool,
+    prompt: bool,
+    preserve_timestamps: bool,
+    preserve_permissions: bool,
+    preserve: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Determine overwrite mode from flags
+    let overwrite_mode = if prompt {
+        OverwriteMode::Prompt
+    } else if skip_existing {
+        OverwriteMode::Never
+    } else {
+        // Default is Always (for backwards compatibility)
+        OverwriteMode::Always
+    };
+
+    // Determine what metadata to preserve
+    let preserve_timestamps = preserve_timestamps || preserve;
+    let preserve_permissions = preserve_permissions || preserve;
+
+    // Check if we're reading from stdin
+    let from_stdin = archive == "-";
+    let to_stdout = output == "-";
+
+    // Disable progress bar for stdin/stdout
+    let progress = progress && !from_stdin && !to_stdout;
+
+    if from_stdin && format_hint.is_none() {
+        return Err("--format is required when reading from stdin".into());
+    }
+
+    // For stdin, we need to read all data into memory first
+    let (format, data): (ArchiveFormat, Vec<u8>) = if from_stdin {
+        let format =
+            match format_hint.ok_or("Format required for stdin")? {
+                OutputFormat::Gzip => ArchiveFormat::Gzip,
+                OutputFormat::Xz => ArchiveFormat::Xz,
+                OutputFormat::Bz2 => ArchiveFormat::Bzip2,
+                OutputFormat::Lz4 => ArchiveFormat::Lz4,
+                OutputFormat::Zst => ArchiveFormat::Zstd,
+                _ => return Err(
+                    "Only single-file formats (gzip, xz, bz2, lz4, zst) are supported for stdin"
+                        .into(),
+                ),
+            };
+
+        let mut stdin = io::stdin();
+        let mut data = Vec::new();
+        stdin.read_to_end(&mut data)?;
+        (format, data)
+    } else {
+        let archive_path = Path::new(archive);
+        let file = File::open(archive_path)?;
+        let mut reader = BufReader::new(file);
+        let (format, _) = ArchiveFormat::detect(&mut reader)?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        // Read entire file for single-file formats when outputting to stdout
+        if to_stdout {
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            (format, data)
+        } else {
+            // For archive formats, we'll process below
+            drop(reader);
+            let file = File::open(archive_path)?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            return extract_archive_format(
+                reader,
+                format,
+                Path::new(output),
+                files,
+                include,
+                exclude,
+                verbose,
+                progress,
+                archive_path,
+                overwrite_mode,
+                preserve_timestamps,
+                preserve_permissions,
+            );
+        }
+    };
+
+    // Only print message if not using stdout (to avoid mixing with output data)
+    if !to_stdout && verbose {
+        eprintln!("Extracting {} to {}", archive, output);
+    }
+
+    // Handle single-file format extraction to stdout or file
+    if to_stdout {
+        let stdout = io::stdout();
+        let mut writer = BufWriter::new(stdout.lock());
+        extract_single_file_to_writer(&data, format, &mut writer, verbose)?;
+        return Ok(());
+    }
+
+    // For stdin to file, handle single-file formats
+    if from_stdin {
+        let output_path = Path::new(output);
+        std::fs::create_dir_all(output_path)?;
+        let out_name = "output"; // Default name for stdin
+        let out_path = output_path.join(out_name);
+
+        let decompressed = decompress_single_file(&data, format)?;
+
+        if should_write_file(&out_path, overwrite_mode, verbose)? {
+            std::fs::write(&out_path, &decompressed)?;
+            if verbose {
+                eprintln!("Extracted: {} ({} bytes)", out_name, decompressed.len());
+            }
+        }
+        return Ok(());
+    }
+
+    unreachable!("Should have been handled above");
+}
+
+/// Decompress a single-file format from a byte slice.
+fn decompress_single_file(
+    data: &[u8],
+    format: ArchiveFormat,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut cursor = io::Cursor::new(data);
+    let mut reader = BufReader::new(&mut cursor);
+
+    match format {
+        ArchiveFormat::Gzip => {
+            let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
+            Ok(gzip.decompress()?)
+        }
+        ArchiveFormat::Xz => Ok(oxiarc_archive::xz::decompress(&mut reader)?),
+        ArchiveFormat::Lz4 => {
+            let mut lz4 = Lz4Reader::new(reader)?;
+            Ok(lz4.decompress()?)
+        }
+        ArchiveFormat::Zstd => {
+            let mut zstd = ZstdReader::new(reader)?;
+            Ok(zstd.decompress()?)
+        }
+        ArchiveFormat::Bzip2 => {
+            let mut bzip2 = Bzip2Reader::new(reader)?;
+            Ok(bzip2.decompress()?)
+        }
+        _ => Err("Unsupported format for stdin/stdout".into()),
+    }
+}
+
+/// Extract a single-file format to a writer.
+fn extract_single_file_to_writer<W: Write>(
+    data: &[u8],
+    format: ArchiveFormat,
+    writer: &mut W,
+    _verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decompressed = decompress_single_file(data, format)?;
+    writer.write_all(&decompressed)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Extract archive formats (non-streaming).
+#[allow(clippy::too_many_arguments)]
+fn extract_archive_format<R: Read + Seek>(
+    mut reader: R,
+    format: ArchiveFormat,
+    output: &Path,
+    files: &[String],
+    include: &[String],
+    exclude: &[String],
+    verbose: bool,
+    progress: bool,
+    archive_path: &Path,
+    overwrite_mode: OverwriteMode,
+    preserve_timestamps: bool,
+    preserve_permissions: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Extracting {} to {}",
+        archive_path.display(),
+        output.display()
+    );
+
+    // Helper to check if entry should be extracted
+    let should_extract = |name: &str| -> bool {
+        // If specific files are requested, check those first
+        if !files.is_empty()
+            && !files
+                .iter()
+                .any(|f| name == f || name.starts_with(&format!("{}/", f)))
+        {
+            return false;
+        }
+        // Apply include/exclude filters
+        matches_filters(name, include, exclude)
+    };
+
+    match format {
+        ArchiveFormat::Zip => {
+            let mut zip = ZipReader::new(reader)?;
+            let entries: Vec<_> = zip.entries().to_vec();
+
+            // Filter entries
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for entry in to_extract {
+                if entry.is_dir() {
+                    let dir_path = output.join(entry.sanitized_name());
+                    std::fs::create_dir_all(&dir_path)?;
+                    if verbose {
+                        pb.println(format!("  Created: {}", entry.name));
+                    }
+                } else {
+                    let file_path = output.join(entry.sanitized_name());
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        let data = zip.extract(entry)?;
+                        std::fs::write(&file_path, data)?;
+                        apply_metadata(
+                            &file_path,
+                            entry,
+                            preserve_timestamps,
+                            preserve_permissions,
+                        )?;
+                        if verbose {
+                            pb.println(format!(
+                                "  Extracted: {} ({} bytes)",
+                                entry.name, entry.size
+                            ));
+                        }
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Gzip => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
+            let data = gzip.decompress()?;
+
+            // Use original filename if available, otherwise strip .gz
+            let out_name = gzip.header().filename.clone().unwrap_or_else(|| {
+                archive_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            // For GZIP, apply filter to output name
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Tar => {
+            let mut tar = oxiarc_archive::TarReader::new(reader)?;
+            let entries: Vec<_> = tar.entries().to_vec();
+
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for entry in to_extract {
+                if entry.is_dir() {
+                    let dir_path = output.join(entry.sanitized_name());
+                    std::fs::create_dir_all(&dir_path)?;
+                    if verbose {
+                        pb.println(format!("  Created: {}", entry.name));
+                    }
+                } else {
+                    let file_path = output.join(entry.sanitized_name());
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        let data = tar.extract_to_vec(entry)?;
+                        std::fs::write(&file_path, data)?;
+                        apply_metadata(
+                            &file_path,
+                            entry,
+                            preserve_timestamps,
+                            preserve_permissions,
+                        )?;
+                        if verbose {
+                            pb.println(format!(
+                                "  Extracted: {} ({} bytes)",
+                                entry.name, entry.size
+                            ));
+                        }
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Lzh => {
+            let mut lzh = oxiarc_archive::LzhReader::new(reader)?;
+            let entries: Vec<_> = lzh.entries().to_vec();
+
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for entry in to_extract {
+                if entry.is_dir() {
+                    let dir_path = output.join(entry.sanitized_name());
+                    std::fs::create_dir_all(&dir_path)?;
+                    if verbose {
+                        pb.println(format!("  Created: {}", entry.name));
+                    }
+                } else {
+                    let file_path = output.join(entry.sanitized_name());
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        let data = lzh.extract_to_vec(entry)?;
+                        std::fs::write(&file_path, data)?;
+                        apply_metadata(
+                            &file_path,
+                            entry,
+                            preserve_timestamps,
+                            preserve_permissions,
+                        )?;
+                        if verbose {
+                            pb.println(format!(
+                                "  Extracted: {} ({} bytes)",
+                                entry.name, entry.size
+                            ));
+                        }
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Xz => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let data = oxiarc_archive::xz::decompress(&mut reader)?;
+
+            // Use input filename without .xz extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            // For XZ, apply filter to output name
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Lz4 => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut lz4 = Lz4Reader::new(reader)?;
+            let data = lz4.decompress()?;
+
+            // Use input filename without .lz4 extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            // For LZ4, apply filter to output name
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Zstd => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut zstd = ZstdReader::new(reader)?;
+            let data = zstd.decompress()?;
+
+            // Use input filename without .zst extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            // For Zstd, apply filter to output name
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Bzip2 => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut bzip2 = Bzip2Reader::new(reader)?;
+            let data = bzip2.decompress()?;
+
+            // Use input filename without .bz2 extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            // For Bzip2, apply filter to output name
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::SevenZip => {
+            let mut sevenz = SevenZReader::new(reader)?;
+            let entries: Vec<_> = sevenz.sevenz_entries().to_vec();
+
+            let to_extract: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| should_extract(&e.name))
+                .collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for (i, entry) in to_extract {
+                if entry.is_dir {
+                    let dir_path = output.join(&entry.name);
+                    std::fs::create_dir_all(&dir_path)?;
+                    if verbose {
+                        pb.println(format!("  Created: {}", entry.name));
+                    }
+                } else {
+                    let file_path = output.join(&entry.name);
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        let data = sevenz.extract(i)?;
+                        std::fs::write(&file_path, &data)?;
+                        // TODO: Add metadata preservation for 7z format (uses SevenZEntry)
+                        if verbose {
+                            pb.println(format!(
+                                "  Extracted: {} ({} bytes)",
+                                entry.name,
+                                data.len()
+                            ));
+                        }
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Cab => {
+            let mut cab = CabReader::new(reader)?;
+            let entries: Vec<_> = cab.entries().to_vec();
+
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for entry in to_extract {
+                if entry.is_dir() {
+                    let dir_path = output.join(&entry.name);
+                    std::fs::create_dir_all(&dir_path)?;
+                    if verbose {
+                        pb.println(format!("  Created: {}", entry.name));
+                    }
+                } else {
+                    let file_path = output.join(&entry.name);
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+
+                    if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        let data = cab.extract(entry)?;
+                        std::fs::write(&file_path, &data)?;
+                        apply_metadata(
+                            &file_path,
+                            entry,
+                            preserve_timestamps,
+                            preserve_permissions,
+                        )?;
+                        if verbose {
+                            pb.println(format!(
+                                "  Extracted: {} ({} bytes)",
+                                entry.name,
+                                data.len()
+                            ));
+                        }
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
+        _ => {
+            println!("Extraction not yet implemented for {}", format);
+        }
+    }
+
+    Ok(())
+}

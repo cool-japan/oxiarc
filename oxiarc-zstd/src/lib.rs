@@ -38,6 +38,9 @@ mod xxhash;
 pub use encode::{CompressionStrategy, ZstdEncoder, compress, compress_no_checksum};
 pub use frame::{ZstdDecoder, decompress};
 
+#[cfg(feature = "parallel")]
+pub use encode::compress_parallel;
+
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Zstandard magic number (0xFD2FB528 little-endian).

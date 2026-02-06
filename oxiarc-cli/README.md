@@ -19,6 +19,62 @@ cargo install --path oxiarc-cli
 cargo run -p oxiarc-cli -- list archive.zip
 ```
 
+## Shell Completions
+
+oxiarc provides shell completion scripts for bash, zsh, fish, and PowerShell.
+
+### Installing Completions
+
+**Bash:**
+```bash
+# Generate completion script
+oxiarc completion bash > oxiarc.bash
+
+# Install (choose one location):
+sudo cp oxiarc.bash /etc/bash_completion.d/
+# or
+cp oxiarc.bash ~/.local/share/bash-completion/completions/
+
+# Or add to your .bashrc:
+echo 'source /path/to/oxiarc.bash' >> ~/.bashrc
+```
+
+**Zsh:**
+```bash
+# Generate completion script
+oxiarc completion zsh > _oxiarc
+
+# Install to a directory in your $fpath
+# For example, if /usr/local/share/zsh/site-functions is in your fpath:
+sudo cp _oxiarc /usr/local/share/zsh/site-functions/
+# or for user-only installation:
+mkdir -p ~/.zsh/completions
+cp _oxiarc ~/.zsh/completions/
+echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc
+echo 'autoload -Uz compinit && compinit' >> ~/.zshrc
+```
+
+**Fish:**
+```bash
+# Generate completion script
+oxiarc completion fish > oxiarc.fish
+
+# Install
+mkdir -p ~/.config/fish/completions
+cp oxiarc.fish ~/.config/fish/completions/
+```
+
+**PowerShell:**
+```powershell
+# Generate completion script
+oxiarc completion powershell > _oxiarc.ps1
+
+# Add to your PowerShell profile
+# Find your profile location with: $PROFILE
+# Then add this line to your profile:
+# . /path/to/_oxiarc.ps1
+```
+
 ## Commands
 
 ### list (l)

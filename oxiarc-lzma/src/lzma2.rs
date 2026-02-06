@@ -212,7 +212,10 @@ impl Lzma2Decoder {
             let state_idx = self.state.value();
 
             // Get mutable reference to model
-            let model = self.model.as_mut().unwrap();
+            let model = self
+                .model
+                .as_mut()
+                .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
 
             // Decode is_match
             let is_match = rc.decode_bit(&mut model.is_match[state_idx][pos_state])?;
@@ -240,12 +243,18 @@ impl Lzma2Decoder {
                 self.state.update_literal();
             } else {
                 // Match or rep
-                let model = self.model.as_mut().unwrap();
+                let model = self
+                    .model
+                    .as_mut()
+                    .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
                 let is_rep = rc.decode_bit(&mut model.is_rep[state_idx])?;
 
                 if is_rep == 0 {
                     // Normal match
-                    let model = self.model.as_mut().unwrap();
+                    let model = self
+                        .model
+                        .as_mut()
+                        .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
                     let len = decode_length(&mut rc, &mut model.match_len, pos_state)?;
                     let dist = self.decode_distance(&mut rc, len)?;
 
@@ -265,12 +274,17 @@ impl Lzma2Decoder {
                     bytes_decoded += len as u64;
                 } else {
                     // Rep match
-                    let model = self.model.as_mut().unwrap();
+                    let model = self
+                        .model
+                        .as_mut()
+                        .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
                     let is_rep0 = rc.decode_bit(&mut model.is_rep0[state_idx])?;
 
                     if is_rep0 == 0 {
                         // Rep0
-                        let model = self.model.as_mut().unwrap();
+                        let model = self.model.as_mut().ok_or_else(|| {
+                            OxiArcError::corrupted(0, "LZMA model not initialized")
+                        })?;
                         let is_rep0_long =
                             rc.decode_bit(&mut model.is_rep0_long[state_idx][pos_state])?;
 
@@ -293,7 +307,9 @@ impl Lzma2Decoder {
                         }
 
                         self.state.update_long_rep();
-                        let model = self.model.as_mut().unwrap();
+                        let model = self.model.as_mut().ok_or_else(|| {
+                            OxiArcError::corrupted(0, "LZMA model not initialized")
+                        })?;
                         let len = decode_length(&mut rc, &mut model.rep_len, pos_state)?;
                         self.copy_from_dict(
                             &mut output,
@@ -303,7 +319,9 @@ impl Lzma2Decoder {
                         )?;
                         bytes_decoded += len as u64;
                     } else {
-                        let model = self.model.as_mut().unwrap();
+                        let model = self.model.as_mut().ok_or_else(|| {
+                            OxiArcError::corrupted(0, "LZMA model not initialized")
+                        })?;
                         let is_rep1 = rc.decode_bit(&mut model.is_rep1[state_idx])?;
 
                         let dist = if is_rep1 == 0 {
@@ -311,7 +329,9 @@ impl Lzma2Decoder {
                             self.rep.swap(0, 1);
                             self.rep[0]
                         } else {
-                            let model = self.model.as_mut().unwrap();
+                            let model = self.model.as_mut().ok_or_else(|| {
+                                OxiArcError::corrupted(0, "LZMA model not initialized")
+                            })?;
                             let is_rep2 = rc.decode_bit(&mut model.is_rep2[state_idx])?;
 
                             if is_rep2 == 0 {
@@ -333,7 +353,9 @@ impl Lzma2Decoder {
                         };
 
                         self.state.update_long_rep();
-                        let model = self.model.as_mut().unwrap();
+                        let model = self.model.as_mut().ok_or_else(|| {
+                            OxiArcError::corrupted(0, "LZMA model not initialized")
+                        })?;
                         let len = decode_length(&mut rc, &mut model.rep_len, pos_state)?;
                         self.copy_from_dict(
                             &mut output,
@@ -380,8 +402,13 @@ impl Lzma2Decoder {
         match_byte: u8,
         bytes_decoded: u64,
     ) -> Result<u8> {
-        let props = self.props.unwrap();
-        let model = self.model.as_mut().unwrap();
+        let props = self
+            .props
+            .ok_or_else(|| OxiArcError::corrupted(0, "LZMA properties not initialized"))?;
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
 
         let lit_state = model
             .literal
@@ -430,7 +457,10 @@ impl Lzma2Decoder {
 
     /// Decode a distance.
     fn decode_distance<R: Read>(&mut self, rc: &mut RangeDecoder<R>, len: u32) -> Result<u32> {
-        let model = self.model.as_mut().unwrap();
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| OxiArcError::corrupted(0, "LZMA model not initialized"))?;
         let len_state = ((len - MATCH_LEN_MIN as u32).min(3)) as usize;
 
         // Decode distance slot

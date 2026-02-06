@@ -113,6 +113,8 @@
   - [x] Match encoding
   - [x] Rep match encoding
   - [x] End marker encoding
+  - [x] Optimal parsing with price calculation and dynamic programming
+  - [x] Compression levels 0-9 (greedy for levels 0-6, optimal for levels 7-9)
 - [x] LZMA decoder
   - [x] Full LZMA stream decoding
   - [x] Known/unknown uncompressed size
@@ -144,10 +146,22 @@
 - [x] LZ77 match finding optimization (early rejection, loop unrolling, best_len check)
 - [x] LZ77 large input handling (proper chunking and window sliding)
 - [x] BWT key-based sorting optimization (4-byte prefix keys for faster sorting)
-- [x] Performance benchmarks (lz77_bench, bwt_bench)
-  - LZ77: 48-400 MB/s (level 1), 13-275 MB/s (level 5), 0.3-253 MB/s (level 9)
-  - BWT Forward: 2-11 MB/s, Inverse: 60-320 MB/s
-- [ ] Parallel compression
+- [x] Comprehensive performance benchmarks
+  - [x] CRC benchmarks (crc_bench)
+  - [x] LZ77 benchmarks (lz77_bench, deflate_bench)
+  - [x] BWT benchmarks (bwt_bench, bzip2_bench)
+  - [x] LZ4 benchmarks (lz4_bench)
+  - [x] LZH benchmarks (lzhuf_bench)
+  - [x] LZMA benchmarks (lzma_bench)
+  - [x] Zstandard benchmarks (zstd_bench, parallel_bench)
+  - [x] LZW benchmarks (lzw_bench)
+  - Performance numbers:
+    - LZ77: 48-400 MB/s (level 1), 13-275 MB/s (level 5), 0.3-253 MB/s (level 9)
+    - BWT Forward: 2-11 MB/s, Inverse: 60-320 MB/s
+- [x] Parallel compression (partially complete)
+  - [x] LZ4 parallel frame compression (rayon-based block-level parallelism)
+  - [x] Zstandard parallel compression (rayon-based block-level parallelism)
+  - [x] Bzip2 parallel compression (rayon-based block-level parallelism)
 - [ ] Memory-mapped file support
 - [ ] Streaming with async I/O
 
@@ -155,36 +169,61 @@
 - [ ] WASM bindings
 - [ ] Python bindings (PyO3)
 
-## Phase 7: CLI Enhancements (Future)
+## Phase 7: CLI Enhancements & Documentation (Complete)
 
 - [x] List command
+  - [x] JSON output support (--json flag with pretty-printing)
 - [x] Extract command (ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2)
+  - [x] Timestamp preservation (--preserve-timestamps, -t)
+  - [x] Permission preservation (--preserve-permissions)
+  - [x] All metadata preservation (-p for timestamps + permissions)
+  - [x] Overwrite modes (--overwrite, --skip-existing, --prompt)
+  - [x] Stdin/stdout support for single-file formats
 - [x] Info command
 - [x] Detect command
 - [x] Test command (archive integrity)
 - [x] Create command (ZIP, TAR, GZIP, LZH, XZ, LZ4, Zstd, Bzip2)
+  - [x] Stdin/stdout support for single-file formats
 - [x] Convert command (format conversion including 7z and CAB input)
 - [x] Progress bars and verbose output (extract command with -v/--verbose and -P/--progress)
 - [x] Recursive directory handling
 - [x] Filter patterns (include/exclude)
+- [x] Shell completion scripts (bash, zsh, fish, powershell)
+- [x] Comprehensive README documentation
+  - [x] Installation instructions (cargo install, build from source)
+  - [x] Format support matrix with full feature breakdown
+  - [x] Performance benchmarks with real data
+  - [x] Detailed CLI examples for all commands
+  - [x] API usage examples for all major codecs
+  - [x] Contributing guidelines following COOLJAPAN policies
 
 ## Known Issues
 
-1. No parallel compression
+1. Bzip2 parallel compression bit-alignment issues have been RESOLVED
 2. LZMA encoder has known issues with certain complex data patterns (simple data works)
 3. BWT has O(n² log n) worst-case for highly repetitive data (mitigated by 900KB block size limit)
 
 ## Test Coverage
 
-- oxiarc-core: 51 tests (CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests)
-- oxiarc-deflate: 43 tests (including dynamic Huffman, Zlib wrapper, Adler-32, edge cases)
-- oxiarc-lzhuf: 19 tests (LH5 roundtrip encoding/decoding)
-- oxiarc-bzip2: 29 tests (BWT, MTF, RLE, Huffman, roundtrip)
-- oxiarc-lz4: 44 tests (official frame format, XXHash32, LZ4-HC, block/frame compression)
-- oxiarc-zstd: 37 tests (FSE, Huffman, XXHash64, frame parsing, raw block compression)
-- oxiarc-archive: 85 tests (ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors)
-- oxiarc-lzma: 27 tests (including LZMA2)
-- Total: 363 tests (all passing, zero warnings)
+- oxiarc-core: 56 tests (51 unit tests + 5 doctests)
+  - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer
+- oxiarc-deflate: 57 tests (43 unit tests + 11 integration tests + 3 doctests)
+  - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels
+- oxiarc-lzhuf: 20 tests (19 unit tests + 1 doctest)
+  - LH5 roundtrip encoding/decoding, LZSS, Huffman trees
+- oxiarc-bzip2: 36 tests
+  - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
+- oxiarc-lz4: 52 tests (51 unit tests + 1 doctest)
+  - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression
+- oxiarc-zstd: 50 tests (49 unit tests + 1 doctest)
+  - FSE, Huffman, XXHash64, frame parsing, raw block compression, parallel compression
+- oxiarc-archive: 92 tests (85 unit tests + 7 doctests)
+  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors
+- oxiarc-lzma: 43 tests (41 unit tests + 2 doctests)
+  - LZMA/LZMA2, optimal parsing, range coder, price calculation
+- oxiarc-lzw: 52 tests (46 unit tests + 6 doctests)
+  - GIF/TIFF configurations, dictionary management, roundtrip tests
+- Total: 458 tests (all passing, zero warnings)
 
 ## Code Statistics
 

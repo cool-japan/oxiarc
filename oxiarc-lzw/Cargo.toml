@@ -1,0 +1,27 @@
+[package]
+name = "oxiarc-lzw"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["compression", "lzw", "tiff", "pure-rust", "archive"]
+categories = ["compression", "encoding"]
+description = "Pure Rust LZW compression for TIFF and GIF formats"
+readme = "README.md"
+
+[dependencies]
+oxiarc-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+weezl = "0.1.12"
+
+[[bench]]
+name = "lzw_bench"
+harness = false
+
+[features]
+default = ["std"]
+std = []

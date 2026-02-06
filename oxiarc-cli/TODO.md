@@ -67,10 +67,10 @@
 - [x] Bzip2 extraction
 - [x] File pattern filtering (include/exclude)
 - [x] Progress bars
-- [ ] Preserve timestamps
-- [ ] Preserve permissions
-- [ ] Overwrite prompts
-- [ ] Skip existing files
+- [x] Preserve timestamps
+- [x] Preserve permissions
+- [x] Overwrite prompts
+- [x] Skip existing files
 
 ### List Improvements
 - [ ] JSON output (`--json`)
@@ -100,7 +100,13 @@
 - [ ] Memory limit option
 
 ### Platform
-- [ ] Shell completion scripts (bash, zsh, fish)
+- [x] Shell completion scripts (bash, zsh, fish, powershell) - COMPLETED
+  - [x] Hidden `completion` subcommand
+  - [x] Bash completion generation
+  - [x] Zsh completion generation
+  - [x] Fish completion generation
+  - [x] PowerShell completion generation
+  - [x] Installation instructions in README
 - [ ] Man page generation
 - [ ] Windows-specific handling
 

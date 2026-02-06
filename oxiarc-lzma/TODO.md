@@ -76,9 +76,26 @@
   - Chain table linking positions with same hash
   - Level-dependent chain depth (4 to 1024)
   - Quick 3-byte rejection for faster matching
-- [ ] Optimal parsing (price calculation)
-- [ ] Fast bytes parameter
-- [ ] Nice length parameter
+- [x] Optimal parsing (price calculation)
+  - Price calculation infrastructure for all encoding operations
+  - Bit encoding price tables (pre-computed)
+  - Match vs literal price estimation
+  - Rep match price calculation
+  - Distance and length encoding prices
+  - Simplified optimal sequence selection (heuristic-based)
+  - Enabled for compression levels 8-9
+- [x] Fast bytes parameter
+  - Configurable fast_bytes (5-273)
+  - Level 8: 64 fast bytes
+  - Level 9: 128 fast bytes
+- [x] Nice length parameter
+  - Configurable nice_length (8-273)
+  - Level 8: 128 nice length
+  - Level 9: 273 nice length
+- [ ] Full dynamic programming optimal parser
+  - Backward optimal parsing with DP table
+  - Multiple path tracking
+  - Forward and backward pass optimization
 - [ ] Binary tree match finder
 
 ### Performance
@@ -105,19 +122,22 @@
 - encoder: 7 tests (includes hash chain tests)
 - decoder: 2 tests
 - lzma2: 5 tests
-- lib: 9 tests
-- Total: 30 tests
+- optimal: 7 tests (price calculation and optimal parser)
+- lib: 13 tests (includes optimal vs greedy comparison)
+- Total: 41 tests
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| encoder.rs | ~660 |
-| decoder.rs | 439 |
+| encoder.rs | 832 |
+| lzma2.rs | 772 |
+| optimal.rs | 474 |
+| decoder.rs | 456 |
 | model.rs | 390 |
-| range_coder.rs | 363 |
-| lib.rs | 212 |
-| **Total** | **~1,921** |
+| range_coder.rs | 361 |
+| lib.rs | 280 |
+| **Total** | **3,565** |
 
 ## Technical Notes
 
@@ -155,7 +175,54 @@ Slot 14+: Distance = ((2 | (slot & 1)) << num_bits) + direct_bits + align_bits
 
 ## Known Limitations
 
-1. LZMA2 format not implemented
-2. No optimal parsing (greedy only)
+1. LZMA2 format partially implemented (no chunking, property changes)
+2. Optimal parsing uses simplified heuristics (not full DP)
 3. Single-threaded only
 4. High memory usage for large dictionaries
+
+## Optimal Parsing Implementation
+
+### Current Implementation (Levels 8-9)
+
+The current optimal parsing implementation uses price estimation and heuristic-based selection:
+
+1. **Price Calculation**:
+   - Pre-computed probability-to-price conversion table
+   - Prices measured in 1/16th bit units for precision
+   - Separate price calculators for literals, matches, and rep matches
+   - Distance and length encoding price estimation
+
+2. **Match Selection**:
+   - Find all matches at current position (not just best)
+   - Calculate prices for rep matches (rep0-rep3)
+   - Use heuristic comparison to select best encoding
+   - Consider match length and distance in price estimation
+
+3. **Parameters**:
+   - **fast_bytes**: Number of bytes to process with simplified optimization
+     - Level 8: 64 bytes
+     - Level 9: 128 bytes
+   - **nice_length**: Match length threshold for immediate acceptance
+     - Level 8: 128 bytes
+     - Level 9: 273 bytes (maximum)
+
+### Future Enhancement: Full Dynamic Programming
+
+A complete optimal parser would implement:
+
+1. **Backward Optimal Parsing**:
+   - DP table storing optimal choices for each position
+   - Track multiple paths through the data
+   - Backtrack to find globally optimal sequence
+
+2. **Forward-Backward Pass**:
+   - Forward pass: build DP table with all possible encodings
+   - Backward pass: select optimal path from end to start
+   - Update probability models during optimization
+
+3. **Advanced Price Calculation**:
+   - Context-dependent probability tracking
+   - State machine simulation for accurate pricing
+   - Literal context modeling (previous byte, position)
+
+This would provide compression ratios similar to 7-Zip's LZMA implementation.

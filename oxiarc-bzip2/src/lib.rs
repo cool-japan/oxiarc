@@ -23,6 +23,9 @@ mod rle;
 pub use decode::{BzDecoder, decompress};
 pub use encode::{BzEncoder, compress};
 
+#[cfg(feature = "parallel")]
+pub use encode::compress_parallel;
+
 /// BZip2 magic bytes ("BZ").
 pub const BZIP2_MAGIC: [u8; 2] = [0x42, 0x5A];
 

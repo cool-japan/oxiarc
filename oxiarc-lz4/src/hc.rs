@@ -517,8 +517,8 @@ mod tests {
 
         for level in [1, 6, 9, 12] {
             let hc_level = HcLevel::new(level).expect("valid level");
-            let compressed =
-                compress_hc_level(&data, hc_level).expect(&format!("level {} failed", level));
+            let compressed = compress_hc_level(&data, hc_level)
+                .unwrap_or_else(|_| panic!("level {} failed", level));
             let decompressed =
                 decompress_block(&compressed, data.len()).expect("decompress failed");
             assert_eq!(decompressed, data);

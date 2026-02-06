@@ -1,0 +1,358 @@
+#compdef oxiarc
+
+autoload -U is-at-least
+
+_oxiarc() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_oxiarc_commands" \
+"*::: :->oxiarc" \
+&& ret=0
+    case $state in
+    (oxiarc)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:oxiarc-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'*-I+[Include only files matching pattern (glob syntax\: *.txt, src/**/*)]:INCLUDE:_default' \
+'*--include=[Include only files matching pattern (glob syntax\: *.txt, src/**/*)]:INCLUDE:_default' \
+'*-X+[Exclude files matching pattern (glob syntax)]:EXCLUDE:_default' \
+'*--exclude=[Exclude files matching pattern (glob syntax)]:EXCLUDE:_default' \
+'-v[Show verbose output]' \
+'--verbose[Show verbose output]' \
+'-j[Output as JSON (machine-readable)]' \
+'--json[Output as JSON (machine-readable)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':archive -- Archive file to list:_files' \
+&& ret=0
+;;
+(extract)
+_arguments "${_arguments_options[@]}" : \
+'-o+[Output directory (use "-" for stdout when extracting single-file formats)]:OUTPUT:_default' \
+'--output=[Output directory (use "-" for stdout when extracting single-file formats)]:OUTPUT:_default' \
+'*-I+[Include only files matching pattern (glob syntax\: *.txt, src/**/*)]:INCLUDE:_default' \
+'*--include=[Include only files matching pattern (glob syntax\: *.txt, src/**/*)]:INCLUDE:_default' \
+'*-X+[Exclude files matching pattern (glob syntax)]:EXCLUDE:_default' \
+'*--exclude=[Exclude files matching pattern (glob syntax)]:EXCLUDE:_default' \
+'-f+[Format hint for stdin (gzip, xz, bz2, lz4, zst)]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'--format=[Format hint for stdin (gzip, xz, bz2, lz4, zst)]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'-v[Show verbose output]' \
+'--verbose[Show verbose output]' \
+'-P[Show progress bar]' \
+'--progress[Show progress bar]' \
+'--overwrite[Always overwrite existing files (default behavior)]' \
+'--skip-existing[Skip extraction if file already exists]' \
+'--prompt[Prompt user before overwriting each file]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':archive -- Archive file to extract (use "-" for stdin):_default' \
+'*::files -- Files to extract (all if empty):_default' \
+&& ret=0
+;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+'-v[Show verbose output]' \
+'--verbose[Show verbose output]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':archive -- Archive file to test:_files' \
+&& ret=0
+;;
+(create)
+_arguments "${_arguments_options[@]}" : \
+'-f+[Archive format (required for stdout\: gzip, xz, bz2, lz4, zst)]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'--format=[Archive format (required for stdout\: gzip, xz, bz2, lz4, zst)]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'-l+[Compression level]:COMPRESSION:((store\:"Store without compression"
+fast\:"Fast compression"
+normal\:"Normal compression (default)"
+best\:"Best compression"))' \
+'--compression=[Compression level]:COMPRESSION:((store\:"Store without compression"
+fast\:"Fast compression"
+normal\:"Normal compression (default)"
+best\:"Best compression"))' \
+'-v[Verbose output]' \
+'--verbose[Verbose output]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':archive -- Output archive file (use "-" for stdout):_default' \
+'*::files -- Files to add to the archive:_files' \
+&& ret=0
+;;
+(info)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':archive -- Archive file to inspect:_files' \
+&& ret=0
+;;
+(detect)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':file -- File to detect:_files' \
+&& ret=0
+;;
+(convert)
+_arguments "${_arguments_options[@]}" : \
+'-f+[Output format (zip, tar, gzip, lzh, xz, lz4) - auto-detected from extension if not specified]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'--format=[Output format (zip, tar, gzip, lzh, xz, lz4) - auto-detected from extension if not specified]:FORMAT:((zip\:"ZIP archive"
+tar\:"TAR archive"
+gzip\:"GZIP compressed file"
+lzh\:"LZH archive"
+xz\:"XZ compressed file"
+lz4\:"LZ4 compressed file"
+bz2\:"Bzip2 compressed file"
+zst\:"Zstandard compressed file"))' \
+'-l+[Compression level for output]:COMPRESSION:((store\:"Store without compression"
+fast\:"Fast compression"
+normal\:"Normal compression (default)"
+best\:"Best compression"))' \
+'--compression=[Compression level for output]:COMPRESSION:((store\:"Store without compression"
+fast\:"Fast compression"
+normal\:"Normal compression (default)"
+best\:"Best compression"))' \
+'-v[Verbose output]' \
+'--verbose[Verbose output]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':input -- Input archive file:_files' \
+':output -- Output archive file:_files' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell to generate completions for:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_oxiarc__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:oxiarc-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(extract)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(info)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(detect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(convert)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_oxiarc_commands] )) ||
+_oxiarc_commands() {
+    local commands; commands=(
+'list:List contents of an archive' \
+'extract:Extract files from an archive' \
+'test:Test archive integrity' \
+'create:Create a new archive' \
+'info:Show information about an archive' \
+'detect:Detect archive format' \
+'convert:Convert archive to another format' \
+'completion:Generate shell completion scripts' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'oxiarc commands' commands "$@"
+}
+(( $+functions[_oxiarc__completion_commands] )) ||
+_oxiarc__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc completion commands' commands "$@"
+}
+(( $+functions[_oxiarc__convert_commands] )) ||
+_oxiarc__convert_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc convert commands' commands "$@"
+}
+(( $+functions[_oxiarc__create_commands] )) ||
+_oxiarc__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc create commands' commands "$@"
+}
+(( $+functions[_oxiarc__detect_commands] )) ||
+_oxiarc__detect_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc detect commands' commands "$@"
+}
+(( $+functions[_oxiarc__extract_commands] )) ||
+_oxiarc__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc extract commands' commands "$@"
+}
+(( $+functions[_oxiarc__help_commands] )) ||
+_oxiarc__help_commands() {
+    local commands; commands=(
+'list:List contents of an archive' \
+'extract:Extract files from an archive' \
+'test:Test archive integrity' \
+'create:Create a new archive' \
+'info:Show information about an archive' \
+'detect:Detect archive format' \
+'convert:Convert archive to another format' \
+'completion:Generate shell completion scripts' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'oxiarc help commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__completion_commands] )) ||
+_oxiarc__help__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help completion commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__convert_commands] )) ||
+_oxiarc__help__convert_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help convert commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__create_commands] )) ||
+_oxiarc__help__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help create commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__detect_commands] )) ||
+_oxiarc__help__detect_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help detect commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__extract_commands] )) ||
+_oxiarc__help__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help extract commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__help_commands] )) ||
+_oxiarc__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help help commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__info_commands] )) ||
+_oxiarc__help__info_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help info commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__list_commands] )) ||
+_oxiarc__help__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help list commands' commands "$@"
+}
+(( $+functions[_oxiarc__help__test_commands] )) ||
+_oxiarc__help__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc help test commands' commands "$@"
+}
+(( $+functions[_oxiarc__info_commands] )) ||
+_oxiarc__info_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc info commands' commands "$@"
+}
+(( $+functions[_oxiarc__list_commands] )) ||
+_oxiarc__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc list commands' commands "$@"
+}
+(( $+functions[_oxiarc__test_commands] )) ||
+_oxiarc__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'oxiarc test commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_oxiarc" ]; then
+    _oxiarc "$@"
+else
+    compdef _oxiarc oxiarc
+fi

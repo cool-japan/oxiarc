@@ -13,8 +13,15 @@ categories = ["compression", "encoding"]
 [dependencies]
 oxiarc-core.workspace = true
 
+[dev-dependencies]
+criterion = "0.8.1"
+
 [[bench]]
 name = "lz77_bench"
+harness = false
+
+[[bench]]
+name = "deflate_bench"
 harness = false
 
 [lints]

@@ -1,6 +1,7 @@
 [package]
 name = "oxiarc-bzip2"
 description = "Pure Rust BZip2 compression/decompression for OxiArc"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +13,22 @@ categories = ["compression", "encoding"]
 
 [dependencies]
 oxiarc-core = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = "0.8.1"
 
 [[bench]]
 name = "bwt_bench"
 harness = false
+
+[[bench]]
+name = "bzip2_bench"
+harness = false
+
+[features]
+default = []
+parallel = ["rayon"]
 
 [lints]
 workspace = true

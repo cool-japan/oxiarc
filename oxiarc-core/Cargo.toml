@@ -13,5 +13,12 @@ categories = ["compression", "encoding"]
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion = "0.8.1"
+
+[[bench]]
+name = "crc_bench"
+harness = false
+
 [lints]
 workspace = true

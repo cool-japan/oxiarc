@@ -10,6 +10,9 @@ use crate::xxhash::xxhash64_checksum;
 use crate::{MAX_BLOCK_SIZE, ZSTD_MAGIC};
 use oxiarc_core::error::Result;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Compression strategy for block encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionStrategy {
@@ -60,6 +63,74 @@ impl ZstdEncoder {
     pub fn set_strategy(&mut self, strategy: CompressionStrategy) -> &mut Self {
         self.strategy = strategy;
         self
+    }
+
+    /// Compress data into a Zstandard frame using parallel block compression
+    /// (requires `parallel` feature).
+    ///
+    /// This function splits the input into independent blocks and compresses them
+    /// in parallel using rayon. The output is identical to serial compression.
+    #[cfg(feature = "parallel")]
+    pub fn compress_parallel(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(data.len() + 32);
+
+        // Write magic number
+        output.extend_from_slice(&ZSTD_MAGIC);
+
+        // Write frame header
+        self.write_frame_header(&mut output, data.len());
+
+        // Split data into blocks
+        if data.is_empty() {
+            // Empty data: write a single empty raw block with last flag
+            let block_header: u32 = 1; // last=1, type=Raw(0), size=0
+            output.push((block_header & 0xFF) as u8);
+            output.push(((block_header >> 8) & 0xFF) as u8);
+            output.push(((block_header >> 16) & 0xFF) as u8);
+        } else {
+            let chunks: Vec<&[u8]> = data.chunks(MAX_BLOCK_SIZE).collect();
+
+            // Process blocks in parallel
+            let block_data: Vec<(bool, Vec<u8>)> = chunks
+                .par_iter()
+                .enumerate()
+                .map(|(idx, chunk)| {
+                    let is_last = idx == chunks.len() - 1;
+
+                    // Try RLE encoding if strategy allows
+                    if self.strategy == CompressionStrategy::RleOnly {
+                        if let Some(rle_byte) = Self::detect_rle(chunk) {
+                            let mut block_output = Vec::new();
+                            self.encode_rle_block(
+                                &mut block_output,
+                                rle_byte,
+                                chunk.len(),
+                                is_last,
+                            );
+                            return (is_last, block_output);
+                        }
+                    }
+
+                    // Fall back to raw block
+                    let mut block_output = Vec::new();
+                    self.encode_raw_block(&mut block_output, chunk, is_last);
+                    (is_last, block_output)
+                })
+                .collect();
+
+            // Assemble blocks sequentially
+            for (_is_last, block_bytes) in block_data {
+                output.extend_from_slice(&block_bytes);
+            }
+        }
+
+        // Write content checksum if enabled
+        if self.include_checksum {
+            let checksum = xxhash64_checksum(data);
+            output.extend_from_slice(&checksum.to_le_bytes());
+        }
+
+        Ok(output)
     }
 
     /// Compress data into a Zstandard frame.
@@ -219,6 +290,11 @@ impl ZstdEncoder {
 
     /// Write a raw (uncompressed) block.
     fn write_raw_block(&self, output: &mut Vec<u8>, data: &[u8], is_last: bool) {
+        self.encode_raw_block(output, data, is_last);
+    }
+
+    /// Encode a raw block (helper for parallel compression).
+    fn encode_raw_block(&self, output: &mut Vec<u8>, data: &[u8], is_last: bool) {
         // Block header (3 bytes):
         // - bit 0: Last_Block
         // - bits 1-2: Block_Type (0 = Raw)
@@ -232,6 +308,24 @@ impl ZstdEncoder {
 
         // Write raw block data
         output.extend_from_slice(data);
+    }
+
+    /// Encode an RLE block (helper for parallel compression).
+    fn encode_rle_block(&self, output: &mut Vec<u8>, byte: u8, size: usize, is_last: bool) {
+        // Block header (3 bytes):
+        // - bit 0: Last_Block
+        // - bits 1-2: Block_Type (1 = RLE)
+        // - bits 3-23: Block_Size (regenerated size, not encoded size)
+        let last_flag = if is_last { 1u32 } else { 0u32 };
+        let block_type = 1u32 << 1; // RLE = 1
+        let block_header: u32 = last_flag | block_type | ((size as u32) << 3);
+
+        output.push((block_header & 0xFF) as u8);
+        output.push(((block_header >> 8) & 0xFF) as u8);
+        output.push(((block_header >> 16) & 0xFF) as u8);
+
+        // RLE block content: single byte
+        output.push(byte);
     }
 }
 
@@ -253,6 +347,15 @@ pub fn compress_no_checksum(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZstdEncoder::new();
     encoder.set_checksum(false);
     encoder.compress(data)
+}
+
+/// Compress data using parallel block compression (requires `parallel` feature).
+///
+/// This function uses rayon to compress blocks in parallel. The number of
+/// threads is automatically determined by rayon (typically matches CPU cores).
+#[cfg(feature = "parallel")]
+pub fn compress_parallel(data: &[u8]) -> Result<Vec<u8>> {
+    ZstdEncoder::new().compress_parallel(data)
 }
 
 #[cfg(test)]
@@ -407,6 +510,88 @@ mod tests {
         // Raw blocks don't compress, so output is slightly larger than input
         assert!(compressed.len() > data.len());
 
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_roundtrip_basic() {
+        let data = b"Hello, World! Parallel Zstandard compression.";
+        let compressed = compress_parallel(data).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_roundtrip_large() {
+        // Large data spanning multiple blocks
+        let data = vec![0xABu8; 5_000_000];
+        let compressed = compress_parallel(&data).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_rle_compression() {
+        // Data that should compress well with RLE
+        let data = vec![0xCCu8; 2_000_000];
+        let compressed = compress_parallel(&data).unwrap();
+
+        // RLE should compress very well
+        assert!(compressed.len() < data.len() / 100);
+
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_empty() {
+        let data: &[u8] = &[];
+        let compressed = compress_parallel(data).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_vs_serial() {
+        let data = b"Testing parallel vs serial compression output.";
+        let serial = compress(data).unwrap();
+        let parallel = compress_parallel(data).unwrap();
+
+        // Both should decompress correctly
+        let serial_decompressed = decompress(&serial).unwrap();
+        let parallel_decompressed = decompress(&parallel).unwrap();
+
+        assert_eq!(serial_decompressed, data.as_slice());
+        assert_eq!(parallel_decompressed, data.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_encoder_options() {
+        let data = vec![0xFFu8; 1_000_000];
+
+        let mut encoder = ZstdEncoder::new();
+        encoder
+            .set_checksum(false)
+            .set_strategy(CompressionStrategy::RleOnly);
+
+        let compressed = encoder.compress_parallel(&data).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_multi_block() {
+        // Create data larger than MAX_BLOCK_SIZE
+        let data = vec![0x55u8; MAX_BLOCK_SIZE * 3 + 5000];
+        let compressed = compress_parallel(&data).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }

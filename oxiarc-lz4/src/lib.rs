@@ -34,6 +34,9 @@ pub use frame::{
 };
 pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level};
 
+#[cfg(feature = "parallel")]
+pub use frame::{compress_parallel, compress_with_options_parallel};
+
 use oxiarc_core::error::Result;
 
 /// LZ4 compression level.

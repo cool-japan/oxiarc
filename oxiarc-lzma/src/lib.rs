@@ -57,6 +57,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod lzma2;
 pub mod model;
+pub mod optimal;
 pub mod range_coder;
 
 // Re-exports
@@ -218,6 +219,66 @@ mod tests {
     fn test_compress_decompress_repeated() {
         let original = vec![b'A'; 1000];
         let compressed = compress(&original, LzmaLevel::DEFAULT).unwrap();
+        let decompressed = decompress_bytes(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_compression_levels() {
+        // Test various compression levels
+        let data = b"Hello World! This is a test of LZMA compression with various levels.";
+
+        for level in 0..=9 {
+            let compressed = compress(data, LzmaLevel::new(level)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                &decompressed[..],
+                &data[..],
+                "Level {} roundtrip failed",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_optimal_vs_greedy_parsing() {
+        // Create test data with repetitive patterns that benefit from optimal parsing
+        let mut data = Vec::new();
+        for _ in 0..10 {
+            data.extend_from_slice(b"The quick brown fox jumps over the lazy dog. ");
+        }
+
+        // Test greedy (level 6) vs optimal (level 9)
+        let compressed_greedy = compress(&data, LzmaLevel::new(6)).unwrap();
+        let compressed_optimal = compress(&data, LzmaLevel::new(9)).unwrap();
+
+        // Both should decompress correctly
+        let decompressed_greedy = decompress_bytes(&compressed_greedy).unwrap();
+        let decompressed_optimal = decompress_bytes(&compressed_optimal).unwrap();
+
+        assert_eq!(decompressed_greedy, data);
+        assert_eq!(decompressed_optimal, data);
+
+        // Note: Optimal parsing should generally produce smaller or equal output
+        // but due to our simplified implementation, we just verify correctness
+        eprintln!("Greedy size: {}", compressed_greedy.len());
+        eprintln!("Optimal size: {}", compressed_optimal.len());
+    }
+
+    #[test]
+    fn test_level_9_compression() {
+        // Test level 9 (optimal parsing) specifically
+        let original = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(20);
+        let compressed = compress(&original, LzmaLevel::BEST).unwrap();
+        let decompressed = decompress_bytes(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_level_8_compression() {
+        // Test level 8 (optimal parsing with different parameters)
+        let original = b"Testing level 8 compression with optimal parsing enabled.".repeat(10);
+        let compressed = compress(&original, LzmaLevel::new(8)).unwrap();
         let decompressed = decompress_bytes(&compressed).unwrap();
         assert_eq!(decompressed, original);
     }

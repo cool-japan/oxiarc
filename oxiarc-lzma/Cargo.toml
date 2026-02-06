@@ -13,5 +13,12 @@ categories = ["compression", "encoding"]
 [dependencies]
 oxiarc-core.workspace = true
 
+[dev-dependencies]
+criterion = "0.8.1"
+
+[[bench]]
+name = "lzma_bench"
+harness = false
+
 [lints]
 workspace = true

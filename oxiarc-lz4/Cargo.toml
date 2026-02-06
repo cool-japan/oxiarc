@@ -7,13 +7,24 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Pure Rust LZ4 compression implementation with LZ4-HC"
+readme = "README.md"
 keywords = ["lz4", "compression", "decompression", "lz4hc", "xxhash"]
 categories = ["compression", "encoding"]
 
 [dependencies]
 oxiarc-core = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = "0.8.1"
+
+[[bench]]
+name = "lz4_bench"
+harness = false
+
+[features]
+default = []
+parallel = ["rayon"]
 
 [lints]
 workspace = true
