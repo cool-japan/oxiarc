@@ -19,6 +19,9 @@ const CODELEN_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
+/// Maximum dictionary size for DEFLATE (32KB).
+pub const MAX_DICTIONARY_SIZE: usize = 32768;
+
 /// DEFLATE compressor.
 #[derive(Debug)]
 pub struct Deflater {
@@ -28,6 +31,8 @@ pub struct Deflater {
     level: u8,
     /// Whether compression is finished.
     finished: bool,
+    /// Dictionary Adler-32 checksum (if dictionary is set).
+    dictionary_checksum: Option<u32>,
 }
 
 impl Deflater {
@@ -37,13 +42,71 @@ impl Deflater {
             lz77: Lz77Encoder::with_level(level),
             level: level.min(9),
             finished: false,
+            dictionary_checksum: None,
         }
+    }
+
+    /// Create a new DEFLATE compressor with a preset dictionary.
+    ///
+    /// The dictionary is used to seed the LZ77 sliding window, allowing
+    /// better compression for data that shares patterns with the dictionary.
+    /// This is useful for compressing similar files or data streams.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - Compression level (0-9)
+    /// * `dictionary` - Dictionary data (up to 32KB). If larger, only the
+    ///   last 32KB is used.
+    ///
+    /// # Returns
+    ///
+    /// A new Deflater with the dictionary set.
+    pub fn with_dictionary(level: u8, dictionary: &[u8]) -> Self {
+        let mut deflater = Self::new(level);
+        deflater.set_dictionary(dictionary);
+        deflater
+    }
+
+    /// Set a preset dictionary for improved compression.
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (up to 32KB). If larger, only the
+    ///   last 32KB is used.
+    ///
+    /// # Returns
+    ///
+    /// The Adler-32 checksum of the dictionary (used for identification).
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> u32 {
+        let checksum = self.lz77.set_dictionary(dictionary);
+        self.dictionary_checksum = Some(checksum);
+        checksum
+    }
+
+    /// Get the dictionary checksum, if a dictionary is set.
+    pub fn dictionary_checksum(&self) -> Option<u32> {
+        self.dictionary_checksum
+    }
+
+    /// Check if a dictionary is currently set.
+    pub fn has_dictionary(&self) -> bool {
+        self.dictionary_checksum.is_some()
     }
 
     /// Reset the compressor.
     pub fn reset(&mut self) {
         self.lz77.reset();
         self.finished = false;
+        self.dictionary_checksum = None;
+    }
+
+    /// Reset the compressor but keep the dictionary.
+    pub fn reset_keep_dictionary(&mut self) {
+        // Store dictionary checksum
+        let checksum = self.dictionary_checksum;
+        self.lz77.reset();
+        self.finished = false;
+        self.dictionary_checksum = checksum;
     }
 
     /// Compress data.

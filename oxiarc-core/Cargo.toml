@@ -10,8 +10,18 @@ description = "Core components for OxiArc - BitReader/Writer, CRC, traits, and e
 keywords = ["archive", "compression", "bitstream", "crc"]
 categories = ["compression", "encoding"]
 
+[features]
+default = []
+async-io = ["dep:tokio"]
+# SIMD-accelerated CRC-32 using PCLMULQDQ (x86_64) or PMULL (aarch64)
+simd = []
+# Memory-mapped file support for efficient large file access
+mmap = ["dep:memmap2"]
+
 [dependencies]
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = "0.8.1"

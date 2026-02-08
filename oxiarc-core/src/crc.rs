@@ -8,7 +8,7 @@
 //!
 //! ## Performance Optimization
 //!
-//! Both CRC-32 and CRC-64 use the "slicing-by-8" technique for data ≥16 bytes,
+//! Both CRC-32 and CRC-64 use the "slicing-by-8" technique for data >=16 bytes,
 //! processing 8 bytes at a time using 8 pre-computed lookup tables. This provides
 //! significant speedup (typically 3-5x) over the traditional byte-at-a-time algorithm
 //! while maintaining full compatibility.
@@ -16,11 +16,33 @@
 //! For smaller data (<16 bytes), a simpler single-table lookup is used to avoid
 //! the overhead of the more complex slicing algorithm.
 //!
-//! ## Note on Hardware Acceleration
+//! ## SIMD Acceleration (Optional)
 //!
-//! The x86_64 SSE4.2 CRC32 instruction uses the Castagnoli polynomial (0x1EDC6F41),
-//! which is different from the ISO 3309 polynomial (0xEDB88320) used by ZIP/GZIP.
-//! Therefore, we use an optimized software implementation for maximum compatibility.
+//! When the `simd` feature is enabled, hardware-accelerated CRC-32 is available:
+//!
+//! - **x86_64**: Uses PCLMULQDQ (carryless multiplication) for 5-20x speedup
+//! - **aarch64**: Uses PMULL (polynomial multiplication) for similar speedup
+//!
+//! The SIMD implementation uses the same ISO 3309 polynomial (0xEDB88320) as the
+//! software implementation, ensuring full compatibility with ZIP/GZIP/PNG formats.
+//!
+//! Runtime feature detection automatically selects the best available implementation.
+//!
+//! ### Enabling SIMD
+//!
+//! Add the `simd` feature to your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! oxiarc-core = { version = "0.2.0", features = ["simd"] }
+//! ```
+//!
+//! ## Note on Hardware CRC Instructions
+//!
+//! The x86_64 SSE4.2 `CRC32` instruction and ARM `CRC32C` instruction use the
+//! Castagnoli polynomial (0x1EDC6F41), which is different from the ISO 3309
+//! polynomial (0xEDB88320) used by ZIP/GZIP. Therefore, we use PCLMULQDQ/PMULL
+//! with pre-computed fold constants for the correct polynomial.
 
 /// CRC-32 lookup table (polynomial 0xEDB88320, reflected).
 const CRC32_TABLE: [u32; 256] = {
@@ -101,6 +123,22 @@ const CRC16_TABLE: [u16; 256] = {
     table
 };
 
+// Re-export SIMD module when feature is enabled
+#[cfg(feature = "simd")]
+pub use crate::crc_simd::{SimdCrc32Dispatcher, software_crc32 as simd_software_crc32};
+
+/// Global SIMD dispatcher (lazily initialized)
+#[cfg(feature = "simd")]
+static SIMD_DISPATCHER: std::sync::OnceLock<crate::crc_simd::SimdCrc32Dispatcher> =
+    std::sync::OnceLock::new();
+
+/// Get the global SIMD dispatcher
+#[cfg(feature = "simd")]
+#[inline]
+fn get_simd_dispatcher() -> &'static crate::crc_simd::SimdCrc32Dispatcher {
+    SIMD_DISPATCHER.get_or_init(crate::crc_simd::SimdCrc32Dispatcher::new)
+}
+
 /// CRC-32 calculator (ISO 3309).
 ///
 /// This is the standard CRC-32 used by ZIP, GZIP, PNG, and many other formats.
@@ -110,6 +148,12 @@ const CRC16_TABLE: [u16; 256] = {
 /// - Final XOR: 0xFFFFFFFF
 /// - Reflected input: Yes
 /// - Reflected output: Yes
+///
+/// # Performance
+///
+/// When the `simd` feature is enabled, this automatically uses hardware-accelerated
+/// SIMD instructions (PCLMULQDQ on x86_64, PMULL on aarch64) for large data blocks,
+/// providing 5-20x speedup over the software implementation.
 ///
 /// # Example
 ///
@@ -137,13 +181,25 @@ impl Crc32 {
     }
 
     /// Update the CRC with more data.
+    ///
+    /// When the `simd` feature is enabled and SIMD instructions are available,
+    /// this will automatically use hardware acceleration for data >= 64 bytes.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
-        // Use slicing-by-8 for better performance on large data
-        if data.len() >= 16 {
-            crc32_slice8(&mut self.crc, data);
-        } else {
-            crc32_sw(&mut self.crc, data);
+        #[cfg(feature = "simd")]
+        {
+            // Use SIMD dispatcher for automatic selection of best implementation
+            self.crc = get_simd_dispatcher().update(self.crc, data);
+        }
+
+        #[cfg(not(feature = "simd"))]
+        {
+            // Use slicing-by-8 for better performance on large data
+            if data.len() >= 16 {
+                crc32_slice8(&mut self.crc, data);
+            } else {
+                crc32_sw(&mut self.crc, data);
+            }
         }
     }
 
@@ -165,6 +221,70 @@ impl Crc32 {
         let mut crc = Self::new();
         crc.update(data);
         crc.finalize()
+    }
+
+    /// Check if SIMD acceleration is available.
+    ///
+    /// Returns `true` if the `simd` feature is enabled AND the current CPU
+    /// supports the required SIMD instructions (PCLMULQDQ on x86_64, PMULL on aarch64).
+    ///
+    /// Returns `false` if the `simd` feature is not enabled or if the CPU
+    /// doesn't support the required instructions.
+    #[inline]
+    pub fn is_simd_available() -> bool {
+        #[cfg(feature = "simd")]
+        {
+            get_simd_dispatcher().is_simd_available()
+        }
+        #[cfg(not(feature = "simd"))]
+        {
+            false
+        }
+    }
+
+    /// Get a description of the current implementation being used.
+    ///
+    /// This is useful for debugging and benchmarking to verify which
+    /// implementation path is being taken.
+    #[inline]
+    pub fn implementation_name() -> &'static str {
+        #[cfg(feature = "simd")]
+        {
+            if get_simd_dispatcher().is_simd_available() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    "PCLMULQDQ (x86_64 SIMD)"
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    "PMULL (aarch64 SIMD)"
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    "slicing-by-8 (software)"
+                }
+            } else {
+                "slicing-by-8 (software, SIMD not available)"
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        {
+            "slicing-by-8 (software)"
+        }
+    }
+
+    /// Compute CRC-32 using software implementation only.
+    ///
+    /// This is useful for benchmarking to compare against SIMD implementation.
+    #[inline]
+    pub fn compute_software(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFFFFFF_u32;
+        if data.len() >= 16 {
+            crc32_slice8(&mut crc, data);
+        } else {
+            crc32_sw(&mut crc, data);
+        }
+        crc ^ 0xFFFFFFFF
     }
 }
 
@@ -576,6 +696,22 @@ mod tests {
     }
 
     #[test]
+    fn test_crc32_software_vs_default() {
+        // Verify software-only matches default implementation
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let sw_crc = Crc32::compute_software(data);
+        let default_crc = Crc32::compute(data);
+        assert_eq!(sw_crc, default_crc);
+    }
+
+    #[test]
+    fn test_crc32_implementation_name() {
+        // Just verify it doesn't panic and returns a non-empty string
+        let name = Crc32::implementation_name();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
     fn test_crc16_empty() {
         assert_eq!(Crc16::compute(b""), 0x0000);
     }
@@ -645,7 +781,7 @@ mod tests {
 
         // Test with larger chunks
         let mut dual2 = DualCrc::new();
-        dual2.update(b"1234567890123456"); // Large chunk (≥ 16)
+        dual2.update(b"1234567890123456"); // Large chunk (>= 16)
         let data = b"1234567890123456";
         assert_eq!(dual2.crc32(), Crc32::compute(data));
         assert_eq!(dual2.crc16(), Crc16::compute(data));

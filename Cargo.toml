@@ -14,10 +14,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxiarc"
 authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 description = "Pure Rust archive/compression library - The Oxidized Archiver"
@@ -26,15 +26,15 @@ categories = ["compression", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-oxiarc-core = { version = "0.2.0", path = "oxiarc-core" }
-oxiarc-deflate = { version = "0.2.0", path = "oxiarc-deflate" }
-oxiarc-lzhuf = { version = "0.2.0", path = "oxiarc-lzhuf" }
-oxiarc-lzw = { version = "0.2.0", path = "oxiarc-lzw" }
-oxiarc-lzma = { version = "0.2.0", path = "oxiarc-lzma" }
-oxiarc-bzip2 = { version = "0.2.0", path = "oxiarc-bzip2" }
-oxiarc-lz4 = { version = "0.2.0", path = "oxiarc-lz4" }
-oxiarc-zstd = { version = "0.2.0", path = "oxiarc-zstd" }
-oxiarc-archive = { version = "0.2.0", path = "oxiarc-archive" }
+oxiarc-core = { version = "0.2.1", path = "oxiarc-core" }
+oxiarc-deflate = { version = "0.2.1", path = "oxiarc-deflate" }
+oxiarc-lzhuf = { version = "0.2.1", path = "oxiarc-lzhuf" }
+oxiarc-lzw = { version = "0.2.1", path = "oxiarc-lzw" }
+oxiarc-lzma = { version = "0.2.1", path = "oxiarc-lzma" }
+oxiarc-bzip2 = { version = "0.2.1", path = "oxiarc-bzip2" }
+oxiarc-lz4 = { version = "0.2.1", path = "oxiarc-lz4" }
+oxiarc-zstd = { version = "0.2.1", path = "oxiarc-zstd" }
+oxiarc-archive = { version = "0.2.1", path = "oxiarc-archive" }
 
 # External dependencies
 thiserror = "2.0.18"
@@ -47,6 +47,8 @@ serde_json = "1.0.149"
 dialoguer = "0.11.0"
 filetime = "0.2.27"
 rayon = "1.11.0"
+tokio = { version = "1.49.0", features = ["io-util", "rt", "macros", "sync"] }
+memmap2 = "0.9.9"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

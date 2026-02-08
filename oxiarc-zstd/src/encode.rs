@@ -311,6 +311,7 @@ impl ZstdEncoder {
     }
 
     /// Encode an RLE block (helper for parallel compression).
+    #[allow(dead_code)]
     fn encode_rle_block(&self, output: &mut Vec<u8>, byte: u8, size: usize, is_last: bool) {
         // Block header (3 bytes):
         // - bit 0: Last_Block

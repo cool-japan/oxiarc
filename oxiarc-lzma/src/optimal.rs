@@ -173,8 +173,24 @@ pub struct ProbabilityModels<'a> {
     pub is_rep2: &'a [u16; NUM_STATES],
     /// Is-rep0-long probabilities.
     pub is_rep0_long: &'a [[u16; POS_STATES_MAX]; NUM_STATES],
+    /// Match length model.
+    pub match_len: &'a crate::model::LengthModel,
+    /// Rep length model.
+    pub rep_len: &'a crate::model::LengthModel,
+    /// Distance slot probabilities.
+    pub dist_slot: &'a [[u16; 64]; 4],
+    /// Distance special probabilities.
+    pub dist_special: &'a [u16],
+    /// Distance alignment probabilities.
+    pub dist_align: &'a [u16; 1 << DIST_ALIGN_BITS],
+    /// Literal probabilities.
+    pub literal: &'a Vec<[u16; 0x300]>,
     /// Number of position states.
     pub num_pos_states: usize,
+    /// Literal context bits.
+    pub lc: u32,
+    /// Literal position bits.
+    pub lp: u32,
 }
 
 /// Price calculator for LZMA encoding decisions.
@@ -346,6 +362,19 @@ pub fn get_distance_price(
     price
 }
 
+/// Match candidate for optimal parsing.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchCandidate {
+    /// Distance (0-based).
+    pub dist: u32,
+    /// Match length.
+    pub len: u32,
+    /// Whether this is a rep match.
+    pub is_rep: bool,
+    /// Rep index (0-3) if is_rep is true.
+    pub rep_idx: u8,
+}
+
 /// Optimal parser for finding the best sequence of literals and matches.
 pub struct OptimalParser {
     /// Optimal states for positions (reserved for full DP implementation).
@@ -357,6 +386,33 @@ pub struct OptimalParser {
     fast_bytes: u32,
     /// Nice length parameter.
     nice_length: u32,
+    /// Compression level (8-10).
+    level: u8,
+    /// Look-ahead distance for match finding.
+    look_ahead: usize,
+}
+
+/// Match type result from optimal encoding.
+#[derive(Debug, Clone, Copy)]
+pub enum MatchType {
+    /// Literal byte.
+    Literal,
+    /// Short rep match (length 1).
+    ShortRep,
+    /// Rep match with index and length.
+    RepMatch {
+        /// Rep index (0-3).
+        rep_idx: u8,
+        /// Match length.
+        len: u32,
+    },
+    /// Normal match with distance and length.
+    Match {
+        /// Distance.
+        dist: u32,
+        /// Match length.
+        len: u32,
+    },
 }
 
 impl OptimalParser {
@@ -370,7 +426,33 @@ impl OptimalParser {
             price_calc: PriceCalculator::new(),
             fast_bytes,
             nice_length,
+            level: 8,
+            look_ahead: 32,
         }
+    }
+
+    /// Create a new optimal parser with the given compression level.
+    pub fn with_level(level: u8) -> Self {
+        let (fast_bytes, nice_length, look_ahead) = match level {
+            8 => (64, 128, 32),
+            9 => (128, 273, 64),
+            _ => (273, 273, 128), // level 10+
+        };
+
+        let mut parser = Self::new(fast_bytes, nice_length);
+        parser.level = level;
+        parser.look_ahead = look_ahead;
+        parser
+    }
+
+    /// Get the compression level.
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// Get the look-ahead distance.
+    pub fn look_ahead(&self) -> usize {
+        self.look_ahead
     }
 
     /// Get fast bytes parameter.
@@ -391,6 +473,109 @@ impl OptimalParser {
     /// Get price calculator.
     pub fn price_calc(&self) -> &PriceCalculator {
         &self.price_calc
+    }
+
+    /// Find optimal encoding for a position.
+    ///
+    /// This implements a simplified optimal parsing approach that evaluates
+    /// all matches at the current position and returns the best one based
+    /// on price estimation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_optimal_encoding<F, G>(
+        &mut self,
+        data: &[u8],
+        pos: usize,
+        state: crate::model::State,
+        _reps: [u32; 4],
+        find_matches: F,
+        check_rep: G,
+        models: &ProbabilityModels<'_>,
+    ) -> Option<(MatchType, u32)>
+    where
+        F: Fn(usize, usize) -> Vec<(u32, u32)>,
+        G: Fn(usize, u8) -> u32,
+    {
+        if pos >= data.len() {
+            return None;
+        }
+
+        let pos_state = pos & (models.num_pos_states - 1);
+        let state_idx = state.value();
+
+        // Get literal price
+        let literal_price = self.price_calc.get_literal_price(state_idx, pos_state);
+
+        // Best result so far
+        let mut best_price = literal_price;
+        let mut best_match = MatchType::Literal;
+
+        // Check rep matches
+        for rep_idx in 0..4u8 {
+            let len = check_rep(pos, rep_idx);
+            if len >= MATCH_LEN_MIN as u32 {
+                let price = if len == 1 && rep_idx == 0 {
+                    self.price_calc.get_short_rep_price(state_idx, pos_state)
+                } else {
+                    let rep_price =
+                        self.price_calc
+                            .get_rep_price(state_idx, rep_idx as usize, pos_state);
+                    let len_price = get_length_price(
+                        models.rep_len.choice,
+                        models.rep_len.choice2,
+                        &models.rep_len.low,
+                        &models.rep_len.mid,
+                        &models.rep_len.high,
+                        len,
+                        pos_state,
+                    );
+                    rep_price + len_price
+                };
+
+                if price < best_price {
+                    best_price = price;
+                    if len == 1 && rep_idx == 0 {
+                        best_match = MatchType::ShortRep;
+                    } else {
+                        best_match = MatchType::RepMatch { rep_idx, len };
+                    }
+                }
+            }
+        }
+
+        // Check normal matches
+        let matches = find_matches(pos, self.look_ahead);
+        for (dist, len) in matches {
+            if len >= MATCH_LEN_MIN as u32 {
+                let match_price = self.price_calc.get_match_price(state_idx, pos_state);
+                let len_price = get_length_price(
+                    models.match_len.choice,
+                    models.match_len.choice2,
+                    &models.match_len.low,
+                    &models.match_len.mid,
+                    &models.match_len.high,
+                    len,
+                    pos_state,
+                );
+                let dist_price = get_distance_price(
+                    models.dist_slot,
+                    models.dist_special,
+                    models.dist_align,
+                    dist,
+                    len,
+                );
+                let price = match_price + len_price + dist_price;
+
+                if price < best_price {
+                    best_price = price;
+                    best_match = MatchType::Match { dist, len };
+                }
+            }
+        }
+
+        match best_match {
+            MatchType::Literal => None,
+            _ => Some((best_match, best_price)),
+        }
     }
 }
 

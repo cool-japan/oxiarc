@@ -48,8 +48,11 @@ pub mod tables;
 pub mod zlib;
 
 // Re-exports
-pub use deflate::{Deflater, deflate};
+pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, inflate};
 pub use lz77::{Lz77Encoder, Lz77Token};
-pub use zlib::{Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_decompress};
+pub use zlib::{
+    Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
+    zlib_decompress, zlib_decompress_with_dict, zlib_requires_dictionary,
+};

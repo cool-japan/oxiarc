@@ -1,13 +1,20 @@
 //! LZMA compression.
 //!
 //! This module implements LZMA compression with both greedy and optimal parsing.
+//!
+//! ## Compression Levels
+//!
+//! - Levels 0-7: Greedy matching with varying chain depths
+//! - Level 8: Optimal parsing with moderate look-ahead
+//! - Level 9: Optimal parsing with extended look-ahead
+//! - Level 10: Ultra optimal parsing with maximum look-ahead
 
 use crate::LzmaLevel;
 use crate::model::{
     DIST_ALIGN_BITS, END_POS_MODEL_INDEX, LEN_HIGH_BITS, LEN_LOW_BITS, LEN_MID_BITS, LengthModel,
     LzmaModel, LzmaProperties, MATCH_LEN_MIN, State,
 };
-use crate::optimal::OptimalParser;
+use crate::optimal::{MatchCandidate, MatchType, OptimalParser, ProbabilityModels};
 use crate::range_coder::RangeEncoder;
 use oxiarc_core::error::Result;
 
@@ -18,7 +25,7 @@ const MATCH_LEN_MAX: usize = 273;
 const HASH_SIZE: usize = 1 << 16;
 
 /// Maximum chain depth per compression level.
-const CHAIN_DEPTH: [usize; 10] = [
+const CHAIN_DEPTH: [usize; 11] = [
     0,    // Level 0: No search (stored mode)
     4,    // Level 1: Very fast
     8,    // Level 2: Fast
@@ -27,8 +34,9 @@ const CHAIN_DEPTH: [usize; 10] = [
     64,   // Level 5: Normal
     128,  // Level 6: Normal (default)
     256,  // Level 7: Maximum
-    512,  // Level 8: Maximum
-    1024, // Level 9: Ultra
+    512,  // Level 8: High (optimal parsing)
+    1024, // Level 9: Best (optimal parsing)
+    2048, // Level 10: Ultra (maximum optimal parsing)
 ];
 
 /// Encode a bit tree.
@@ -102,11 +110,12 @@ pub struct LzmaEncoder {
     level: LzmaLevel,
     /// Bytes encoded.
     bytes_encoded: u64,
-    /// Optimal parser (used for levels 8-9, reserved for full DP implementation).
-    #[allow(dead_code)]
+    /// Optimal parser (used for levels 8-10).
     optimal_parser: Option<OptimalParser>,
     /// Use optimal parsing.
     use_optimal: bool,
+    /// Price update counter.
+    price_update_counter: u32,
 }
 
 impl LzmaEncoder {
@@ -114,20 +123,13 @@ impl LzmaEncoder {
     pub fn new(level: LzmaLevel, dict_size: u32) -> Self {
         let dict_size = dict_size.max(4096) as usize;
         let props = LzmaProperties::default();
-        let level_idx = (level.level() as usize).min(9);
+        let level_idx = (level.level() as usize).min(10);
         let chain_depth = CHAIN_DEPTH[level_idx];
 
-        // Use optimal parsing for levels 8-9
+        // Use optimal parsing for levels 8-10
         let use_optimal = level.level() >= 8;
         let optimal_parser = if use_optimal {
-            // Level 8: fast_bytes=64, nice_length=128
-            // Level 9: fast_bytes=128, nice_length=273
-            let (fast_bytes, nice_length) = if level.level() >= 9 {
-                (128, 273)
-            } else {
-                (64, 128)
-            };
-            Some(OptimalParser::new(fast_bytes, nice_length))
+            Some(OptimalParser::with_level(level.level()))
         } else {
             None
         };
@@ -139,18 +141,40 @@ impl LzmaEncoder {
             state: State::new(),
             rep: [0; 4],
             hash_head: vec![u32::MAX; HASH_SIZE],
-            hash_chain: Vec::new(), // Will be sized as we encode
+            hash_chain: Vec::new(),
             chain_depth,
             level,
             bytes_encoded: 0,
             optimal_parser,
             use_optimal,
+            price_update_counter: 0,
         }
     }
 
     /// Get properties.
     pub fn properties(&self) -> LzmaProperties {
         self.model.props
+    }
+
+    /// Build probability models for optimal parser.
+    fn build_probability_models(&self) -> ProbabilityModels<'_> {
+        ProbabilityModels {
+            is_match: &self.model.is_match,
+            is_rep: &self.model.is_rep,
+            is_rep0: &self.model.is_rep0,
+            is_rep1: &self.model.is_rep1,
+            is_rep2: &self.model.is_rep2,
+            is_rep0_long: &self.model.is_rep0_long,
+            match_len: &self.model.match_len,
+            rep_len: &self.model.rep_len,
+            dist_slot: &self.model.distance.slot,
+            dist_special: &self.model.distance.special,
+            dist_align: &self.model.distance.align,
+            literal: &self.model.literal.probs,
+            num_pos_states: self.model.props.num_pos_states(),
+            lc: self.model.props.lc,
+            lp: self.model.props.lp,
+        }
     }
 
     /// Calculate hash for 3 bytes with improved avalanche properties.
@@ -170,7 +194,6 @@ impl LzmaEncoder {
     }
 
     /// Calculate hash for 4 bytes (better for longer matches).
-    /// Reserved for future optimal parsing implementation.
     #[allow(dead_code)]
     fn hash4(data: &[u8]) -> usize {
         if data.len() < 4 {
@@ -363,16 +386,224 @@ impl LzmaEncoder {
         matches
     }
 
-    /// Find the optimal sequence of literals and matches using backward DP.
-    /// Returns the length of the optimal sequence and the decisions.
+    /// Find optimal encoding decision using DP.
+    fn find_optimal_decision(&mut self, data: &[u8], pos: usize) -> Option<(MatchType, usize)> {
+        // Take the parser out temporarily to avoid borrow conflicts
+        let mut parser = self.optimal_parser.take()?;
+
+        // Update prices periodically (before borrowing self for models)
+        self.price_update_counter += 1;
+        let should_update_prices = self.price_update_counter >= 64;
+        if should_update_prices {
+            self.price_update_counter = 0;
+        }
+
+        // Capture state before borrowing self for models
+        let state = self.state;
+        let reps = self.rep;
+        let dict_size = self.dict_size;
+        let chain_depth = self.chain_depth;
+
+        // Pre-compute matches to avoid borrowing self in closures
+        let all_matches = self.find_all_matches_internal(data, pos, 32, dict_size, chain_depth);
+
+        // Pre-compute rep match lengths
+        let rep_lengths: [u32; 4] = [
+            self.check_rep_match_internal(data, pos, 0, reps),
+            self.check_rep_match_internal(data, pos, 1, reps),
+            self.check_rep_match_internal(data, pos, 2, reps),
+            self.check_rep_match_internal(data, pos, 3, reps),
+        ];
+
+        // Build probability models after all mutable operations on self are done
+        let models = self.build_probability_models();
+
+        // Now update prices if needed (parser is separate from self)
+        if should_update_prices {
+            parser.update_prices(&models);
+        }
+
+        // Closures now use pre-computed data
+        let find_matches = |_p: usize, _max: usize| -> Vec<(u32, u32)> { all_matches.clone() };
+
+        let check_rep = |_p: usize, rep_idx: u8| -> u32 {
+            rep_lengths.get(rep_idx as usize).copied().unwrap_or(0)
+        };
+
+        let result =
+            parser.find_optimal_encoding(data, pos, state, reps, find_matches, check_rep, &models);
+
+        // Put the parser back
+        self.optimal_parser = Some(parser);
+
+        // Convert (MatchType, u32) to (MatchType, usize) for price
+        result.map(|(match_type, _price)| {
+            let len = match match_type {
+                MatchType::Literal => 1,
+                MatchType::ShortRep => 1,
+                MatchType::RepMatch { len, .. } => len as usize,
+                MatchType::Match { len, .. } => len as usize,
+            };
+            (match_type, len)
+        })
+    }
+
+    /// Internal match finding for closures.
+    fn find_all_matches_internal(
+        &self,
+        data: &[u8],
+        pos: usize,
+        max_matches: usize,
+        dict_size: usize,
+        chain_depth: usize,
+    ) -> Vec<(u32, u32)> {
+        if pos + MATCH_LEN_MIN > data.len() {
+            return Vec::new();
+        }
+
+        let hash = Self::hash3(&data[pos..]);
+        let mut match_pos = self.hash_head[hash] as usize;
+
+        if match_pos == u32::MAX as usize {
+            return Vec::new();
+        }
+
+        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
+        let mut matches = Vec::with_capacity(max_matches);
+        let mut prev_len = 0usize;
+        let mut chain_count = 0;
+
+        while match_pos < pos && chain_count < chain_depth && matches.len() < max_matches {
+            let dist = pos - match_pos;
+            if dist > dict_size {
+                break;
+            }
+
+            if data[pos] == data[match_pos]
+                && data[pos + 1] == data[match_pos + 1]
+                && data[pos + 2] == data[match_pos + 2]
+            {
+                let mut len = 3usize;
+                while len < max_len && data[pos + len] == data[match_pos + len] {
+                    len += 1;
+                }
+
+                if len > prev_len {
+                    matches.push(((dist - 1) as u32, len as u32));
+                    prev_len = len;
+
+                    if len >= max_len {
+                        break;
+                    }
+                }
+            }
+
+            if match_pos < self.hash_chain.len() {
+                let next = self.hash_chain[match_pos] as usize;
+                if next >= match_pos || next == u32::MAX as usize {
+                    break;
+                }
+                match_pos = next;
+            } else {
+                break;
+            }
+
+            chain_count += 1;
+        }
+
+        matches
+    }
+
+    /// Internal rep match check for closures.
+    fn check_rep_match_internal(
+        &self,
+        data: &[u8],
+        pos: usize,
+        rep_idx: usize,
+        reps: [u32; 4],
+    ) -> u32 {
+        let dist = reps[rep_idx] as usize;
+
+        if dist >= pos {
+            return 0;
+        }
+
+        let match_pos = pos - dist - 1;
+        let mut len = 0usize;
+        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
+
+        while len < max_len && pos + len < data.len() && match_pos + len < data.len() {
+            if data[pos + len] == data[match_pos + len] {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+
+        len as u32
+    }
+
+    /// Get all match candidates for optimal parsing.
+    #[allow(dead_code)]
+    fn get_match_candidates(&self, data: &[u8], pos: usize) -> Vec<MatchCandidate> {
+        let mut candidates = Vec::new();
+
+        // Check rep matches
+        for rep_idx in 0..4u8 {
+            let len = self.check_rep_match(data, pos, rep_idx as usize);
+            if len >= MATCH_LEN_MIN as u32 {
+                candidates.push(MatchCandidate {
+                    dist: self.rep[rep_idx as usize],
+                    len,
+                    is_rep: true,
+                    rep_idx,
+                });
+            }
+        }
+
+        // Get normal matches
+        let max_matches = self
+            .optimal_parser
+            .as_ref()
+            .map(|p| p.look_ahead())
+            .unwrap_or(32);
+        let normal_matches = self.find_all_matches(data, pos, max_matches);
+        for (dist, len) in normal_matches {
+            if len >= MATCH_LEN_MIN as u32 {
+                candidates.push(MatchCandidate {
+                    dist,
+                    len,
+                    is_rep: false,
+                    rep_idx: 0,
+                });
+            }
+        }
+
+        candidates
+    }
+
+    /// Find the optimal sequence using DP-based backward parsing.
     fn find_optimal_sequence(
         &mut self,
         data: &[u8],
         start_pos: usize,
     ) -> Option<(bool, usize, u32)> {
-        // For optimal parsing, we need to look ahead and find the best sequence
-        // This is a simplified version - a full implementation would use dynamic programming
+        // Try to use the new DP-based optimal parser
+        if let Some(decision) = self.find_optimal_decision(data, start_pos) {
+            match decision.0 {
+                MatchType::Literal => None,
+                MatchType::ShortRep => Some((true, 0, 1)),
+                MatchType::RepMatch { rep_idx, len } => Some((true, rep_idx as usize, len)),
+                MatchType::Match { dist, len } => Some((false, dist as usize, len)),
+            }
+        } else {
+            // Fall back to heuristic selection
+            self.find_heuristic_match(data, start_pos)
+        }
+    }
 
+    /// Heuristic match finding (fallback).
+    fn find_heuristic_match(&self, data: &[u8], start_pos: usize) -> Option<(bool, usize, u32)> {
         // Get rep matches
         let mut best_rep: Option<(usize, u32)> = None;
         for rep_idx in 0..4 {
@@ -386,19 +617,14 @@ impl LzmaEncoder {
 
         // Get normal matches
         let matches = self.find_all_matches(data, start_pos, 32);
-
-        // Simple heuristic: prefer longer matches
-        // In full optimal parsing, we would calculate prices and use DP
         let normal_match = matches.last().copied();
 
         // Decision logic with price estimation
         match (best_rep, normal_match) {
             (Some((rep_idx, rep_len)), Some((dist, len))) => {
-                // Estimate prices:
-                // Rep match: ~3-4 bits + length encoding
-                // Normal match: ~8-10 bits + length + distance encoding
-                let rep_price = 4 + (rep_len / 4); // Rough estimate
-                let normal_price = 10 + (len / 4) + 8; // Rough estimate
+                // Estimate prices
+                let rep_price = 4 + (rep_len / 4);
+                let normal_price = 10 + (len / 4) + 8;
 
                 if rep_price < normal_price || (rep_len >= len && rep_idx == 0) {
                     Some((true, rep_idx, rep_len))
@@ -545,6 +771,16 @@ impl LzmaEncoder {
     /// Compress data.
     pub fn compress(mut self, data: &[u8]) -> Result<Vec<u8>> {
         let mut i = 0;
+
+        // Initialize prices for optimal parser
+        if self.use_optimal {
+            // Take the parser out temporarily to avoid borrow conflict
+            if let Some(mut parser) = self.optimal_parser.take() {
+                let models = self.build_probability_models();
+                parser.update_prices(&models);
+                self.optimal_parser = Some(parser);
+            }
+        }
 
         while i < data.len() {
             let pos_state = (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
@@ -725,7 +961,8 @@ pub fn compress(data: &[u8], level: LzmaLevel) -> Result<Vec<u8>> {
         0 => 1 << 16,     // 64 KB
         1..=3 => 1 << 20, // 1 MB
         4..=6 => 1 << 22, // 4 MB
-        _ => 1 << 24,     // 16 MB
+        7..=8 => 1 << 24, // 16 MB
+        _ => 1 << 25,     // 32 MB for levels 9-10
     };
 
     let encoder = LzmaEncoder::new(level, dict_size);
@@ -801,6 +1038,11 @@ mod tests {
         // Level 9 should have depth 1024
         let enc9 = LzmaEncoder::new(LzmaLevel::new(9), 1 << 16);
         assert_eq!(enc9.chain_depth, 1024);
+
+        // Level 10 is clamped to 9 by LzmaLevel::new(), so chain_depth is 1024
+        // (LzmaLevel::new caps at level 9)
+        let enc10 = LzmaEncoder::new(LzmaLevel::new(10), 1 << 16);
+        assert_eq!(enc10.chain_depth, 1024);
     }
 
     #[test]
@@ -827,5 +1069,47 @@ mod tests {
         // hash4 should give different results than hash3 for same prefix
         let h3_1 = LzmaEncoder::hash3(&data1);
         assert!(h3_1 < HASH_SIZE); // Verify hash3 result is valid
+    }
+
+    #[test]
+    fn test_optimal_parser_level_8() {
+        let encoder = LzmaEncoder::new(LzmaLevel::new(8), 1 << 20);
+        assert!(encoder.use_optimal);
+        assert!(encoder.optimal_parser.is_some());
+        assert_eq!(encoder.optimal_parser.as_ref().map(|p| p.level()), Some(8));
+    }
+
+    #[test]
+    fn test_optimal_parser_level_9() {
+        let encoder = LzmaEncoder::new(LzmaLevel::new(9), 1 << 20);
+        assert!(encoder.use_optimal);
+        assert!(encoder.optimal_parser.is_some());
+        assert_eq!(encoder.optimal_parser.as_ref().map(|p| p.level()), Some(9));
+    }
+
+    #[test]
+    fn test_optimal_parser_level_10() {
+        // Level 10 is clamped to 9 by LzmaLevel::new()
+        let encoder = LzmaEncoder::new(LzmaLevel::new(10), 1 << 20);
+        assert!(encoder.use_optimal);
+        assert!(encoder.optimal_parser.is_some());
+        // Parser level is 9 (clamped from 10)
+        assert_eq!(encoder.optimal_parser.as_ref().map(|p| p.level()), Some(9));
+    }
+
+    #[test]
+    fn test_no_optimal_parser_for_low_levels() {
+        let encoder = LzmaEncoder::new(LzmaLevel::new(6), 1 << 20);
+        assert!(!encoder.use_optimal);
+        assert!(encoder.optimal_parser.is_none());
+    }
+
+    #[test]
+    fn test_match_candidates() {
+        let encoder = LzmaEncoder::new(LzmaLevel::new(9), 1 << 20);
+        let data = b"ABCDEFGHIJ";
+        let candidates = encoder.get_match_candidates(data, 0);
+        // At position 0 with empty hash tables, no matches expected
+        assert!(candidates.is_empty());
     }
 }

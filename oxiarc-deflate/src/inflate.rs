@@ -16,6 +16,9 @@ use oxiarc_core::traits::{DecompressStatus, Decompressor};
 use oxiarc_core::{BitReader, OutputRingBuffer};
 use std::io::Read;
 
+/// Maximum dictionary size for DEFLATE (32KB).
+pub const MAX_DICTIONARY_SIZE: usize = 32768;
+
 /// DEFLATE decompressor.
 #[derive(Debug)]
 pub struct Inflater {
@@ -25,6 +28,8 @@ pub struct Inflater {
     final_block: bool,
     /// Whether decompression is complete.
     finished: bool,
+    /// Expected dictionary checksum (if dictionary is required).
+    expected_dict_checksum: Option<u32>,
 }
 
 impl Inflater {
@@ -34,7 +39,85 @@ impl Inflater {
             output: OutputRingBuffer::with_capacity(32768, 65536),
             final_block: false,
             finished: false,
+            expected_dict_checksum: None,
         }
+    }
+
+    /// Create a new DEFLATE decompressor with a preset dictionary.
+    ///
+    /// The dictionary must match the one used during compression.
+    /// The decompressor uses the dictionary to resolve back-references
+    /// that point into the dictionary content.
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (up to 32KB). If larger, only the
+    ///   last 32KB is used.
+    ///
+    /// # Returns
+    ///
+    /// A new Inflater with the dictionary preloaded.
+    pub fn with_dictionary(dictionary: &[u8]) -> Self {
+        let mut inflater = Self::new();
+        inflater.set_dictionary(dictionary);
+        inflater
+    }
+
+    /// Set a preset dictionary for decompression.
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (up to 32KB). If larger, only the
+    ///   last 32KB is used.
+    ///
+    /// # Returns
+    ///
+    /// The Adler-32 checksum of the dictionary.
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> u32 {
+        self.output.preload_dictionary(dictionary);
+        self.expected_dict_checksum = Some(Self::adler32(dictionary));
+        self.expected_dict_checksum.unwrap_or(1)
+    }
+
+    /// Get the expected dictionary checksum.
+    pub fn expected_dictionary_checksum(&self) -> Option<u32> {
+        self.expected_dict_checksum
+    }
+
+    /// Check if a dictionary is currently set.
+    pub fn has_dictionary(&self) -> bool {
+        self.expected_dict_checksum.is_some()
+    }
+
+    /// Calculate Adler-32 checksum (for dictionary identification).
+    fn adler32(data: &[u8]) -> u32 {
+        const MOD_ADLER: u32 = 65521;
+        const NMAX: usize = 5552;
+
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+
+        let mut remaining = data;
+
+        while remaining.len() >= NMAX {
+            let (chunk, rest) = remaining.split_at(NMAX);
+            remaining = rest;
+
+            for &byte in chunk {
+                a += byte as u32;
+                b += a;
+            }
+
+            a %= MOD_ADLER;
+            b %= MOD_ADLER;
+        }
+
+        for &byte in remaining {
+            a += byte as u32;
+            b += a;
+        }
+
+        ((b % MOD_ADLER) << 16) | (a % MOD_ADLER)
     }
 
     /// Reset the decompressor.
@@ -42,6 +125,16 @@ impl Inflater {
         self.output.clear();
         self.final_block = false;
         self.finished = false;
+        self.expected_dict_checksum = None;
+    }
+
+    /// Reset the decompressor but keep the dictionary.
+    pub fn reset_keep_dictionary(&mut self) {
+        let checksum = self.expected_dict_checksum;
+        self.output.clear();
+        self.final_block = false;
+        self.finished = false;
+        self.expected_dict_checksum = checksum;
     }
 
     /// Decompress data from a reader.

@@ -1,7 +1,7 @@
 # OxiArc - The Oxidized Archiver
 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-cli.svg)](https://crates.io/crates/oxiarc-cli)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](README.md#license)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](README.md#license)
 
 Pure Rust implementation of archive and compression formats with core algorithms implemented from scratch.
 
@@ -827,12 +827,7 @@ When adding new formats or algorithms:
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0).
 
 ## Repository
 

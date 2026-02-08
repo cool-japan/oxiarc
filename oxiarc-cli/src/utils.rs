@@ -1,8 +1,10 @@
 //! Utility functions for the CLI.
 
+use crate::commands::SortBy;
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use oxiarc_core::Entry;
+use std::collections::BTreeMap;
 
 /// An extracted entry: (filename, is_directory, file_contents).
 pub type ExtractedEntry = (String, bool, Vec<u8>);
@@ -124,5 +126,141 @@ pub fn print_entries(entries: &[Entry], verbose: bool) {
         for entry in entries {
             println!("{}", entry.name);
         }
+    }
+}
+
+/// Sort entries by the specified criteria.
+pub fn sort_entries(entries: &mut [Entry], sort_by: SortBy, reverse: bool) {
+    match sort_by {
+        SortBy::Name => {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        SortBy::Size => {
+            entries.sort_by(|a, b| a.size.cmp(&b.size));
+        }
+        SortBy::Date => {
+            entries.sort_by(|a, b| a.modified.cmp(&b.modified));
+        }
+    }
+
+    if reverse {
+        entries.reverse();
+    }
+}
+
+/// Represents a node in the directory tree.
+#[derive(Debug, Default)]
+struct TreeNode {
+    /// Children indexed by name.
+    children: BTreeMap<String, TreeNode>,
+    /// Entry data if this is a file/directory leaf.
+    entry: Option<Entry>,
+    /// Whether this is a directory (has children or ends with /).
+    is_dir: bool,
+}
+
+impl TreeNode {
+    fn insert(&mut self, path: &str, entry: Entry) {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        self.insert_parts(&parts, 0, entry);
+    }
+
+    fn insert_parts(&mut self, parts: &[&str], idx: usize, entry: Entry) {
+        if idx >= parts.len() {
+            self.entry = Some(entry);
+            return;
+        }
+
+        let part = parts[idx];
+        let child = self.children.entry(part.to_string()).or_default();
+
+        if idx == parts.len() - 1 {
+            // This is the final part
+            child.entry = Some(entry.clone());
+            child.is_dir = entry.is_dir();
+        } else {
+            // Intermediate directory
+            child.is_dir = true;
+            child.insert_parts(parts, idx + 1, entry);
+        }
+    }
+}
+
+/// Print entries as a directory tree.
+pub fn print_tree(entries: &[Entry], verbose: bool) {
+    // Build the tree structure
+    let mut root = TreeNode::default();
+    for entry in entries {
+        root.insert(&entry.name, entry.clone());
+    }
+
+    // Print the tree
+    print_tree_node(&root, "", verbose, true);
+}
+
+/// Recursively print a tree node.
+fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool) {
+    // Sort children: directories first, then files, both alphabetically
+    let mut children: Vec<(&String, &TreeNode)> = node.children.iter().collect();
+    children.sort_by(|a, b| match (a.1.is_dir, b.1.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.cmp(b.0),
+    });
+
+    for (i, (name, child)) in children.iter().enumerate() {
+        let is_last_child = i == children.len() - 1;
+
+        // Determine the prefix for this item
+        let (current_prefix, next_prefix) = if is_root {
+            ("".to_string(), "".to_string())
+        } else if is_last_child {
+            (format!("{}{}── ", prefix, "└"), format!("{}    ", prefix))
+        } else {
+            (format!("{}{}── ", prefix, "├"), format!("{}│   ", prefix))
+        };
+
+        // Format the entry line
+        let type_indicator = if child.is_dir { "/" } else { "" };
+
+        if verbose {
+            if let Some(ref entry) = child.entry {
+                let size_str = if child.is_dir {
+                    "-".to_string()
+                } else {
+                    format_size(entry.size)
+                };
+                println!(
+                    "{}{}{} [{}]",
+                    current_prefix, name, type_indicator, size_str
+                );
+            } else {
+                println!("{}{}{}", current_prefix, name, type_indicator);
+            }
+        } else {
+            println!("{}{}{}", current_prefix, name, type_indicator);
+        }
+
+        // Recursively print children
+        if child.is_dir {
+            print_tree_node(child, &next_prefix, verbose, false);
+        }
+    }
+}
+
+/// Format file size in human-readable format.
+fn format_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{} B", size)
     }
 }

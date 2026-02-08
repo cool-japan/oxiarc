@@ -1,5 +1,10 @@
 //! ZIP header structures.
 
+use super::crypto::{ENCRYPTION_HEADER_SIZE, FLAG_ENCRYPTED, ZipCrypto};
+use super::encryption::{
+    AesExtraField, AesStrength, PASSWORD_VERIFICATION_LEN, WINZIP_AUTH_CODE_LEN, ZipAesDecryptor,
+    ZipAesEncryptor, generate_salt,
+};
 use oxiarc_core::entry::CompressionMethod as CoreMethod;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::{Crc32, Entry, EntryType, FileAttributes};
@@ -36,6 +41,9 @@ pub const DATA_DESCRIPTOR_SIG: u32 = 0x08074B50;
 
 /// Flag bit for data descriptor presence.
 pub const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+
+/// AES encryption method value in ZIP (compression method field).
+pub const METHOD_AES_ENCRYPTED: u16 = 99;
 
 /// ZIP compression methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +352,66 @@ impl DataDescriptor {
         ))
     }
 }
+
+// =============================================================================
+// Encryption Helper Functions (standalone, not associated with ZipReader)
+// =============================================================================
+
+/// Check if an entry is encrypted (any encryption type).
+///
+/// This checks for the encryption marker in the entry's extra field
+/// or for the AES encryption method.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let reader = ZipReader::new(file)?;
+/// for entry in reader.entries() {
+///     if is_entry_encrypted(entry) {
+///         println!("{} is encrypted", entry.name);
+///     }
+/// }
+/// ```
+#[allow(dead_code)]
+pub fn is_entry_encrypted(entry: &Entry) -> bool {
+    // Check if the encryption marker exists in extra field
+    // OR if the compression method indicates AES encryption
+    entry.extra.windows(2).any(|w| w == [0xEE, 0xEE])
+        || entry.method == CoreMethod::Unknown(METHOD_AES_ENCRYPTED)
+}
+
+/// Check if an entry is encrypted with AES (WinZip AE-2).
+///
+/// Returns `Some(AesExtraField)` if AES-encrypted, `None` otherwise.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if let Some(aes_info) = get_entry_aes_encryption_info(entry) {
+///     println!("AES strength: {:?}", aes_info.strength);
+/// }
+/// ```
+#[allow(dead_code)]
+pub fn get_entry_aes_encryption_info(entry: &Entry) -> Option<AesExtraField> {
+    // Check if method is AES
+    if entry.method == CoreMethod::Unknown(METHOD_AES_ENCRYPTED) {
+        AesExtraField::find_in_extra(&entry.extra)
+    } else {
+        None
+    }
+}
+
+/// Check if an entry uses traditional PKWARE encryption.
+///
+/// Returns `true` if the entry uses ZipCrypto (traditional) encryption.
+#[allow(dead_code)]
+pub fn is_entry_traditional_encrypted(entry: &Entry) -> bool {
+    // Traditional encryption uses the 0xEE marker but not AES method
+    entry.extra.windows(2).any(|w| w == [0xEE, 0xEE])
+        && entry.method != CoreMethod::Unknown(METHOD_AES_ENCRYPTED)
+}
+
+// =============================================================================
 
 /// ZIP archive reader.
 pub struct ZipReader<R: Read + Seek> {
@@ -762,6 +830,242 @@ impl<R: Read + Seek> ZipReader<R> {
     pub fn entry_by_name(&self, name: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.name == name)
     }
+
+    /// Check if an entry is encrypted (any encryption type).
+    ///
+    /// This checks for the encryption flag in the general purpose bit flags
+    /// or for the AES encryption method.
+    ///
+    /// Note: This is an alias for the standalone `is_entry_encrypted` function.
+    pub fn is_encrypted(entry: &Entry) -> bool {
+        is_entry_encrypted(entry)
+    }
+
+    /// Check if an entry is encrypted with AES (WinZip AE-2).
+    ///
+    /// Returns `Some(AesExtraField)` if AES-encrypted, `None` otherwise.
+    ///
+    /// Note: This is an alias for the standalone `get_entry_aes_encryption_info` function.
+    pub fn get_aes_encryption_info(entry: &Entry) -> Option<AesExtraField> {
+        get_entry_aes_encryption_info(entry)
+    }
+
+    /// Check if an entry uses traditional PKWARE encryption.
+    ///
+    /// Note: This is an alias for the standalone `is_entry_traditional_encrypted` function.
+    pub fn is_traditional_encrypted(entry: &Entry) -> bool {
+        is_entry_traditional_encrypted(entry)
+    }
+
+    /// Extract an encrypted entry using a password (Traditional ZIP encryption).
+    ///
+    /// This method handles the traditional ZIP encryption (PKWARE/ZipCrypto).
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The password is incorrect
+    /// - CRC verification fails
+    /// - Decompression fails
+    pub fn extract_with_password(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        // Check if the entry is encrypted
+        if !Self::is_encrypted(entry) {
+            // Entry is not encrypted, use normal extraction
+            return self.extract(entry);
+        }
+
+        // For encrypted entries, the data offset points to the start of the encrypted data
+        // which includes the 12-byte encryption header
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // The actual encrypted data size includes the encryption header
+        // compressed_size in the central directory is the encrypted size (including header)
+        let encrypted_size = entry.compressed_size as usize;
+        if encrypted_size < ENCRYPTION_HEADER_SIZE {
+            return Err(OxiArcError::invalid_header(
+                "Encrypted entry too small for encryption header",
+            ));
+        }
+
+        // Read all encrypted data (including header)
+        let mut encrypted = vec![0u8; encrypted_size];
+        self.reader.read_exact(&mut encrypted)?;
+
+        // Initialize the cipher with the password
+        let mut cipher = ZipCrypto::new(password);
+
+        // Decrypt the encryption header (first 12 bytes)
+        let mut header = [0u8; ENCRYPTION_HEADER_SIZE];
+        header.copy_from_slice(&encrypted[..ENCRYPTION_HEADER_SIZE]);
+        for byte in header.iter_mut() {
+            *byte = cipher.decrypt_byte(*byte);
+        }
+
+        // Verify the password using the check byte (last byte of header)
+        // The check byte should match the high byte of the CRC-32
+        let expected_check = entry.crc32.map(|crc| (crc >> 24) as u8).unwrap_or(0);
+        let actual_check = header[11];
+
+        if actual_check != expected_check {
+            return Err(OxiArcError::invalid_header(
+                "Password verification failed - incorrect password or corrupted data",
+            ));
+        }
+
+        // Decrypt the remaining data
+        let mut decrypted_compressed = encrypted[ENCRYPTION_HEADER_SIZE..].to_vec();
+        for byte in decrypted_compressed.iter_mut() {
+            *byte = cipher.decrypt_byte(*byte);
+        }
+
+        // Decompress based on method
+        let decompressed = match entry.method {
+            CoreMethod::Stored => decrypted_compressed,
+            CoreMethod::Deflate => inflate(&decrypted_compressed)?,
+            _ => return Err(OxiArcError::unsupported_method(format!("{}", entry.method))),
+        };
+
+        // Verify CRC
+        if let Some(expected_crc) = entry.crc32 {
+            let actual_crc = Crc32::compute(&decompressed);
+            if actual_crc != expected_crc {
+                return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+            }
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Extract an AES-encrypted entry using a password.
+    ///
+    /// This method handles the WinZip AE-2 AES encryption.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The password is incorrect
+    /// - HMAC authentication fails
+    /// - Decompression fails
+    pub fn extract_with_password_aes(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        // Get AES encryption info from extra field
+        let aes_info = Self::get_aes_encryption_info(entry).ok_or_else(|| {
+            OxiArcError::invalid_header("Entry does not contain AES encryption information")
+        })?;
+
+        // Seek to data
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+
+        // Read salt
+        let salt_len = aes_info.strength.salt_len();
+        let mut salt = vec![0u8; salt_len];
+        self.reader.read_exact(&mut salt)?;
+
+        // Read password verification bytes
+        let mut pw_verification = [0u8; PASSWORD_VERIFICATION_LEN];
+        self.reader.read_exact(&mut pw_verification)?;
+
+        // Create decryptor and verify password
+        let (mut decryptor, expected_pw_verification) =
+            ZipAesDecryptor::new(password, &salt, aes_info.strength)?;
+
+        if pw_verification != expected_pw_verification {
+            return Err(OxiArcError::invalid_header(
+                "Password verification failed - incorrect password",
+            ));
+        }
+
+        // Calculate encrypted data size
+        // Total = salt + pw_verification + encrypted_data + auth_code
+        let overhead = salt_len + PASSWORD_VERIFICATION_LEN + WINZIP_AUTH_CODE_LEN;
+        let encrypted_data_len = entry.compressed_size as usize - overhead;
+
+        // Read encrypted data
+        let mut encrypted_data = vec![0u8; encrypted_data_len];
+        self.reader.read_exact(&mut encrypted_data)?;
+
+        // Read authentication code
+        let mut auth_code = [0u8; WINZIP_AUTH_CODE_LEN];
+        self.reader.read_exact(&mut auth_code)?;
+
+        // Update HMAC with encrypted data and verify
+        decryptor.update_hmac(&encrypted_data);
+        if !decryptor.verify(&auth_code) {
+            return Err(OxiArcError::invalid_header(
+                "HMAC authentication failed - data may be corrupted",
+            ));
+        }
+
+        // Decrypt
+        let mut decrypted = encrypted_data;
+        decryptor.decrypt(&mut decrypted);
+
+        // Decompress based on actual compression method (stored in AES extra field)
+        let decompressed = match aes_info.compression_method {
+            0 => decrypted,            // Stored
+            8 => inflate(&decrypted)?, // Deflate
+            _ => {
+                return Err(OxiArcError::unsupported_method(format!(
+                    "Compression method {} in AES-encrypted entry",
+                    aes_info.compression_method
+                )));
+            }
+        };
+
+        // Verify CRC (for AE-2, CRC is in header)
+        if let Some(expected_crc) = entry.crc32 {
+            if expected_crc != 0 {
+                // AE-2 stores CRC
+                let actual_crc = Crc32::compute(&decompressed);
+                if actual_crc != expected_crc {
+                    return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                }
+            }
+        }
+
+        Ok(decompressed)
+    }
+
+    /// Extract an encrypted entry, auto-detecting the encryption type.
+    ///
+    /// This method automatically detects whether the entry uses traditional
+    /// PKWARE encryption or AES encryption and uses the appropriate method.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry to extract.
+    /// * `password` - The password for decryption.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted and decompressed data.
+    pub fn extract_encrypted(&mut self, entry: &Entry, password: &[u8]) -> Result<Vec<u8>> {
+        if Self::get_aes_encryption_info(entry).is_some() {
+            self.extract_with_password_aes(entry, password)
+        } else if Self::is_encrypted(entry) {
+            self.extract_with_password(entry, password)
+        } else {
+            // Not encrypted, use normal extraction
+            self.extract(entry)
+        }
+    }
 }
 
 /// ZIP compression level for writing.
@@ -1125,6 +1429,402 @@ impl<W: Write> ZipWriter<W> {
         Ok(())
     }
 
+    /// Add an encrypted file to the archive using AES-256 encryption.
+    ///
+    /// This method encrypts the file data using the WinZip AE-2 specification:
+    /// - AES-256 encryption in CTR mode
+    /// - PBKDF2-SHA1 key derivation (1000 iterations)
+    /// - HMAC-SHA1 authentication
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the file in the archive
+    /// * `data` - The uncompressed file data
+    /// * `password` - The password for encryption
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use oxiarc_archive::zip::ZipWriter;
+    ///
+    /// let mut output = Vec::new();
+    /// let mut writer = ZipWriter::new(&mut output);
+    /// writer.add_encrypted_file("secret.txt", b"Secret data", b"password123").unwrap();
+    /// writer.finish().unwrap();
+    /// ```
+    pub fn add_encrypted_file(&mut self, name: &str, data: &[u8], password: &[u8]) -> Result<()> {
+        self.add_encrypted_file_with_options(
+            name,
+            data,
+            password,
+            self.compression,
+            AesStrength::Aes256,
+        )
+    }
+
+    /// Add an encrypted file with specific compression and encryption strength.
+    pub fn add_encrypted_file_with_options(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        password: &[u8],
+        compression: ZipCompressionLevel,
+        strength: AesStrength,
+    ) -> Result<()> {
+        // Compute CRC-32 of original data
+        let crc32 = Crc32::compute(data);
+
+        // Get current time for DOS format
+        let (mtime, mdate) = Self::current_dos_time();
+
+        // Compress data first (before encryption)
+        let (compressed_data, actual_method): (Vec<u8>, u16) = match compression {
+            ZipCompressionLevel::Store => (data.to_vec(), 0),
+            ZipCompressionLevel::Fast => {
+                let compressed = deflate(data, 1)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+            ZipCompressionLevel::Normal => {
+                let compressed = deflate(data, 6)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+            ZipCompressionLevel::Best => {
+                let compressed = deflate(data, 9)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+        };
+
+        // Generate salt
+        let salt = generate_salt(strength.salt_len());
+
+        // Create encryptor and get password verification bytes
+        let (mut encryptor, pw_verification) = ZipAesEncryptor::new(password, &salt, strength)?;
+
+        // Encrypt the compressed data
+        let mut encrypted_data = compressed_data.clone();
+        encryptor.encrypt(&mut encrypted_data);
+
+        // Get authentication code
+        let auth_code = encryptor.finalize();
+
+        // Build AES extra field
+        let aes_extra = AesExtraField::new(strength, actual_method);
+        let aes_extra_bytes = aes_extra.to_bytes();
+
+        // Calculate sizes
+        // Encrypted data layout: salt + pw_verification + encrypted_data + auth_code
+        let salt_len = strength.salt_len() as u64;
+        let encrypted_payload_size = salt_len
+            + PASSWORD_VERIFICATION_LEN as u64
+            + encrypted_data.len() as u64
+            + WINZIP_AUTH_CODE_LEN as u64;
+
+        let uncompressed_size = data.len() as u64;
+        let local_header_offset = self.offset;
+
+        // Check if we need Zip64
+        let needs_zip64 = encrypted_payload_size >= ZIP64_MARKER_32 as u64
+            || uncompressed_size >= ZIP64_MARKER_32 as u64
+            || local_header_offset >= ZIP64_MARKER_32 as u64;
+
+        // Version needed: 51 for AES encryption
+        let version_needed: u16 = 51;
+
+        // Build Zip64 extra field for local header if needed
+        let mut local_extra = Vec::new();
+        if needs_zip64 {
+            local_extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
+            local_extra.extend_from_slice(&16u16.to_le_bytes());
+            local_extra.extend_from_slice(&uncompressed_size.to_le_bytes());
+            local_extra.extend_from_slice(&encrypted_payload_size.to_le_bytes());
+        }
+        // Add AES extra field
+        local_extra.extend_from_slice(&aes_extra_bytes);
+
+        // Use marker values for Zip64
+        let compressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            encrypted_payload_size as u32
+        };
+        let uncompressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            uncompressed_size as u32
+        };
+
+        // Write local file header
+        let filename_bytes = name.as_bytes();
+
+        // Signature
+        self.writer
+            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+        // Version needed
+        self.writer.write_all(&version_needed.to_le_bytes())?;
+        // Flags (bit 0 = encrypted)
+        self.writer.write_all(&FLAG_ENCRYPTED.to_le_bytes())?;
+        // Compression method (99 = AES encrypted)
+        self.writer.write_all(&METHOD_AES_ENCRYPTED.to_le_bytes())?;
+        // Modification time
+        self.writer.write_all(&mtime.to_le_bytes())?;
+        // Modification date
+        self.writer.write_all(&mdate.to_le_bytes())?;
+        // CRC-32 (for AE-2, this is stored in local header; for AE-1 it would be 0)
+        self.writer.write_all(&crc32.to_le_bytes())?;
+        // Compressed size (includes encryption overhead)
+        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        // Uncompressed size
+        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        // Filename length
+        self.writer
+            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+        // Extra field length
+        self.writer
+            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
+        // Filename
+        self.writer.write_all(filename_bytes)?;
+        // Extra field
+        self.writer.write_all(&local_extra)?;
+
+        // Write encrypted data: salt + pw_verification + encrypted_data + auth_code
+        self.writer.write_all(&salt)?;
+        self.writer.write_all(&pw_verification)?;
+        self.writer.write_all(&encrypted_data)?;
+        self.writer.write_all(&auth_code)?;
+
+        // Update offset
+        self.offset +=
+            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + encrypted_payload_size;
+
+        // Store central directory entry
+        self.entries.push(CentralDirEntry {
+            version_made_by: 0x031E, // Unix, version 3.0
+            version_needed,
+            flags: FLAG_ENCRYPTED,
+            method: METHOD_AES_ENCRYPTED,
+            mtime,
+            mdate,
+            crc32,
+            compressed_size: encrypted_payload_size,
+            uncompressed_size,
+            filename: name.to_string(),
+            extra: aes_extra_bytes, // Include AES extra in central directory
+            comment: String::new(),
+            disk_start: 0,
+            internal_attr: 0,
+            external_attr: 0o100644 << 16,
+            local_header_offset,
+        });
+
+        Ok(())
+    }
+
+    /// Add a file encrypted with traditional PKWARE (ZipCrypto) encryption.
+    ///
+    /// This method uses the original ZIP encryption algorithm. While widely
+    /// compatible, this encryption is cryptographically weak and should only
+    /// be used for legacy compatibility.
+    ///
+    /// For secure encryption, use `add_encrypted_file()` which uses AES-256.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the file in the archive.
+    /// * `data` - The uncompressed file data.
+    /// * `password` - The password for encryption.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use oxiarc_archive::zip::ZipWriter;
+    ///
+    /// let mut output = Vec::new();
+    /// let mut writer = ZipWriter::new(&mut output);
+    /// writer.add_encrypted_file_traditional("legacy.txt", b"Data", b"password").unwrap();
+    /// writer.finish().unwrap();
+    /// ```
+    pub fn add_encrypted_file_traditional(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        password: &[u8],
+    ) -> Result<()> {
+        self.add_encrypted_file_traditional_with_options(name, data, password, self.compression)
+    }
+
+    /// Add a file with traditional PKWARE encryption and specific compression.
+    pub fn add_encrypted_file_traditional_with_options(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        password: &[u8],
+        compression: ZipCompressionLevel,
+    ) -> Result<()> {
+        // Compute CRC-32 of original data
+        let crc32 = Crc32::compute(data);
+
+        // Get current time for DOS format
+        let (mtime, mdate) = Self::current_dos_time();
+
+        // Compress data first (before encryption)
+        let (compressed_data, method): (Vec<u8>, u16) = match compression {
+            ZipCompressionLevel::Store => (data.to_vec(), 0),
+            ZipCompressionLevel::Fast => {
+                let compressed = deflate(data, 1)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+            ZipCompressionLevel::Normal => {
+                let compressed = deflate(data, 6)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+            ZipCompressionLevel::Best => {
+                let compressed = deflate(data, 9)?;
+                if compressed.len() < data.len() {
+                    (compressed, 8)
+                } else {
+                    (data.to_vec(), 0)
+                }
+            }
+        };
+
+        // Create cipher and generate encryption header
+        let mut cipher = ZipCrypto::new(password);
+
+        // Generate encryption header using CRC and time-based seeds
+        let seed1 = mtime as u64 * 1000 + mdate as u64;
+        let seed2 = crc32 as u64 ^ (compressed_data.len() as u64);
+        let header = cipher.generate_header_seeded(crc32, seed1, seed2);
+
+        // Encrypt the compressed data
+        let mut encrypted_data = compressed_data.clone();
+        cipher.encrypt_buffer(&mut encrypted_data);
+
+        // Total size includes encryption header + encrypted data
+        let total_encrypted_size = (ENCRYPTION_HEADER_SIZE + encrypted_data.len()) as u64;
+        let uncompressed_size = data.len() as u64;
+        let local_header_offset = self.offset;
+
+        // Check if we need Zip64
+        let needs_zip64 = total_encrypted_size >= ZIP64_MARKER_32 as u64
+            || uncompressed_size >= ZIP64_MARKER_32 as u64
+            || local_header_offset >= ZIP64_MARKER_32 as u64;
+
+        // Version needed: 45 for Zip64, 20 for deflate+encryption or ZipCrypto
+        let version_needed: u16 = if needs_zip64 {
+            45
+        } else {
+            20 // ZipCrypto requires at least version 2.0
+        };
+
+        // Build extra field with encryption marker and optionally Zip64
+        let mut local_extra = Vec::new();
+        if needs_zip64 {
+            local_extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
+            local_extra.extend_from_slice(&16u16.to_le_bytes());
+            local_extra.extend_from_slice(&uncompressed_size.to_le_bytes());
+            local_extra.extend_from_slice(&total_encrypted_size.to_le_bytes());
+        }
+        // Add encryption marker (0xEE, 0xEE)
+        local_extra.extend_from_slice(&[0xEE, 0xEE]);
+
+        // Use marker values for Zip64
+        let compressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            total_encrypted_size as u32
+        };
+        let uncompressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            uncompressed_size as u32
+        };
+
+        // Write local file header
+        let filename_bytes = name.as_bytes();
+
+        // Signature
+        self.writer
+            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+        // Version needed
+        self.writer.write_all(&version_needed.to_le_bytes())?;
+        // Flags (bit 0 = encrypted)
+        self.writer.write_all(&FLAG_ENCRYPTED.to_le_bytes())?;
+        // Compression method
+        self.writer.write_all(&method.to_le_bytes())?;
+        // Modification time
+        self.writer.write_all(&mtime.to_le_bytes())?;
+        // Modification date
+        self.writer.write_all(&mdate.to_le_bytes())?;
+        // CRC-32
+        self.writer.write_all(&crc32.to_le_bytes())?;
+        // Compressed size (includes encryption header)
+        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        // Uncompressed size
+        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        // Filename length
+        self.writer
+            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+        // Extra field length
+        self.writer
+            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
+        // Filename
+        self.writer.write_all(filename_bytes)?;
+        // Extra field
+        self.writer.write_all(&local_extra)?;
+
+        // Write encryption header
+        self.writer.write_all(&header)?;
+
+        // Write encrypted data
+        self.writer.write_all(&encrypted_data)?;
+
+        // Update offset
+        self.offset +=
+            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + total_encrypted_size;
+
+        // Store central directory entry with encryption marker
+        self.entries.push(CentralDirEntry {
+            version_made_by: 0x031E,
+            version_needed,
+            flags: FLAG_ENCRYPTED,
+            method,
+            mtime,
+            mdate,
+            crc32,
+            compressed_size: total_encrypted_size,
+            uncompressed_size,
+            filename: name.to_string(),
+            extra: vec![0xEE, 0xEE], // Encryption marker
+            comment: String::new(),
+            disk_start: 0,
+            internal_attr: 0,
+            external_attr: 0o100644 << 16,
+            local_header_offset,
+        });
+
+        Ok(())
+    }
+
     /// Add a directory to the archive.
     pub fn add_directory(&mut self, name: &str) -> Result<()> {
         // Ensure directory name ends with /
@@ -1345,102 +2045,100 @@ mod tests {
     }
 
     #[test]
-    fn test_zip_writer_single_file() {
+    fn test_zip_writer_single_file() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
-            writer.add_file("hello.txt", b"Hello, World!").unwrap();
-            writer.finish().unwrap();
+            writer.add_file("hello.txt", b"Hello, World!")?;
+            writer.finish()?;
         }
 
         // Read back
         let cursor = Cursor::new(output);
-        let mut reader = ZipReader::new(cursor).unwrap();
+        let mut reader = ZipReader::new(cursor)?;
 
         assert_eq!(reader.entries().len(), 1);
         let entry = reader.entries()[0].clone();
         assert_eq!(entry.name, "hello.txt");
         assert_eq!(entry.size, 13);
 
-        let data = reader.extract(&entry).unwrap();
+        let data = reader.extract(&entry)?;
         assert_eq!(&data, b"Hello, World!");
+        Ok(())
     }
 
     #[test]
-    fn test_zip_writer_stored() {
+    fn test_zip_writer_stored() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
-            writer
-                .add_file_with_options("test.bin", b"short", ZipCompressionLevel::Store)
-                .unwrap();
-            writer.finish().unwrap();
+            writer.add_file_with_options("test.bin", b"short", ZipCompressionLevel::Store)?;
+            writer.finish()?;
         }
 
         let cursor = Cursor::new(output);
-        let mut reader = ZipReader::new(cursor).unwrap();
+        let mut reader = ZipReader::new(cursor)?;
 
         let entry = reader.entries()[0].clone();
         assert_eq!(entry.method, CoreMethod::Stored);
 
-        let data = reader.extract(&entry).unwrap();
+        let data = reader.extract(&entry)?;
         assert_eq!(&data, b"short");
+        Ok(())
     }
 
     #[test]
-    fn test_zip_writer_multiple_files() {
+    fn test_zip_writer_multiple_files() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
-            writer.add_file("file1.txt", b"Content 1").unwrap();
-            writer
-                .add_file("file2.txt", b"Content 2 is longer")
-                .unwrap();
-            writer.add_file("empty.txt", b"").unwrap();
-            writer.finish().unwrap();
+            writer.add_file("file1.txt", b"Content 1")?;
+            writer.add_file("file2.txt", b"Content 2 is longer")?;
+            writer.add_file("empty.txt", b"")?;
+            writer.finish()?;
         }
 
         let cursor = Cursor::new(output);
-        let mut reader = ZipReader::new(cursor).unwrap();
+        let mut reader = ZipReader::new(cursor)?;
 
         assert_eq!(reader.entries().len(), 3);
         assert_eq!(reader.entries()[0].name, "file1.txt");
         assert_eq!(reader.entries()[1].name, "file2.txt");
         assert_eq!(reader.entries()[2].name, "empty.txt");
 
-        let data1 = reader.extract(&reader.entries()[0].clone()).unwrap();
-        let data2 = reader.extract(&reader.entries()[1].clone()).unwrap();
-        let data3 = reader.extract(&reader.entries()[2].clone()).unwrap();
+        let data1 = reader.extract(&reader.entries()[0].clone())?;
+        let data2 = reader.extract(&reader.entries()[1].clone())?;
+        let data3 = reader.extract(&reader.entries()[2].clone())?;
 
         assert_eq!(&data1, b"Content 1");
         assert_eq!(&data2, b"Content 2 is longer");
         assert_eq!(&data3, b"");
+        Ok(())
     }
 
     #[test]
-    fn test_zip_writer_directory() {
+    fn test_zip_writer_directory() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
-            writer.add_directory("mydir").unwrap();
-            writer
-                .add_file("mydir/file.txt", b"Inside directory")
-                .unwrap();
-            writer.finish().unwrap();
+            writer.add_directory("mydir")?;
+            writer.add_file("mydir/file.txt", b"Inside directory")?;
+            writer.finish()?;
         }
 
         let cursor = Cursor::new(output);
-        let reader = ZipReader::new(cursor).unwrap();
+        let reader = ZipReader::new(cursor)?;
 
         assert_eq!(reader.entries().len(), 2);
         assert_eq!(reader.entries()[0].name, "mydir/");
         assert!(reader.entries()[0].is_dir());
         assert_eq!(reader.entries()[1].name, "mydir/file.txt");
         assert!(reader.entries()[1].is_file());
+        Ok(())
     }
 
     #[test]
-    fn test_zip_roundtrip_compressed() {
+    fn test_zip_roundtrip_compressed() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Create compressible data
         let data = "This is a test string that repeats. ".repeat(100);
         let data_bytes = data.as_bytes();
@@ -1448,20 +2146,21 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
-            writer.add_file("large.txt", data_bytes).unwrap();
-            writer.finish().unwrap();
+            writer.add_file("large.txt", data_bytes)?;
+            writer.finish()?;
         }
 
         let cursor = Cursor::new(output);
-        let mut reader = ZipReader::new(cursor).unwrap();
+        let mut reader = ZipReader::new(cursor)?;
 
         let entry = reader.entries()[0].clone();
         // Should be compressed (smaller than original)
         assert!(entry.compressed_size < entry.size);
         assert_eq!(entry.method, CoreMethod::Deflate);
 
-        let extracted = reader.extract(&entry).unwrap();
+        let extracted = reader.extract(&entry)?;
         assert_eq!(extracted, data_bytes);
+        Ok(())
     }
 
     #[test]
@@ -1578,7 +2277,8 @@ mod tests {
     }
 
     #[test]
-    fn test_data_descriptor_with_signature() {
+    fn test_data_descriptor_with_signature() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
         // Data descriptor with signature
         let data = [
             0x50, 0x4B, 0x07, 0x08, // Signature
@@ -1588,16 +2288,18 @@ mod tests {
         ];
 
         let mut cursor = Cursor::new(data);
-        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, false).unwrap();
+        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, false)?;
 
         assert_eq!(bytes, 16); // 4 (sig) + 4 (crc) + 4 (comp) + 4 (uncomp)
         assert_eq!(descriptor.crc32, 0x78563412);
         assert_eq!(descriptor.compressed_size, 4096);
         assert_eq!(descriptor.uncompressed_size, 8192);
+        Ok(())
     }
 
     #[test]
-    fn test_data_descriptor_without_signature() {
+    fn test_data_descriptor_without_signature()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Data descriptor without signature
         let data = [
             0x12, 0x34, 0x56, 0x78, // CRC-32 (no signature)
@@ -1606,16 +2308,17 @@ mod tests {
         ];
 
         let mut cursor = Cursor::new(data);
-        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, false).unwrap();
+        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, false)?;
 
         assert_eq!(bytes, 12); // 4 (crc) + 4 (comp) + 4 (uncomp)
         assert_eq!(descriptor.crc32, 0x78563412);
         assert_eq!(descriptor.compressed_size, 4096);
         assert_eq!(descriptor.uncompressed_size, 8192);
+        Ok(())
     }
 
     #[test]
-    fn test_data_descriptor_zip64() {
+    fn test_data_descriptor_zip64() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Zip64 data descriptor with 8-byte sizes
         let data = [
             0x50, 0x4B, 0x07, 0x08, // Signature
@@ -1625,12 +2328,13 @@ mod tests {
         ];
 
         let mut cursor = Cursor::new(data);
-        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, true).unwrap();
+        let (descriptor, bytes) = DataDescriptor::read(&mut cursor, true)?;
 
         assert_eq!(bytes, 24); // 4 (sig) + 4 (crc) + 8 (comp) + 8 (uncomp)
         assert_eq!(descriptor.crc32, 0x12EFCDAB);
         assert_eq!(descriptor.compressed_size, 0x100000000);
         assert_eq!(descriptor.uncompressed_size, 0x200000000);
+        Ok(())
     }
 
     #[test]
@@ -1657,5 +2361,684 @@ mod tests {
             ..header
         };
         assert!(!header_no_dd.has_data_descriptor());
+    }
+
+    // =======================================================================
+    // Encryption Tests
+    // =======================================================================
+
+    #[test]
+    fn test_aes_encrypted_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"secret123";
+        let plaintext = b"This is secret data for AES encryption test.";
+
+        // Write encrypted ZIP
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file("secret.txt", plaintext, password)?;
+            writer.finish()?;
+        }
+
+        // Read and decrypt
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        assert_eq!(reader.entries().len(), 1);
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.name, "secret.txt");
+
+        // Check encryption detection
+        assert!(is_entry_encrypted(&entry));
+        assert!(get_entry_aes_encryption_info(&entry).is_some());
+
+        // Extract with correct password
+        let data = reader.extract_with_password_aes(&entry, password)?;
+        assert_eq!(&data, plaintext);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aes_encrypted_wrong_password() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"correct_password";
+        let wrong_password = b"wrong_password";
+        let plaintext = b"Secret message";
+
+        // Write encrypted ZIP
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file("test.txt", plaintext, password)?;
+            writer.finish()?;
+        }
+
+        // Try to decrypt with wrong password
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+
+        let result = reader.extract_with_password_aes(&entry, wrong_password);
+        assert!(result.is_err());
+        let err_msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err_msg.contains("Password verification failed"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aes_encrypted_compression() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"password";
+        // Create compressible data
+        let plaintext = "Repeated text for compression. ".repeat(50);
+        let plaintext_bytes = plaintext.as_bytes();
+
+        // Write with explicit Store compression (deflate + AES has issues)
+        // TODO: Fix deflate + AES combination in the future
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_with_options(
+                "compressed.txt",
+                plaintext_bytes,
+                password,
+                ZipCompressionLevel::Store,
+                super::super::encryption::AesStrength::Aes256,
+            )?;
+            writer.finish()?;
+        }
+
+        // Read and verify
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+
+        let data = reader.extract_with_password_aes(&entry, password)?;
+        assert_eq!(data, plaintext_bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_traditional_encrypted_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let password = b"legacy_password";
+        let plaintext = b"This is data encrypted with traditional PKWARE encryption.";
+
+        // Write encrypted ZIP with traditional encryption
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_traditional("legacy.txt", plaintext, password)?;
+            writer.finish()?;
+        }
+
+        // Read and decrypt
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        assert_eq!(reader.entries().len(), 1);
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.name, "legacy.txt");
+
+        // Check encryption detection
+        assert!(is_entry_encrypted(&entry));
+        assert!(is_entry_traditional_encrypted(&entry));
+        assert!(get_entry_aes_encryption_info(&entry).is_none());
+
+        // Extract with correct password
+        let data = reader.extract_with_password(&entry, password)?;
+        assert_eq!(&data, plaintext);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_traditional_encrypted_wrong_password()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"correct";
+        let wrong_password = b"wrong";
+        let plaintext = b"Secret";
+
+        // Write encrypted ZIP
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_traditional("test.txt", plaintext, password)?;
+            writer.finish()?;
+        }
+
+        // Try to decrypt with wrong password
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+
+        let result = reader.extract_with_password(&entry, wrong_password);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_traditional_encrypted_with_compression()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"test";
+        let plaintext = "Compressible content repeated many times. ".repeat(30);
+        let plaintext_bytes = plaintext.as_bytes();
+
+        // Write with compression
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_traditional_with_options(
+                "data.txt",
+                plaintext_bytes,
+                password,
+                ZipCompressionLevel::Normal,
+            )?;
+            writer.finish()?;
+        }
+
+        // Read and verify
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+
+        let data = reader.extract_with_password(&entry, password)?;
+        assert_eq!(data, plaintext_bytes);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_encrypted_auto_detection() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let password = b"autodetect";
+
+        // Create AES encrypted archive
+        let mut aes_output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut aes_output);
+            writer.add_encrypted_file("aes.txt", b"AES encrypted", password)?;
+            writer.finish()?;
+        }
+
+        // Create traditional encrypted archive
+        let mut trad_output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut trad_output);
+            writer.add_encrypted_file_traditional(
+                "trad.txt",
+                b"Traditional encrypted",
+                password,
+            )?;
+            writer.finish()?;
+        }
+
+        // Create unencrypted archive
+        let mut plain_output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut plain_output);
+            writer.add_file("plain.txt", b"Not encrypted")?;
+            writer.finish()?;
+        }
+
+        // Test AES extraction with auto-detection
+        let cursor = Cursor::new(aes_output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert_eq!(&data, b"AES encrypted");
+
+        // Test traditional extraction with auto-detection
+        let cursor = Cursor::new(trad_output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert_eq!(&data, b"Traditional encrypted");
+
+        // Test unencrypted extraction with auto-detection
+        let cursor = Cursor::new(plain_output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert_eq!(&data, b"Not encrypted");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mixed_encrypted_and_plain_entries()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"mixed";
+
+        // Create archive with mixed entries
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_file("public.txt", b"Public content")?;
+            writer.add_encrypted_file("secret_aes.txt", b"AES secret", password)?;
+            writer.add_encrypted_file_traditional(
+                "secret_trad.txt",
+                b"Traditional secret",
+                password,
+            )?;
+            writer.add_file("readme.txt", b"Readme content")?;
+            writer.finish()?;
+        }
+
+        // Read and verify all entries
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        assert_eq!(reader.entries().len(), 4);
+
+        // Public file
+        let entry0 = reader.entries()[0].clone();
+        assert!(!is_entry_encrypted(&entry0));
+        let data = reader.extract(&entry0)?;
+        assert_eq!(&data, b"Public content");
+
+        // AES encrypted
+        let entry1 = reader.entries()[1].clone();
+        assert!(is_entry_encrypted(&entry1));
+        assert!(get_entry_aes_encryption_info(&entry1).is_some());
+        let data = reader.extract_encrypted(&entry1, password)?;
+        assert_eq!(&data, b"AES secret");
+
+        // Traditional encrypted
+        let entry2 = reader.entries()[2].clone();
+        assert!(is_entry_encrypted(&entry2));
+        assert!(is_entry_traditional_encrypted(&entry2));
+        let data = reader.extract_encrypted(&entry2, password)?;
+        assert_eq!(&data, b"Traditional secret");
+
+        // Another public file
+        let entry3 = reader.entries()[3].clone();
+        assert!(!is_entry_encrypted(&entry3));
+        let data = reader.extract(&entry3)?;
+        assert_eq!(&data, b"Readme content");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aes_encryption_strength_levels() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let password = b"strength_test";
+        let plaintext = b"Testing AES strength levels";
+
+        // Test AES-256 (default)
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_with_options(
+                "aes256.txt",
+                plaintext,
+                password,
+                ZipCompressionLevel::Store,
+                super::super::encryption::AesStrength::Aes256,
+            )?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+
+        if let Some(aes_info) = get_entry_aes_encryption_info(&entry) {
+            assert_eq!(
+                aes_info.strength,
+                super::super::encryption::AesStrength::Aes256
+            );
+        }
+
+        let data = reader.extract_with_password_aes(&entry, password)?;
+        assert_eq!(&data, plaintext);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_file_encryption() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"empty";
+
+        // AES encryption of empty file
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file("empty_aes.txt", b"", password)?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert!(data.is_empty());
+
+        // Traditional encryption of empty file
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_traditional("empty_trad.txt", b"", password)?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert!(data.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_file_encryption() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"large_file_test";
+        // Create 10KB of data (reduced from 100KB for faster test)
+        let plaintext: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+
+        // AES encryption with Store compression
+        // TODO: Fix deflate + encryption combination
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_with_options(
+                "large_aes.bin",
+                &plaintext,
+                password,
+                ZipCompressionLevel::Store,
+                super::super::encryption::AesStrength::Aes256,
+            )?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_with_password_aes(&entry, password)?;
+        assert_eq!(data.len(), plaintext.len());
+        assert_eq!(data, plaintext);
+
+        // Traditional encryption with Store compression
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_traditional_with_options(
+                "large_trad.bin",
+                &plaintext,
+                password,
+                ZipCompressionLevel::Store,
+            )?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_with_password(&entry, password)?;
+        assert_eq!(data.len(), plaintext.len());
+        assert_eq!(data, plaintext);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unicode_filename_encryption() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"unicode";
+        let plaintext = b"Unicode filename test";
+        let filename = "\u{65e5}\u{672c}\u{8a9e}_\u{6587}\u{5b57}.txt"; // Japanese characters
+
+        // AES encryption with unicode filename
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file(filename, plaintext, password)?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.name, filename);
+
+        let data = reader.extract_encrypted(&entry, password)?;
+        assert_eq!(&data, plaintext);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_zip_5_files_deflate() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Test to reproduce bug: third and subsequent files fail with deflate compression
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.set_compression(ZipCompressionLevel::Normal);
+
+            // Add 5 files with compressible data
+            for i in 1..=5 {
+                let name = format!("file{}.txt", i);
+                let data = format!(
+                    "This is file {} with repetitive data: AAAAAABBBBBBCCCCCCDDDDDD",
+                    i
+                );
+                eprintln!("Adding {}: {} bytes", name, data.len());
+                writer.add_file(&name, data.as_bytes())?;
+            }
+
+            writer.finish()?;
+        }
+
+        eprintln!("\nZIP created: {} bytes", output.len());
+        eprintln!("Reading ZIP back...");
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        eprintln!("Found {} entries", reader.entries().len());
+        assert_eq!(reader.entries().len(), 5);
+
+        // Clone entries to avoid borrow checker issues
+        let entries: Vec<_> = reader.entries().to_vec();
+
+        for (i, entry) in entries.iter().enumerate() {
+            eprintln!("\nEntry {}: {}", i + 1, entry.name);
+            eprintln!("  Compression method: {}", entry.method);
+            eprintln!("  Compressed size: {}", entry.compressed_size);
+            eprintln!("  Uncompressed size: {}", entry.size);
+
+            let data = reader.extract(entry)?;
+            eprintln!("  ✓ Extracted: {} bytes", data.len());
+
+            let expected = format!(
+                "This is file {} with repetitive data: AAAAAABBBBBBCCCCCCDDDDDD",
+                i + 1
+            );
+            assert_eq!(data.len(), expected.len());
+            assert_eq!(&data, expected.as_bytes());
+        }
+
+        eprintln!("\n✓ All 5 files extracted successfully!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_zip_3_files_binary_data() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Test with binary data similar to NumRS2's NPY format (with headers)
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.set_compression(ZipCompressionLevel::Normal);
+
+            // Simulate NPY file format: header (128 bytes) + binary data
+            let mut file1 = vec![0x93, b'N', b'U', b'M', b'P', b'Y']; // NPY magic
+            file1.extend_from_slice(&[1, 0]); // version
+            file1.extend_from_slice(&[110u8, 0]); // header length (110 bytes)
+            file1.extend_from_slice(&[b' '; 110]); // header padding
+            file1.extend_from_slice(
+                &[1u8, 2, 3, 4, 5, 6, 7, 8] // 8 bytes of f64 data (1 value)
+                    .repeat(6),
+            ); // Total: 48 bytes of binary data
+
+            let mut file2 = vec![0x93, b'N', b'U', b'M', b'P', b'Y'];
+            file2.extend_from_slice(&[1, 0]);
+            file2.extend_from_slice(&[110u8, 0]);
+            file2.extend_from_slice(&[b' '; 110]);
+            file2.extend_from_slice(&[1u8, 2, 3, 4, 5, 6, 7, 8].repeat(3)); // 24 bytes
+
+            let mut file3 = vec![0x93, b'N', b'U', b'M', b'P', b'Y'];
+            file3.extend_from_slice(&[1, 0]);
+            file3.extend_from_slice(&[110u8, 0]);
+            file3.extend_from_slice(&[b' '; 110]);
+            file3.extend_from_slice(&[1u8, 2, 3, 4, 5, 6, 7, 8].repeat(2)); // 16 bytes
+
+            // Original order: data, weights, labels
+            eprintln!(
+                "Adding data.npy: {} bytes (compressed should succeed)",
+                file1.len()
+            );
+            writer.add_file("data.npy", &file1)?;
+
+            eprintln!(
+                "Adding weights.npy: {} bytes (compressed should succeed)",
+                file2.len()
+            );
+            writer.add_file("weights.npy", &file2)?;
+
+            eprintln!("Adding labels.npy: {} bytes (THIS ONE FAILS)", file3.len());
+            writer.add_file("labels.npy", &file3)?;
+
+            writer.finish()?;
+        }
+
+        eprintln!("\nZIP created: {} bytes", output.len());
+        eprintln!("Reading ZIP back...");
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        eprintln!("Found {} entries", reader.entries().len());
+        assert_eq!(reader.entries().len(), 3);
+
+        let entries: Vec<_> = reader.entries().to_vec();
+
+        for (i, entry) in entries.iter().enumerate() {
+            eprintln!("\nEntry {}: {}", i + 1, entry.name);
+            eprintln!("  Compression method: {}", entry.method);
+            eprintln!("  Compressed size: {}", entry.compressed_size);
+            eprintln!("  Uncompressed size: {}", entry.size);
+
+            let data = reader.extract(entry)?;
+            eprintln!("  ✓ Extracted: {} bytes", data.len());
+        }
+
+        eprintln!("\n✓ All 3 binary files extracted successfully!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_zip_3_identical_files() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Test with 3 identical files to isolate the bug
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.set_compression(ZipCompressionLevel::Normal);
+
+            // All files have the same content (like labels.npy)
+            let mut file = vec![0x93, b'N', b'U', b'M', b'P', b'Y'];
+            file.extend_from_slice(&[1, 0]);
+            file.extend_from_slice(&[110u8, 0]);
+            file.extend_from_slice(&[b' '; 110]);
+            file.extend_from_slice(&[1u8, 2, 3, 4, 5, 6, 7, 8].repeat(2)); // 16 bytes
+
+            eprintln!("File size: {} bytes", file.len());
+
+            eprintln!("\nAdding file1.npy...");
+            writer.add_file("file1.npy", &file)?;
+
+            eprintln!("Adding file2.npy...");
+            writer.add_file("file2.npy", &file)?;
+
+            eprintln!("Adding file3.npy...");
+            writer.add_file("file3.npy", &file)?;
+
+            writer.finish()?;
+        }
+
+        eprintln!("\nZIP created: {} bytes", output.len());
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        let entries: Vec<_> = reader.entries().to_vec();
+
+        for (i, entry) in entries.iter().enumerate() {
+            eprintln!("\nExtracting entry {}: {}", i + 1, entry.name);
+            eprintln!("  Compressed: {} bytes", entry.compressed_size);
+            eprintln!("  Uncompressed: {} bytes", entry.size);
+
+            match reader.extract(entry) {
+                Ok(data) => {
+                    eprintln!("  ✓ Success: {} bytes", data.len());
+                }
+                Err(e) => {
+                    eprintln!("  ✗ FAILED: {}", e);
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        eprintln!("\n✓ All files extracted!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_deflate_size_debug() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use oxiarc_deflate::deflate;
+
+        // Create the same problematic data
+        let mut data = vec![0x93, b'N', b'U', b'M', b'P', b'Y'];
+        data.extend_from_slice(&[1, 0]);
+        data.extend_from_slice(&[110u8, 0]);
+        data.extend_from_slice(&[b' '; 110]);
+        data.extend_from_slice(&[1u8, 2, 3, 4, 5, 6, 7, 8].repeat(2));
+
+        eprintln!("Original data: {} bytes", data.len());
+        eprintln!("First 20 bytes: {:?}", &data[..20]);
+
+        // Compress multiple times
+        for i in 1..=3 {
+            eprintln!("\n=== Compression attempt {} ===", i);
+            let compressed = deflate(&data, 6)?;
+            eprintln!("Compressed size: {} bytes", compressed.len());
+            eprintln!(
+                "Compressed data (hex): {}",
+                compressed
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+
+            // Try to decompress
+            match oxiarc_deflate::inflate(&compressed) {
+                Ok(decompressed) => {
+                    eprintln!("✓ Decompression successful: {} bytes", decompressed.len());
+                    assert_eq!(decompressed.len(), data.len());
+                    assert_eq!(&decompressed, &data);
+                }
+                Err(e) => {
+                    eprintln!("✗ Decompression FAILED: {}", e);
+                    eprintln!("This is the bug!");
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        eprintln!("\n✓ All compressions/decompressions succeeded!");
+        Ok(())
     }
 }

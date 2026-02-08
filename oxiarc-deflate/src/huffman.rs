@@ -199,19 +199,27 @@ impl HuffmanTree {
         }
 
         // Try fast lookup (handles 90%+ of symbols)
-        let bits = reader.peek_bits(self.fast_bits)?;
-        let (symbol, len) = unsafe {
-            // SAFETY: bits is masked to fast_bits range, guaranteed to be valid index
-            *self.fast_table.get_unchecked(bits as usize)
-        };
+        // If peek_bits fails (not enough bits remaining), fall back to slow decoding
+        match reader.peek_bits(self.fast_bits) {
+            Ok(bits) => {
+                let (symbol, len) = unsafe {
+                    // SAFETY: bits is masked to fast_bits range, guaranteed to be valid index
+                    *self.fast_table.get_unchecked(bits as usize)
+                };
 
-        if len > 0 {
-            reader.skip_bits(len)?;
-            return Ok(symbol);
+                if len > 0 {
+                    reader.skip_bits(len)?;
+                    return Ok(symbol);
+                }
+
+                // Slow path for longer codes (rare)
+                self.decode_slow(reader)
+            }
+            Err(_) => {
+                // Not enough bits for fast lookup, use slow path
+                self.decode_slow(reader)
+            }
         }
-
-        // Slow path for longer codes (rare)
-        self.decode_slow(reader)
     }
 
     /// Slow decoding path for codes longer than fast_bits.

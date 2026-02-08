@@ -5,6 +5,49 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-02-09
+
+### Added
+- **oxiarc-archive**: ZIP encryption support
+  - Traditional ZIP encryption (ZipCrypto) implementation
+  - Encryption and decryption modules for password-protected archives
+  - Comprehensive crypto primitives for secure archive handling
+- **oxiarc-core**: Advanced I/O capabilities
+  - Async I/O support for non-blocking operations
+  - SIMD-accelerated CRC implementations for faster checksums
+  - Memory-mapped I/O (mmap) support for efficient large file handling
+  - Enhanced CRC benchmarks and performance testing
+- **oxiarc-lz4**: Dictionary support for improved compression
+  - LZ4 dictionary compression for better ratios on similar data
+  - Dictionary API for streaming compression scenarios
+- **oxiarc-lzhuf**: Streaming support
+  - Streaming compression and decompression API
+  - Comprehensive streaming integration tests
+- **oxiarc-lzma**: LZMA2 chunking improvements
+  - Enhanced LZMA2 chunk handling for better performance
+  - Optimal parsing improvements for compression efficiency
+- **oxiarc-deflate**: Enhanced compression capabilities
+  - Improved LZ77 implementation with better match finding
+  - Enhanced zlib support with more compression options
+- **oxiarc-cli**: Enhanced utilities and command improvements
+  - New utility modules for better file handling
+  - Improved list and extract commands
+
+### Changed
+- **oxiarc-core**: Enhanced ring buffer implementation
+- **oxiarc-deflate**: Optimized Huffman coding
+- **CLI**: Improved error handling and user feedback
+
+### Fixed
+- Multi-file archive handling edge cases
+- DEFLATE compression edge cases in simple scenarios
+
+### Tests
+- Added comprehensive ZIP encryption tests
+- Added streaming integration tests for LZHUF
+- Added multi-file bug regression tests
+- Added simple DEFLATE test cases
+
 ## [0.2.0] - 2026-02-06
 
 ### Added

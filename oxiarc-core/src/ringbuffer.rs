@@ -216,6 +216,36 @@ impl RingBuffer {
 
         result
     }
+
+    /// Preload the ring buffer with dictionary data.
+    ///
+    /// This is used for custom dictionary support in DEFLATE/zlib.
+    /// The dictionary is loaded into the history buffer, allowing
+    /// back-references to dictionary content during decompression.
+    ///
+    /// If the dictionary is larger than the buffer capacity, only
+    /// the last `capacity` bytes are used (as per zlib specification).
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (typically up to 32KB)
+    pub fn preload_dictionary(&mut self, dictionary: &[u8]) {
+        // If dictionary is larger than capacity, use only the last capacity bytes
+        let dict_to_use = if dictionary.len() > self.capacity {
+            &dictionary[dictionary.len() - self.capacity..]
+        } else {
+            dictionary
+        };
+
+        // Copy dictionary to buffer
+        for &byte in dict_to_use {
+            self.buffer[self.position] = byte;
+            self.position = (self.position + 1) & self.mask;
+        }
+
+        // Set size to the amount of dictionary data loaded
+        self.size = dict_to_use.len().min(self.capacity);
+    }
 }
 
 /// A ring buffer that also accumulates output data.
@@ -306,6 +336,21 @@ impl OutputRingBuffer {
     /// Get the ring buffer for direct access.
     pub fn ring(&self) -> &RingBuffer {
         &self.ring
+    }
+
+    /// Preload the ring buffer with dictionary data.
+    ///
+    /// This is used for custom dictionary support in DEFLATE/zlib.
+    /// The dictionary is loaded into the history (ring buffer) but NOT
+    /// included in the output. This allows back-references into the
+    /// dictionary during decompression.
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (up to window_size bytes, typically 32KB max)
+    pub fn preload_dictionary(&mut self, dictionary: &[u8]) {
+        self.ring.preload_dictionary(dictionary);
+        // Note: Dictionary is NOT added to output, only to history
     }
 }
 

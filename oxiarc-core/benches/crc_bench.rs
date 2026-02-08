@@ -6,6 +6,7 @@
 //! - Performance of slicing-by-8 optimization for large data
 //! - Comparison across different data patterns
 //! - Incremental vs single-shot CRC calculation
+//! - SIMD vs software implementation comparison (when simd feature enabled)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxiarc_core::crc::{Crc16, Crc32, Crc64};
@@ -390,6 +391,122 @@ fn bench_throughput_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark SIMD vs Software CRC-32 implementation
+///
+/// This benchmark compares the default (possibly SIMD-accelerated) implementation
+/// against the software-only implementation across various data sizes.
+fn bench_simd_vs_software(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_vs_software");
+
+    // Print which implementation is being used
+    println!("CRC-32 implementation: {}", Crc32::implementation_name());
+    println!("SIMD available: {}", Crc32::is_simd_available());
+
+    let sizes = [
+        ("64B", 64),
+        ("256B", 256),
+        ("1KB", 1024),
+        ("4KB", 4 * 1024),
+        ("16KB", 16 * 1024),
+        ("64KB", 64 * 1024),
+        ("256KB", 256 * 1024),
+        ("1MB", 1024 * 1024),
+    ];
+
+    for (size_name, size) in sizes {
+        let data = test_data::random(size);
+
+        // Benchmark default implementation (SIMD if available)
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("default", size_name), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute(black_box(data));
+                black_box(checksum);
+            });
+        });
+
+        // Benchmark software-only implementation
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("software", size_name), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute_software(black_box(data));
+                black_box(checksum);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark SIMD threshold behavior
+///
+/// Tests performance around the SIMD threshold (64 bytes) to understand
+/// the crossover point where SIMD becomes beneficial.
+fn bench_simd_threshold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_threshold");
+
+    // Test sizes around and beyond the 64-byte SIMD threshold
+    for size in [32, 48, 64, 80, 96, 128, 192, 256, 512] {
+        let data = test_data::random(size);
+
+        // Default (may use SIMD)
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("default", size), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute(black_box(data));
+                black_box(checksum);
+            });
+        });
+
+        // Software only
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("software", size), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute_software(black_box(data));
+                black_box(checksum);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark large data throughput (for measuring peak SIMD performance)
+fn bench_large_data_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_data_throughput");
+
+    // Large data sizes to measure peak throughput
+    let sizes = [
+        ("1MB", 1024 * 1024),
+        ("4MB", 4 * 1024 * 1024),
+        ("16MB", 16 * 1024 * 1024),
+    ];
+
+    for (size_name, size) in sizes {
+        let data = test_data::random(size);
+
+        // Default implementation
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("default", size_name), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute(black_box(data));
+                black_box(checksum);
+            });
+        });
+
+        // Software implementation
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("software", size_name), &data, |b, data| {
+            b.iter(|| {
+                let checksum = Crc32::compute_software(black_box(data));
+                black_box(checksum);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_crc16_sizes,
@@ -402,5 +519,8 @@ criterion_group!(
     bench_crc_comparison,
     bench_slicing_threshold,
     bench_throughput_scaling,
+    bench_simd_vs_software,
+    bench_simd_threshold,
+    bench_large_data_throughput,
 );
 criterion_main!(benches);

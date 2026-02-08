@@ -1,6 +1,7 @@
 //! List command implementation.
 
-use crate::utils::{filter_entries, print_entries};
+use super::SortBy;
+use crate::utils::{filter_entries, print_entries, print_tree, sort_entries};
 use oxiarc_archive::{
     ArchiveFormat, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, ZipReader, ZstdReader,
 };
@@ -57,12 +58,20 @@ struct ArchiveListJson {
     metadata: Option<serde_json::Value>,
 }
 
+/// Options for listing archive contents.
+pub struct ListOptions<'a> {
+    pub verbose: bool,
+    pub json: bool,
+    pub tree: bool,
+    pub sort_by: SortBy,
+    pub reverse: bool,
+    pub include: &'a [String],
+    pub exclude: &'a [String],
+}
+
 pub fn cmd_list(
     archive: &PathBuf,
-    verbose: bool,
-    json: bool,
-    include: &[String],
-    exclude: &[String],
+    options: &ListOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(archive)?;
     let mut reader = BufReader::new(file);
@@ -71,9 +80,9 @@ pub fn cmd_list(
     let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
 
-    if json {
+    if options.json {
         // JSON output mode
-        return cmd_list_json(archive, format, reader, include, exclude);
+        return cmd_list_json(archive, format, reader, options);
     }
 
     println!("Archive: {} ({})", archive.display(), format);
@@ -82,18 +91,21 @@ pub fn cmd_list(
     match format {
         ArchiveFormat::Zip => {
             let zip = ZipReader::new(reader)?;
-            let filtered = filter_entries(zip.entries(), include, exclude);
-            print_entries(&filtered, verbose);
+            let mut filtered = filter_entries(zip.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
+            display_entries(&filtered, options.verbose, options.tree);
         }
         ArchiveFormat::Tar => {
             let tar = oxiarc_archive::TarReader::new(reader)?;
-            let filtered = filter_entries(tar.entries(), include, exclude);
-            print_entries(&filtered, verbose);
+            let mut filtered = filter_entries(tar.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
+            display_entries(&filtered, options.verbose, options.tree);
         }
         ArchiveFormat::Lzh => {
             let lzh = oxiarc_archive::LzhReader::new(reader)?;
-            let filtered = filter_entries(&lzh.entries(), include, exclude);
-            print_entries(&filtered, verbose);
+            let mut filtered = filter_entries(&lzh.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
+            display_entries(&filtered, options.verbose, options.tree);
         }
         ArchiveFormat::Gzip => {
             let gzip = oxiarc_archive::GzipReader::new(reader)?;
@@ -136,13 +148,15 @@ pub fn cmd_list(
         }
         ArchiveFormat::SevenZip => {
             let sevenz = SevenZReader::new(reader)?;
-            let filtered = filter_entries(&sevenz.entries(), include, exclude);
-            print_entries(&filtered, verbose);
+            let mut filtered = filter_entries(&sevenz.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
+            display_entries(&filtered, options.verbose, options.tree);
         }
         ArchiveFormat::Cab => {
             let cab = CabReader::new(reader)?;
-            let filtered = filter_entries(cab.entries(), include, exclude);
-            print_entries(&filtered, verbose);
+            let mut filtered = filter_entries(cab.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
+            display_entries(&filtered, options.verbose, options.tree);
         }
         _ => {
             println!("Unsupported format: {}", format);
@@ -152,13 +166,21 @@ pub fn cmd_list(
     Ok(())
 }
 
+/// Display entries in either table or tree format.
+fn display_entries(entries: &[Entry], verbose: bool, tree: bool) {
+    if tree {
+        print_tree(entries, verbose);
+    } else {
+        print_entries(entries, verbose);
+    }
+}
+
 /// Output archive listing as JSON.
 fn cmd_list_json<R: std::io::Read + std::io::Seek>(
     archive: &std::path::Path,
     format: ArchiveFormat,
     reader: R,
-    include: &[String],
-    exclude: &[String],
+    options: &ListOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = ArchiveListJson {
         archive: archive.display().to_string(),
@@ -170,17 +192,20 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
     match format {
         ArchiveFormat::Zip => {
             let zip = ZipReader::new(reader)?;
-            let filtered = filter_entries(zip.entries(), include, exclude);
+            let mut filtered = filter_entries(zip.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
         }
         ArchiveFormat::Tar => {
             let tar = oxiarc_archive::TarReader::new(reader)?;
-            let filtered = filter_entries(tar.entries(), include, exclude);
+            let mut filtered = filter_entries(tar.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
         }
         ArchiveFormat::Lzh => {
             let lzh = oxiarc_archive::LzhReader::new(reader)?;
-            let filtered = filter_entries(&lzh.entries(), include, exclude);
+            let mut filtered = filter_entries(&lzh.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
         }
         ArchiveFormat::Gzip => {
@@ -224,12 +249,14 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
         }
         ArchiveFormat::SevenZip => {
             let sevenz = SevenZReader::new(reader)?;
-            let filtered = filter_entries(&sevenz.entries(), include, exclude);
+            let mut filtered = filter_entries(&sevenz.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
         }
         ArchiveFormat::Cab => {
             let cab = CabReader::new(reader)?;
-            let filtered = filter_entries(cab.entries(), include, exclude);
+            let mut filtered = filter_entries(cab.entries(), options.include, options.exclude);
+            sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
         }
         _ => {

@@ -8,8 +8,8 @@ mod utils;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use commands::{
-    CompressionLevel, OutputFormat, cmd_convert, cmd_create, cmd_detect, cmd_extract, cmd_info,
-    cmd_list, cmd_test,
+    CompressionLevel, OutputFormat, SortBy, cmd_convert, cmd_create, cmd_detect, cmd_extract,
+    cmd_info, cmd_list, cmd_test,
 };
 use std::io;
 use std::path::PathBuf;
@@ -63,6 +63,18 @@ enum Commands {
         /// Output as JSON (machine-readable)
         #[arg(short, long)]
         json: bool,
+
+        /// Display as directory tree
+        #[arg(short = 'T', long)]
+        tree: bool,
+
+        /// Sort entries by: name, size, or date
+        #[arg(short, long, value_enum, default_value = "name")]
+        sort: SortBy,
+
+        /// Reverse sort order
+        #[arg(short = 'r', long)]
+        reverse: bool,
 
         /// Include only files matching pattern (glob syntax: *.txt, src/**/*)
         #[arg(short = 'I', long)]
@@ -277,9 +289,23 @@ fn main() {
             archive,
             verbose,
             json,
+            tree,
+            sort,
+            reverse,
             include,
             exclude,
-        } => cmd_list(&archive, verbose, json, &include, &exclude),
+        } => {
+            let options = commands::list::ListOptions {
+                verbose,
+                json,
+                tree,
+                sort_by: sort,
+                reverse,
+                include: &include,
+                exclude: &exclude,
+            };
+            cmd_list(&archive, &options)
+        }
         Commands::Extract {
             archive,
             output,

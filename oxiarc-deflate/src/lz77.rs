@@ -105,6 +105,94 @@ impl Lz77Encoder {
         self.hash_chain.fill(0);
     }
 
+    /// Set a preset dictionary for improved compression.
+    ///
+    /// The dictionary is preloaded into the sliding window, allowing
+    /// matches to reference dictionary content from the start of compression.
+    /// This can significantly improve compression for data that shares
+    /// patterns with the dictionary (e.g., compressing similar files).
+    ///
+    /// # Arguments
+    ///
+    /// * `dictionary` - Dictionary data (up to 32KB). If larger, only the
+    ///   last 32KB is used.
+    ///
+    /// # Returns
+    ///
+    /// The Adler-32 checksum of the dictionary (used for identification).
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> u32 {
+        // Reset state first
+        self.reset();
+
+        // Use only last WINDOW_SIZE bytes if dictionary is larger
+        let dict_to_use = if dictionary.len() > WINDOW_SIZE {
+            &dictionary[dictionary.len() - WINDOW_SIZE..]
+        } else {
+            dictionary
+        };
+
+        // Copy dictionary to window
+        self.window[..dict_to_use.len()].copy_from_slice(dict_to_use);
+        self.window_pos = dict_to_use.len();
+
+        // Build hash table for dictionary content
+        // We need at least 3 bytes to form a hash
+        if dict_to_use.len() >= MIN_MATCH {
+            for pos in 0..dict_to_use.len().saturating_sub(MIN_MATCH - 1) {
+                let h = Self::hash(dict_to_use[pos], dict_to_use[pos + 1], dict_to_use[pos + 2]);
+                let prev = self.hash_table[h];
+                self.hash_chain[pos & (WINDOW_SIZE - 1)] = prev;
+                self.hash_table[h] = pos as u16;
+            }
+        }
+
+        // Calculate Adler-32 checksum for dictionary identification
+        Self::adler32(dictionary)
+    }
+
+    /// Calculate Adler-32 checksum (for dictionary identification).
+    fn adler32(data: &[u8]) -> u32 {
+        const MOD_ADLER: u32 = 65521;
+        const NMAX: usize = 5552;
+
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+
+        let mut remaining = data;
+
+        // Process in chunks to avoid overflow
+        while remaining.len() >= NMAX {
+            let (chunk, rest) = remaining.split_at(NMAX);
+            remaining = rest;
+
+            for &byte in chunk {
+                a += byte as u32;
+                b += a;
+            }
+
+            a %= MOD_ADLER;
+            b %= MOD_ADLER;
+        }
+
+        // Process remaining bytes
+        for &byte in remaining {
+            a += byte as u32;
+            b += a;
+        }
+
+        ((b % MOD_ADLER) << 16) | (a % MOD_ADLER)
+    }
+
+    /// Check if dictionary is currently set.
+    pub fn has_dictionary(&self) -> bool {
+        self.window_pos > 0
+    }
+
+    /// Get the current dictionary size (how much of window is pre-filled).
+    pub fn dictionary_size(&self) -> usize {
+        self.window_pos
+    }
+
     /// Compute hash for 3 bytes using improved mixing for better distribution.
     #[inline(always)]
     fn hash(b0: u8, b1: u8, b2: u8) -> usize {

@@ -92,7 +92,12 @@
   - [x] Compression level indicator
   - [x] Streaming ZlibCompressor/ZlibDecompressor
 - [ ] Gzip wrapper integration
-- [ ] Custom dictionary support
+- [x] Custom dictionary support
+  - [x] Deflater.with_dictionary() and set_dictionary()
+  - [x] Inflater.with_dictionary() and set_dictionary()
+  - [x] zlib_compress_with_dict() and zlib_decompress_with_dict()
+  - [x] FDICT flag support in zlib header
+  - [x] Dictionary checksum verification (Adler-32)
 - [ ] Flush modes (sync, full, partial)
 
 ### Compliance
@@ -107,8 +112,9 @@
 - huffman: 4 tests
 - lz77: 7 tests
 - tables: 7 tests
-- zlib: 16 tests (Adler-32, roundtrip, levels, streaming)
-- Total: 43 tests
+- zlib: 27 tests (Adler-32, roundtrip, levels, streaming, dictionary support)
+- edge_cases: 11 tests
+- Total: 65 tests
 
 ## Code Statistics
 
@@ -125,4 +131,3 @@
 ## Known Limitations
 
 1. Single-threaded only
-2. No custom dictionary support

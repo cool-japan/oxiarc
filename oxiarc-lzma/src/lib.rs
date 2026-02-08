@@ -37,6 +37,26 @@
 //! let compressed = compress(data, LzmaLevel::DEFAULT)?;
 //! ```
 //!
+//! ### LZMA2 Chunked Encoding (XZ compatible)
+//!
+//! ```ignore
+//! use oxiarc_lzma::{encode_lzma2_chunked, decode_lzma2_chunked, LzmaLevel};
+//!
+//! let data = b"Hello, LZMA2 chunked world!";
+//! let encoded = encode_lzma2_chunked(data, LzmaLevel::DEFAULT)?;
+//! let decoded = decode_lzma2_chunked(&encoded, 1 << 20)?;
+//! ```
+//!
+//! For custom chunk sizes, use `Lzma2ChunkedEncoder`:
+//!
+//! ```ignore
+//! use oxiarc_lzma::{Lzma2ChunkedEncoder, Lzma2Config, LzmaLevel};
+//!
+//! let config = Lzma2Config::with_level(LzmaLevel::DEFAULT).chunk_size(64 * 1024);
+//! let mut encoder = Lzma2ChunkedEncoder::with_config(config);
+//! let encoded = encoder.encode(data)?;
+//! ```
+//!
 //! ## LZMA Format
 //!
 //! An LZMA stream consists of:
@@ -56,6 +76,7 @@
 pub mod decoder;
 pub mod encoder;
 pub mod lzma2;
+pub mod lzma2_chunk;
 pub mod model;
 pub mod optimal;
 pub mod range_coder;
@@ -66,6 +87,11 @@ pub use encoder::{LzmaEncoder, compress, compress_raw};
 pub use lzma2::{
     Lzma2Decoder, Lzma2Encoder, decode_lzma2, dict_size_from_props, encode_lzma2,
     props_from_dict_size,
+};
+pub use lzma2_chunk::{
+    ChunkType, DEFAULT_CHUNK_SIZE, LZMA_CHUNK_MAX_COMPRESSED, LZMA_CHUNK_MAX_UNCOMPRESSED,
+    Lzma2ChunkedEncoder, Lzma2Config, UNCOMPRESSED_CHUNK_MAX, control, decode_lzma2_chunked,
+    encode_lzma2_chunked, encode_lzma2_with_config,
 };
 pub use model::{LzmaModel, LzmaProperties, State};
 pub use range_coder::{RangeDecoder, RangeEncoder};

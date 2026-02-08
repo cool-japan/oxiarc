@@ -10,6 +10,8 @@
 //! - [`traits`]: Core traits for compression/decompression
 //! - [`entry`]: Archive entry metadata
 //! - [`error`]: Error types
+//! - `async_io`: Async I/O support (requires `async-io` feature)
+//! - `mmap`: Memory-mapped file support (requires `mmap` feature)
 //!
 //! ## Architecture
 //!
@@ -54,10 +56,18 @@
 
 pub mod bitstream;
 pub mod crc;
+#[cfg(feature = "simd")]
+pub mod crc_simd;
 pub mod entry;
 pub mod error;
 pub mod ringbuffer;
 pub mod traits;
+
+#[cfg(feature = "async-io")]
+pub mod async_io;
+
+#[cfg(feature = "mmap")]
+pub mod mmap;
 
 // Re-exports for convenience
 pub use bitstream::{BitReader, BitWriter};
@@ -70,12 +80,30 @@ pub use traits::{
     Decompressor, FlushMode,
 };
 
+// Optional async-io re-exports
+#[cfg(feature = "async-io")]
+pub use async_io::{
+    AsyncCompressor, AsyncCompressorWrapper, AsyncDecompressor, AsyncDecompressorWrapper,
+    StreamingAsyncCompressor, StreamingAsyncDecompressor, compress_concurrent,
+    decompress_concurrent,
+};
+
+// Optional mmap re-exports
+#[cfg(feature = "mmap")]
+pub use mmap::{MmapOptions, MmapReader};
+
 /// Prelude module for convenient imports.
 pub mod prelude {
+    #[cfg(feature = "async-io")]
+    pub use crate::async_io::{
+        AsyncCompressor, AsyncCompressorWrapper, AsyncDecompressor, AsyncDecompressorWrapper,
+    };
     pub use crate::bitstream::{BitReader, BitWriter};
     pub use crate::crc::{Crc16, Crc32};
     pub use crate::entry::{CompressionMethod, Entry, EntryType};
     pub use crate::error::{OxiArcError, Result};
+    #[cfg(feature = "mmap")]
+    pub use crate::mmap::{MmapOptions, MmapReader};
     pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer};
     pub use crate::traits::{
         ArchiveReader, ArchiveWriter, CompressionLevel, Compressor, Decompressor,
