@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "Command-line interface for OxiArc archive operations"
 keywords = ["cli", "archive", "compression", "zip", "lzh"]
 categories = ["command-line-utilities", "compression"]

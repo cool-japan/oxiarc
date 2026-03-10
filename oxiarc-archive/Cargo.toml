@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "Archive container format support for OxiArc (ZIP, TAR, GZIP, LZH, XZ)"
 keywords = ["archive", "zip", "tar", "gzip", "xz"]
 categories = ["compression", "encoding", "filesystem"]

@@ -183,6 +183,8 @@ pub struct ZstdDecoder {
     output: Vec<u8>,
     /// Window size.
     window_size: usize,
+    /// Optional dictionary for decompression.
+    dictionary: Option<Vec<u8>>,
 }
 
 impl ZstdDecoder {
@@ -193,6 +195,18 @@ impl ZstdDecoder {
             sequences_decoder: SequencesDecoder::new(),
             output: Vec::new(),
             window_size: MAX_WINDOW_SIZE,
+            dictionary: None,
+        }
+    }
+
+    /// Set a dictionary for decompression.
+    ///
+    /// Must match the dictionary used during compression.
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        if dict.is_empty() {
+            self.dictionary = None;
+        } else {
+            self.dictionary = Some(dict.to_vec());
         }
     }
 
@@ -327,6 +341,8 @@ impl ZstdDecoder {
     /// Execute sequences to produce output.
     fn execute_sequences(&mut self, literals: &[u8], sequences: &[Sequence]) -> Result<()> {
         let mut lit_pos = 0;
+        let dict = self.dictionary.as_deref().unwrap_or(&[]);
+        let dict_len = dict.len();
 
         for seq in sequences {
             // Copy literals
@@ -344,23 +360,41 @@ impl ZstdDecoder {
 
             // Copy match
             if seq.match_length > 0 {
-                if seq.offset == 0 || seq.offset > self.output.len() {
+                let max_offset = self.output.len() + dict_len;
+                if seq.offset == 0 || seq.offset > max_offset {
                     return Err(OxiArcError::CorruptedData {
                         offset: 0,
                         message: format!(
-                            "invalid offset {} (output length {})",
+                            "invalid offset {} (output length {}, dict length {})",
                             seq.offset,
-                            self.output.len()
+                            self.output.len(),
+                            dict_len
                         ),
                     });
                 }
 
-                let start = self.output.len() - seq.offset;
+                if seq.offset <= self.output.len() {
+                    // Normal case: offset within output buffer
+                    let start = self.output.len() - seq.offset;
+                    for i in 0..seq.match_length {
+                        let byte = self.output[start + (i % seq.offset)];
+                        self.output.push(byte);
+                    }
+                } else {
+                    // Dictionary reference: offset extends into dictionary
+                    // The logical buffer is [dict | output], and we go back `offset` from end
+                    let dict_and_output_len = dict_len + self.output.len();
+                    let start_in_combined = dict_and_output_len - seq.offset;
 
-                // Handle overlapping copies
-                for i in 0..seq.match_length {
-                    let byte = self.output[start + (i % seq.offset)];
-                    self.output.push(byte);
+                    for i in 0..seq.match_length {
+                        let pos_in_combined = start_in_combined + (i % seq.offset);
+                        let byte = if pos_in_combined < dict_len {
+                            dict[pos_in_combined]
+                        } else {
+                            self.output[pos_in_combined - dict_len]
+                        };
+                        self.output.push(byte);
+                    }
                 }
             }
         }
@@ -389,6 +423,13 @@ impl Default for ZstdDecoder {
 /// Decompress Zstandard data.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ZstdDecoder::new();
+    decoder.decode_frame(data)
+}
+
+/// Decompress Zstandard data using a dictionary.
+pub fn decompress_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = ZstdDecoder::new();
+    decoder.set_dictionary(dict);
     decoder.decode_frame(data)
 }
 

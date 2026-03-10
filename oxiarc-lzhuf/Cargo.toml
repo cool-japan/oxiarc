@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "Pure Rust LZH (LZSS + Huffman) compression for OxiArc"
 keywords = ["lzh", "lha", "lzss", "compression", "huffman"]
 categories = ["compression", "encoding"]
@@ -14,7 +15,7 @@ categories = ["compression", "encoding"]
 oxiarc-core.workspace = true
 
 [dev-dependencies]
-criterion = "0.8.1"
+criterion.workspace = true
 
 [[bench]]
 name = "lzhuf_bench"

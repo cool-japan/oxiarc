@@ -14,41 +14,42 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxiarc"
-authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
+authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "Pure Rust archive/compression library - The Oxidized Archiver"
 keywords = ["archive", "compression", "zip", "lzh", "deflate"]
 categories = ["compression", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-oxiarc-core = { version = "0.2.1", path = "oxiarc-core" }
-oxiarc-deflate = { version = "0.2.1", path = "oxiarc-deflate" }
-oxiarc-lzhuf = { version = "0.2.1", path = "oxiarc-lzhuf" }
-oxiarc-lzw = { version = "0.2.1", path = "oxiarc-lzw" }
-oxiarc-lzma = { version = "0.2.1", path = "oxiarc-lzma" }
-oxiarc-bzip2 = { version = "0.2.1", path = "oxiarc-bzip2" }
-oxiarc-lz4 = { version = "0.2.1", path = "oxiarc-lz4" }
-oxiarc-zstd = { version = "0.2.1", path = "oxiarc-zstd" }
-oxiarc-archive = { version = "0.2.1", path = "oxiarc-archive" }
+oxiarc-core = { version = "0.2.2", path = "oxiarc-core" }
+oxiarc-deflate = { version = "0.2.2", path = "oxiarc-deflate" }
+oxiarc-lzhuf = { version = "0.2.2", path = "oxiarc-lzhuf" }
+oxiarc-lzw = { version = "0.2.2", path = "oxiarc-lzw" }
+oxiarc-lzma = { version = "0.2.2", path = "oxiarc-lzma" }
+oxiarc-bzip2 = { version = "0.2.2", path = "oxiarc-bzip2" }
+oxiarc-lz4 = { version = "0.2.2", path = "oxiarc-lz4" }
+oxiarc-zstd = { version = "0.2.2", path = "oxiarc-zstd" }
+oxiarc-archive = { version = "0.2.2", path = "oxiarc-archive" }
 
 # External dependencies
 thiserror = "2.0.18"
 encoding_rs = "0.8.35"
-clap = { version = "4.5.57", features = ["derive"] }
-clap_complete = "4.5.65"
-indicatif = "0.18.3"
+clap = { version = "4.5.60", features = ["derive"] }
+clap_complete = "4.5.66"
+indicatif = "0.18.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-dialoguer = "0.11.0"
+dialoguer = "0.12.0"
 filetime = "0.2.27"
 rayon = "1.11.0"
-tokio = { version = "1.49.0", features = ["io-util", "rt", "macros", "sync"] }
-memmap2 = "0.9.9"
+tokio = { version = "1.50.0", features = ["io-util", "rt", "macros", "sync"] }
+memmap2 = "0.9.10"
+criterion = "0.8.2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

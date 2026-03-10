@@ -131,7 +131,7 @@
   - [x] Content size in header and content checksum verification
   - [x] LZ4-HC high compression mode (levels 1-12)
   - [x] Optimal parsing for level 12 (dynamic programming)
-- [x] Zstandard (FSE + Huffman + XXHash64, full roundtrip with raw block compression)
+- [x] Zstandard (FSE + Huffman + XXHash64, full encoder with bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict modules)
 
 ### Additional Formats
 - [x] 7z archive format (read support with LZMA/LZMA2 decompression)
@@ -205,25 +205,25 @@
 
 ## Test Coverage
 
-- oxiarc-core: 56 tests (51 unit tests + 5 doctests)
+- oxiarc-core: 95 tests
   - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer
-- oxiarc-deflate: 57 tests (43 unit tests + 11 integration tests + 3 doctests)
+- oxiarc-deflate: 65 tests
   - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels
-- oxiarc-lzhuf: 20 tests (19 unit tests + 1 doctest)
+- oxiarc-lzhuf: 48 tests
   - LH5 roundtrip encoding/decoding, LZSS, Huffman trees
-- oxiarc-bzip2: 36 tests
+- oxiarc-bzip2: 34 tests
   - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
-- oxiarc-lz4: 52 tests (51 unit tests + 1 doctest)
+- oxiarc-lz4: 94 tests
   - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression
-- oxiarc-zstd: 50 tests (49 unit tests + 1 doctest)
-  - FSE, Huffman, XXHash64, frame parsing, raw block compression, parallel compression
-- oxiarc-archive: 92 tests (85 unit tests + 7 doctests)
+- oxiarc-zstd: 163 tests
+  - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression
+- oxiarc-archive: 134 tests
   - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors
-- oxiarc-lzma: 43 tests (41 unit tests + 2 doctests)
+- oxiarc-lzma: 58 tests
   - LZMA/LZMA2, optimal parsing, range coder, price calculation
-- oxiarc-lzw: 52 tests (46 unit tests + 6 doctests)
+- oxiarc-lzw: 43 tests
   - GIF/TIFF configurations, dictionary management, roundtrip tests
-- Total: 458 tests (all passing, zero warnings)
+- Total: 734 tests (734 passed, 5 skipped, zero warnings)
 
 ## Code Statistics
 
@@ -233,9 +233,10 @@
 | oxiarc-deflate | ~2,700 (with Zlib wrapper and Adler-32) |
 | oxiarc-lzhuf | ~1,000 |
 | oxiarc-bzip2 | ~1,600 |
-| oxiarc-lz4 | ~1,350 (official frame, XXHash32, LZ4-HC) |
-| oxiarc-zstd | ~2,750 |
-| oxiarc-archive | ~7,500 |
+| oxiarc-lz4 | ~1,600 (official frame, XXHash32, LZ4-HC; refactored frame/ module) |
+| oxiarc-zstd | ~5,500 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
+| oxiarc-archive | ~9,500 (ZIP header refactored into header/mod.rs, reader.rs, types.rs, writer.rs) |
 | oxiarc-cli | ~2,020 |
 | oxiarc-lzma | ~2,900 |
-| **Total** | **~27,313** |
+| oxiarc-lzw | ~800 |
+| **Total** | **~36,889** |

@@ -52,63 +52,58 @@ impl FseTable {
         let table_size = 1usize << accuracy_log;
         let mut entries = vec![FseTableEntry::default(); table_size];
 
-        // Build the state allocation
+        // Step 1: Place -1 (less-than-1 probability) symbols at the high end of the table.
+        // These are assigned exactly 1 cell each, starting from tableSize-1 downward.
+        let mut high_threshold = table_size - 1;
         let mut symbol_next = vec![0u16; probabilities.len()];
 
-        // First pass: calculate starting positions
-        let mut cumulative = 0u16;
         for (symbol, &prob) in probabilities.iter().enumerate() {
             if prob == -1 {
-                // Less than 1 probability - allocate 1 state at the end
-                symbol_next[symbol] = (table_size - 1) as u16;
+                entries[high_threshold].symbol = symbol as u8;
+                high_threshold = high_threshold.wrapping_sub(1);
+                symbol_next[symbol] = 1; // -1 prob symbols get symbolNext = 1
             } else if prob > 0 {
-                symbol_next[symbol] = cumulative;
-                cumulative += prob as u16;
+                symbol_next[symbol] = prob as u16;
             }
         }
 
-        // Spread symbols across states using step algorithm
+        // Step 2: Spread positive-probability symbols across the remaining positions
+        // using the step algorithm. Skip positions already taken by -1 symbols.
         let table_mask = table_size - 1;
         let step = (table_size >> 1) + (table_size >> 3) + 3;
         let mut position = 0usize;
 
         for (symbol, &prob) in probabilities.iter().enumerate() {
-            let count = if prob == -1 { 1 } else { prob.max(0) as usize };
-
+            if prob <= 0 {
+                continue; // -1 symbols already placed; 0 probability = absent
+            }
+            let count = prob as usize;
             for _ in 0..count {
                 entries[position].symbol = symbol as u8;
-
-                // Find next available position using step
+                // Advance to next position, skipping high-end positions used by -1 symbols
                 loop {
                     position = (position + step) & table_mask;
-                    // Skip positions that are part of high-state symbols
-                    if position < table_size {
+                    if position <= high_threshold {
                         break;
                     }
                 }
             }
         }
 
-        // Second pass: fill in num_bits and baseline
+        // Step 3: Fill in num_bits and baseline for each state.
+        // For each state, symbolNext[s] tracks which "instance" of symbol s we're at.
+        // baseline = (symbolNext[s] << num_bits) - table_size
+        // num_bits = accuracy_log - floor(log2(symbolNext[s]))
         for entry in &mut entries {
             let symbol = entry.symbol as usize;
-            let prob = probabilities[symbol];
 
-            if prob == -1 {
-                // Less than 1 probability
-                entry.num_bits = accuracy_log;
-                entry.baseline = 0;
-            } else if prob > 0 {
-                let prob = prob as u16;
-                // Calculate num_bits: number of bits needed
-                let num_bits = accuracy_log - highest_bit_set(prob);
-                entry.num_bits = num_bits;
+            let next_state = symbol_next[symbol];
+            symbol_next[symbol] += 1;
 
-                // Calculate baseline
-                let next_state = symbol_next[symbol];
-                symbol_next[symbol] += 1;
-                entry.baseline = (next_state << num_bits).wrapping_sub(prob);
-            }
+            let num_bits = accuracy_log - highest_bit_set(next_state);
+            entry.num_bits = num_bits;
+            entry.baseline =
+                ((next_state as u32) << num_bits).wrapping_sub(table_size as u32) as u16;
         }
 
         Ok(Self {
@@ -144,12 +139,18 @@ impl FseTable {
 }
 
 /// FSE bitstream reader for decoding.
+///
+/// Reads a backward (reversed) bitstream as used in Zstandard sequence encoding.
+/// The last byte contains a sentinel bit (the highest set bit) which marks the
+/// start of the data. Bits are read starting just below the sentinel, proceeding
+/// towards byte 0.
 pub struct FseBitReader<'a> {
-    /// Input bytes (read backwards).
+    /// Input bytes.
     data: &'a [u8],
-    /// Current bit position from end.
-    bit_pos: usize,
-    /// Accumulated bits.
+    /// Index of the next byte to load (going backwards from the end).
+    /// Starts at `data.len() - 2` (byte before the sentinel byte) and decrements.
+    next_byte_idx: isize,
+    /// Accumulated bits (LSB = next bit to return).
     bits: u64,
     /// Number of valid bits in accumulator.
     bits_count: u8,
@@ -165,14 +166,7 @@ impl<'a> FseBitReader<'a> {
             });
         }
 
-        let mut reader = Self {
-            data,
-            bit_pos: data.len() * 8,
-            bits: 0,
-            bits_count: 0,
-        };
-
-        // Find the highest set bit in last byte (marks stream start)
+        // Find the sentinel in the last byte.
         let last_byte = data[data.len() - 1];
         if last_byte == 0 {
             return Err(OxiArcError::CorruptedData {
@@ -181,22 +175,38 @@ impl<'a> FseBitReader<'a> {
             });
         }
 
-        let padding_bits = 7 - highest_bit_set(last_byte as u16);
-        reader.bit_pos -= padding_bits as usize + 1; // Skip padding and sentinel
+        // The sentinel is the highest set bit. Data bits are below it.
+        let sentinel_pos = highest_bit_set(last_byte as u16);
+        let data_bits_in_last = sentinel_pos; // bits 0..sentinel_pos-1
 
-        // Fill initial bits
+        // Extract the data bits from the last byte (below sentinel).
+        let initial_bits = if data_bits_in_last > 0 {
+            (last_byte & ((1u8 << data_bits_in_last) - 1)) as u64
+        } else {
+            0
+        };
+
+        let mut reader = Self {
+            data,
+            next_byte_idx: data.len() as isize - 2,
+            bits: initial_bits,
+            bits_count: data_bits_in_last,
+        };
+
+        // Pre-fill the accumulator with more bytes.
         reader.refill();
 
         Ok(reader)
     }
 
-    /// Refill the bit buffer from input.
+    /// Refill the bit buffer from input bytes, loading from the byte just
+    /// before the last loaded byte and working towards byte 0.
     fn refill(&mut self) {
-        while self.bits_count <= 56 && self.bit_pos >= 8 {
-            self.bit_pos -= 8;
-            let byte_idx = self.bit_pos / 8;
-            self.bits |= (self.data[byte_idx] as u64) << self.bits_count;
+        while self.bits_count <= 56 && self.next_byte_idx >= 0 {
+            let byte_val = self.data[self.next_byte_idx as usize];
+            self.bits |= (byte_val as u64) << self.bits_count;
             self.bits_count += 8;
+            self.next_byte_idx -= 1;
         }
     }
 
@@ -219,7 +229,7 @@ impl<'a> FseBitReader<'a> {
 
     /// Check if the stream is exhausted.
     pub fn is_empty(&self) -> bool {
-        self.bits_count == 0 && self.bit_pos == 0
+        self.bits_count == 0 && self.next_byte_idx < 0
     }
 }
 
@@ -416,5 +426,25 @@ mod tests {
         assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b0100);
         assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b1011);
         assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b1010);
+    }
+
+    #[test]
+    fn test_backward_writer_reader_roundtrip() {
+        use crate::bitwriter::BackwardBitWriter;
+
+        let mut writer = BackwardBitWriter::new();
+        writer.write_bits(42, 6);
+        writer.write_bits(7, 5);
+        writer.write_bits(100, 8);
+        let output = writer.finish();
+
+        let mut reader = FseBitReader::new(&output).expect("should create reader");
+        let v1 = reader.read_bits(6);
+        let v2 = reader.read_bits(5);
+        let v3 = reader.read_bits(8);
+
+        assert_eq!(v1, 42, "first value");
+        assert_eq!(v2, 7, "second value");
+        assert_eq!(v3, 100, "third value");
     }
 }

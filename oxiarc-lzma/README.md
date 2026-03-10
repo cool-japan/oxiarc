@@ -211,4 +211,4 @@ let value = decoder.decode_direct_bits(num_bits)?;
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

@@ -1,11 +1,13 @@
 //! Zstandard encoder (frame construction).
 //!
-//! This module provides Zstandard compression with multiple block types:
-//! - Raw blocks: Uncompressed data (used when data doesn't benefit from compression)
-//! - RLE blocks: Single byte repeated (efficient for homogeneous data)
+//! This module provides Zstandard compression with multiple strategies:
+//! - **Level 0**: Raw/RLE blocks only (no LZ77 compression)
+//! - **Levels 1-22**: Full LZ77 + Huffman + FSE compressed blocks
 //!
-//! Creates valid Zstd frames that any decoder can read.
+//! Creates valid Zstd frames compatible with any decoder.
 
+use crate::compressed_block::encode_compressed_block;
+use crate::lz77::{LevelConfig, MatchFinder};
 use crate::xxhash::xxhash64_checksum;
 use crate::{MAX_BLOCK_SIZE, ZSTD_MAGIC};
 use oxiarc_core::error::Result;
@@ -25,25 +27,34 @@ pub enum CompressionStrategy {
 
 /// Zstandard encoder.
 ///
-/// Supports raw and RLE block encoding for efficient compression.
-/// Creates valid Zstd frames compatible with any decoder.
+/// Supports multiple compression levels (0-22) with LZ77 matching,
+/// Huffman literal encoding, and FSE sequence encoding.
 #[derive(Debug, Clone)]
 pub struct ZstdEncoder {
     /// Include content checksum in output.
     include_checksum: bool,
     /// Include content size in header.
     include_content_size: bool,
-    /// Compression strategy.
+    /// Compression strategy (used when level == 0).
     strategy: CompressionStrategy,
+    /// Compression level (0 = raw/RLE, 1-22 = LZ77 compression).
+    level: i32,
+    /// Optional dictionary for improved compression of small data.
+    dictionary: Option<Vec<u8>>,
+    /// Dictionary ID (XXH64 of dictionary data, lower 32 bits).
+    dict_id: Option<u32>,
 }
 
 impl ZstdEncoder {
-    /// Create a new encoder with default settings.
+    /// Create a new encoder with default settings (level 0, RLE strategy).
     pub fn new() -> Self {
         Self {
             include_checksum: true,
             include_content_size: true,
             strategy: CompressionStrategy::default(),
+            level: 0,
+            dictionary: None,
+            dict_id: None,
         }
     }
 
@@ -59,17 +70,66 @@ impl ZstdEncoder {
         self
     }
 
-    /// Set compression strategy.
+    /// Set compression strategy (only effective when level == 0).
     pub fn set_strategy(&mut self, strategy: CompressionStrategy) -> &mut Self {
         self.strategy = strategy;
         self
     }
 
+    /// Set compression level (0-22).
+    ///
+    /// - Level 0: Raw/RLE blocks (fastest, no compression)
+    /// - Levels 1-3: Fast compression (greedy matching)
+    /// - Levels 4-9: Balanced compression (lazy matching)
+    /// - Levels 10-22: High compression (deep search)
+    pub fn set_level(&mut self, level: i32) -> &mut Self {
+        self.level = level.clamp(0, 22);
+        self
+    }
+
+    /// Set a pre-trained dictionary for improved compression of small data.
+    pub fn set_dictionary(&mut self, dict: &[u8]) -> &mut Self {
+        if dict.is_empty() {
+            self.dictionary = None;
+            self.dict_id = None;
+        } else {
+            let id = crate::xxhash::xxhash64(dict) as u32;
+            self.dictionary = Some(dict.to_vec());
+            self.dict_id = Some(id);
+        }
+        self
+    }
+
+    /// Compress data into a Zstandard frame.
+    ///
+    /// Uses the configured compression level and strategy.
+    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(data.len() + 32);
+
+        // Write magic number
+        output.extend_from_slice(&ZSTD_MAGIC);
+
+        // Write frame header
+        self.write_frame_header(&mut output, data.len());
+
+        // Write blocks with compression
+        if self.level > 0 {
+            self.write_compressed_blocks(&mut output, data)?;
+        } else {
+            self.write_blocks(&mut output, data);
+        }
+
+        // Write content checksum if enabled
+        if self.include_checksum {
+            let checksum = xxhash64_checksum(data);
+            output.extend_from_slice(&checksum.to_le_bytes());
+        }
+
+        Ok(output)
+    }
+
     /// Compress data into a Zstandard frame using parallel block compression
     /// (requires `parallel` feature).
-    ///
-    /// This function splits the input into independent blocks and compresses them
-    /// in parallel using rayon. The output is identical to serial compression.
     #[cfg(feature = "parallel")]
     pub fn compress_parallel(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut output = Vec::with_capacity(data.len() + 32);
@@ -82,11 +142,7 @@ impl ZstdEncoder {
 
         // Split data into blocks
         if data.is_empty() {
-            // Empty data: write a single empty raw block with last flag
-            let block_header: u32 = 1; // last=1, type=Raw(0), size=0
-            output.push((block_header & 0xFF) as u8);
-            output.push(((block_header >> 8) & 0xFF) as u8);
-            output.push(((block_header >> 16) & 0xFF) as u8);
+            write_empty_block(&mut output);
         } else {
             let chunks: Vec<&[u8]> = data.chunks(MAX_BLOCK_SIZE).collect();
 
@@ -99,21 +155,16 @@ impl ZstdEncoder {
 
                     // Try RLE encoding if strategy allows
                     if self.strategy == CompressionStrategy::RleOnly {
-                        if let Some(rle_byte) = Self::detect_rle(chunk) {
+                        if let Some(rle_byte) = detect_rle(chunk) {
                             let mut block_output = Vec::new();
-                            self.encode_rle_block(
-                                &mut block_output,
-                                rle_byte,
-                                chunk.len(),
-                                is_last,
-                            );
+                            write_rle_block_to(&mut block_output, rle_byte, chunk.len(), is_last);
                             return (is_last, block_output);
                         }
                     }
 
                     // Fall back to raw block
                     let mut block_output = Vec::new();
-                    self.encode_raw_block(&mut block_output, chunk, is_last);
+                    write_raw_block_to(&mut block_output, chunk, is_last);
                     (is_last, block_output)
                 })
                 .collect();
@@ -133,42 +184,8 @@ impl ZstdEncoder {
         Ok(output)
     }
 
-    /// Compress data into a Zstandard frame.
-    ///
-    /// Uses the configured compression strategy to encode blocks efficiently.
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(data.len() + 32);
-
-        // Write magic number
-        output.extend_from_slice(&ZSTD_MAGIC);
-
-        // Write frame header
-        self.write_frame_header(&mut output, data.len());
-
-        // Write blocks with compression
-        self.write_blocks(&mut output, data);
-
-        // Write content checksum if enabled
-        if self.include_checksum {
-            let checksum = xxhash64_checksum(data);
-            output.extend_from_slice(&checksum.to_le_bytes());
-        }
-
-        Ok(output)
-    }
-
     /// Write frame header descriptor.
     fn write_frame_header(&self, output: &mut Vec<u8>, content_size: usize) {
-        // Frame header descriptor byte:
-        // - bits 0-1: Dictionary_ID_flag (0 = no dict)
-        // - bit 2: Content_Checksum_flag
-        // - bit 3: reserved (0)
-        // - bit 4: unused (0)
-        // - bit 5: Single_Segment_flag (1 = no window descriptor)
-        // - bits 6-7: Frame_Content_Size_flag
-        //
-        // For simplicity, we use single segment mode with content size.
-
         let mut descriptor: u8 = 0;
 
         if self.include_checksum {
@@ -178,26 +195,28 @@ impl ZstdEncoder {
         // Single_Segment_flag = 1 (no window descriptor needed)
         descriptor |= 0x20;
 
+        // Dictionary ID flag
+        let dict_id_flag = if self.dict_id.is_some() { 3u8 } else { 0u8 };
+        descriptor |= dict_id_flag;
+
         // Determine content size encoding
-        let (fcs_flag, fcs_bytes) = if !self.include_content_size || content_size == 0 {
-            // For single segment with fcs_flag=0, content size uses 1 byte
-            (0u8, 1)
-        } else if content_size <= 255 {
-            // 1 byte content size (fcs_flag=0 with single segment)
+        let (fcs_flag, fcs_bytes) = if !self.include_content_size || content_size <= 255 {
             (0u8, 1)
         } else if content_size <= 65535 + 256 {
-            // 2 bytes content size
             (1u8, 2)
         } else if content_size <= u32::MAX as usize {
-            // 4 bytes content size
             (2u8, 4)
         } else {
-            // 8 bytes content size
             (3u8, 8)
         };
 
         descriptor |= fcs_flag << 6;
         output.push(descriptor);
+
+        // Write Dictionary_ID (4 bytes if present)
+        if let Some(id) = self.dict_id {
+            output.extend_from_slice(&id.to_le_bytes());
+        }
 
         // Write Frame_Content_Size (required for single segment)
         match fcs_bytes {
@@ -205,7 +224,6 @@ impl ZstdEncoder {
                 output.push(content_size as u8);
             }
             2 => {
-                // FCS is (value - 256) for 2-byte encoding
                 let adjusted = (content_size - 256) as u16;
                 output.extend_from_slice(&adjusted.to_le_bytes());
             }
@@ -219,14 +237,10 @@ impl ZstdEncoder {
         }
     }
 
-    /// Write data as blocks using the configured strategy.
+    /// Write data as raw/RLE blocks (level 0).
     fn write_blocks(&self, output: &mut Vec<u8>, data: &[u8]) {
         if data.is_empty() {
-            // Empty data: write a single empty raw block with last flag
-            let block_header: u32 = 1; // last=1, type=Raw(0), size=0
-            output.push((block_header & 0xFF) as u8);
-            output.push(((block_header >> 8) & 0xFF) as u8);
-            output.push(((block_header >> 16) & 0xFF) as u8);
+            write_empty_block(output);
             return;
         }
 
@@ -239,94 +253,69 @@ impl ZstdEncoder {
 
             // Try RLE encoding if strategy allows
             if self.strategy == CompressionStrategy::RleOnly {
-                if let Some(rle_byte) = Self::detect_rle(block_data) {
-                    self.write_rle_block(output, rle_byte, block_size, is_last);
+                if let Some(rle_byte) = detect_rle(block_data) {
+                    write_rle_block_to(output, rle_byte, block_size, is_last);
                     offset += block_size;
                     continue;
                 }
             }
 
             // Fall back to raw block
-            self.write_raw_block(output, block_data, is_last);
+            write_raw_block_to(output, block_data, is_last);
             offset += block_size;
         }
     }
 
-    /// Detect if block can be encoded as RLE (all bytes the same).
-    fn detect_rle(data: &[u8]) -> Option<u8> {
+    /// Write data as compressed blocks using LZ77 (levels 1-22).
+    fn write_compressed_blocks(&self, output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
         if data.is_empty() {
-            return None;
+            write_empty_block(output);
+            return Ok(());
         }
 
-        let first = data[0];
+        let config = LevelConfig::for_level(self.level);
+        let mut finder = MatchFinder::new(&config);
+        let dict = self.dictionary.as_deref().unwrap_or(&[]);
 
-        // Quick check using chunks for SIMD-friendly comparison
-        for chunk in data.chunks(16) {
-            if !chunk.iter().all(|&b| b == first) {
-                return None;
+        let mut offset = 0;
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            let block_size = remaining.min(config.target_block_size);
+            let is_last = offset + block_size >= data.len();
+            let block_data = &data[offset..offset + block_size];
+
+            // Try RLE first (always efficient for homogeneous data)
+            if let Some(rle_byte) = detect_rle(block_data) {
+                write_rle_block_to(output, rle_byte, block_size, is_last);
+                offset += block_size;
+                continue;
             }
+
+            // Find LZ77 matches
+            let sequences = finder.find_sequences(block_data, dict)?;
+
+            // Try to encode as a compressed block
+            match encode_compressed_block(&sequences) {
+                Ok(compressed_content) => {
+                    // Only use compressed block if it's actually smaller
+                    if compressed_content.len() < block_data.len() {
+                        write_compressed_block_to(output, &compressed_content, is_last);
+                    } else {
+                        // Compressed is larger, use raw block
+                        write_raw_block_to(output, block_data, is_last);
+                    }
+                }
+                Err(_) => {
+                    // Compression failed, fall back to raw block
+                    write_raw_block_to(output, block_data, is_last);
+                }
+            }
+
+            finder.reset();
+            offset += block_size;
         }
 
-        Some(first)
-    }
-
-    /// Write an RLE block (single byte repeated).
-    fn write_rle_block(&self, output: &mut Vec<u8>, byte: u8, size: usize, is_last: bool) {
-        // Block header (3 bytes):
-        // - bit 0: Last_Block
-        // - bits 1-2: Block_Type (1 = RLE)
-        // - bits 3-23: Block_Size (regenerated size, not encoded size)
-        let last_flag = if is_last { 1u32 } else { 0u32 };
-        let block_type = 1u32 << 1; // RLE = 1
-        let block_header: u32 = last_flag | block_type | ((size as u32) << 3);
-
-        output.push((block_header & 0xFF) as u8);
-        output.push(((block_header >> 8) & 0xFF) as u8);
-        output.push(((block_header >> 16) & 0xFF) as u8);
-
-        // RLE block content: single byte
-        output.push(byte);
-    }
-
-    /// Write a raw (uncompressed) block.
-    fn write_raw_block(&self, output: &mut Vec<u8>, data: &[u8], is_last: bool) {
-        self.encode_raw_block(output, data, is_last);
-    }
-
-    /// Encode a raw block (helper for parallel compression).
-    fn encode_raw_block(&self, output: &mut Vec<u8>, data: &[u8], is_last: bool) {
-        // Block header (3 bytes):
-        // - bit 0: Last_Block
-        // - bits 1-2: Block_Type (0 = Raw)
-        // - bits 3-23: Block_Size
-        let last_flag = if is_last { 1u32 } else { 0u32 };
-        let block_header: u32 = last_flag | ((data.len() as u32) << 3);
-
-        output.push((block_header & 0xFF) as u8);
-        output.push(((block_header >> 8) & 0xFF) as u8);
-        output.push(((block_header >> 16) & 0xFF) as u8);
-
-        // Write raw block data
-        output.extend_from_slice(data);
-    }
-
-    /// Encode an RLE block (helper for parallel compression).
-    #[allow(dead_code)]
-    fn encode_rle_block(&self, output: &mut Vec<u8>, byte: u8, size: usize, is_last: bool) {
-        // Block header (3 bytes):
-        // - bit 0: Last_Block
-        // - bits 1-2: Block_Type (1 = RLE)
-        // - bits 3-23: Block_Size (regenerated size, not encoded size)
-        let last_flag = if is_last { 1u32 } else { 0u32 };
-        let block_type = 1u32 << 1; // RLE = 1
-        let block_header: u32 = last_flag | block_type | ((size as u32) << 3);
-
-        output.push((block_header & 0xFF) as u8);
-        output.push(((block_header >> 8) & 0xFF) as u8);
-        output.push(((block_header >> 16) & 0xFF) as u8);
-
-        // RLE block content: single byte
-        output.push(byte);
+        Ok(())
     }
 }
 
@@ -336,11 +325,83 @@ impl Default for ZstdEncoder {
     }
 }
 
-/// Compress data using raw blocks.
+// --- Block writing helpers ---
+
+/// Write an empty last block.
+fn write_empty_block(output: &mut Vec<u8>) {
+    let block_header: u32 = 1; // last=1, type=Raw(0), size=0
+    output.push((block_header & 0xFF) as u8);
+    output.push(((block_header >> 8) & 0xFF) as u8);
+    output.push(((block_header >> 16) & 0xFF) as u8);
+}
+
+/// Write a raw (uncompressed) block.
+fn write_raw_block_to(output: &mut Vec<u8>, data: &[u8], is_last: bool) {
+    let last_flag = if is_last { 1u32 } else { 0u32 };
+    let block_header: u32 = last_flag | ((data.len() as u32) << 3);
+    output.push((block_header & 0xFF) as u8);
+    output.push(((block_header >> 8) & 0xFF) as u8);
+    output.push(((block_header >> 16) & 0xFF) as u8);
+    output.extend_from_slice(data);
+}
+
+/// Write an RLE block.
+fn write_rle_block_to(output: &mut Vec<u8>, byte: u8, size: usize, is_last: bool) {
+    let last_flag = if is_last { 1u32 } else { 0u32 };
+    let block_type = 1u32 << 1; // RLE = 1
+    let block_header: u32 = last_flag | block_type | ((size as u32) << 3);
+    output.push((block_header & 0xFF) as u8);
+    output.push(((block_header >> 8) & 0xFF) as u8);
+    output.push(((block_header >> 16) & 0xFF) as u8);
+    output.push(byte);
+}
+
+/// Write a compressed block.
+fn write_compressed_block_to(output: &mut Vec<u8>, content: &[u8], is_last: bool) {
+    let last_flag = if is_last { 1u32 } else { 0u32 };
+    let block_type = 2u32 << 1; // Compressed = 2
+    let block_header: u32 = last_flag | block_type | ((content.len() as u32) << 3);
+    output.push((block_header & 0xFF) as u8);
+    output.push(((block_header >> 8) & 0xFF) as u8);
+    output.push(((block_header >> 16) & 0xFF) as u8);
+    output.extend_from_slice(content);
+}
+
+/// Detect if block can be encoded as RLE (all bytes the same).
+fn detect_rle(data: &[u8]) -> Option<u8> {
+    if data.is_empty() {
+        return None;
+    }
+    let first = data[0];
+    for chunk in data.chunks(16) {
+        if !chunk.iter().all(|&b| b == first) {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+// --- Convenience functions ---
+
+/// Compress data using default settings (raw/RLE blocks, level 0).
 ///
-/// This is a convenience function that uses default encoder settings.
+/// For actual LZ77 compression, use [`compress_with_level`] or configure
+/// [`ZstdEncoder`] with [`set_level`](ZstdEncoder::set_level).
 pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
     ZstdEncoder::new().compress(data)
+}
+
+/// Compress data with a specific compression level (1-22).
+///
+/// This is the primary compression function for most use cases.
+///
+/// # Arguments
+/// * `data` - Data to compress
+/// * `level` - Compression level (1 = fastest, 22 = best compression)
+pub fn compress_with_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    let mut encoder = ZstdEncoder::new();
+    encoder.set_level(level);
+    encoder.compress(data)
 }
 
 /// Compress data without checksum.
@@ -351,12 +412,24 @@ pub fn compress_no_checksum(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Compress data using parallel block compression (requires `parallel` feature).
-///
-/// This function uses rayon to compress blocks in parallel. The number of
-/// threads is automatically determined by rayon (typically matches CPU cores).
 #[cfg(feature = "parallel")]
 pub fn compress_parallel(data: &[u8]) -> Result<Vec<u8>> {
     ZstdEncoder::new().compress_parallel(data)
+}
+
+/// Convenience function: compress data and return bytes (compatible with
+/// `zstd::encode_all` pattern).
+///
+/// # Arguments
+/// * `data` - Data to compress (implements `AsRef<[u8]>`)
+/// * `level` - Compression level (1-22)
+pub fn encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    compress_with_level(data, level)
+}
+
+/// Convenience function: decompress data (compatible with `zstd::decode_all` pattern).
+pub fn decode_all(data: &[u8]) -> Result<Vec<u8>> {
+    crate::decompress(data)
 }
 
 #[cfg(test)]
@@ -368,11 +441,7 @@ mod tests {
     fn test_compress_empty() {
         let data: &[u8] = &[];
         let compressed = compress(data).unwrap();
-
-        // Verify magic
         assert_eq!(&compressed[0..4], &ZSTD_MAGIC);
-
-        // Roundtrip
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -381,8 +450,6 @@ mod tests {
     fn test_compress_small() {
         let data = b"Hello, Zstandard!";
         let compressed = compress(data).unwrap();
-
-        // Roundtrip
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data.as_slice());
     }
@@ -391,17 +458,14 @@ mod tests {
     fn test_compress_larger() {
         let data = vec![0x42u8; 1000];
         let compressed = compress(&data).unwrap();
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_compress_multi_block() {
-        // Data larger than MAX_BLOCK_SIZE to test multi-block
         let data = vec![0xABu8; MAX_BLOCK_SIZE + 1000];
         let compressed = compress(&data).unwrap();
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -410,8 +474,6 @@ mod tests {
     fn test_compress_no_checksum() {
         let data = b"Test without checksum";
         let compressed = compress_no_checksum(data).unwrap();
-
-        // Should still decompress
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data.as_slice());
     }
@@ -419,11 +481,9 @@ mod tests {
     #[test]
     fn test_encoder_builder() {
         let data = b"Builder pattern test";
-
         let mut encoder = ZstdEncoder::new();
         encoder.set_checksum(true).set_content_size(true);
         let compressed = encoder.compress(data).unwrap();
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data.as_slice());
     }
@@ -440,46 +500,36 @@ mod tests {
 
     #[test]
     fn test_rle_compression() {
-        // Data that is all the same byte - should compress well with RLE
         let data = vec![0xAAu8; 10000];
         let compressed = compress(&data).unwrap();
-
-        // RLE should be much smaller (1 byte per block vs full data)
         assert!(
             compressed.len() < data.len() / 10,
             "RLE compression failed: {} vs {}",
             compressed.len(),
             data.len()
         );
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_rle_multi_block() {
-        // Multiple blocks of the same byte
         let data = vec![0xBBu8; MAX_BLOCK_SIZE * 3];
         let compressed = compress(&data).unwrap();
-
-        // Should compress very well
         assert!(
             compressed.len() < 100,
             "Expected small output, got {}",
             compressed.len()
         );
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_rle_mixed_data() {
-        // Data with some RLE-able parts and some mixed
-        let mut data = vec![0xCCu8; 1000]; // RLE-able
-        data.extend_from_slice(b"Hello, World!"); // Not RLE-able
-        data.extend_from_slice(&vec![0xDDu8; 1000]); // RLE-able
-
+        let mut data = vec![0xCCu8; 1000];
+        data.extend_from_slice(b"Hello, World!");
+        data.extend_from_slice(&vec![0xDDu8; 1000]);
         let compressed = compress(&data).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
@@ -487,32 +537,95 @@ mod tests {
 
     #[test]
     fn test_detect_rle() {
-        // All same bytes
-        assert_eq!(ZstdEncoder::detect_rle(&[0xAA; 100]), Some(0xAA));
-        assert_eq!(ZstdEncoder::detect_rle(&[0x00; 50]), Some(0x00));
-        assert_eq!(ZstdEncoder::detect_rle(&[0xFF]), Some(0xFF));
-
-        // Mixed bytes
-        assert_eq!(ZstdEncoder::detect_rle(&[0xAA, 0xAA, 0xBB]), None);
-        assert_eq!(ZstdEncoder::detect_rle(&[0x00, 0x01]), None);
-
-        // Empty
-        assert_eq!(ZstdEncoder::detect_rle(&[]), None);
+        assert_eq!(detect_rle(&[0xAA; 100]), Some(0xAA));
+        assert_eq!(detect_rle(&[0x00; 50]), Some(0x00));
+        assert_eq!(detect_rle(&[0xFF]), Some(0xFF));
+        assert_eq!(detect_rle(&[0xAA, 0xAA, 0xBB]), None);
+        assert_eq!(detect_rle(&[0x00, 0x01]), None);
+        assert_eq!(detect_rle(&[]), None);
     }
 
     #[test]
     fn test_raw_strategy() {
         let data = vec![0xEEu8; 1000];
-
         let mut encoder = ZstdEncoder::new();
         encoder.set_strategy(CompressionStrategy::Raw);
         let compressed = encoder.compress(&data).unwrap();
-
-        // Raw blocks don't compress, so output is slightly larger than input
         assert!(compressed.len() > data.len());
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_compress_with_level() {
+        // Test that level-based compression produces valid output
+        let data = b"The quick brown fox jumps over the lazy dog. \
+                     The quick brown fox jumps over the lazy dog. \
+                     The quick brown fox jumps over the lazy dog.";
+
+        for level in [1, 3, 6, 9, 15, 22] {
+            let compressed = compress_with_level(data, level).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(
+                decompressed,
+                data.as_slice(),
+                "Roundtrip failed for level {}",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_all_decode_all() {
+        let data = b"Testing encode_all and decode_all convenience functions";
+        let compressed = encode_all(data, 3).unwrap();
+        let decompressed = decode_all(&compressed).unwrap();
+        assert_eq!(decompressed, data.as_slice());
+    }
+
+    #[test]
+    fn test_level_compression_ratio() {
+        // Repetitive data should compress with LZ77
+        let mut data = Vec::new();
+        for _ in 0..100 {
+            data.extend_from_slice(b"ABCDEFGHIJKLMNOP");
+        }
+
+        let raw = compress(&data).unwrap();
+        let level3 = compress_with_level(&data, 3).unwrap();
+
+        // Level 3 should produce smaller output than raw for repetitive data
+        assert!(
+            level3.len() <= raw.len(),
+            "Level 3 ({}) should be <= raw ({}) for repetitive data",
+            level3.len(),
+            raw.len()
+        );
+
+        // Both should decompress correctly
+        assert_eq!(decompress(&raw).unwrap(), data);
+        assert_eq!(decompress(&level3).unwrap(), data);
+    }
+
+    #[test]
+    fn test_large_data_roundtrip() {
+        // Simulate compressible data similar to what network compression tests use.
+        let mut data = Vec::with_capacity(16384);
+        let pattern = b"RDF triple: <http://example.org/subject> <http://example.org/predicate> \"value\" .\n";
+        while data.len() < 16384 {
+            data.extend_from_slice(pattern);
+        }
+        data.truncate(16384);
+
+        for level in [1, 3] {
+            let compressed = encode_all(&data, level).unwrap();
+            let decompressed = decode_all(&compressed).unwrap();
+            assert_eq!(
+                decompressed, data,
+                "Large roundtrip failed for level {}",
+                level
+            );
+        }
     }
 
     #[test]
@@ -527,7 +640,6 @@ mod tests {
     #[test]
     #[cfg(feature = "parallel")]
     fn test_parallel_roundtrip_large() {
-        // Large data spanning multiple blocks
         let data = vec![0xABu8; 5_000_000];
         let compressed = compress_parallel(&data).unwrap();
         let decompressed = decompress(&compressed).unwrap();
@@ -537,13 +649,9 @@ mod tests {
     #[test]
     #[cfg(feature = "parallel")]
     fn test_parallel_rle_compression() {
-        // Data that should compress well with RLE
         let data = vec![0xCCu8; 2_000_000];
         let compressed = compress_parallel(&data).unwrap();
-
-        // RLE should compress very well
         assert!(compressed.len() < data.len() / 100);
-
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -563,11 +671,8 @@ mod tests {
         let data = b"Testing parallel vs serial compression output.";
         let serial = compress(data).unwrap();
         let parallel = compress_parallel(data).unwrap();
-
-        // Both should decompress correctly
         let serial_decompressed = decompress(&serial).unwrap();
         let parallel_decompressed = decompress(&parallel).unwrap();
-
         assert_eq!(serial_decompressed, data.as_slice());
         assert_eq!(parallel_decompressed, data.as_slice());
     }
@@ -576,12 +681,10 @@ mod tests {
     #[cfg(feature = "parallel")]
     fn test_parallel_encoder_options() {
         let data = vec![0xFFu8; 1_000_000];
-
         let mut encoder = ZstdEncoder::new();
         encoder
             .set_checksum(false)
             .set_strategy(CompressionStrategy::RleOnly);
-
         let compressed = encoder.compress_parallel(&data).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
@@ -590,7 +693,6 @@ mod tests {
     #[test]
     #[cfg(feature = "parallel")]
     fn test_parallel_multi_block() {
-        // Create data larger than MAX_BLOCK_SIZE
         let data = vec![0x55u8; MAX_BLOCK_SIZE * 3 + 5000];
         let compressed = compress_parallel(&data).unwrap();
         let decompressed = decompress(&compressed).unwrap();

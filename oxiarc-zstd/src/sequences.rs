@@ -342,51 +342,94 @@ impl SequencesDecoder {
 }
 
 /// Decode offset with repeat offset handling.
+///
+/// In Zstandard, the offset code and extra bits produce an `Offset_Value`:
+///   `Offset_Value = (1 << code) + readBits(code)`
+///
+/// - `Offset_Value == 1`: repeat offset 1 (or 2 if `literal_length == 0`)
+/// - `Offset_Value == 2`: repeat offset 2 (or 3 if `literal_length == 0`)
+/// - `Offset_Value == 3`: repeat offset 3 (or `repeat[0] - 1` if `literal_length == 0`)
+/// - `Offset_Value > 3`: real offset = `Offset_Value - 3`
 fn decode_offset(
     code: u8,
     literal_length: usize,
     repeat_offsets: &mut [usize; 3],
     reader: &mut FseBitReader,
 ) -> Result<usize> {
-    if code == 0 {
-        // Use repeat offset
-        let offset = if literal_length == 0 {
-            // Special case: offset = repeat_offset[1]
-            repeat_offsets.swap(0, 1);
-            repeat_offsets[0]
-        } else {
-            repeat_offsets[0]
-        };
-        Ok(offset)
-    } else if code <= 3 && literal_length == 0 {
-        // Repeat offset with adjustment
-        let idx = code as usize;
-        let offset = if idx <= 2 {
-            repeat_offsets[idx]
-        } else {
-            repeat_offsets[0] - 1
-        };
+    // Read extra bits (always `code` bits for offset).
+    let extra = reader.read_bits(code);
+    let offset_value = (1usize << code) + extra as usize;
 
-        // Update repeat offsets
-        if idx != 0 {
-            let temp = repeat_offsets[idx];
-            for i in (1..=idx).rev() {
-                repeat_offsets[i] = repeat_offsets[i - 1];
-            }
-            repeat_offsets[0] = temp;
-        }
-
-        Ok(offset)
-    } else {
-        // Regular offset
-        let extra_bits = code.saturating_sub(1);
-        let extra = reader.read_bits(extra_bits);
-        let offset = (1 << code) + extra as usize;
+    if offset_value > 3 {
+        // Regular offset: subtract 3 to get real offset.
+        let offset = offset_value - 3;
 
         // Update repeat offsets
         repeat_offsets[2] = repeat_offsets[1];
         repeat_offsets[1] = repeat_offsets[0];
         repeat_offsets[0] = offset;
+
+        Ok(offset)
+    } else {
+        // Repeat offset handling based on Offset_Value (1, 2, or 3)
+        // and whether literal_length is zero.
+        let idx = if literal_length > 0 {
+            // offset_value 1 -> repeat[0], 2 -> repeat[1], 3 -> repeat[2]
+            offset_value - 1
+        } else {
+            // offset_value 1 -> repeat[1], 2 -> repeat[2], 3 -> repeat[0]-1
+            offset_value
+        };
+
+        let offset = if literal_length == 0 && offset_value == 3 {
+            repeat_offsets[0].saturating_sub(1)
+        } else if idx < 3 {
+            repeat_offsets[idx]
+        } else {
+            repeat_offsets[0].saturating_sub(1)
+        };
+
+        // Rotate repeat offsets: bring the used one to front.
+        if literal_length > 0 {
+            // For offset_value 1: no rotation needed (already at [0])
+            // For offset_value 2: swap [0] and [1]
+            // For offset_value 3: rotate [2] to front
+            match offset_value {
+                1 => {} // repeat[0], no change
+                2 => {
+                    repeat_offsets.swap(1, 0);
+                }
+                3 => {
+                    let temp = repeat_offsets[2];
+                    repeat_offsets[2] = repeat_offsets[1];
+                    repeat_offsets[1] = repeat_offsets[0];
+                    repeat_offsets[0] = temp;
+                }
+                _ => {}
+            }
+        } else {
+            // literal_length == 0
+            match offset_value {
+                1 => {
+                    // Use repeat[1], swap with [0]
+                    repeat_offsets.swap(0, 1);
+                }
+                2 => {
+                    // Use repeat[2], rotate to front
+                    let temp = repeat_offsets[2];
+                    repeat_offsets[2] = repeat_offsets[1];
+                    repeat_offsets[1] = repeat_offsets[0];
+                    repeat_offsets[0] = temp;
+                }
+                3 => {
+                    // Use repeat[0]-1, push to front
+                    repeat_offsets[2] = repeat_offsets[1];
+                    repeat_offsets[1] = repeat_offsets[0];
+                    repeat_offsets[0] = offset;
+                }
+                _ => {}
+            }
+        }
 
         Ok(offset)
     }
@@ -469,10 +512,11 @@ fn predefined_ll_table() -> FseTable {
 
 /// Create predefined offset FSE table.
 fn predefined_of_table() -> FseTable {
-    // Predefined distribution for offsets (accuracy log 5)
+    // Predefined distribution for offsets (accuracy log 5, 29 symbols 0-28)
+    // Per RFC 8878 Section 3.1.1.3.2.2.1
     let probs = [
         1i16, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
-        -1, -1, -1, -1,
+        -1,
     ];
     FseTable::new(5, &probs).expect("Predefined offset FSE table should always be valid")
 }

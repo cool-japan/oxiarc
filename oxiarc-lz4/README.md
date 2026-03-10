@@ -76,4 +76,4 @@ This crate is part of the [OxiArc](https://github.com/cool-japan/oxiarc) project
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

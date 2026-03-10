@@ -3,40 +3,78 @@
 //! Pure Rust implementation of the Zstandard (zstd) compression format (RFC 8878).
 //!
 //! Zstandard is a modern, fast compression algorithm providing excellent compression
-//! ratios. This implementation provides decompression and basic compression support.
+//! ratios. This implementation provides full compression and decompression support.
 //!
 //! ## Features
 //!
-//! - Complete Zstandard frame parsing
-//! - FSE (Finite State Entropy) decoding
-//! - Huffman decoding for literals
-//! - Raw block compression (valid Zstd output)
+//! - Full LZ77 + Huffman + FSE compression (levels 1-22)
+//! - Complete Zstandard frame parsing and decompression
+//! - FSE (Finite State Entropy) encoding and decoding
+//! - Huffman encoding and decoding for literals
+//! - Dictionary-based compression for small data
+//! - Streaming Write/Read API
 //! - XXH64 checksum verification
+//! - Optional parallel compression
 //!
 //! ## Example
 //!
 //! ```rust,no_run
-//! use oxiarc_zstd::{compress, decompress};
+//! use oxiarc_zstd::{compress_with_level, decompress, encode_all, decode_all};
 //!
+//! // Buffer-based compression with level
 //! let data = b"Hello, Zstandard!";
-//! let compressed = compress(data).unwrap();
+//! let compressed = compress_with_level(data, 3).unwrap();
 //! let decompressed = decompress(&compressed).unwrap();
+//! assert_eq!(decompressed, data);
+//!
+//! // Convenience functions (zstd crate compatible pattern)
+//! let compressed = encode_all(data, 3).unwrap();
+//! let decompressed = decode_all(&compressed).unwrap();
 //! assert_eq!(decompressed, data);
 //! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+mod bitwriter;
+mod compressed_block;
+/// Dictionary support for improved compression of small data.
+pub mod dict;
 mod encode;
 mod frame;
 mod fse;
+#[allow(dead_code)]
+mod fse_encoder;
 mod huffman;
+#[allow(dead_code)]
+mod huffman_encoder;
 mod literals;
+mod lz77;
 mod sequences;
+/// Streaming compression and decompression.
+pub mod streaming;
 mod xxhash;
 
-pub use encode::{CompressionStrategy, ZstdEncoder, compress, compress_no_checksum};
-pub use frame::{ZstdDecoder, decompress};
+// Primary compression API
+pub use encode::{
+    CompressionStrategy, ZstdEncoder, compress, compress_no_checksum, compress_with_level,
+    decode_all, encode_all,
+};
+
+// Decompression API
+pub use frame::{ZstdDecoder, decompress, decompress_with_dict};
+
+// Streaming API
+pub use streaming::{ZstdStreamDecoder, ZstdStreamEncoder};
+
+// Dictionary API
+pub use dict::{ZstdDict, train_dictionary};
+
+// Advanced: LZ77 types (for users who want fine-grained control)
+pub use lz77::{LevelConfig, Lz77Sequence, MatchFinder};
+
+// Advanced: Bitstream writers (for custom encoding)
+pub use bitwriter::{BackwardBitWriter, ForwardBitWriter};
 
 #[cfg(feature = "parallel")]
 pub use encode::compress_parallel;
@@ -138,7 +176,6 @@ mod tests {
 
     #[test]
     fn test_zstd_magic() {
-        // 0xFD2FB528 in little-endian
         assert_eq!(u32::from_le_bytes(ZSTD_MAGIC), 0xFD2FB528);
     }
 }

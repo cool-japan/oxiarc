@@ -16,7 +16,7 @@ oxiarc-core = { workspace = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
-criterion = "0.8.1"
+criterion.workspace = true
 
 [[bench]]
 name = "zstd_bench"

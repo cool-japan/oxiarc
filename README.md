@@ -70,16 +70,17 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8) | ~1,800 | 56 |
-| `oxiarc-deflate` | DEFLATE compression (RFC 1951) with LZ77 + Huffman + Zlib | ~2,100 | 57 |
-| `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman | ~1,400 | 20 |
-| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~1,200 | 29 |
-| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32 | ~1,600 | 45 |
-| `oxiarc-zstd` | Zstandard with FSE + Huffman + XXHash64 | ~2,100 | 43 |
-| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains | ~2,000 | 30 |
-| `oxiarc-archive` | 10 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, etc.) | ~5,600 | 91 |
+| `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8) | ~1,800 | 95 |
+| `oxiarc-deflate` | DEFLATE compression (RFC 1951) with LZ77 + Huffman + Zlib | ~2,100 | 65 |
+| `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman | ~1,400 | 48 |
+| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~1,200 | 34 |
+| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32 | ~1,600 | 94 |
+| `oxiarc-zstd` | Zstandard with FSE + Huffman + XXHash64 | ~2,100 | 163 |
+| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains | ~2,000 | 58 |
+| `oxiarc-archive` | 10 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, etc.) | ~5,600 | 134 |
+| `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream and variable bit widths | ~800 | 43 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output | ~1,800 | - |
-| **Total** | **Pure Rust archive/compression library** | **~19,600** | **371** |
+| **Total** | **Pure Rust archive/compression library** | **~27,000** | **734** |
 
 ## Installation
 
@@ -102,12 +103,12 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.1.0"  # For archive format support
-oxiarc-deflate = "0.1.0"  # For DEFLATE compression
-oxiarc-lzma = "0.1.0"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.1.0"    # For Bzip2 compression
-oxiarc-lz4 = "0.1.0"      # For LZ4 compression
-oxiarc-zstd = "0.1.0"     # For Zstandard compression
+oxiarc-archive = "0.2.2"  # For archive format support
+oxiarc-deflate = "0.2.2"  # For DEFLATE compression
+oxiarc-lzma = "0.2.2"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.2.2"    # For Bzip2 compression
+oxiarc-lz4 = "0.2.2"      # For LZ4 compression
+oxiarc-zstd = "0.2.2"     # For Zstandard compression
 ```
 
 ## Quick Start
@@ -660,7 +661,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 293 tests
+# Run all 734 tests
 cargo nextest run --all-features
 
 # Build CLI only
@@ -824,6 +825,21 @@ When adding new formats or algorithms:
 - Help others in issues and discussions
 - Share knowledge and expertise
 - Follow the Rust Code of Conduct
+
+## Sponsorship
+
+OxiARC is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find OxiARC useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiGDAL, OxiMedia, OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
 
 ## License
 

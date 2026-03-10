@@ -207,4 +207,4 @@ let safe_path = entry.sanitized_name();
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

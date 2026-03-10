@@ -235,4 +235,4 @@ cargo build --release -p oxiarc-cli --all-features
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

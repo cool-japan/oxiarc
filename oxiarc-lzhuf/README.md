@@ -179,4 +179,4 @@ The format declined in the 2000s as ZIP became universal, but remains important 
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
