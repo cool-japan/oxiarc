@@ -1,6 +1,13 @@
 # oxiarc-deflate
 
+[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
+
+**Version 0.2.3** (2026-03-11) — 79 tests passing.
+
+**What's new in 0.2.3**: Added `async_deflate` module (async streaming compression/decompression via Tokio) and `gzip` module (GZIP format support wrapping DEFLATE with RFC 1952 headers/trailers).
 
 ## Overview
 
@@ -20,6 +27,31 @@ This crate provides both compression and decompression with no external dependen
 - **Compression levels 0-9** - From stored to maximum compression
 - **Streaming API** - Process data in chunks
 - **One-shot API** - Convenient functions for simple cases
+- **Async I/O** - `async_deflate` module with Tokio-based async streaming (enable `async-io` feature)
+- **GZIP support** - `gzip` module for RFC 1952 GZIP format encoding/decoding
+
+### Cargo Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `default` | yes | DEFLATE compression/decompression, LZ77, Huffman |
+| `async-io` | no | Async streaming I/O via Tokio (enables `async_deflate` module) |
+
+## Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+oxiarc-deflate = "0.2.3"
+```
+
+With async I/O support:
+
+```toml
+[dependencies]
+oxiarc-deflate = { version = "0.2.3", features = ["async-io"] }
+```
 
 ## Quick Start
 
@@ -158,6 +190,35 @@ let symbol = tree.decode(&mut bit_reader)?;
 | `huffman` | Huffman tree operations |
 | `lz77` | LZ77 dictionary encoder |
 | `tables` | Fixed Huffman tables, length/distance extra bits |
+| `gzip` | GZIP format (RFC 1952) encoding and decoding |
+| `async_deflate` | Async streaming compression/decompression (requires `async-io` feature) |
+
+### GZIP API
+
+```rust
+use oxiarc_deflate::gzip::{gzip_encode, gzip_decode};
+
+// Encode to GZIP format
+let compressed = gzip_encode(data, 6)?;
+
+// Decode GZIP data
+let decompressed = gzip_decode(&compressed)?;
+```
+
+### Async DEFLATE (requires `async-io` feature)
+
+```rust
+use oxiarc_deflate::async_deflate::{AsyncDeflater, AsyncInflater};
+use tokio::io::BufReader;
+
+// Async compression
+let mut deflater = AsyncDeflater::new(6);
+let compressed = deflater.compress_all(reader).await?;
+
+// Async decompression
+let mut inflater = AsyncInflater::new();
+let decompressed = inflater.decompress_all(reader).await?;
+```
 
 ## Performance
 

@@ -5,6 +5,33 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-03-11
+
+### Added
+- `oxiarc-archive`: Async ZIP support (`async_zip` module)
+- `oxiarc-deflate`: Async deflate support (`async_deflate` module) and GZip module (`gzip`)
+- `oxiarc-lzw`: New GIF LZW codec (`gif_lzw` module) and LSB bitstream support (`bitstream_lsb` module)
+
+### Changed
+- `oxiarc-deflate`: Various improvements to LZ77 match-finding, deflate engine, and lib interface
+- `oxiarc-lz4`: Dictionary and HC (high-compression) improvements
+- `oxiarc-lzma`: Encoder optimizations, model refinements, and optimal parsing improvements
+- `oxiarc-zstd`: Frame, streaming, and lib improvements
+- `oxiarc-lzhuf`: LZSS improvements
+- `oxiarc-bzip2`: BWT improvements
+- `oxiarc-archive`: ZIP header reader and module-level improvements
+
+### Quality
+- Zero clippy warnings (strict mode with `-D warnings`)
+- Zero rustdoc warnings
+- 100% test pass rate
+- All policies compliant (no unwrap in production code, pure Rust, latest crates, workspace)
+
+### Crates in This Release
+All crates published at version 0.2.3:
+- oxiarc-core, oxiarc-deflate, oxiarc-lzhuf, oxiarc-lzw, oxiarc-lzma
+- oxiarc-bzip2, oxiarc-lz4, oxiarc-zstd, oxiarc-archive, oxiarc-cli
+
 ## [0.2.2] - 2026-03-10
 
 ### Added
@@ -268,5 +295,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.2.3]: https://github.com/cool-japan/oxiarc/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/cool-japan/oxiarc/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/cool-japan/oxiarc/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxiarc/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cool-japan/oxiarc/releases/tag/v0.1.0

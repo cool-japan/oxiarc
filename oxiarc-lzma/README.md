@@ -1,6 +1,13 @@
 # oxiarc-lzma
 
+[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
+
+**Version 0.2.3** (2026-03-11) — 66 tests passing.
+
+**What's new in 0.2.3**: Encoder improvements including probability model refinements and optimal parsing enhancements for better compression ratios on structured data.
 
 ## Overview
 
@@ -185,13 +192,23 @@ let bit = decoder.decode_bit(&mut prob)?;
 let value = decoder.decode_direct_bits(num_bits)?;
 ```
 
+## Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+oxiarc-lzma = "0.2.3"
+```
+
 ## Modules
 
 | Module | Description |
 |--------|-------------|
 | `encoder` | LZMA compression |
 | `decoder` | LZMA decompression |
-| `model` | Probability models |
+| `model` | Context-dependent probability models |
+| `optimal` | Optimal parsing for improved compression decisions |
 | `range_coder` | Range encoder/decoder |
 
 ## Comparison with Other Codecs

@@ -2,18 +2,24 @@
 
 Pure Rust implementation of Zstandard (zstd) compression algorithm.
 
+[![Crates.io](https://img.shields.io/crates/v/oxiarc-zstd.svg)](https://crates.io/crates/oxiarc-zstd)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**Version: 0.2.3 (2026-03-11) | Tests: 170 passing**
+
 ## Overview
 
-Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications.
+Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.2.3 includes improvements to the frame, streaming, and core library modules.
 
 ## Features
 
 - **Pure Rust** - No C dependencies or unsafe FFI
 - **Excellent compression ratios** - Better than DEFLATE, competitive with BZip2
 - **Fast decompression** - Faster than BZip2, competitive with DEFLATE
-- **Parallel compression** - Multi-threaded block compression with Rayon
+- **Parallel compression** - Multi-threaded block compression with Rayon (`parallel` feature)
 - **Dictionary support** - Pre-trained dictionaries for better compression
 - **Checksum support** - XXH64 checksums for data integrity
+- **Streaming API** - Incremental encoder/decoder for large data
 
 ## Quick Start
 
@@ -43,7 +49,7 @@ assert_eq!(decompressed, original);
 ```rust
 use oxiarc_zstd::compress_parallel;
 
-// Use all available CPU cores
+// Use all available CPU cores (requires `parallel` feature)
 let compressed = compress_parallel(&data, 3)?;
 ```
 
@@ -75,6 +81,21 @@ use oxiarc_zstd::Decoder;
 
 let mut decoder = Decoder::new();
 let decompressed = decoder.decompress(&compressed)?;
+```
+
+## Features (Cargo)
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `parallel` | no | Multi-threaded block compression via Rayon |
+
+```toml
+[dependencies]
+# Default (no parallel)
+oxiarc-zstd = "0.2.3"
+
+# With parallel compression
+oxiarc-zstd = { version = "0.2.3", features = ["parallel"] }
 ```
 
 ## Algorithm

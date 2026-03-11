@@ -1,5 +1,13 @@
 # OxiArc - Development Roadmap
 
+## Version History
+
+- **v0.2.3** (2026-03-11): Async ZIP (async_zip), async deflate (async_deflate), GZip module, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb). Total: 799 tests, ~39,417 lines, 127 files.
+- **v0.2.2**: Previous release
+- **v0.2.1**: Previous release
+- **v0.2.0**: LZW crate, full Zstandard encoder, Bzip2 parallel compression
+- **v0.1.0**: Initial release — core codecs, archive formats, CLI
+
 ## Phase 1: Core Foundation (Complete)
 
 - [x] BitStream (LSB-first bit packing)
@@ -132,6 +140,8 @@
   - [x] LZ4-HC high compression mode (levels 1-12)
   - [x] Optimal parsing for level 12 (dynamic programming)
 - [x] Zstandard (FSE + Huffman + XXHash64, full encoder with bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict modules)
+- [x] GIF LZW codec (gif_lzw module in oxiarc-lzw, LSB bitstream)
+- [x] LSB bitstream (bitstream_lsb module in oxiarc-lzw)
 
 ### Additional Formats
 - [x] 7z archive format (read support with LZMA/LZMA2 decompression)
@@ -163,7 +173,10 @@
   - [x] Zstandard parallel compression (rayon-based block-level parallelism)
   - [x] Bzip2 parallel compression (rayon-based block-level parallelism)
 - [ ] Memory-mapped file support
-- [ ] Streaming with async I/O
+- [x] Async deflate (async_deflate module in oxiarc-deflate, async-io feature)
+- [x] GZip module (gzip module in oxiarc-deflate)
+- [x] Async ZIP support (async_zip module in oxiarc-archive, async-io feature)
+- [ ] Streaming with async I/O (full streaming pipeline)
 
 ### Platform
 - [ ] WASM bindings
@@ -207,36 +220,37 @@
 
 - oxiarc-core: 95 tests
   - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer
-- oxiarc-deflate: 65 tests
-  - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels
-- oxiarc-lzhuf: 48 tests
+- oxiarc-deflate: 79 tests
+  - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module
+- oxiarc-lzhuf: 54 tests
   - LH5 roundtrip encoding/decoding, LZSS, Huffman trees
-- oxiarc-bzip2: 34 tests
+- oxiarc-bzip2: 37 tests (2 skipped)
   - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
-- oxiarc-lz4: 94 tests
+- oxiarc-lz4: 99 tests
   - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression
-- oxiarc-zstd: 163 tests
+- oxiarc-zstd: 170 tests
   - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression
-- oxiarc-archive: 134 tests
-  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors
-- oxiarc-lzma: 58 tests
+- oxiarc-archive: 140 tests
+  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP
+- oxiarc-lzma: 66 tests
   - LZMA/LZMA2, optimal parsing, range coder, price calculation
-- oxiarc-lzw: 43 tests
-  - GIF/TIFF configurations, dictionary management, roundtrip tests
-- Total: 734 tests (734 passed, 5 skipped, zero warnings)
+- oxiarc-lzw: 59 tests
+  - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests
+- oxiarc-cli: 0 tests
+- Total: 799 tests (799 passed, 2 skipped, zero warnings)
 
-## Code Statistics
+## Code Statistics (v0.2.3, 2026-03-11)
 
 | Crate | Lines of Code |
 |-------|---------------|
 | oxiarc-core | ~2,821 (CRC-32/64 slicing-by-8, optimized DualCrc) |
-| oxiarc-deflate | ~2,700 (with Zlib wrapper and Adler-32) |
+| oxiarc-deflate | ~3,000 (Zlib wrapper, Adler-32, async_deflate module, gzip module) |
 | oxiarc-lzhuf | ~1,000 |
 | oxiarc-bzip2 | ~1,600 |
 | oxiarc-lz4 | ~1,600 (official frame, XXHash32, LZ4-HC; refactored frame/ module) |
 | oxiarc-zstd | ~5,500 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
-| oxiarc-archive | ~9,500 (ZIP header refactored into header/mod.rs, reader.rs, types.rs, writer.rs) |
+| oxiarc-archive | ~9,800 (ZIP header refactored into header/mod.rs, reader.rs, types.rs, writer.rs; async_zip module) |
 | oxiarc-cli | ~2,020 |
 | oxiarc-lzma | ~2,900 |
-| oxiarc-lzw | ~800 |
-| **Total** | **~36,889** |
+| oxiarc-lzw | ~1,100 (gif_lzw module, bitstream_lsb module) |
+| **Total** | **~39,417** (127 files) |

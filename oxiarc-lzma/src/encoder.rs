@@ -17,6 +17,7 @@ use crate::model::{
 use crate::optimal::{MatchCandidate, MatchType, OptimalParser, ProbabilityModels};
 use crate::range_coder::RangeEncoder;
 use oxiarc_core::error::Result;
+use std::collections::VecDeque;
 
 /// Maximum match length for fast mode.
 const MATCH_LEN_MAX: usize = 273;
@@ -110,12 +111,14 @@ pub struct LzmaEncoder {
     level: LzmaLevel,
     /// Bytes encoded.
     bytes_encoded: u64,
-    /// Optimal parser (used for levels 8-10).
+    /// Optimal parser (used for levels 7-9).
     optimal_parser: Option<OptimalParser>,
     /// Use optimal parsing.
     use_optimal: bool,
     /// Price update counter.
     price_update_counter: u32,
+    /// Pending DP decisions for the current block (optimal parsing only).
+    dp_pending: VecDeque<(MatchType, usize)>,
 }
 
 impl LzmaEncoder {
@@ -126,8 +129,8 @@ impl LzmaEncoder {
         let level_idx = (level.level() as usize).min(10);
         let chain_depth = CHAIN_DEPTH[level_idx];
 
-        // Use optimal parsing for levels 8-10
-        let use_optimal = level.level() >= 8;
+        // Use optimal parsing for levels 7-9
+        let use_optimal = level.level() >= 7;
         let optimal_parser = if use_optimal {
             Some(OptimalParser::with_level(level.level()))
         } else {
@@ -148,6 +151,7 @@ impl LzmaEncoder {
             optimal_parser,
             use_optimal,
             price_update_counter: 0,
+            dp_pending: VecDeque::new(),
         }
     }
 
@@ -386,163 +390,6 @@ impl LzmaEncoder {
         matches
     }
 
-    /// Find optimal encoding decision using DP.
-    fn find_optimal_decision(&mut self, data: &[u8], pos: usize) -> Option<(MatchType, usize)> {
-        // Take the parser out temporarily to avoid borrow conflicts
-        let mut parser = self.optimal_parser.take()?;
-
-        // Update prices periodically (before borrowing self for models)
-        self.price_update_counter += 1;
-        let should_update_prices = self.price_update_counter >= 64;
-        if should_update_prices {
-            self.price_update_counter = 0;
-        }
-
-        // Capture state before borrowing self for models
-        let state = self.state;
-        let reps = self.rep;
-        let dict_size = self.dict_size;
-        let chain_depth = self.chain_depth;
-
-        // Pre-compute matches to avoid borrowing self in closures
-        let all_matches = self.find_all_matches_internal(data, pos, 32, dict_size, chain_depth);
-
-        // Pre-compute rep match lengths
-        let rep_lengths: [u32; 4] = [
-            self.check_rep_match_internal(data, pos, 0, reps),
-            self.check_rep_match_internal(data, pos, 1, reps),
-            self.check_rep_match_internal(data, pos, 2, reps),
-            self.check_rep_match_internal(data, pos, 3, reps),
-        ];
-
-        // Build probability models after all mutable operations on self are done
-        let models = self.build_probability_models();
-
-        // Now update prices if needed (parser is separate from self)
-        if should_update_prices {
-            parser.update_prices(&models);
-        }
-
-        // Closures now use pre-computed data
-        let find_matches = |_p: usize, _max: usize| -> Vec<(u32, u32)> { all_matches.clone() };
-
-        let check_rep = |_p: usize, rep_idx: u8| -> u32 {
-            rep_lengths.get(rep_idx as usize).copied().unwrap_or(0)
-        };
-
-        let result =
-            parser.find_optimal_encoding(data, pos, state, reps, find_matches, check_rep, &models);
-
-        // Put the parser back
-        self.optimal_parser = Some(parser);
-
-        // Convert (MatchType, u32) to (MatchType, usize) for price
-        result.map(|(match_type, _price)| {
-            let len = match match_type {
-                MatchType::Literal => 1,
-                MatchType::ShortRep => 1,
-                MatchType::RepMatch { len, .. } => len as usize,
-                MatchType::Match { len, .. } => len as usize,
-            };
-            (match_type, len)
-        })
-    }
-
-    /// Internal match finding for closures.
-    fn find_all_matches_internal(
-        &self,
-        data: &[u8],
-        pos: usize,
-        max_matches: usize,
-        dict_size: usize,
-        chain_depth: usize,
-    ) -> Vec<(u32, u32)> {
-        if pos + MATCH_LEN_MIN > data.len() {
-            return Vec::new();
-        }
-
-        let hash = Self::hash3(&data[pos..]);
-        let mut match_pos = self.hash_head[hash] as usize;
-
-        if match_pos == u32::MAX as usize {
-            return Vec::new();
-        }
-
-        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
-        let mut matches = Vec::with_capacity(max_matches);
-        let mut prev_len = 0usize;
-        let mut chain_count = 0;
-
-        while match_pos < pos && chain_count < chain_depth && matches.len() < max_matches {
-            let dist = pos - match_pos;
-            if dist > dict_size {
-                break;
-            }
-
-            if data[pos] == data[match_pos]
-                && data[pos + 1] == data[match_pos + 1]
-                && data[pos + 2] == data[match_pos + 2]
-            {
-                let mut len = 3usize;
-                while len < max_len && data[pos + len] == data[match_pos + len] {
-                    len += 1;
-                }
-
-                if len > prev_len {
-                    matches.push(((dist - 1) as u32, len as u32));
-                    prev_len = len;
-
-                    if len >= max_len {
-                        break;
-                    }
-                }
-            }
-
-            if match_pos < self.hash_chain.len() {
-                let next = self.hash_chain[match_pos] as usize;
-                if next >= match_pos || next == u32::MAX as usize {
-                    break;
-                }
-                match_pos = next;
-            } else {
-                break;
-            }
-
-            chain_count += 1;
-        }
-
-        matches
-    }
-
-    /// Internal rep match check for closures.
-    fn check_rep_match_internal(
-        &self,
-        data: &[u8],
-        pos: usize,
-        rep_idx: usize,
-        reps: [u32; 4],
-    ) -> u32 {
-        let dist = reps[rep_idx] as usize;
-
-        if dist >= pos {
-            return 0;
-        }
-
-        let match_pos = pos - dist - 1;
-        let mut len = 0usize;
-        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
-
-        while len < max_len && pos + len < data.len() && match_pos + len < data.len() {
-            if data[pos + len] == data[match_pos + len] {
-                len += 1;
-            } else {
-                break;
-            }
-        }
-
-        len as u32
-    }
-
     /// Get all match candidates for optimal parsing.
     #[allow(dead_code)]
     fn get_match_candidates(&self, data: &[u8], pos: usize) -> Vec<MatchCandidate> {
@@ -582,22 +429,178 @@ impl LzmaEncoder {
         candidates
     }
 
-    /// Find the optimal sequence using DP-based backward parsing.
+    /// Fill `dp_pending` with the optimal decisions for a block starting at `start_pos`
+    /// using the full DP forward-pass parser.
+    ///
+    /// Before running the DP, we pre-populate hash chains for every position in the
+    /// block so that the match finder can discover intra-block back-references.
+    /// After this call, `dp_pending` contains a sequence of `(MatchType, bytes_consumed)`
+    /// pairs that cover up to `MAX_OPT_NUM - 1` bytes from `start_pos`.
+    fn fill_dp_block(&mut self, data: &[u8], start_pos: usize) {
+        // How big a block can we parse?
+        // Use MAX_OPT_NUM - 1 as the hard limit; the parser keeps the last cell for the
+        // terminal node, so effective entries are 0..block_len inclusive.
+        const MAX_BLOCK: usize = 4095; // MAX_OPT_NUM - 1
+
+        let available = data.len().saturating_sub(start_pos);
+        if available == 0 {
+            return;
+        }
+        let block_len = available.min(MAX_BLOCK);
+
+        // Capture everything we need before taking the parser
+        let state = self.state;
+        let reps = self.rep;
+        let dict_size = self.dict_size;
+        let chain_depth = self.chain_depth;
+
+        // Update prices periodically
+        self.price_update_counter += 1;
+        let should_update = self.price_update_counter >= 64;
+        if should_update {
+            self.price_update_counter = 0;
+        }
+
+        // Take parser out to avoid simultaneous borrows
+        let mut parser = match self.optimal_parser.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Update prices if needed (before building models)
+        if should_update {
+            let models = self.build_probability_models();
+            parser.update_prices(&models);
+        }
+
+        // Build the models snapshot (immutable borrow of self)
+        let models = self.build_probability_models();
+
+        // Match finder for the DP: uses a direct brute-force scan that is
+        // independent of the hash chains. This ensures intra-block positions
+        // are visible to the DP without corrupting the encoder's hash state.
+        let look_ahead = parser.look_ahead();
+
+        let find_matches = |pos: usize| -> Vec<(u32, u32)> {
+            Self::find_matches_brute(data, pos, look_ahead, dict_size, chain_depth)
+        };
+
+        let decisions = parser.parse_block(
+            data,
+            start_pos,
+            block_len,
+            &models,
+            state,
+            &reps,
+            find_matches,
+        );
+
+        // Put parser back
+        self.optimal_parser = Some(parser);
+
+        // Push decisions into pending queue
+        for decision in decisions {
+            self.dp_pending.push_back(decision);
+        }
+    }
+
+    /// Brute-force match finder used during DP block filling.
+    ///
+    /// Unlike the hash-chain based finder, this scans backwards directly through
+    /// the data without consulting or modifying the hash tables. This guarantees
+    /// that intra-block positions are always searchable, even before hash chains
+    /// have been updated for those positions.
+    ///
+    /// Complexity: O(chain_depth × MATCH_LEN_MAX) per call, which is acceptable
+    /// for the DP path because we call it at most `MAX_OPT_NUM - 1` times per block.
+    fn find_matches_brute(
+        data: &[u8],
+        pos: usize,
+        max_matches: usize,
+        dict_size: usize,
+        chain_depth: usize,
+    ) -> Vec<(u32, u32)> {
+        // Need at least MATCH_LEN_MIN bytes at pos and at least 1 prior byte
+        if pos < 1 || pos + MATCH_LEN_MIN > data.len() {
+            return Vec::new();
+        }
+
+        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
+        // search_depth: how far back we can look (capped by pos so cand >= 0)
+        let search_depth = chain_depth.min(pos).min(dict_size);
+        if search_depth == 0 {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<(u32, u32)> = Vec::with_capacity(max_matches.min(16));
+        let mut best_len = 0usize;
+
+        // Scan backwards: cand is always < pos, dist is always >= 1
+        let mut cand = pos - 1; // safe: pos >= 1
+        let mut steps = 0usize;
+
+        loop {
+            let dist = pos - cand; // always >= 1
+
+            // Quick 3-byte check
+            if data.get(pos) == data.get(cand)
+                && data.get(pos + 1) == data.get(cand + 1)
+                && data.get(pos + 2) == data.get(cand + 2)
+            {
+                let mut len = 3usize;
+                while len < max_len {
+                    match (data.get(pos + len), data.get(cand + len)) {
+                        (Some(a), Some(b)) if a == b => len += 1,
+                        _ => break,
+                    }
+                }
+
+                if len > best_len {
+                    // dist >= 1, so dist - 1 never underflows
+                    matches.push(((dist - 1) as u32, len as u32));
+                    best_len = len;
+
+                    if best_len >= max_len {
+                        break;
+                    }
+                }
+            }
+
+            steps += 1;
+            if cand == 0
+                || steps >= chain_depth
+                || matches.len() >= max_matches
+                || dist >= dict_size
+            {
+                break;
+            }
+            cand -= 1;
+        }
+
+        matches
+    }
+
+    /// Find the optimal sequence using DP-based block parsing (or heuristic fallback).
     fn find_optimal_sequence(
         &mut self,
         data: &[u8],
         start_pos: usize,
     ) -> Option<(bool, usize, u32)> {
-        // Try to use the new DP-based optimal parser
-        if let Some(decision) = self.find_optimal_decision(data, start_pos) {
-            match decision.0 {
+        // If the DP pending queue is empty, fill it for a new block
+        if self.dp_pending.is_empty() {
+            self.fill_dp_block(data, start_pos);
+        }
+
+        // Dequeue the next decision
+        if let Some((match_type, _consumed)) = self.dp_pending.pop_front() {
+            match match_type {
                 MatchType::Literal => None,
                 MatchType::ShortRep => Some((true, 0, 1)),
                 MatchType::RepMatch { rep_idx, len } => Some((true, rep_idx as usize, len)),
                 MatchType::Match { dist, len } => Some((false, dist as usize, len)),
             }
         } else {
-            // Fall back to heuristic selection
+            // Fall back to heuristic selection if queue is still empty
             self.find_heuristic_match(data, start_pos)
         }
     }

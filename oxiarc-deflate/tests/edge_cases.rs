@@ -1,5 +1,6 @@
 //! Edge case tests for DEFLATE compression.
 
+use oxiarc_deflate::gzip::{gzip_compress, gzip_decompress};
 use oxiarc_deflate::{deflate, inflate};
 
 #[test]
@@ -142,3 +143,81 @@ fn test_long_distance_match() {
 
 // Note: Removed test_utf8_text - Unicode text compresses correctly in real-world usage
 // The standalone test exposed an edge case in the encoder that doesn't affect normal operation
+
+/// Gzip roundtrip: compress then decompress, verify identical.
+#[test]
+fn test_gzip_roundtrip() {
+    let inputs: &[&[u8]] = &[
+        b"",
+        b"Hello, gzip!",
+        b"AAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCC",
+    ];
+    for &input in inputs {
+        let compressed = gzip_compress(input, 6).expect("gzip_compress failed");
+        let decompressed = gzip_decompress(&compressed).expect("gzip_decompress failed");
+        assert_eq!(&decompressed, input, "gzip roundtrip mismatch");
+    }
+}
+
+/// Sync-flush two-chunk: compress chunk1 with Sync flush, chunk2 with Finish, decompress both.
+#[test]
+fn test_sync_flush_two_chunk() {
+    use oxiarc_core::traits::{CompressStatus, Compressor, FlushMode};
+    use oxiarc_deflate::Deflater;
+
+    let chunk1 = b"First chunk of data. First chunk of data.";
+    let chunk2 = b"Second chunk of data. Second chunk of data.";
+
+    let mut compressor = Deflater::new(6);
+
+    // Compress chunk1 with Sync flush.
+    let mut out1 = vec![0u8; chunk1.len() * 4];
+    let (_in1, n1, _status1) = compressor
+        .compress(chunk1, &mut out1, FlushMode::Sync)
+        .expect("compress chunk1 failed");
+    let out1_used = &out1[..n1];
+
+    // Compress chunk2 with Finish.
+    let mut out2 = vec![0u8; chunk2.len() * 4];
+    let (_in2, n2, status2) = compressor
+        .compress(chunk2, &mut out2, FlushMode::Finish)
+        .expect("compress chunk2 failed");
+    let out2_used = &out2[..n2];
+
+    assert_eq!(status2, CompressStatus::Done);
+
+    // Concatenate and decompress.
+    let mut combined = Vec::new();
+    combined.extend_from_slice(out1_used);
+    combined.extend_from_slice(out2_used);
+
+    let decompressed = inflate(&combined).expect("inflate failed");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(chunk1);
+    expected.extend_from_slice(chunk2);
+    assert_eq!(
+        decompressed, expected,
+        "sync-flush two-chunk roundtrip mismatch"
+    );
+}
+
+/// 4-byte hash roundtrip: compress/decompress still works after hash change.
+#[test]
+fn test_four_byte_hash_roundtrip() {
+    let inputs: &[&[u8]] = &[
+        b"abcabcabc",
+        b"The quick brown fox jumps over the lazy dog",
+        &vec![0xABu8; 512],
+    ];
+    for &input in inputs {
+        for level in [1u8, 5, 6, 9] {
+            let compressed = deflate(input, level).expect("deflate failed");
+            let decompressed = inflate(&compressed).expect("inflate failed");
+            assert_eq!(
+                &decompressed, input,
+                "4-byte hash roundtrip failed at level {}",
+                level
+            );
+        }
+    }
+}

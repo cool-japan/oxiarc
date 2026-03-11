@@ -349,33 +349,58 @@ impl HuffmanBuilder {
 
     /// Adjust code lengths to satisfy Kraft inequality and length limit.
     fn adjust_lengths(&self, lengths: &mut [u8], max_len: usize) {
-        // Calculate Kraft sum
-        let kraft_sum: f64 = lengths
-            .iter()
-            .filter(|&&l| l > 0)
-            .map(|&l| 2.0f64.powi(-(l as i32)))
-            .sum();
+        // Iteratively increase lengths until Kraft inequality is satisfied.
+        // A single pass is not sufficient for large, highly skewed distributions
+        // (e.g. 1MB of identical bytes) where the Shannon-Fano approximation may
+        // under-estimate many code lengths at once.  We keep looping as long as
+        // the tree is over-subscribed AND at least one symbol can still be
+        // lengthened.
+        loop {
+            // Calculate Kraft sum
+            let kraft_sum: f64 = lengths
+                .iter()
+                .filter(|&&l| l > 0)
+                .map(|&l| 2.0f64.powi(-(l as i32)))
+                .sum();
 
-        if kraft_sum <= 1.0 {
-            return; // Already valid
-        }
+            if kraft_sum <= 1.0 {
+                return; // Satisfied
+            }
 
-        // If over-subscribed, increase some lengths
-        let mut sorted_indices: Vec<usize> =
-            (0..lengths.len()).filter(|&i| lengths[i] > 0).collect();
-        sorted_indices.sort_by(|&a, &b| lengths[b].cmp(&lengths[a])); // Sort by length descending
+            // Gather indices of symbols that still have room to grow,
+            // sorted longest-first so we perturb the least-frequent symbols first.
+            let mut candidates: Vec<usize> = (0..lengths.len())
+                .filter(|&i| lengths[i] > 0 && lengths[i] < max_len as u8)
+                .collect();
 
-        for &i in &sorted_indices {
-            if lengths[i] < max_len as u8 {
-                lengths[i] += 1;
-                let new_kraft: f64 = lengths
-                    .iter()
-                    .filter(|&&l| l > 0)
-                    .map(|&l| 2.0f64.powi(-(l as i32)))
-                    .sum();
-                if new_kraft <= 1.0 {
-                    break;
+            if candidates.is_empty() {
+                // All symbols are at max_len; cannot fix further.
+                return;
+            }
+
+            candidates.sort_by(|&a, &b| lengths[b].cmp(&lengths[a]));
+
+            let mut made_progress = false;
+            for &i in &candidates {
+                if lengths[i] < max_len as u8 {
+                    lengths[i] += 1;
+                    made_progress = true;
+
+                    let new_kraft: f64 = lengths
+                        .iter()
+                        .filter(|&&l| l > 0)
+                        .map(|&l| 2.0f64.powi(-(l as i32)))
+                        .sum();
+
+                    if new_kraft <= 1.0 {
+                        return; // Satisfied
+                    }
                 }
+            }
+
+            if !made_progress {
+                // No symbol could be incremented; give up.
+                return;
             }
         }
     }

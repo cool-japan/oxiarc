@@ -285,10 +285,69 @@ mod tests {
         assert_eq!(decompressed_greedy, data);
         assert_eq!(decompressed_optimal, data);
 
-        // Note: Optimal parsing should generally produce smaller or equal output
-        // but due to our simplified implementation, we just verify correctness
         eprintln!("Greedy size: {}", compressed_greedy.len());
         eprintln!("Optimal size: {}", compressed_optimal.len());
+    }
+
+    /// DP parser should produce smaller or equal compressed output vs greedy
+    /// on highly repetitive data.
+    #[test]
+    fn test_dp_optimal_compression_ratio() {
+        // 1200 bytes of highly repetitive data: repeating 6-byte pattern.
+        let pattern = b"abcabc";
+        let mut data = Vec::with_capacity(1200);
+        while data.len() < 1200 {
+            data.extend_from_slice(pattern);
+        }
+        data.truncate(1200);
+
+        let compressed_greedy = compress(&data, LzmaLevel::new(6)).unwrap();
+        let compressed_optimal = compress(&data, LzmaLevel::new(8)).unwrap();
+
+        // Both must round-trip correctly
+        let decompressed_greedy = decompress_bytes(&compressed_greedy).unwrap();
+        let decompressed_optimal = decompress_bytes(&compressed_optimal).unwrap();
+        assert_eq!(decompressed_greedy, data, "greedy roundtrip failed");
+        assert_eq!(decompressed_optimal, data, "optimal roundtrip failed");
+
+        // The DP optimal parser (level 8) must not produce larger output than greedy (level 6)
+        assert!(
+            compressed_optimal.len() <= compressed_greedy.len(),
+            "DP optimal ({} bytes) should be <= greedy ({} bytes)",
+            compressed_optimal.len(),
+            compressed_greedy.len()
+        );
+    }
+
+    /// Compress with full DP (level 8), decompress, verify identical bytes.
+    #[test]
+    fn test_dp_roundtrip_various_data() {
+        // Test several different data shapes
+        let test_cases: &[&[u8]] = &[
+            // Completely repetitive
+            &[0xAAu8; 2000],
+            // Increasing bytes
+            &{
+                let v: Vec<u8> = (0..=255u8).cycle().take(500).collect();
+                v
+            }[..],
+            // Mixed text-like data
+            b"Hello, World! This is a test of the DP optimal parser at level 8. \
+              The parser should find optimal matches across the 4096-byte window.",
+            // Short data
+            b"tiny",
+        ];
+
+        for (i, data) in test_cases.iter().enumerate() {
+            let compressed = compress(data, LzmaLevel::new(8)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                decompressed.as_slice(),
+                *data,
+                "DP roundtrip failed for test case {}",
+                i
+            );
+        }
     }
 
     #[test]
@@ -307,5 +366,175 @@ mod tests {
         let compressed = compress(&original, LzmaLevel::new(8)).unwrap();
         let decompressed = decompress_bytes(&compressed).unwrap();
         assert_eq!(decompressed, original);
+    }
+
+    /// Test large data > 4095 bytes (multiple DP blocks) with optimal parsing.
+    #[test]
+    fn test_complex_data_large_optimal() {
+        // Data that spans multiple DP blocks (each block is 4095 bytes)
+        // cycling bytes: exercises every hash/match path
+        let data: Vec<u8> = (0u8..=255).cycle().take(10000).collect();
+        for level in [7u8, 8, 9] {
+            let compressed = compress(&data, LzmaLevel::new(level)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                decompressed, data,
+                "Level {} roundtrip failed for cycling 10k data",
+                level
+            );
+        }
+    }
+
+    /// LCG pseudo-random data stress test (exercises all code paths).
+    #[test]
+    fn test_complex_data_pseudorandom() {
+        let mut data = Vec::with_capacity(10000);
+        let mut x: u32 = 12345;
+        for _ in 0..10000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((x >> 24) as u8);
+        }
+
+        for level in [0u8, 3, 6, 7, 8, 9] {
+            let compressed = compress(&data, LzmaLevel::new(level)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                decompressed, data,
+                "Level {} roundtrip failed for pseudorandom 10k data",
+                level
+            );
+        }
+    }
+
+    /// Test data with varied byte values and local repetition (binary-like).
+    #[test]
+    fn test_complex_data_binary_patterns() {
+        // Mix of runs, cycling, and unique bytes
+        let mut data = Vec::new();
+        // Runs of same byte
+        for b in 0u8..=255 {
+            data.extend(std::iter::repeat_n(b, 8));
+        }
+        // Cycling 256-byte ramp
+        data.extend((0u8..=255).cycle().take(2048));
+        // "Text-like" repeated phrase
+        data.extend(
+            b"The quick brown fox jumps over the lazy dog. "
+                .iter()
+                .cycle()
+                .take(1000),
+        );
+        // High-entropy 4-byte repeating pattern
+        let pat = [0xDE, 0xAD, 0xBE, 0xEF];
+        data.extend(pat.iter().cycle().take(800));
+
+        for level in [0u8, 6, 8, 9] {
+            let compressed = compress(&data, LzmaLevel::new(level)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                decompressed,
+                data,
+                "Level {} roundtrip failed for binary-pattern data (len={})",
+                level,
+                data.len()
+            );
+        }
+    }
+
+    /// Test data exactly at the DP block boundary (4095 bytes) and just over it.
+    #[test]
+    fn test_complex_data_block_boundary() {
+        // Exactly 4095 bytes (one full DP block)
+        let data_4095: Vec<u8> = (0u8..=254).cycle().take(4095).collect();
+        // 4096 bytes: forces a block transition mid-stream
+        let data_4096: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        // 8191 bytes: two full blocks exactly
+        let data_8191: Vec<u8> = (0u8..=254).cycle().take(8191).collect();
+
+        for (label, data) in [
+            ("4095", data_4095.as_slice()),
+            ("4096", data_4096.as_slice()),
+            ("8191", data_8191.as_slice()),
+        ] {
+            for level in [7u8, 8, 9] {
+                let compressed = compress(data, LzmaLevel::new(level)).unwrap();
+                let decompressed = decompress_bytes(&compressed).unwrap();
+                assert_eq!(
+                    decompressed, data,
+                    "Level {} roundtrip failed for {}-byte boundary data",
+                    level, label
+                );
+            }
+        }
+    }
+
+    /// Test data with rep-distance stress: long matches at rep slots 0-3.
+    #[test]
+    fn test_complex_data_rep_distance_stress() {
+        // Pattern designed to exercise rep[0], rep[1], rep[2], rep[3] transitions
+        // Interleaved identical segments separated by different bytes
+        let seg_a = b"AAAAAAAAAAAAAAAA"; // 16 A's
+        let seg_b = b"BBBBBBBBBBBBBBBB"; // 16 B's
+        let sep = b"XYZ";
+        let mut data = Vec::new();
+        for _ in 0..50 {
+            data.extend_from_slice(seg_a);
+            data.extend_from_slice(sep);
+            data.extend_from_slice(seg_b);
+            data.extend_from_slice(sep);
+            data.extend_from_slice(seg_a); // rep match should fire here
+            data.extend_from_slice(seg_b); // rep match for rep[1]
+        }
+        for level in [6u8, 7, 8, 9] {
+            let compressed = compress(&data, LzmaLevel::new(level)).unwrap();
+            let decompressed = decompress_bytes(&compressed).unwrap();
+            assert_eq!(
+                decompressed, data,
+                "Level {} roundtrip failed for rep-distance stress test",
+                level
+            );
+        }
+    }
+
+    /// Stress test: all compression levels with all "complex" pattern types.
+    #[test]
+    fn test_complex_data_all_levels_all_patterns() {
+        let patterns: &[(&str, Vec<u8>)] = &[
+            ("all_zeros_100", vec![0u8; 100]),
+            ("all_same_1000", vec![0x41u8; 1000]),
+            ("cycling_256_1000", (0..=255u8).cycle().take(1000).collect()),
+            (
+                "text_repeat_100",
+                b"The quick brown fox jumps over the lazy dog"
+                    .iter()
+                    .cycle()
+                    .take(430)
+                    .copied()
+                    .collect(),
+            ),
+            ("binary_random_500", {
+                let mut v = Vec::with_capacity(500);
+                let mut x: u32 = 99991;
+                for _ in 0..500 {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    v.push((x >> 24) as u8);
+                }
+                v
+            }),
+        ];
+
+        for level in 0u8..=9 {
+            for (name, data) in patterns {
+                let compressed = compress(data, LzmaLevel::new(level)).unwrap();
+                let decompressed = decompress_bytes(&compressed).unwrap();
+                assert_eq!(
+                    decompressed.as_slice(),
+                    data.as_slice(),
+                    "Level {} roundtrip failed for pattern '{}'",
+                    level,
+                    name
+                );
+            }
+        }
     }
 }

@@ -818,12 +818,52 @@ pub fn compress_with_dict(input: &[u8], dict: &Lz4Dict) -> Result<Vec<u8>> {
 pub fn compress_with_dict_level(data: &[u8], dict: &Lz4Dict, level: DictLevel) -> Result<Vec<u8>> {
     match level {
         DictLevel::Fast => compress_with_dict(data, dict),
-        DictLevel::High => {
-            // For high compression, we could use HC encoder with dictionary
-            // For now, use fast compression (HC with dict requires more work)
-            compress_with_dict(data, dict)
-        }
+        DictLevel::High => compress_with_dict_hc(data, dict, crate::hc::HcLevel::default()),
     }
+}
+
+/// Compress data using LZ4-HC with dictionary support.
+///
+/// This is the genuine HC dictionary path: it uses the virtual-buffer
+/// strategy so the HC chain search can find matches in both the dictionary
+/// and the input simultaneously, giving better compression ratios than the
+/// fast dictionary path — especially when the input shares many patterns
+/// with the dictionary.
+///
+/// If `dict` is empty, this falls back to regular HC compression at the
+/// given level.
+///
+/// # Arguments
+///
+/// * `data`  - Data to compress.
+/// * `dict`  - Pre-trained LZ4 dictionary.
+/// * `level` - HC compression level (use [`crate::hc::HcLevel::default()`] for level 9).
+///
+/// # Returns
+///
+/// Compressed data in LZ4 block format, compatible with the standard LZ4
+/// decoder when the same dictionary is provided at decompression time.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_lz4::dict::{Lz4Dict, compress_with_dict_hc, decompress_with_dict};
+/// use oxiarc_lz4::hc::HcLevel;
+///
+/// let dict_bytes = b"common header: version=1 content-type=json";
+/// let dict = Lz4Dict::new(dict_bytes);
+///
+/// let input = b"common header: version=1 content-type=json body={}";
+/// let compressed = compress_with_dict_hc(input, &dict, HcLevel::default()).unwrap();
+/// let decompressed = decompress_with_dict(&compressed, input.len() * 2, &dict).unwrap();
+/// assert_eq!(decompressed, input);
+/// ```
+pub fn compress_with_dict_hc(
+    data: &[u8],
+    dict: &Lz4Dict,
+    level: crate::hc::HcLevel,
+) -> Result<Vec<u8>> {
+    crate::hc::compress_hc_with_dict(data, dict, level)
 }
 
 /// Decompress LZ4 block data with dictionary.

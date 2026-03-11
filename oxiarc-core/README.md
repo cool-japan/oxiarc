@@ -1,6 +1,11 @@
 # oxiarc-core
 
+[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Core primitives and traits for the OxiArc archive library.
+
+**Version 0.2.3** (2026-03-11) — 95 tests passing.
 
 ## Overview
 
@@ -149,13 +154,29 @@ OxiArcError::Corrupted { offset, message }
 OxiArcError::InvalidHeader(message)
 ```
 
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `default` | yes | Core primitives with no extra dependencies |
+| `async-io` | no | Async I/O support via Tokio (`AsyncRead`/`AsyncWrite`) |
+| `simd` | no | SIMD-accelerated CRC-32 (PCLMULQDQ on x86_64, PMULL on aarch64) |
+| `mmap` | no | Memory-mapped file access for efficient large file processing (memmap2) |
+
 ## Usage
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = { path = "../oxiarc-core" }
+oxiarc-core = "0.2.3"
+```
+
+Or with optional features:
+
+```toml
+[dependencies]
+oxiarc-core = { version = "0.2.3", features = ["async-io", "simd"] }
 ```
 
 ## API Summary

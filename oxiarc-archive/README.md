@@ -2,6 +2,11 @@
 
 Container format support for OxiArc - parsing and extraction of archive formats.
 
+[![Crates.io](https://img.shields.io/crates/v/oxiarc-archive.svg)](https://crates.io/crates/oxiarc-archive)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**Version: 0.2.3 (2026-03-11) | Tests: 140 passing**
+
 ## Overview
 
 This crate handles the container/wrapper aspects of archive formats:
@@ -9,6 +14,7 @@ This crate handles the container/wrapper aspects of archive formats:
 - Entry enumeration
 - File extraction
 - Format auto-detection
+- Async ZIP entry reading (new in 0.2.3, via `async-io` feature)
 
 The actual compression/decompression is delegated to codec crates (`oxiarc-deflate`, `oxiarc-lzhuf`, `oxiarc-lzma`).
 
@@ -16,7 +22,7 @@ The actual compression/decompression is delegated to codec crates (`oxiarc-defla
 
 | Format | Extension | Read | Write | Notes |
 |--------|-----------|------|-------|-------|
-| ZIP | .zip | Yes | No | DEFLATE, Stored |
+| ZIP | .zip | Yes | No | DEFLATE, Stored; async read via `async-io` |
 | GZIP | .gz | Yes | No | RFC 1952 |
 | TAR | .tar | Yes | No | UStar format |
 | LZH | .lzh, .lha | Yes | No | Level 0/1/2 headers |
@@ -42,6 +48,52 @@ for entry in zip.entries() {
 
 // Extract a file
 let data = zip.extract(&zip.entries()[0])?;
+```
+
+## Async ZIP Support (New in 0.2.3)
+
+The `async_zip` module (enabled via `async-io` feature) provides non-blocking ZIP entry reading using Tokio's async I/O primitives:
+
+```rust
+use oxiarc_archive::async_zip::{read_zip_entry_async, read_zip_entry_from_reader_async};
+use oxiarc_archive::zip::ZipReader;
+use std::io::Cursor;
+
+// High-level: read entry from ZipReader asynchronously
+let zip_bytes: Vec<u8> = /* ... */;
+let cursor = Cursor::new(zip_bytes);
+let mut reader = ZipReader::new(cursor)?;
+let entries = reader.entries().to_vec();
+
+let data = read_zip_entry_from_reader_async(&mut reader, &entries[0]).await?;
+
+// Low-level: read from any AsyncRead + AsyncSeek
+let mut async_reader = tokio::io::BufReader::new(Cursor::new(zip_bytes));
+let data = read_zip_entry_async(&mut async_reader, &entries[0]).await?;
+```
+
+Supported async compression methods: `Stored`, `Deflate`.
+
+## Features (Cargo)
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `mmap` | no | Memory-mapped file support for efficient large file reading (via `memmap2`) |
+| `async-io` | no | Async ZIP entry reading via Tokio (`async_zip` module) |
+
+```toml
+[dependencies]
+# Default (no optional features)
+oxiarc-archive = "0.2.3"
+
+# With memory-mapped I/O
+oxiarc-archive = { version = "0.2.3", features = ["mmap"] }
+
+# With async ZIP support
+oxiarc-archive = { version = "0.2.3", features = ["async-io"] }
+
+# With all features
+oxiarc-archive = { version = "0.2.3", features = ["mmap", "async-io"] }
 ```
 
 ## Format Detection
@@ -176,6 +228,7 @@ for entry in lzh.entries() {
 | `gzip` | GZIP file handling |
 | `tar` | TAR archive handling |
 | `lzh` | LZH archive handling |
+| `async_zip` | Async ZIP entry reading (requires `async-io` feature) |
 
 ## Security
 

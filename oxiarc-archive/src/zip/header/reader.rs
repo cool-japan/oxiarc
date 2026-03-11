@@ -430,6 +430,25 @@ impl<R: Read + Seek> ZipReader<R> {
         Ok(decompressed)
     }
 
+    /// Extract raw compressed bytes for an entry without decompressing.
+    ///
+    /// This is useful for async decompression workflows where the decompression
+    /// step is performed separately (e.g., via [`crate::async_zip`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - The entry whose compressed bytes to read
+    ///
+    /// # Returns
+    ///
+    /// The raw compressed bytes (exactly `entry.compressed_size` bytes).
+    pub fn extract_raw(&mut self, entry: &Entry) -> Result<Vec<u8>> {
+        self.reader.seek(SeekFrom::Start(entry.offset))?;
+        let mut compressed = vec![0u8; entry.compressed_size as usize];
+        self.reader.read_exact(&mut compressed)?;
+        Ok(compressed)
+    }
+
     /// Get entry by name.
     pub fn entry_by_name(&self, name: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.name == name)

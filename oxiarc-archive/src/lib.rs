@@ -49,6 +49,9 @@ pub mod xz;
 pub mod zip;
 pub mod zstd;
 
+#[cfg(feature = "async-io")]
+pub mod async_zip;
+
 // Re-exports
 pub use bzip2::{Bzip2Reader, Bzip2Writer};
 pub use cab::CabReader;
@@ -61,3 +64,20 @@ pub use tar::{TarHeader, TarReader, TarWriter};
 pub use xz::{XzReader, XzWriter};
 pub use zip::{LocalFileHeader, ZipCompressionLevel, ZipReader, ZipWriter};
 pub use zstd::{ZstdReader, ZstdWriter};
+
+// Optional feature re-exports
+
+/// Memory-mapped ZIP reader convenience function.
+/// Open a ZIP archive via memory-mapped I/O.
+#[cfg(feature = "mmap")]
+pub use zip::open_zip_mmap;
+
+/// Re-export MmapReader when the mmap feature is enabled.
+#[cfg(feature = "mmap")]
+pub use oxiarc_core::mmap::{MmapOptions, MmapReader};
+
+/// Async ZIP entry reading functions.
+#[cfg(feature = "async-io")]
+pub use async_zip::{
+    decompress_zip_entry_async, read_zip_entry_async, read_zip_entry_from_reader_async,
+};

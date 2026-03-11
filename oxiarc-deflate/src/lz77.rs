@@ -60,6 +60,8 @@ pub struct Lz77Encoder {
     min_match: usize,
     /// Enable lazy matching.
     lazy_match: bool,
+    /// Nice match length: stop searching when match reaches this length.
+    nice_length: usize,
 }
 
 impl Lz77Encoder {
@@ -73,17 +75,18 @@ impl Lz77Encoder {
         let level = level.min(9);
 
         // Adjust parameters based on level
-        let (max_chain, min_match, lazy_match) = match level {
-            0 => (0, MAX_MATCH + 1, false), // Store only
-            1 => (4, 4, false),
-            2 => (8, 4, false),
-            3 => (16, 4, false),
-            4 => (32, 4, false),
-            5 => (64, 4, true),
-            6 => (128, 4, true),
-            7 => (256, 3, true),
-            8 => (1024, 3, true),
-            9 => (MAX_CHAIN_LENGTH, 3, true),
+        // Tuple: (max_chain, min_match, lazy_match, nice_length)
+        let (max_chain, min_match, lazy_match, nice_length) = match level {
+            0 => (0, MAX_MATCH + 1, false, MAX_MATCH), // Store only
+            1 => (4, 4, false, MAX_MATCH),
+            2 => (8, 4, false, MAX_MATCH),
+            3 => (16, 4, false, MAX_MATCH),
+            4 => (32, 4, false, MAX_MATCH),
+            5 => (64, 4, true, 64),
+            6 => (128, 4, true, 128),
+            7 => (256, 3, true, 192),
+            8 => (1024, 3, true, 250),
+            9 => (MAX_CHAIN_LENGTH, 3, true, MAX_MATCH),
             _ => unreachable!(),
         };
 
@@ -95,6 +98,7 @@ impl Lz77Encoder {
             max_chain,
             min_match,
             lazy_match,
+            nice_length,
         }
     }
 
@@ -136,10 +140,17 @@ impl Lz77Encoder {
         self.window_pos = dict_to_use.len();
 
         // Build hash table for dictionary content
-        // We need at least 3 bytes to form a hash
-        if dict_to_use.len() >= MIN_MATCH {
-            for pos in 0..dict_to_use.len().saturating_sub(MIN_MATCH - 1) {
-                let h = Self::hash(dict_to_use[pos], dict_to_use[pos + 1], dict_to_use[pos + 2]);
+        // We need at least 4 bytes to form the hash (MIN_MATCH stays 3; 4th byte reduces collisions)
+        let len = dict_to_use.len();
+        if len >= 4 {
+            for pos in 0..len.saturating_sub(3) {
+                // Guard: pos+3 < len is guaranteed by the loop bound above
+                let h = Self::hash(
+                    dict_to_use[pos],
+                    dict_to_use[pos + 1],
+                    dict_to_use[pos + 2],
+                    dict_to_use[pos + 3],
+                );
                 let prev = self.hash_table[h];
                 self.hash_chain[pos & (WINDOW_SIZE - 1)] = prev;
                 self.hash_table[h] = pos as u16;
@@ -193,21 +204,29 @@ impl Lz77Encoder {
         self.window_pos
     }
 
-    /// Compute hash for 3 bytes using improved mixing for better distribution.
+    /// Compute hash for 4 bytes using improved mixing for better distribution.
+    ///
+    /// Uses 4 bytes to reduce hash collisions, though MIN_MATCH remains 3.
     #[inline(always)]
-    fn hash(b0: u8, b1: u8, b2: u8) -> usize {
+    fn hash(b0: u8, b1: u8, b2: u8, b3: u8) -> usize {
         // Improved hash with better avalanche properties
         // Multiply and rotate for better distribution
         let h = ((b0 as usize).wrapping_mul(506832829))
             ^ ((b1 as usize).wrapping_mul(2654435761) << 8)
-            ^ ((b2 as usize).wrapping_mul(374761393) << 16);
+            ^ ((b2 as usize).wrapping_mul(374761393) << 16)
+            ^ ((b3 as usize).wrapping_mul(1000000007) << 24);
         (h ^ (h >> 15)) & HASH_MASK
     }
 
     /// Update hash table with current position.
     fn update_hash(&mut self, pos: usize) {
-        if pos + 2 < self.window.len() {
-            let h = Self::hash(self.window[pos], self.window[pos + 1], self.window[pos + 2]);
+        if pos + 3 < self.window.len() {
+            let h = Self::hash(
+                self.window[pos],
+                self.window[pos + 1],
+                self.window[pos + 2],
+                self.window[pos + 3],
+            );
             let prev = self.hash_table[h];
             self.hash_chain[pos & (WINDOW_SIZE - 1)] = prev;
             self.hash_table[h] = pos as u16;
@@ -220,7 +239,24 @@ impl Lz77Encoder {
             return None;
         }
 
-        let h = Self::hash(self.window[pos], self.window[pos + 1], self.window[pos + 2]);
+        // Need at least 4 bytes for the hash; fall back gracefully when near end.
+        let h = if pos + 3 < self.window.len() {
+            Self::hash(
+                self.window[pos],
+                self.window[pos + 1],
+                self.window[pos + 2],
+                self.window[pos + 3],
+            )
+        } else if pos + 2 < self.window.len() {
+            Self::hash(
+                self.window[pos],
+                self.window[pos + 1],
+                self.window[pos + 2],
+                0,
+            )
+        } else {
+            return None;
+        };
 
         let mut match_pos = self.hash_table[h] as usize;
         let mut best_len = self.min_match - 1;
@@ -267,8 +303,8 @@ impl Lz77Encoder {
                             best_len = len;
                             best_dist = dist;
 
-                            // Early exit if we found a great match
-                            if len >= max_len || len >= MAX_MATCH {
+                            // Early exit if we found a great match or reached nice_length
+                            if len >= max_len || len >= MAX_MATCH || best_len >= self.nice_length {
                                 break;
                             }
                         }
@@ -476,12 +512,12 @@ mod tests {
     #[test]
     fn test_hash() {
         // Hash should be consistent
-        let h1 = Lz77Encoder::hash(b'a', b'b', b'c');
-        let h2 = Lz77Encoder::hash(b'a', b'b', b'c');
+        let h1 = Lz77Encoder::hash(b'a', b'b', b'c', b'd');
+        let h2 = Lz77Encoder::hash(b'a', b'b', b'c', b'd');
         assert_eq!(h1, h2);
 
         // Different input should (usually) give different hash
-        let h3 = Lz77Encoder::hash(b'x', b'y', b'z');
+        let h3 = Lz77Encoder::hash(b'x', b'y', b'z', b'w');
         // Note: collisions are possible, so we don't assert inequality
         let _ = h3;
     }

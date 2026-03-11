@@ -1,6 +1,13 @@
 # oxiarc-bzip2
 
+[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Pure Rust implementation of BZip2 compression/decompression algorithm.
+
+**Version 0.2.3** (2026-03-11) — 37 tests passing (2 skipped: heavy/long-running).
+
+**What's new in 0.2.3**: SA-IS correctness fix in the Burrows-Wheeler Transform implementation for improved BWT accuracy on pathological inputs.
 
 ## Overview
 
@@ -53,9 +60,30 @@ BZip2 uses a multi-stage pipeline:
 3. **Run-Length Encoding** - Compresses runs of zeros
 4. **Huffman Coding** - Final entropy coding stage
 
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `default` | yes | Core BZip2 compression/decompression |
+| `parallel` | no | Multi-threaded block compression via Rayon |
+
 ## Part of OxiArc
 
 This crate is part of the [OxiArc](https://github.com/cool-japan/oxiarc) project - a Pure Rust archive/compression library ecosystem.
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+oxiarc-bzip2 = "0.2.3"
+```
+
+With parallel compression enabled:
+
+```toml
+[dependencies]
+oxiarc-bzip2 = { version = "0.2.3", features = ["parallel"] }
+```
 
 ## License
 

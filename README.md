@@ -24,13 +24,13 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Bzip2** - Block-sorting compression
 
 ### Compression Algorithms (8 implemented)
-- **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9
+- **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
 - **LZH** - LZSS + Huffman (lh0, lh4-lh7)
 - **Bzip2** - BWT + MTF + RLE + Huffman
 - **LZ4** - Ultra-fast LZ77 variant with LZ4-HC
 - **Zstandard** - FSE + Huffman entropy coding
-- **LZW** - Lempel-Ziv-Welch for TIFF compression
+- **LZW** - Lempel-Ziv-Welch for TIFF and GIF compression (MSB/LSB bitstream)
 - **Store** - No compression
 
 ### Core Features
@@ -38,6 +38,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Optimized CRC** - Slicing-by-8 implementation (3-5x faster than table lookup)
 - **Modern CLI** - Progress bars, verbose output, JSON support, shell completions
 - **Streaming API** - Memory-efficient processing with stdin/stdout support
+- **Async I/O** - Async ZIP and async deflate support (async-io feature flag)
 - **Pattern Filtering** - Include/exclude patterns with glob syntax
 - **Metadata Preservation** - Timestamps, permissions, extended attributes
 - **Auto-detection** - Automatic format detection from magic bytes
@@ -54,12 +55,13 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 |     ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2   |
 +----------------------------------------------------------+
 | L2: Codecs                                               |
-|     oxiarc-deflate: DEFLATE (RFC 1951)                   |
+|     oxiarc-deflate: DEFLATE (RFC 1951) + async + GZip    |
 |     oxiarc-lzma: LZMA/LZMA2                              |
 |     oxiarc-lzhuf: LZH (lh0-lh7)                          |
 |     oxiarc-bzip2: BWT + MTF + Huffman                    |
 |     oxiarc-lz4: LZ4 block/frame                          |
 |     oxiarc-zstd: Zstandard (FSE + Huffman)               |
+|     oxiarc-lzw: LZW (GIF/TIFF, MSB/LSB bitstream)       |
 +----------------------------------------------------------+
 | L1: Core (oxiarc-core)                                   |
 |     BitReader/Writer, RingBuffer, CRC-16/32/64 (simd-8)  |
@@ -70,17 +72,17 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8) | ~1,800 | 95 |
-| `oxiarc-deflate` | DEFLATE compression (RFC 1951) with LZ77 + Huffman + Zlib | ~2,100 | 65 |
-| `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman | ~1,400 | 48 |
-| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~1,200 | 34 |
-| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32 | ~1,600 | 94 |
-| `oxiarc-zstd` | Zstandard with FSE + Huffman + XXHash64 | ~2,100 | 163 |
-| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains | ~2,000 | 58 |
-| `oxiarc-archive` | 10 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, etc.) | ~5,600 | 134 |
-| `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream and variable bit widths | ~800 | 43 |
-| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output | ~1,800 | - |
-| **Total** | **Pure Rust archive/compression library** | **~27,000** | **734** |
+| `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8) | ~2,800 | 95 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip module, LZ77 + Huffman + Zlib | ~3,000 | 79 |
+| `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman | ~1,400 | 54 |
+| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~1,600 | 37 |
+| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32 | ~1,600 | 99 |
+| `oxiarc-zstd` | Zstandard with FSE + Huffman + XXHash64 | ~5,500 | 170 |
+| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains | ~2,900 | 66 |
+| `oxiarc-archive` | 10 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, etc.) + async ZIP | ~9,800 | 140 |
+| `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream, GIF LZW codec | ~1,100 | 59 |
+| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output | ~2,000 | - |
+| **Total** | **Pure Rust archive/compression library** | **~39,417** | **799** |
 
 ## Installation
 
@@ -103,12 +105,12 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.2.2"  # For archive format support
-oxiarc-deflate = "0.2.2"  # For DEFLATE compression
-oxiarc-lzma = "0.2.2"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.2.2"    # For Bzip2 compression
-oxiarc-lz4 = "0.2.2"      # For LZ4 compression
-oxiarc-zstd = "0.2.2"     # For Zstandard compression
+oxiarc-archive = "0.2.3"  # For archive format support
+oxiarc-deflate = "0.2.3"  # For DEFLATE compression
+oxiarc-lzma = "0.2.3"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.2.3"    # For Bzip2 compression
+oxiarc-lz4 = "0.2.3"      # For LZ4 compression
+oxiarc-zstd = "0.2.3"     # For Zstandard compression
 ```
 
 ## Quick Start
@@ -213,11 +215,26 @@ Modern fast compression:
 - XXHash64 checksums
 - Dictionary support
 
+### LZW
+
+Lempel-Ziv-Welch compression:
+- GIF LZW codec with configurable initial code size
+- LSB-first bitstream packing (GIF standard)
+- MSB-first bitstream packing (TIFF standard)
+- Variable bit widths (2-12 bits) with clear/EOI codes
+
+### Async DEFLATE and GZip (0.2.3)
+
+Async I/O support in `oxiarc-deflate` (enabled via `async-io` feature):
+- `async_deflate` module: non-blocking DEFLATE compress/decompress
+- `gzip` module: streaming GZip encode/decode with RFC 1952 compliance
+- Compatible with tokio and async-std runtimes
+
 ## Format Support Matrix
 
 | Format | Read | Write | Compression | Checksums | Notes |
 |--------|------|-------|-------------|-----------|-------|
-| **ZIP** | ✅ | ✅ | DEFLATE, Store | CRC-32 | Zip64 support, data descriptors |
+| **ZIP** | ✅ | ✅ | DEFLATE, Store | CRC-32 | Zip64 support, data descriptors, async ZIP (async-io feature) |
 | **TAR** | ✅ | ✅ | N/A (container only) | None | UStar, PAX, GNU long names |
 | **GZIP** | ✅ | ✅ | DEFLATE | CRC-32 | RFC 1952 compliant |
 | **LZH** | ✅ | ✅ | lh0-lh7 | CRC-16 | Shift_JIS support, all header levels |
@@ -661,7 +678,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 734 tests
+# Run all 799 tests
 cargo nextest run --all-features
 
 # Build CLI only

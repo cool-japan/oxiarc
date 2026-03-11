@@ -35,12 +35,12 @@ pub use frame::{
     compress_frame_with_dict, compress_frame_with_dict_options, compress_with_options, decompress,
     decompress_frame_with_dict, get_frame_dict_id,
 };
-pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level};
+pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level, compress_hc_with_dict};
 
 // Re-export dictionary types for convenience
 pub use dict::{
     DictBuilder, DictFrameDescriptor, DictLevel, Lz4Dict, compress_with_dict,
-    compress_with_dict_level, decompress_with_dict,
+    compress_with_dict_hc, compress_with_dict_level, decompress_with_dict,
 };
 
 #[cfg(feature = "parallel")]

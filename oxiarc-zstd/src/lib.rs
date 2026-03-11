@@ -62,10 +62,17 @@ pub use encode::{
 };
 
 // Decompression API
-pub use frame::{ZstdDecoder, decompress, decompress_with_dict};
+pub use frame::{
+    ZstdDecoder, decompress, decompress_frame, decompress_multi_frame, decompress_with_dict,
+    write_skippable_frame,
+};
 
 // Streaming API
 pub use streaming::{ZstdStreamDecoder, ZstdStreamEncoder};
+
+/// Alias for [`ZstdStreamEncoder`] — a streaming writer that emits incremental
+/// Zstandard frames.
+pub type ZstdWriter<W> = ZstdStreamEncoder<W>;
 
 // Dictionary API
 pub use dict::{ZstdDict, train_dictionary};
@@ -154,6 +161,73 @@ impl LiteralsBlockType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_multi_frame_decompress() {
+        let frame1 = compress_with_level(b"Hello ", 3).unwrap();
+        let frame2 = compress_with_level(b"World!", 3).unwrap();
+        let mut combined = frame1;
+        combined.extend_from_slice(&frame2);
+        let result = decompress_multi_frame(&combined).unwrap();
+        assert_eq!(result, b"Hello World!");
+    }
+
+    #[test]
+    fn test_skippable_frame_ignored() {
+        let skip = write_skippable_frame(b"metadata", 0);
+        let frame = compress_with_level(b"data", 3).unwrap();
+        let mut combined = skip;
+        combined.extend_from_slice(&frame);
+        let result = decompress_multi_frame(&combined).unwrap();
+        assert_eq!(result, b"data");
+    }
+
+    #[test]
+    fn test_incremental_streaming_writer() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        let mut writer = ZstdWriter::new(&mut buf, 3);
+        // Write in small chunks.
+        for chunk in b"Hello World! ".chunks(3) {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.finish().unwrap();
+        let decompressed = decompress_multi_frame(&buf).unwrap();
+        assert_eq!(decompressed, b"Hello World! ");
+    }
+
+    #[test]
+    fn test_decompress_frame_returns_consumed() {
+        let frame1 = compress_with_level(b"abc", 1).unwrap();
+        let frame2 = compress_with_level(b"xyz", 1).unwrap();
+        let mut combined = frame1.clone();
+        combined.extend_from_slice(&frame2);
+        let (data, consumed) = decompress_frame(&combined).unwrap();
+        assert_eq!(data, b"abc");
+        assert_eq!(consumed, frame1.len());
+    }
+
+    #[test]
+    fn test_skippable_frame_magic_nibble() {
+        for nibble in 0u8..=15 {
+            let frame = write_skippable_frame(b"test", nibble);
+            let magic = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+            assert!((SKIPPABLE_MAGIC_LOW..=SKIPPABLE_MAGIC_HIGH).contains(&magic));
+        }
+    }
+
+    #[test]
+    fn test_multi_frame_empty_input() {
+        let result = decompress_multi_frame(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_multi_frame_skippable_only() {
+        let skip = write_skippable_frame(b"some metadata", 3);
+        let result = decompress_multi_frame(&skip).unwrap();
+        assert!(result.is_empty());
+    }
 
     #[test]
     fn test_block_type_from_bits() {

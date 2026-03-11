@@ -12,7 +12,6 @@ description = "Pure Rust LZW compression for TIFF and GIF formats"
 readme = "README.md"
 
 [dependencies]
-oxiarc-core.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -2,15 +2,22 @@
 
 Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF formats.
 
+[![Crates.io](https://img.shields.io/crates/v/oxiarc-lzw.svg)](https://crates.io/crates/oxiarc-lzw)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**Version: 0.2.3 (2026-03-11) | Tests: 59 passing**
+
 ## Overview
 
-LZW is a dictionary-based compression algorithm used in TIFF images, GIF animations, and legacy Unix compress. This implementation provides both TIFF-style (MSB-first) and GIF-style (LSB-first) bit packing.
+LZW is a dictionary-based compression algorithm used in TIFF images, GIF animations, and legacy Unix compress. This implementation provides both TIFF-style (MSB-first) and GIF-style (LSB-first) bit packing, with dedicated GIF LZW codec support via the `gif_lzw` module.
 
 ## Features
 
 - **Pure Rust** - No C dependencies or unsafe FFI
 - **TIFF support** - MSB-first bit ordering for TIFF images
-- **GIF support** - LSB-first bit ordering for GIF animations
+- **GIF support** - LSB-first bit ordering for GIF animations via `gif_lzw` module
+- **GIF LZW codec** - Dedicated `gif_compress`/`gif_decompress` functions conforming to GIF spec §22
+- **LSB bitstream** - `bitstream_lsb` module with `LsbBitWriter`/`LsbBitReader` for GIF-compatible bit packing
 - **Configurable** - Adjustable code width (9-12 bits)
 - **Early change** - Code width increases before table full
 
@@ -25,6 +32,41 @@ let original = b"ABCABCABCABC";
 let compressed = encode(original, &config);
 let decompressed = decode(&compressed, &config)?;
 assert_eq!(decompressed, original);
+```
+
+## GIF LZW Codec (New in 0.2.3)
+
+The `gif_lzw` module implements the GIF-specific variant of LZW as described in the GIF spec §22:
+- LSB-first (Least Significant Bit) bit ordering
+- Variable initial code size driven by `minimum_lzw_code_size` from the GIF header
+- Clear code and End-of-Information (EOI) code
+- Dictionary reset on overflow (max 4096 codes / 12-bit codes)
+
+```rust
+use oxiarc_lzw::gif_lzw::{gif_compress, gif_decompress};
+
+// minimum_code_size must be 2..=11 (GIF spec §22)
+let data = b"TOBEORNOTTOBEORTOBEORNOT";
+let compressed = gif_compress(data, 8)?;
+let decompressed = gif_decompress(&compressed, 8)?;
+assert_eq!(decompressed.as_slice(), data.as_slice());
+```
+
+## LSB Bitstream (New in 0.2.3)
+
+The `bitstream_lsb` module provides low-level LSB-first bit packing used internally by `gif_lzw`:
+
+```rust
+use oxiarc_lzw::bitstream_lsb::{LsbBitWriter, LsbBitReader};
+
+let mut writer = LsbBitWriter::new();
+writer.write_bits(0b101, 3);
+writer.write_bits(0b1100, 4);
+let data = writer.into_bytes();
+
+let mut reader = LsbBitReader::new(&data);
+assert_eq!(reader.read_bits(3), Some(0b101));
+assert_eq!(reader.read_bits(4), Some(0b1100));
 ```
 
 ## Configuration
@@ -94,10 +136,21 @@ LZW builds a dictionary dynamically:
 | 256 | Clear code (reset dictionary) |
 | 257-4095 | Dictionary entries |
 
+## Features (Cargo)
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `std` | yes | Standard library support |
+
+```toml
+[dependencies]
+oxiarc-lzw = "0.2.3"
+```
+
 ## Use Cases
 
 - **TIFF images** - LZW is one of the standard TIFF compression methods
-- **GIF animations** - Original GIF compression format
+- **GIF animations** - Original GIF compression format (including full GIF LZW codec)
 - **Legacy data** - Unix `.Z` files (compress/uncompress)
 
 ## Part of OxiArc

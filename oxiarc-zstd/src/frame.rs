@@ -433,6 +433,174 @@ pub fn decompress_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
     decoder.decode_frame(data)
 }
 
+/// Decompress a single Zstandard frame, returning the decompressed data and
+/// the number of bytes consumed from `data`.
+///
+/// This allows callers to locate the end of one frame in a concatenated
+/// stream and proceed to the next.
+pub fn decompress_frame(data: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let header = parse_frame_header(data)?;
+    let mut decoder = ZstdDecoder::new();
+    decoder.window_size = header.window_size;
+
+    if let Some(size) = header.content_size {
+        decoder.output.reserve(size as usize);
+    }
+
+    let mut pos = header.header_size;
+
+    // Decode blocks, tracking how many bytes we consume.
+    loop {
+        if data.len() < pos + 3 {
+            return Err(OxiArcError::CorruptedData {
+                offset: pos as u64,
+                message: "truncated block header".to_string(),
+            });
+        }
+
+        let block_header = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], 0]);
+        pos += 3;
+
+        let last_block = (block_header & 1) != 0;
+        let block_type = crate::BlockType::from_bits(((block_header >> 1) & 0x03) as u8)?;
+        let block_size = ((block_header >> 3) & 0x1FFFFF) as usize;
+
+        if block_size > crate::MAX_BLOCK_SIZE {
+            return Err(OxiArcError::CorruptedData {
+                offset: pos as u64,
+                message: format!("block size {} exceeds maximum", block_size),
+            });
+        }
+
+        let compressed_size = match block_type {
+            crate::BlockType::Rle => 1,
+            _ => block_size,
+        };
+
+        if data.len() < pos + compressed_size {
+            return Err(OxiArcError::CorruptedData {
+                offset: pos as u64,
+                message: "truncated block data".to_string(),
+            });
+        }
+
+        let block_data = &data[pos..pos + compressed_size];
+        pos += compressed_size;
+
+        match block_type {
+            crate::BlockType::Raw => {
+                decoder.output.extend_from_slice(block_data);
+            }
+            crate::BlockType::Rle => {
+                decoder
+                    .output
+                    .extend(std::iter::repeat_n(block_data[0], block_size));
+            }
+            crate::BlockType::Compressed => {
+                decoder.decode_compressed_block(block_data)?;
+            }
+            crate::BlockType::Reserved => {
+                return Err(OxiArcError::CorruptedData {
+                    offset: pos as u64,
+                    message: "reserved block type".to_string(),
+                });
+            }
+        }
+
+        if last_block {
+            break;
+        }
+    }
+
+    // Verify checksum if present.
+    if header.has_checksum {
+        if data.len() < pos + 4 {
+            return Err(OxiArcError::CorruptedData {
+                offset: pos as u64,
+                message: "missing content checksum".to_string(),
+            });
+        }
+
+        let expected = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let computed = xxhash64_checksum(&decoder.output);
+
+        if expected != computed {
+            return Err(OxiArcError::CrcMismatch { expected, computed });
+        }
+        pos += 4;
+    }
+
+    // Verify content size if known.
+    if let Some(expected_size) = header.content_size {
+        if decoder.output.len() as u64 != expected_size {
+            return Err(OxiArcError::CorruptedData {
+                offset: 0,
+                message: format!(
+                    "content size mismatch: expected {}, got {}",
+                    expected_size,
+                    decoder.output.len()
+                ),
+            });
+        }
+    }
+
+    let decompressed = std::mem::take(&mut decoder.output);
+    Ok((decompressed, pos))
+}
+
+/// Decompress one or more concatenated Zstandard frames.
+///
+/// Skippable frames (magic `0x184D2A50`–`0x184D2A5F`) are silently skipped.
+/// Unknown magic values cause iteration to stop and the accumulated output is
+/// returned (trailing garbage is tolerated).
+pub fn decompress_multi_frame(data: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Need at least 4 bytes to read a magic number.
+        if data.len() - pos < 4 {
+            break;
+        }
+        let magic = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+
+        if magic == 0xFD2FB528 {
+            // Normal Zstd frame.
+            let (decompressed, consumed) = decompress_frame(&data[pos..])?;
+            output.extend_from_slice(&decompressed);
+            pos += consumed;
+        } else if (crate::SKIPPABLE_MAGIC_LOW..=crate::SKIPPABLE_MAGIC_HIGH).contains(&magic) {
+            // Skippable frame: 4 bytes magic + 4 bytes size + <size> bytes data.
+            if data.len() - pos < 8 {
+                break;
+            }
+            let skip_size =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            pos += 8 + skip_size;
+        } else {
+            // Unknown magic — stop gracefully.
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
+/// Write a skippable Zstandard frame containing arbitrary user data.
+///
+/// `magic_nibble` selects which skippable magic to use; it is masked to the
+/// lower 4 bits so the resulting magic is always in the range
+/// `0x184D2A50`–`0x184D2A5F`.
+pub fn write_skippable_frame(user_data: &[u8], magic_nibble: u8) -> Vec<u8> {
+    let magic = crate::SKIPPABLE_MAGIC_LOW | (magic_nibble & 0xF) as u32;
+    let mut out = Vec::with_capacity(8 + user_data.len());
+    out.extend_from_slice(&magic.to_le_bytes());
+    out.extend_from_slice(&(user_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(user_data);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

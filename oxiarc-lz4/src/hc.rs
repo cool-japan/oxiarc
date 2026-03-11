@@ -252,6 +252,27 @@ impl HcEncoder {
         self.compress(input)
     }
 
+    /// Compress data using LZ4-HC with dictionary support.
+    ///
+    /// Uses the virtual-buffer strategy: the dictionary is logically prepended
+    /// to the input, allowing matches to reference bytes in the dictionary.
+    /// This provides genuine HC-quality compression (chain-based longest-match
+    /// search) against dictionary content.
+    ///
+    /// If the dictionary is empty, delegates to the regular [`compress`][Self::compress]
+    /// method.
+    pub fn compress_with_dict(
+        &mut self,
+        input: &[u8],
+        dict: &crate::dict::Lz4Dict,
+    ) -> Result<Vec<u8>> {
+        if dict.is_empty() {
+            return self.compress(input);
+        }
+        let mut encoder = HcDictEncoder::new(input, dict.data(), self.level);
+        encoder.compress()
+    }
+
     fn compress_optimal_internal(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         // Clear tables
         self.hash_table.fill(0);
@@ -371,6 +392,222 @@ impl Default for HcEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HC dictionary support — virtual-buffer strategy
+// ---------------------------------------------------------------------------
+
+/// HC encoder with dictionary support.
+///
+/// The virtual buffer model: dictionary occupies virtual positions `0..dict_len`,
+/// input occupies virtual positions `dict_len..dict_len+input_len`.
+/// Hash and chain tables are indexed by `(virtual_pos + 1)` — we add 1 so that
+/// virtual position 0 (first byte of dictionary) is distinguishable from the
+/// "empty slot" sentinel value of 0 stored in the tables.
+struct HcDictEncoder<'a> {
+    level: HcLevel,
+    hash_table: Vec<u32>,
+    chain_table: Vec<u32>,
+    input: &'a [u8],
+    dict: &'a [u8],
+    dict_len: usize,
+}
+
+impl<'a> HcDictEncoder<'a> {
+    /// Create a new HC dict encoder and pre-populate tables with dictionary positions.
+    fn new(input: &'a [u8], dict: &'a [u8], level: HcLevel) -> Self {
+        let dict_len = dict.len();
+        let mut hash_table = vec![0u32; HASH_SIZE];
+        let mut chain_table = vec![0u32; CHAIN_SIZE];
+
+        // Pre-populate hash/chain tables with dictionary positions.
+        // We store `(virtual_pos + 1)` to avoid collision with the sentinel 0.
+        if dict_len >= MIN_MATCH {
+            for virt in 0..=(dict_len.saturating_sub(MIN_MATCH)) {
+                let h = Self::hash4_slice(dict, virt);
+                let prev = hash_table[h];
+                chain_table[(virt + 1) & (CHAIN_SIZE - 1)] = prev;
+                hash_table[h] = (virt + 1) as u32;
+            }
+        }
+
+        Self {
+            level,
+            hash_table,
+            chain_table,
+            input,
+            dict,
+            dict_len,
+        }
+    }
+
+    /// Hash 4 bytes starting at `pos` within `data`.
+    #[inline]
+    fn hash4_slice(data: &[u8], pos: usize) -> usize {
+        if pos + 4 > data.len() {
+            return 0;
+        }
+        let val = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        ((val.wrapping_mul(2654435761)) >> 16) as usize & (HASH_SIZE - 1)
+    }
+
+    /// Hash 4 bytes of the input at `input_pos`.
+    #[inline]
+    fn hash4_input(&self, input_pos: usize) -> usize {
+        Self::hash4_slice(self.input, input_pos)
+    }
+
+    /// Get a byte from the virtual buffer (dict then input).
+    #[inline]
+    fn virt_byte(&self, virt: usize) -> Option<u8> {
+        if virt < self.dict_len {
+            self.dict.get(virt).copied()
+        } else {
+            self.input.get(virt - self.dict_len).copied()
+        }
+    }
+
+    /// Insert an input position into hash/chain tables.
+    ///
+    /// `input_pos` is the position in `self.input`; its virtual position is
+    /// `input_pos + self.dict_len`.
+    #[inline]
+    fn insert_input_pos(&mut self, input_pos: usize) {
+        if input_pos + 4 > self.input.len() {
+            return;
+        }
+        let virt = input_pos + self.dict_len;
+        let h = self.hash4_input(input_pos);
+        let prev = self.hash_table[h];
+        self.chain_table[(virt + 1) & (CHAIN_SIZE - 1)] = prev;
+        self.hash_table[h] = (virt + 1) as u32;
+    }
+
+    /// Find the best match at `input_pos`, considering both dictionary and input.
+    ///
+    /// Returns `(best_length, best_offset)` or `(0, 0)` if no match of
+    /// length ≥ `MIN_MATCH` is found.
+    fn find_best_match_with_dict(&self, input_pos: usize) -> (usize, usize) {
+        if input_pos + MIN_MATCH > self.input.len() {
+            return (0, 0);
+        }
+
+        let h = self.hash4_input(input_pos);
+        // stored value is (virt + 1); 0 means empty
+        let mut slot = self.hash_table[h] as usize;
+
+        let virt_pos = input_pos + self.dict_len;
+        let mut best_len = MIN_MATCH - 1;
+        let mut best_offset = 0usize;
+        let max_attempts = self.level.max_attempts();
+        let mut attempts = 0;
+
+        while slot > 0 && attempts < max_attempts {
+            // Recover the actual virtual position
+            let match_virt = slot - 1;
+            let offset = virt_pos.saturating_sub(match_virt);
+
+            if offset > MAX_OFFSET || offset == 0 {
+                break;
+            }
+
+            // Quick reject using best_len byte
+            let skip = best_len >= MIN_MATCH && {
+                let a = self.virt_byte(match_virt + best_len);
+                let b = self.input.get(input_pos + best_len).copied();
+                a != b
+            };
+
+            if !skip {
+                // Measure match length in the virtual buffer vs. input
+                let max_len = (self.input.len() - input_pos).min(MAX_MATCH);
+                let mut len = 0;
+                while len < max_len {
+                    match (
+                        self.virt_byte(match_virt + len),
+                        self.input.get(input_pos + len).copied(),
+                    ) {
+                        (Some(a), Some(b)) if a == b => len += 1,
+                        _ => break,
+                    }
+                }
+
+                if len > best_len {
+                    best_len = len;
+                    best_offset = offset;
+                    if len >= 128 {
+                        break;
+                    }
+                }
+            }
+
+            // Follow chain
+            slot = self.chain_table[(match_virt + 1) & (CHAIN_SIZE - 1)] as usize;
+            attempts += 1;
+        }
+
+        if best_len >= MIN_MATCH && best_offset > 0 {
+            (best_len, best_offset)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Compress input using HC with dictionary via the virtual-buffer strategy.
+    fn compress(&mut self) -> crate::Result<Vec<u8>> {
+        let input = self.input;
+
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut output = Vec::with_capacity(input.len());
+        let mut pos = 0;
+        let mut anchor = 0;
+
+        // Insert initial position
+        if input.len() >= 4 {
+            self.insert_input_pos(0);
+        }
+
+        let end = input.len().saturating_sub(5);
+
+        while pos < end {
+            let (match_len, offset) = self.find_best_match_with_dict(pos);
+
+            if match_len >= MIN_MATCH && offset > 0 {
+                // Emit literals before this match
+                let literal_len = pos - anchor;
+                emit_sequence(&mut output, input, anchor, literal_len, offset, match_len);
+
+                // Insert positions inside the matched region
+                for i in 1..match_len {
+                    if pos + i < input.len() {
+                        self.insert_input_pos(pos + i);
+                    }
+                }
+
+                pos += match_len;
+                anchor = pos;
+
+                if pos < input.len() {
+                    self.insert_input_pos(pos);
+                }
+            } else {
+                self.insert_input_pos(pos);
+                pos += 1;
+            }
+        }
+
+        // Emit remaining literals
+        let remaining = input.len() - anchor;
+        if remaining > 0 {
+            emit_last_literals(&mut output, input, anchor, remaining);
+        }
+
+        Ok(output)
+    }
+}
+
 /// Emit a sequence (literals + match) to output.
 fn emit_sequence(
     output: &mut Vec<u8>,
@@ -458,6 +695,32 @@ pub fn compress_hc_level(input: &[u8], level: HcLevel) -> Result<Vec<u8>> {
     } else {
         encoder.compress(input)
     }
+}
+
+/// Compress data using LZ4-HC with dictionary and a specific compression level.
+///
+/// The dictionary is used via the virtual-buffer strategy, allowing HC's
+/// chain-based longest-match search to reference dictionary content.
+///
+/// If `dict` is empty, this behaves identically to [`compress_hc_level`].
+///
+/// # Arguments
+///
+/// * `input` - Data to compress.
+/// * `dict`  - Pre-trained LZ4 dictionary.
+/// * `level` - HC compression level (1–12).
+///
+/// # Returns
+///
+/// Compressed data in LZ4 block format (compatible with the standard decoder
+/// when the same dictionary is supplied at decompression time).
+pub fn compress_hc_with_dict(
+    input: &[u8],
+    dict: &crate::dict::Lz4Dict,
+    level: HcLevel,
+) -> Result<Vec<u8>> {
+    let mut encoder = HcEncoder::with_level(level);
+    encoder.compress_with_dict(input, dict)
 }
 
 #[cfg(test)]
@@ -569,5 +832,103 @@ mod tests {
         let compressed = compress_hc_level(&data, level).expect("compress failed");
         let decompressed = decompress_block(&compressed, data.len()).expect("decompress failed");
         assert_eq!(decompressed, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // HC dictionary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hc_dict_roundtrip() {
+        let dict_bytes = b"The quick brown fox jumps over the lazy dog.";
+        let dict = crate::dict::Lz4Dict::new(dict_bytes);
+
+        let input = b"The quick brown fox jumps over the lazy dog. And again!";
+        let level = HcLevel::default();
+        let compressed =
+            compress_hc_with_dict(input, &dict, level).expect("hc dict compress failed");
+        let decompressed = crate::dict::decompress_with_dict(&compressed, input.len() * 2, &dict)
+            .expect("hc dict decompress failed");
+        assert_eq!(decompressed.as_slice(), input.as_ref());
+    }
+
+    #[test]
+    fn test_hc_dict_empty_dict_fallback() {
+        // Empty dictionary must produce output decompressable by the plain decoder.
+        let dict = crate::dict::Lz4Dict::empty();
+        let input = b"Hello world from HC with empty dict!";
+        let level = HcLevel::default();
+        let compressed =
+            compress_hc_with_dict(input, &dict, level).expect("hc dict (empty) compress failed");
+        // Empty dict delegates to regular HC — decompress with plain block decoder.
+        let decompressed =
+            decompress_block(&compressed, input.len() * 2).expect("decompress failed");
+        assert_eq!(decompressed.as_slice(), input.as_ref());
+    }
+
+    #[test]
+    fn test_hc_dict_improves_ratio() {
+        // Input is highly similar to the dictionary; compression should be
+        // at least as good with the dictionary as without.
+        let common = b"Content-Type: application/json\r\nAccept-Encoding: gzip\r\n";
+        let dict = crate::dict::Lz4Dict::new(common);
+
+        let input = b"Content-Type: application/json\r\nAccept-Encoding: gzip\r\n\
+                      Content-Length: 42\r\nX-Custom-Header: value\r\n\r\n{}";
+
+        let with_dict = compress_hc_with_dict(input, &dict, HcLevel::default())
+            .expect("hc dict compress failed");
+        let without_dict = compress_hc(input).expect("hc compress failed");
+
+        // Verify roundtrip correctness first
+        let decompressed = crate::dict::decompress_with_dict(&with_dict, input.len() * 2, &dict)
+            .expect("hc dict decompress failed");
+        assert_eq!(decompressed.as_slice(), input.as_ref());
+
+        // With a dictionary that matches the beginning of the input exactly,
+        // the dict version should be at most as large as the non-dict version.
+        assert!(
+            with_dict.len() <= without_dict.len(),
+            "with_dict={} without_dict={}",
+            with_dict.len(),
+            without_dict.len()
+        );
+    }
+
+    #[test]
+    fn test_hc_dict_all_levels() {
+        let dict_bytes = b"abcdef repeated pattern 1234567890";
+        let dict = crate::dict::Lz4Dict::new(dict_bytes);
+        let input = b"abcdef repeated pattern 1234567890 with extra data abcdef";
+
+        for level_num in [1u8, 3, 6, 9, 12] {
+            let level = HcLevel::new(level_num).expect("valid level");
+            let compressed = compress_hc_with_dict(input, &dict, level)
+                .unwrap_or_else(|_| panic!("level {} failed", level_num));
+            let decompressed =
+                crate::dict::decompress_with_dict(&compressed, input.len() * 2, &dict)
+                    .unwrap_or_else(|_| panic!("level {} decompress failed", level_num));
+            assert_eq!(
+                decompressed.as_slice(),
+                input.as_ref(),
+                "level {} roundtrip failed",
+                level_num
+            );
+        }
+    }
+
+    #[test]
+    fn test_hc_encoder_compress_with_dict_method() {
+        let dict_bytes = b"shared prefix data that appears in inputs";
+        let dict = crate::dict::Lz4Dict::new(dict_bytes);
+        let input = b"shared prefix data that appears in inputs plus more";
+
+        let mut encoder = HcEncoder::new();
+        let compressed = encoder
+            .compress_with_dict(input, &dict)
+            .expect("compress_with_dict failed");
+        let decompressed = crate::dict::decompress_with_dict(&compressed, input.len() * 2, &dict)
+            .expect("decompress failed");
+        assert_eq!(decompressed.as_slice(), input.as_ref());
     }
 }

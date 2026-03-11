@@ -64,6 +64,11 @@ impl State {
         Self(0)
     }
 
+    /// Construct from a raw state value (clamped to 0..11).
+    pub fn from_value(v: u8) -> Self {
+        Self(v.min(11))
+    }
+
     /// Get state value.
     pub fn value(self) -> usize {
         self.0 as usize

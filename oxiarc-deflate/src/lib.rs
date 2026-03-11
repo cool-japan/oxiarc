@@ -41,14 +41,19 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod deflate;
+pub mod gzip;
 pub mod huffman;
 pub mod inflate;
 pub mod lz77;
 pub mod tables;
 pub mod zlib;
 
+#[cfg(feature = "async-io")]
+pub mod async_deflate;
+
 // Re-exports
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
+pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, inflate};
 pub use lz77::{Lz77Encoder, Lz77Token};

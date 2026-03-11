@@ -7,7 +7,7 @@
 //!
 //! - **Pure Rust**: No C dependencies, 100% safe Rust
 //! - **TIFF LZW**: MSB-first bit order, early code change
-//! - **GIF LZW**: LSB-first bit order (planned)
+//! - **GIF LZW**: LSB-first bit order, variable minimum code size
 //! - **Bug Fix**: Fixes truncation bug found in weezl crate
 //!
 //! ## TIFF LZW Specification
@@ -61,17 +61,20 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
 
+mod bitstream_lsb;
 mod bitstream_msb;
 mod config;
 mod decoder;
 mod dictionary;
 mod encoder;
 mod error;
+mod gif_lzw;
 
 pub use config::LzwConfig;
 pub use decoder::LzwDecoder;
 pub use encoder::LzwEncoder;
 pub use error::{LzwError, Result};
+pub use gif_lzw::{gif_compress, gif_decompress};
 
 /// Decompress LZW-compressed data with the given configuration.
 ///
@@ -245,7 +248,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Known limitation: large repetitive data triggers Invalid Code errors. See KNOWN_ISSUES.md
     fn test_large_input() {
         let original = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
         let compressed = compress_tiff(&original).unwrap();

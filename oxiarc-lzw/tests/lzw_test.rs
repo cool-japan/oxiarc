@@ -40,7 +40,6 @@ fn test_lzw_roundtrip_310_bytes() {
 }
 
 #[test]
-#[ignore] // Known limitation: large repetitive data. See KNOWN_ISSUES.md
 fn test_lzw_roundtrip_large() {
     let original = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
     let compressed = compress_tiff(&original).expect("compression failed");
@@ -155,7 +154,6 @@ fn test_lzw_incremental_pattern() {
 }
 
 #[test]
-#[ignore] // Known limitation: large data triggers Invalid Code errors. See KNOWN_ISSUES.md
 fn test_lzw_very_large_input() {
     // Test with 10MB of repetitive data
     let original = b"The quick brown fox jumps over the lazy dog. ".repeat(200_000);

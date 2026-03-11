@@ -2,6 +2,11 @@
 
 Command-line interface for OxiArc - The Oxidized Archiver.
 
+[![Crates.io](https://img.shields.io/crates/v/oxiarc-cli.svg)](https://crates.io/crates/oxiarc-cli)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**Version: 0.2.3 (2026-03-11)**
+
 ## Overview
 
 A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, and LZH archives.

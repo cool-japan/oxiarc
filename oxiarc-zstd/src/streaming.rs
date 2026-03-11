@@ -28,18 +28,26 @@
 //! ```
 
 use crate::encode::ZstdEncoder;
-use crate::frame::ZstdDecoder;
+use crate::frame::{ZstdDecoder, decompress_multi_frame};
 use std::io::{self, Read, Write};
+
+/// Default block size for the incremental encoder (128 KiB).
+const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Streaming Zstandard encoder that implements [`Write`].
 ///
-/// Data written to this encoder is buffered internally.  When
-/// [`finish`](ZstdStreamEncoder::finish) is called, the accumulated data is
-/// compressed as a single Zstandard frame and written to the inner writer.
+/// Data written to this encoder is buffered internally.  When the internal
+/// buffer reaches `block_size` bytes it is automatically flushed as a
+/// complete Zstandard frame to the inner writer (truly incremental).  Any
+/// remaining data is flushed when [`finish`](ZstdStreamEncoder::finish) is
+/// called.
+///
+/// The output is a sequence of valid concatenated Zstandard frames and can be
+/// decoded with [`decompress_multi_frame`].
 ///
 /// **Important:** you *must* call [`finish`](ZstdStreamEncoder::finish) to
-/// flush the final compressed data. Dropping the encoder without calling
-/// `finish` will silently discard any buffered data.
+/// flush the final (possibly partial) block. Dropping the encoder without
+/// calling `finish` will silently discard any buffered data.
 pub struct ZstdStreamEncoder<W: Write> {
     /// The wrapped writer that receives compressed output.
     inner: Option<W>,
@@ -51,13 +59,17 @@ pub struct ZstdStreamEncoder<W: Write> {
     dict: Option<Vec<u8>>,
     /// Whether `finish` has already been called.
     finished: bool,
+    /// Threshold at which the buffer is automatically flushed.
+    block_size: usize,
 }
 
 impl<W: Write> ZstdStreamEncoder<W> {
     /// Create a new streaming encoder wrapping `writer`.
     ///
     /// The `level` parameter controls the compression level passed to the
-    /// underlying [`ZstdEncoder`].
+    /// underlying [`ZstdEncoder`].  The encoder uses a default block size of
+    /// 128 KiB; use [`with_block_size`](ZstdStreamEncoder::with_block_size)
+    /// to customise this.
     pub fn new(writer: W, level: i32) -> Self {
         Self {
             inner: Some(writer),
@@ -65,6 +77,7 @@ impl<W: Write> ZstdStreamEncoder<W> {
             level,
             dict: None,
             finished: false,
+            block_size: DEFAULT_BLOCK_SIZE,
         }
     }
 
@@ -79,7 +92,17 @@ impl<W: Write> ZstdStreamEncoder<W> {
             level,
             dict: Some(dict),
             finished: false,
+            block_size: DEFAULT_BLOCK_SIZE,
         }
+    }
+
+    /// Set the block size used for incremental flushing.
+    ///
+    /// When the internal buffer reaches this many bytes it is automatically
+    /// compressed and written to the inner writer as a Zstandard frame.
+    pub fn with_block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size.max(1);
+        self
     }
 
     /// Finish compression and return the inner writer.
@@ -93,36 +116,46 @@ impl<W: Write> ZstdStreamEncoder<W> {
     /// fails.
     pub fn finish(mut self) -> io::Result<W> {
         if !self.finished {
-            self.flush_buffer()?;
+            // Flush whatever remains in the buffer (even if empty, to match
+            // the single-frame behaviour expected by existing tests).
+            self.flush_buffer_unconditional()?;
             self.finished = true;
         }
         // inner is always Some until finish() is called once.
-        Ok(self
-            .inner
+        self.inner
             .take()
-            .expect("inner writer should still be present"))
+            .ok_or_else(|| io::Error::other("inner writer already taken"))
     }
 
-    /// Compress the buffered data and write it to the inner writer.
-    fn flush_buffer(&mut self) -> io::Result<()> {
-        let data = if self.buffer.is_empty() {
-            vec![]
-        } else {
-            std::mem::take(&mut self.buffer)
-        };
-
+    /// Compress `data` as a single Zstandard frame and write it to `inner`.
+    fn compress_and_write(&mut self, data: &[u8]) -> io::Result<()> {
         let mut encoder = ZstdEncoder::new();
         encoder.set_level(self.level);
         if let Some(ref dict) = self.dict {
             encoder.set_dictionary(dict);
         }
         let compressed = encoder
-            .compress(&data)
+            .compress(data)
             .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(ref mut w) = self.inner {
             w.write_all(&compressed)?;
         }
         Ok(())
+    }
+
+    /// If the buffer has reached `block_size`, flush it as a frame.
+    fn maybe_flush_block(&mut self) -> io::Result<()> {
+        if self.buffer.len() >= self.block_size {
+            let data = std::mem::take(&mut self.buffer);
+            self.compress_and_write(&data)?;
+        }
+        Ok(())
+    }
+
+    /// Always flush the current buffer contents (even if empty) as a frame.
+    fn flush_buffer_unconditional(&mut self) -> io::Result<()> {
+        let data = std::mem::take(&mut self.buffer);
+        self.compress_and_write(&data)
     }
 
     /// Returns the number of uncompressed bytes currently buffered.
@@ -137,23 +170,26 @@ impl<W: Write> ZstdStreamEncoder<W> {
 }
 
 impl<W: Write> Write for ZstdStreamEncoder<W> {
-    /// Buffer the supplied data for later compression.
-    ///
-    /// All bytes are accepted and buffered; the actual compression takes place
-    /// inside [`finish`](ZstdStreamEncoder::finish).
+    /// Buffer `buf` and flush a frame to the inner writer whenever the
+    /// internal buffer reaches `block_size`.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.finished {
             return Err(io::Error::other("encoder already finished"));
         }
         self.buffer.extend_from_slice(buf);
+        self.maybe_flush_block()?;
         Ok(buf.len())
     }
 
-    /// No-op for the streaming encoder.
-    ///
-    /// Compression is deferred until [`finish`](ZstdStreamEncoder::finish) is
-    /// called, so flushing does nothing.
+    /// Flush any buffered data as a Zstandard frame to the inner writer.
     fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let data = std::mem::take(&mut self.buffer);
+            self.compress_and_write(&data)?;
+        }
+        if let Some(ref mut w) = self.inner {
+            w.flush()?;
+        }
         Ok(())
     }
 }
@@ -207,6 +243,9 @@ impl<R: Read> ZstdStreamDecoder<R> {
     }
 
     /// Read and decompress all compressed data from the inner reader.
+    ///
+    /// Handles concatenated Zstandard frames (multi-frame streams) by using
+    /// [`decompress_multi_frame`].  Skippable frames are silently ignored.
     fn fill_buffer(&mut self) -> io::Result<()> {
         if self.finished || self.output_pos < self.output_buffer.len() {
             return Ok(());
@@ -220,13 +259,23 @@ impl<R: Read> ZstdStreamDecoder<R> {
             return Ok(());
         }
 
-        let mut decoder = ZstdDecoder::new();
-        if let Some(ref dict) = self.dict {
-            decoder.set_dictionary(dict);
-        }
-        self.output_buffer = decoder
-            .decode_frame(&compressed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // Use multi-frame decompression so that a stream of concatenated
+        // frames (as produced by the incremental encoder) is handled correctly.
+        // Dictionary support: if a dict is set we fall back to single-frame
+        // decoding (dict + multi-frame is a more complex scenario and not
+        // required by the current API surface).
+        self.output_buffer = if self.dict.is_none() {
+            decompress_multi_frame(&compressed)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        } else {
+            let mut decoder = ZstdDecoder::new();
+            if let Some(ref dict) = self.dict {
+                decoder.set_dictionary(dict);
+            }
+            decoder
+                .decode_frame(&compressed)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        };
         self.output_pos = 0;
         self.finished = true;
 

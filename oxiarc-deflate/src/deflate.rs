@@ -524,27 +524,25 @@ impl Deflater {
         while i < lengths.len() {
             let len = lengths[i];
 
-            // Count repeats
-            let mut count = 1;
-            while i + count < lengths.len() && lengths[i + count] == len && count < 138 {
-                count += 1;
-            }
+            // Count the full run of identical values (no cap here so we advance i correctly).
+            let run_end = i + lengths[i..].iter().take_while(|&&l| l == len).count();
+            let mut count = run_end - i;
 
             if len == 0 {
-                // Encode zeros
+                // Encode zeros in batches of at most 138.
                 while count > 0 {
                     if count >= 11 {
                         // Use symbol 18 (11-138 zeros)
-                        let run = count.min(138);
-                        symbols.push((18, (run - 11) as u8, 7));
+                        let batch = count.min(138);
+                        symbols.push((18, (batch - 11) as u8, 7));
                         freqs[18] += 1;
-                        count -= run;
+                        count -= batch;
                     } else if count >= 3 {
                         // Use symbol 17 (3-10 zeros)
-                        let run = count.min(10);
-                        symbols.push((17, (run - 3) as u8, 3));
+                        let batch = count.min(10);
+                        symbols.push((17, (batch - 3) as u8, 3));
                         freqs[17] += 1;
-                        count -= run;
+                        count -= batch;
                     } else {
                         // Output individual zeros
                         symbols.push((0, 0, 0));
@@ -553,18 +551,18 @@ impl Deflater {
                     }
                 }
             } else {
-                // Output the first occurrence
+                // Output the first occurrence as a literal symbol.
                 symbols.push((len, 0, 0));
                 freqs[len as usize] += 1;
                 count -= 1;
 
-                // Encode repeats with symbol 16
+                // Encode repeats with symbol 16 (repeat previous, 3-6 times).
                 while count > 0 {
                     if count >= 3 {
-                        let run = count.min(6);
-                        symbols.push((16, (run - 3) as u8, 2));
+                        let batch = count.min(6);
+                        symbols.push((16, (batch - 3) as u8, 2));
                         freqs[16] += 1;
-                        count -= run;
+                        count -= batch;
                     } else {
                         symbols.push((len, 0, 0));
                         freqs[len as usize] += 1;
@@ -573,7 +571,8 @@ impl Deflater {
                 }
             }
 
-            i += lengths[i..].iter().take_while(|&&l| l == len).count();
+            // Advance past the full run.
+            i = run_end;
         }
 
         (symbols, freqs)
@@ -640,6 +639,27 @@ impl Deflater {
         Ok(())
     }
 
+    /// Compress data with a sync-flush: write a non-final compressed block followed
+    /// by an empty stored block (BFINAL=0, BTYPE=00, LEN=0, NLEN=0xFFFF), then flush
+    /// all bits to a byte boundary. Everything is written through a single BitWriter
+    /// so the partial-byte state is coherent.
+    pub fn deflate_sync<W: Write>(&mut self, data: &[u8], writer: &mut W) -> Result<()> {
+        let mut bit_writer = BitWriter::new(writer);
+
+        // Write the compressed (non-final) block.
+        self.write_compressed_block(data, &mut bit_writer, false)?;
+
+        // Append the empty stored sync-flush block.
+        bit_writer.write_bit(false)?; // BFINAL=0
+        bit_writer.write_bits(0b00, 2)?; // BTYPE=00 stored
+        bit_writer.align_to_byte()?; // pad to byte boundary
+        bit_writer.write_bits(0u32, 16)?; // LEN=0
+        bit_writer.write_bits(0xFFFF_u32, 16)?; // NLEN=0xFFFF
+        bit_writer.flush()?;
+
+        Ok(())
+    }
+
     /// Compress data to a Vec.
     pub fn compress_to_vec(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let mut output = Vec::new();
@@ -665,11 +685,36 @@ impl Compressor for Deflater {
             return Ok((0, 0, CompressStatus::Done));
         }
 
-        let finish = matches!(flush, FlushMode::Finish);
-
         let mut buffer = Vec::new();
-        self.deflate(input, &mut buffer, finish)?;
 
+        match flush {
+            FlushMode::Finish => {
+                self.deflate(input, &mut buffer, true)?;
+            }
+            FlushMode::Sync => {
+                // Compress input then append an empty stored sync block, all in one
+                // BitWriter so partial-byte state is coherent.
+                if self.level == 0 {
+                    self.deflate(input, &mut buffer, false)?;
+                } else {
+                    self.deflate_sync(input, &mut buffer)?;
+                }
+            }
+            FlushMode::Full => {
+                // Same as Sync, then reset hash state to allow independent decompression.
+                if self.level == 0 {
+                    self.deflate(input, &mut buffer, false)?;
+                } else {
+                    self.deflate_sync(input, &mut buffer)?;
+                }
+                self.lz77.reset();
+            }
+            FlushMode::None => {
+                self.deflate(input, &mut buffer, false)?;
+            }
+        }
+
+        let finish = matches!(flush, FlushMode::Finish);
         let to_copy = buffer.len().min(output.len());
         output[..to_copy].copy_from_slice(&buffer[..to_copy]);
 
@@ -821,6 +866,26 @@ mod tests {
             if level > 0 {
                 prev_size = compressed.len();
             }
+        }
+    }
+
+    #[test]
+    fn test_deflate_large_homogeneous() {
+        // 1 MB of identical bytes - this triggered "Over-subscribed Huffman tree"
+        // in the dynamic Huffman path before the adjust_lengths fix.
+        let input = vec![42u8; 1_000_000];
+        for level in [1u8, 5, 6, 9] {
+            println!("Testing level {}...", level);
+            let compressed = deflate(&input, level).expect("compress failed");
+            println!("  Compressed to {} bytes", compressed.len());
+            assert!(
+                compressed.len() < input.len() / 100,
+                "Expected high compression for level {}: got {} bytes",
+                level,
+                compressed.len()
+            );
+            let decompressed = inflate(&compressed).expect("inflate failed");
+            assert_eq!(decompressed, input, "roundtrip failed at level {}", level);
         }
     }
 }

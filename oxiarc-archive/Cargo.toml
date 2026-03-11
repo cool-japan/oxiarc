@@ -11,6 +11,13 @@ description = "Archive container format support for OxiArc (ZIP, TAR, GZIP, LZH,
 keywords = ["archive", "zip", "tar", "gzip", "xz"]
 categories = ["compression", "encoding", "filesystem"]
 
+[features]
+default = []
+# Memory-mapped file support for efficient large file reading
+mmap = ["oxiarc-core/mmap"]
+# Async I/O support via Tokio
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+
 [dependencies]
 oxiarc-core.workspace = true
 oxiarc-deflate.workspace = true
@@ -20,6 +27,7 @@ oxiarc-lz4.workspace = true
 oxiarc-zstd.workspace = true
 oxiarc-bzip2.workspace = true
 encoding_rs.workspace = true
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true

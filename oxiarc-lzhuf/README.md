@@ -1,6 +1,13 @@
 # oxiarc-lzhuf
 
+[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
+
+**Version 0.2.3** (2026-03-11) — 54 tests passing.
+
+**What's new in 0.2.3**: LZSS correctness improvements — better match-finding boundary conditions and improved token output fidelity.
 
 ## Overview
 
@@ -150,6 +157,15 @@ let symbol = tree.decode(&mut bit_reader)?;
 | `huffman` | LZH Huffman tree operations |
 | `encode` | High-level encoder |
 | `decode` | High-level decoder |
+
+## Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+oxiarc-lzhuf = "0.2.3"
+```
 
 ## Compatibility
 

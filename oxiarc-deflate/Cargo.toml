@@ -11,8 +11,14 @@ description = "Pure Rust DEFLATE compression algorithm (RFC 1951) for OxiArc"
 keywords = ["deflate", "compression", "huffman", "lz77", "zlib"]
 categories = ["compression", "encoding"]
 
+[features]
+default = []
+# Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for Deflater/Inflater
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+
 [dependencies]
 oxiarc-core.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
