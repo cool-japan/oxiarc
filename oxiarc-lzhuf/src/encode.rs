@@ -331,7 +331,7 @@ impl LzhEncoder {
             .collect();
 
         // Sort by length descending
-        items.sort_by(|a, b| b.1.cmp(&a.1));
+        items.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // Cap lengths at max_len
         for &mut (sym, ref mut len) in &mut items {

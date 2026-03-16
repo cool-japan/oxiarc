@@ -2,6 +2,7 @@
 
 ## Version History
 
+- **v0.2.4** (2026-03-16): Dependency updates (clap 4.5→4.6, clap_complete 4.5→4.6), clippy fixes (collapsible match guards, sort_by→sort_by_key, redundant .max(0)). Total: 799 tests, ~40,406 lines, 127 files.
 - **v0.2.3** (2026-03-11): Async ZIP (async_zip), async deflate (async_deflate), GZip module, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb). Total: 799 tests, ~39,417 lines, 127 files.
 - **v0.2.2**: Previous release
 - **v0.2.1**: Previous release
@@ -239,11 +240,11 @@
 - oxiarc-cli: 0 tests
 - Total: 799 tests (799 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.2.3, 2026-03-11)
+## Code Statistics (v0.2.4, 2026-03-16)
 
 | Crate | Lines of Code |
 |-------|---------------|
-| oxiarc-core | ~2,821 (CRC-32/64 slicing-by-8, optimized DualCrc) |
+| oxiarc-core | ~2,800 (CRC-32/64 slicing-by-8, optimized DualCrc) |
 | oxiarc-deflate | ~3,000 (Zlib wrapper, Adler-32, async_deflate module, gzip module) |
 | oxiarc-lzhuf | ~1,000 |
 | oxiarc-bzip2 | ~1,600 |
@@ -253,4 +254,4 @@
 | oxiarc-cli | ~2,020 |
 | oxiarc-lzma | ~2,900 |
 | oxiarc-lzw | ~1,100 (gif_lzw module, bitstream_lsb module) |
-| **Total** | **~39,417** (127 files) |
+| **Total** | **~40,406** (127 files) |

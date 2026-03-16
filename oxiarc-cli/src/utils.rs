@@ -136,10 +136,10 @@ pub fn sort_entries(entries: &mut [Entry], sort_by: SortBy, reverse: bool) {
             entries.sort_by(|a, b| a.name.cmp(&b.name));
         }
         SortBy::Size => {
-            entries.sort_by(|a, b| a.size.cmp(&b.size));
+            entries.sort_by_key(|a| a.size);
         }
         SortBy::Date => {
-            entries.sort_by(|a, b| a.modified.cmp(&b.modified));
+            entries.sort_by_key(|a| a.modified);
         }
     }
 

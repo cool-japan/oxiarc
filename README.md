@@ -82,7 +82,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-archive` | 10 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, etc.) + async ZIP | ~9,800 | 140 |
 | `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream, GIF LZW codec | ~1,100 | 59 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output | ~2,000 | - |
-| **Total** | **Pure Rust archive/compression library** | **~39,417** | **799** |
+| **Total** | **Pure Rust archive/compression library** | **~40,406** | **799** |
 
 ## Installation
 
@@ -105,12 +105,12 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.2.3"  # For archive format support
-oxiarc-deflate = "0.2.3"  # For DEFLATE compression
-oxiarc-lzma = "0.2.3"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.2.3"    # For Bzip2 compression
-oxiarc-lz4 = "0.2.3"      # For LZ4 compression
-oxiarc-zstd = "0.2.3"     # For Zstandard compression
+oxiarc-archive = "0.2.4"  # For archive format support
+oxiarc-deflate = "0.2.4"  # For DEFLATE compression
+oxiarc-lzma = "0.2.4"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.2.4"    # For Bzip2 compression
+oxiarc-lz4 = "0.2.4"      # For LZ4 compression
+oxiarc-zstd = "0.2.4"     # For Zstandard compression
 ```
 
 ## Quick Start

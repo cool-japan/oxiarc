@@ -1,11 +1,11 @@
 # oxiarc-core
 
-[![Version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/cool-japan/oxiarc)
+[![Version](https://img.shields.io/badge/version-0.2.4-blue)](https://github.com/cool-japan/oxiarc)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Core primitives and traits for the OxiArc archive library.
 
-**Version 0.2.3** (2026-03-11) — 95 tests passing.
+**Version 0.2.4** (2026-03-11) — 95 tests passing.
 
 ## Overview
 
@@ -169,14 +169,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.2.3"
+oxiarc-core = "0.2.4"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.2.3", features = ["async-io", "simd"] }
+oxiarc-core = { version = "0.2.4", features = ["async-io", "simd"] }
 ```
 
 ## API Summary

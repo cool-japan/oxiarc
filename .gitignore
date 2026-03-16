@@ -24,3 +24,6 @@ Thumbs.db
 
 # Debug
 *.pdb
+
+# Rustc ICE dumps
+rustc-ice-*.txt

@@ -5,6 +5,23 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-03-16
+
+### Changed
+- Updated dependencies: `clap` 4.5→4.6, `clap_complete` 4.5→4.6
+- Clippy fixes: collapsible match guards, `sort_by` → `sort_by_key`, removed redundant `.max(0)`
+
+### Quality
+- Zero clippy warnings (strict mode with `-D warnings`)
+- Zero rustdoc warnings (strict mode with all lint checks)
+- 100% test pass rate (799 tests)
+- All policies compliant (no unwrap in production code, pure Rust, latest crates, workspace)
+
+### Crates in This Release
+All crates published at version 0.2.4:
+- oxiarc-core, oxiarc-deflate, oxiarc-lzhuf, oxiarc-lzw, oxiarc-lzma
+- oxiarc-bzip2, oxiarc-lz4, oxiarc-zstd, oxiarc-archive, oxiarc-cli
+
 ## [0.2.3] - 2026-03-11
 
 ### Added

@@ -587,7 +587,7 @@ impl Deflater {
                 break;
             }
         }
-        hclen.max(0)
+        hclen
     }
 
     /// Build canonical Huffman codes from lengths.

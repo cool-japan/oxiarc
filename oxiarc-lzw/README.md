@@ -5,7 +5,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-lzw.svg)](https://crates.io/crates/oxiarc-lzw)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.3 (2026-03-11) | Tests: 59 passing**
+**Version: 0.2.4 (2026-03-11) | Tests: 59 passing**
 
 ## Overview
 
@@ -34,7 +34,7 @@ let decompressed = decode(&compressed, &config)?;
 assert_eq!(decompressed, original);
 ```
 
-## GIF LZW Codec (New in 0.2.3)
+## GIF LZW Codec (New in 0.2.4)
 
 The `gif_lzw` module implements the GIF-specific variant of LZW as described in the GIF spec §22:
 - LSB-first (Least Significant Bit) bit ordering
@@ -52,7 +52,7 @@ let decompressed = gif_decompress(&compressed, 8)?;
 assert_eq!(decompressed.as_slice(), data.as_slice());
 ```
 
-## LSB Bitstream (New in 0.2.3)
+## LSB Bitstream (New in 0.2.4)
 
 The `bitstream_lsb` module provides low-level LSB-first bit packing used internally by `gif_lzw`:
 
@@ -144,7 +144,7 @@ LZW builds a dictionary dynamically:
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.2.3"
+oxiarc-lzw = "0.2.4"
 ```
 
 ## Use Cases

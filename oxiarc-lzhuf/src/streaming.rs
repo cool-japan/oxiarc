@@ -1464,10 +1464,8 @@ mod tests {
 
             match status {
                 DecompressStatus::Done => break,
-                DecompressStatus::NeedsInput => {
-                    if input_pos >= data.len() {
-                        break;
-                    }
+                DecompressStatus::NeedsInput if input_pos >= data.len() => {
+                    break;
                 }
                 DecompressStatus::NeedsOutput => {
                     // Continue with more output space

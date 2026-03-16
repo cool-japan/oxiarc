@@ -317,11 +317,8 @@ impl Entry {
                 std::path::Component::ParentDir => {
                     return Err(OxiArcError::path_traversal(&self.name));
                 }
-                std::path::Component::Normal(s) => {
-                    // Check for null bytes
-                    if s.to_string_lossy().contains('\0') {
-                        return Err(OxiArcError::path_traversal(&self.name));
-                    }
+                std::path::Component::Normal(s) if s.to_string_lossy().contains('\0') => {
+                    return Err(OxiArcError::path_traversal(&self.name));
                 }
                 _ => {}
             }
