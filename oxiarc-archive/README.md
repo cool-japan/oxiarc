@@ -5,7 +5,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-archive.svg)](https://crates.io/crates/oxiarc-archive)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.4 (2026-03-11) | Tests: 140 passing**
+**Version: 0.2.5 (2026-03-18) | Tests: 165 passing**
 
 ## Overview
 
@@ -15,8 +15,10 @@ This crate handles the container/wrapper aspects of archive formats:
 - File extraction
 - Format auto-detection
 - Async ZIP entry reading (new in 0.2.4, via `async-io` feature)
+- Brotli compression support (via `oxiarc-brotli`)
+- Snappy compression support (via `oxiarc-snappy`)
 
-The actual compression/decompression is delegated to codec crates (`oxiarc-deflate`, `oxiarc-lzhuf`, `oxiarc-lzma`).
+The actual compression/decompression is delegated to codec crates (`oxiarc-deflate`, `oxiarc-lzhuf`, `oxiarc-lzma`, `oxiarc-brotli`, `oxiarc-snappy`).
 
 ## Supported Formats
 
@@ -26,6 +28,8 @@ The actual compression/decompression is delegated to codec crates (`oxiarc-defla
 | GZIP | .gz | Yes | No | RFC 1952 |
 | TAR | .tar | Yes | No | UStar format |
 | LZH | .lzh, .lha | Yes | No | Level 0/1/2 headers |
+| Brotli | .br | Yes | No | RFC 7932, via `oxiarc-brotli` |
+| Snappy | .sz | Yes | No | Block and framed formats, via `oxiarc-snappy` |
 
 ## Quick Start
 
@@ -84,7 +88,7 @@ Supported async compression methods: `Stored`, `Deflate`.
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.2.4"
+oxiarc-archive = "0.2.5"
 
 # With memory-mapped I/O
 oxiarc-archive = { version = "0.2.4", features = ["mmap"] }

@@ -141,6 +141,23 @@ pub fn sort_entries(entries: &mut [Entry], sort_by: SortBy, reverse: bool) {
         SortBy::Date => {
             entries.sort_by_key(|a| a.modified);
         }
+        SortBy::Ratio => {
+            entries.sort_by(|a, b| {
+                let ratio_a = if a.size > 0 {
+                    a.compressed_size as f64 / a.size as f64
+                } else {
+                    0.0
+                };
+                let ratio_b = if b.size > 0 {
+                    b.compressed_size as f64 / b.size as f64
+                } else {
+                    0.0
+                };
+                ratio_a
+                    .partial_cmp(&ratio_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
     }
 
     if reverse {

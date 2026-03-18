@@ -2,15 +2,15 @@
 
 ## Completed Features
 
-### Format Detection (207 lines)
+### Format Detection (~300 lines)
 - [x] `ArchiveFormat` enum
-- [x] Magic byte detection for ZIP, GZIP, 7z, XZ, BZip2, Zstd, LZH, TAR
+- [x] Magic byte detection for ZIP, GZIP, 7z, XZ, BZip2, Zstd, LZH, TAR, LZ4, CAB, Brotli, Snappy
 - [x] `detect()` function from reader
 - [x] `from_magic()` for direct byte analysis
 - [x] Extension and MIME type mappings
 - [x] Archive vs. compression-only classification
 
-### ZIP (296 lines)
+### ZIP (~3,000 lines)
 - [x] Local file header parsing
 - [x] Central directory parsing
 - [x] End of central directory
@@ -19,8 +19,18 @@
 - [x] File extraction with Stored method
 - [x] CRC-32 verification
 - [x] UTF-8 filename support (flag bit 11)
+- [x] Local file header writing
+- [x] Central directory writing
+- [x] End of central directory writing
+- [x] DEFLATE compression
+- [x] CRC-32 computation during write
+- [x] Zip64 for large files
+- [x] Zip64 read support (>4GB files)
+- [x] Data descriptor support
+- [x] Archive comments
+- [x] Async ZIP I/O support
 
-### GZIP (223 lines)
+### GZIP (~800 lines)
 - [x] Header parsing (RFC 1952)
 - [x] Magic byte validation (0x1F 0x8B)
 - [x] Compression method check (CM=8 = DEFLATE)
@@ -32,8 +42,11 @@
   - [x] FCOMMENT (comment)
 - [x] `GzipReader` with decompression
 - [x] Trailer parsing (CRC-32 + ISIZE)
+- [x] Header writing
+- [x] DEFLATE compression (write)
+- [x] Trailer writing
 
-### TAR (224 lines)
+### TAR (~1,500 lines)
 - [x] UStar header parsing
 - [x] 512-byte block structure
 - [x] Header fields: name, mode, uid, gid, size, mtime, chksum, typeflag, linkname
@@ -41,8 +54,12 @@
 - [x] Prefix field for long names
 - [x] `TarReader` with entry enumeration
 - [x] File type detection (regular, directory, symlink, etc.)
+- [x] File extraction
+- [x] PAX extended headers
+- [x] GNU long names
+- [x] Archive creation
 
-### LZH (338 lines)
+### LZH (~1,000 lines)
 - [x] Level 0 header parsing
 - [x] Level 1 header parsing
 - [x] Level 2 header parsing
@@ -55,94 +72,111 @@
 - [x] CRC-16 verification
 - [x] `LzhReader` with entry enumeration
 - [x] Path sanitization
+- [x] File extraction with all methods
+- [x] Archive creation
+
+### XZ (~600 lines)
+- [x] XZ (.xz) read support
+- [x] Stream header/footer parsing
+- [x] Block and index handling
+- [x] LZMA2 decompression
+- [x] Extraction support
+
+### 7-Zip (~500 lines)
+- [x] 7-Zip (.7z) read support
+- [x] Signature header parsing
+- [x] Entry enumeration
+- [x] Extraction support
+
+### CAB (~400 lines)
+- [x] CAB (.cab) read support
+- [x] Cabinet header parsing
+- [x] Folder/file enumeration
+- [x] Extraction support
+
+### LZ4 / Zstd / Bzip2 Archive (~500 lines)
+- [x] LZ4 frame read/write support
+- [x] Zstd frame read/write support
+- [x] Bzip2 stream read/write support
+
+### Brotli / Snappy Archive (NEW in v0.2.5)
+- [x] BrotliReader for decompression (.br/.brotli)
+- [x] BrotliWriter for compression (.br/.brotli)
+- [x] SnappyReader for decompression (.sz/.snappy)
+- [x] SnappyWriter for compression (.sz/.snappy)
+- [x] Format detection for Brotli and Snappy
 
 ## Future Enhancements
 
-### ZIP Write Support
-- [ ] Local file header writing
-- [ ] Central directory writing
-- [ ] End of central directory
-- [ ] DEFLATE compression
-- [ ] CRC-32 computation during write
-- [ ] Zip64 for large files
-
 ### ZIP Improvements
-- [ ] Zip64 read support (>4GB files)
-- [ ] Data descriptor support
 - [ ] ZIP encryption (traditional)
 - [ ] ZIP encryption (AES)
 - [ ] Split/multi-part archives
-- [ ] Archive comments
-
-### GZIP Write Support
-- [ ] Header writing
-- [ ] DEFLATE compression
-- [ ] Trailer writing
 
 ### TAR Improvements
-- [ ] File extraction
-- [ ] PAX extended headers
-- [ ] GNU long names
 - [ ] Sparse files
-- [ ] Archive creation
 
 ### LZH Improvements
 - [ ] Level 3 headers
-- [ ] File extraction with all methods
-- [ ] Archive creation
 - [ ] More extension headers
 
 ### New Formats
-- [ ] 7-Zip (.7z) read support
-- [ ] XZ (.xz) read support
 - [ ] RAR read support (licensing?)
-- [ ] CAB (.cab) read support
 - [ ] ISO 9660 read support
 
 ### General
 - [ ] Streaming extraction (without buffering entire file)
-- [ ] Async I/O support
+- [ ] Async I/O for more formats (currently ZIP only)
 - [ ] Progress callbacks
 - [ ] Memory-mapped files
 - [ ] Archive repair/recovery
 
 ## Test Coverage
 
-- detect: 7 tests
-- zip: 8 tests
-- gzip: 4 tests
-- tar: 3 tests
-- lzh: 3 tests
-- Total: 25 tests
+- detect: ~15 tests
+- zip: ~40 tests (including Zip64, data descriptors, async)
+- gzip: ~15 tests
+- tar: ~20 tests (PAX, GNU long names)
+- lzh: ~10 tests
+- xz: ~10 tests
+- 7z: ~5 tests
+- cab: ~5 tests
+- lz4/zstd/bzip2 archive: ~15 tests
+- integration: ~5 tests
+- Total: ~172 tests
 
 ## Code Statistics
 
-| File | Lines |
-|------|-------|
-| lzh/mod.rs | 338 |
-| zip/header.rs | 280 |
-| tar/mod.rs | 224 |
-| gzip/header.rs | 207 |
-| detect.rs | 207 |
-| lib.rs | 45 |
-| zip/mod.rs | 16 |
-| gzip/mod.rs | 16 |
-| **Total** | **~1,333** |
+| Module | Lines |
+|--------|-------|
+| zip/ | ~3,000 (header, reader, writer, types, async_zip) |
+| tar/ | ~1,500 |
+| lzh/ | ~1,000 |
+| gzip/ | ~800 |
+| xz/ | ~600 |
+| sevenz/ | ~500 |
+| cab/ | ~400 |
+| detect.rs | ~300 |
+| lz4/zstd/bzip2 | ~500 |
+| lib.rs | ~200 |
+| **Total** | **~7,897** |
 
 ## Format Support Matrix
 
-| Feature | ZIP | GZIP | TAR | LZH |
-|---------|-----|------|-----|-----|
-| Read headers | Yes | Yes | Yes | Yes |
-| List entries | Yes | N/A | Yes | Yes |
-| Extract files | Yes | Yes | No | No |
-| Create archive | No | No | No | No |
-| Multi-file | Yes | No | Yes | Yes |
+| Feature | ZIP | GZIP | TAR | LZH | XZ | 7z | CAB | LZ4 | Zstd | Bzip2 | Brotli | Snappy |
+|---------|-----|------|-----|-----|----|----|-----|-----|------|-------|--------|--------|
+| Read | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| List entries | Yes | N/A | Yes | Yes | N/A | Yes | Yes | N/A | N/A | N/A | N/A | N/A |
+| Extract | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Create | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes |
+| Async | Yes | No | No | No | No | No | No | No | No | No | No | No |
 
 ## Known Limitations
 
-1. No write support for any format yet
-2. TAR extraction not implemented
-3. LZH extraction needs per-method codec integration
-4. No support for encrypted archives
-5. No Zip64 large file support
+1. No support for encrypted ZIP archives (traditional or AES)
+2. No split/multi-part ZIP archive support
+3. TAR sparse files not supported
+4. LZH level 3 headers not supported
+5. No RAR format support
+6. 7z and CAB are read-only (no create/write)
+7. Async I/O only available for ZIP format

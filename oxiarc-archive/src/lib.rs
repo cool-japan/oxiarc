@@ -37,6 +37,7 @@
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod brotli;
 pub mod bzip2;
 pub mod cab;
 pub mod detect;
@@ -44,6 +45,7 @@ pub mod gzip;
 pub mod lz4;
 pub mod lzh;
 pub mod sevenz;
+pub mod snappy;
 pub mod tar;
 pub mod xz;
 pub mod zip;
@@ -53,6 +55,7 @@ pub mod zstd;
 pub mod async_zip;
 
 // Re-exports
+pub use brotli::{BrotliReader, BrotliWriter};
 pub use bzip2::{Bzip2Reader, Bzip2Writer};
 pub use cab::CabReader;
 pub use detect::ArchiveFormat;
@@ -60,6 +63,7 @@ pub use gzip::{GzipHeader, GzipReader};
 pub use lz4::{Lz4Reader, Lz4Writer};
 pub use lzh::{LzhCompressionLevel, LzhHeader, LzhReader, LzhWriter};
 pub use sevenz::{SevenZEntry, SevenZReader};
+pub use snappy::{SnappyReader, SnappyWriter};
 pub use tar::{TarHeader, TarReader, TarWriter};
 pub use xz::{XzReader, XzWriter};
 pub use zip::{LocalFileHeader, ZipCompressionLevel, ZipReader, ZipWriter};

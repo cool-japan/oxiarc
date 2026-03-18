@@ -22,14 +22,46 @@ const HASH_SIZE: usize = 1 << 14; // 16K entries
 
 /// Compress data using LZ4 block format.
 pub fn compress_block(input: &[u8]) -> Result<Vec<u8>> {
+    compress_block_with_accel(input, 1)
+}
+
+/// Compress data using LZ4 block format with an acceleration parameter.
+///
+/// `acceleration` controls how aggressively the compressor skips positions
+/// after a hash miss. A value of 1 is the default (no extra skipping). Higher
+/// values make compression faster at the cost of a worse compression ratio.
+/// Values less than 1 are clamped to 1.
+///
+/// This mirrors the `LZ4_compress_fast` acceleration parameter from the C
+/// reference implementation.
+pub fn compress_block_with_accel(input: &[u8], acceleration: i32) -> Result<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
+    let accel = acceleration.max(1) as usize;
     let mut output = Vec::with_capacity(input.len());
     let mut encoder = BlockEncoder::new(input);
-    encoder.encode(&mut output)?;
+    encoder.encode_with_accel(&mut output, accel)?;
     Ok(output)
+}
+
+/// Compress data using LZ4-HC (High Compression) block format.
+///
+/// `compression_level` ranges from 1 to 12. Higher values produce better
+/// compression ratios but take longer. Values outside the valid range are
+/// clamped to the nearest bound (1 or 12).
+///
+/// The output is a standard LZ4 block that can be decompressed with
+/// [`decompress_block`].
+pub fn compress_block_hc(input: &[u8], compression_level: i32) -> Result<Vec<u8>> {
+    let clamped = compression_level.clamp(1, 12) as u8;
+    // HcLevel::new will always succeed for 1..=12
+    let level = match crate::hc::HcLevel::new(clamped) {
+        Some(l) => l,
+        None => crate::hc::HcLevel::DEFAULT,
+    };
+    crate::hc::compress_hc_level(input, level)
 }
 
 /// Decompress LZ4 block data.
@@ -73,8 +105,13 @@ impl<'a> BlockEncoder<'a> {
         }
     }
 
-    /// Encode the input data.
-    fn encode(&mut self, output: &mut Vec<u8>) -> Result<()> {
+    /// Encode the input data with the given acceleration factor.
+    ///
+    /// `accel` controls the step size after a hash miss. The position
+    /// advances by `1 + (misses >> accel_shift)` where `accel_shift` is
+    /// derived from `accel`. This matches the spirit of the C reference
+    /// `LZ4_compress_fast` implementation.
+    fn encode_with_accel(&mut self, output: &mut Vec<u8>, accel: usize) -> Result<()> {
         let input = self.input;
         let len = input.len();
 
@@ -84,9 +121,25 @@ impl<'a> BlockEncoder<'a> {
             return Ok(());
         }
 
+        // The skip-acceleration logic: after each consecutive miss we
+        // increase the step. `accel` scales how quickly the step grows.
+        // accel = 1 → standard behaviour (step grows slowly)
+        // accel > 1 → step grows faster → fewer probes → faster, worse ratio
+        let accel_shift = match accel {
+            0..=1 => 6, // default: step grows by 1 every 64 misses
+            2 => 5,     // every 32
+            3..=4 => 4, // every 16
+            5..=8 => 3, // every 8
+            9..=16 => 2,
+            17..=64 => 1,
+            _ => 0, // extreme: step = 1 + misses (very fast, poor ratio)
+        };
+
         let mut pos = 0;
         let mut anchor = 0; // Start of current literal run
         let end = len.saturating_sub(5); // Leave room for last literals
+
+        let mut misses: usize = 0;
 
         while pos < end {
             let cur_u32 = Self::read_u32(input, pos);
@@ -102,7 +155,6 @@ impl<'a> BlockEncoder<'a> {
                 // Found a match!
                 let offset = pos - match_pos;
 
-                // Extend match backwards (optional, skip for simplicity)
                 // Extend match forwards
                 let mut match_len = MIN_MATCH;
                 while pos + match_len < len
@@ -117,8 +169,12 @@ impl<'a> BlockEncoder<'a> {
 
                 pos += match_len;
                 anchor = pos;
+                misses = 0;
             } else {
-                pos += 1;
+                // Miss — advance by acceleration-scaled step
+                let step = 1 + (misses >> accel_shift);
+                misses += 1;
+                pos += step;
             }
         }
 
@@ -380,6 +436,134 @@ mod tests {
         let data = b"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
         let compressed = compress_block(data).unwrap();
         let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_roundtrip_with_accel_default() {
+        let data = b"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
+        let compressed = compress_block_with_accel(data, 1).expect("accel=1 failed");
+        let decompressed = decompress_block(&compressed, data.len()).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_roundtrip_with_accel_high() {
+        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
+        let compressed = compress_block_with_accel(&data, 10).expect("accel=10 failed");
+        let decompressed = decompress_block(&compressed, data.len()).expect("decompress failed");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_accel_higher_means_faster_larger() {
+        // Higher acceleration should produce larger (or equal) output
+        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(200);
+        let c1 = compress_block_with_accel(&data, 1).expect("accel=1");
+        let c10 = compress_block_with_accel(&data, 10).expect("accel=10");
+        let c100 = compress_block_with_accel(&data, 100).expect("accel=100");
+
+        // All must roundtrip
+        assert_eq!(decompress_block(&c1, data.len()).expect("d1"), data);
+        assert_eq!(decompress_block(&c10, data.len()).expect("d10"), data);
+        assert_eq!(decompress_block(&c100, data.len()).expect("d100"), data);
+
+        // Higher accel => larger (or equal) compressed output
+        assert!(
+            c10.len() >= c1.len(),
+            "accel10={} should be >= accel1={}",
+            c10.len(),
+            c1.len()
+        );
+        assert!(
+            c100.len() >= c1.len(),
+            "accel100={} should be >= accel1={}",
+            c100.len(),
+            c1.len()
+        );
+    }
+
+    #[test]
+    fn test_accel_clamp_negative() {
+        // Negative acceleration should be clamped to 1 (default behaviour)
+        let data = b"Hello world Hello world Hello world";
+        let c_neg = compress_block_with_accel(data, -5).expect("accel=-5");
+        let c_def = compress_block(data).expect("default");
+        assert_eq!(c_neg, c_def);
+    }
+
+    #[test]
+    fn test_accel_zero_treated_as_default() {
+        let data = b"ABCABCABCABCABCABCABCABCABCABC";
+        let c0 = compress_block_with_accel(data, 0).expect("accel=0");
+        let c1 = compress_block_with_accel(data, 1).expect("accel=1");
+        assert_eq!(c0, c1);
+    }
+
+    #[test]
+    fn test_compress_block_hc_roundtrip() {
+        let data = b"The quick brown fox jumps over the lazy dog. ".repeat(50);
+        for level in [1, 3, 6, 9, 12] {
+            let compressed =
+                compress_block_hc(&data, level).unwrap_or_else(|_| panic!("hc level={}", level));
+            let decompressed = decompress_block(&compressed, data.len())
+                .unwrap_or_else(|_| panic!("decompress hc level={}", level));
+            assert_eq!(
+                decompressed, data,
+                "roundtrip failed for hc level={}",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_block_hc_clamp() {
+        // Out-of-range levels should be clamped, not error
+        let data = b"some data to compress with clamped levels here!";
+        let c_low = compress_block_hc(data, -10).expect("hc level=-10 (clamped to 1)");
+        let c_high = compress_block_hc(data, 999).expect("hc level=999 (clamped to 12)");
+        assert_eq!(decompress_block(&c_low, data.len()).expect("d"), data);
+        assert_eq!(decompress_block(&c_high, data.len()).expect("d"), data);
+    }
+
+    #[test]
+    fn test_hc_vs_fast_compression_ratio() {
+        let data = b"The quick brown fox jumps over the lazy dog repeatedly. ".repeat(100);
+        let fast = compress_block(&data).expect("fast");
+        let hc = compress_block_hc(&data, 9).expect("hc9");
+
+        // Both roundtrip correctly
+        assert_eq!(decompress_block(&fast, data.len()).expect("d"), data);
+        assert_eq!(decompress_block(&hc, data.len()).expect("d"), data);
+
+        // HC should achieve at least as good (usually better) ratio
+        assert!(
+            hc.len() <= fast.len(),
+            "HC={} should be <= Fast={}",
+            hc.len(),
+            fast.len()
+        );
+    }
+
+    #[test]
+    fn test_compress_block_hc_empty() {
+        let data: &[u8] = b"";
+        let compressed = compress_block_hc(data, 9).expect("hc empty");
+        assert!(compressed.is_empty());
+    }
+
+    #[test]
+    fn test_compress_block_with_accel_empty() {
+        let data: &[u8] = b"";
+        let compressed = compress_block_with_accel(data, 5).expect("accel empty");
+        assert!(compressed.is_empty());
+    }
+
+    #[test]
+    fn test_compress_block_with_accel_small() {
+        let data = b"ab";
+        let compressed = compress_block_with_accel(data, 1).expect("accel small");
+        let decompressed = decompress_block(&compressed, data.len()).expect("d");
         assert_eq!(decompressed, data);
     }
 

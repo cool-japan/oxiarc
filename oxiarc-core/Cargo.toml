@@ -18,14 +18,18 @@ async-io = ["dep:tokio"]
 simd = []
 # Memory-mapped file support for efficient large file access
 mmap = ["dep:memmap2"]
+# Serde serialization/deserialization support for entry types
+serde = ["dep:serde"]
 
 [dependencies]
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "crc_bench"

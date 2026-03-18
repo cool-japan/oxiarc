@@ -2,6 +2,7 @@
 
 ## Version History
 
+- **v0.2.5** (2026-03-18): New codecs: Brotli (RFC 7932) with quality levels 0-11, static dictionary, streaming; Snappy with block and framed formats, CRC32C. DEFLATE streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder) with flush modes (sync_flush, full_flush, partial_flush). LZ4 acceleration parameter for compress_block_with_accel(). LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder, TIFF and GIF modes). Brotli/Snappy archive integration (BrotliReader/BrotliWriter, SnappyReader/SnappyWriter with format detection). EntryBuilder pattern with fluent API. Serde serialization for Entry types (optional feature). CLI: dry-run mode (--dry-run/-n), sort by ratio, Brotli/Snappy format support. Total: 1038 tests, ~47,241 lines, 150 files.
 - **v0.2.4** (2026-03-16): Dependency updates (clap 4.5→4.6, clap_complete 4.5→4.6), clippy fixes (collapsible match guards, sort_by→sort_by_key, redundant .max(0)). Total: 799 tests, ~40,406 lines, 127 files.
 - **v0.2.3** (2026-03-11): Async ZIP (async_zip), async deflate (async_deflate), GZip module, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb). Total: 799 tests, ~39,417 lines, 127 files.
 - **v0.2.2**: Previous release
@@ -143,6 +144,8 @@
 - [x] Zstandard (FSE + Huffman + XXHash64, full encoder with bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict modules)
 - [x] GIF LZW codec (gif_lzw module in oxiarc-lzw, LSB bitstream)
 - [x] LSB bitstream (bitstream_lsb module in oxiarc-lzw)
+- [x] Brotli (RFC 7932 with LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API)
+- [x] Snappy (block format + framed format with CRC32C checksums, streaming Write/Read API)
 
 ### Additional Formats
 - [x] 7z archive format (read support with LZMA/LZMA2 decompression)
@@ -166,6 +169,8 @@
   - [x] LZMA benchmarks (lzma_bench)
   - [x] Zstandard benchmarks (zstd_bench, parallel_bench)
   - [x] LZW benchmarks (lzw_bench)
+  - [x] Brotli benchmarks (brotli_bench)
+  - [x] Snappy benchmarks (snappy_bench)
   - Performance numbers:
     - LZ77: 48-400 MB/s (level 1), 13-275 MB/s (level 5), 0.3-253 MB/s (level 9)
     - BWT Forward: 2-11 MB/s, Inverse: 60-320 MB/s
@@ -173,11 +178,17 @@
   - [x] LZ4 parallel frame compression (rayon-based block-level parallelism)
   - [x] Zstandard parallel compression (rayon-based block-level parallelism)
   - [x] Bzip2 parallel compression (rayon-based block-level parallelism)
+- [x] DEFLATE streaming compression/decompression (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder with configurable block sizes)
+- [x] LZ4 acceleration parameter (compress_block_with_accel, adaptive skip scaling)
 - [ ] Memory-mapped file support
 - [x] Async deflate (async_deflate module in oxiarc-deflate, async-io feature)
 - [x] GZip module (gzip module in oxiarc-deflate)
 - [x] Async ZIP support (async_zip module in oxiarc-archive, async-io feature)
-- [ ] Streaming with async I/O (full streaming pipeline)
+- [x] DEFLATE flush modes (sync_flush, full_flush, partial_flush for GzipStreamEncoder/ZlibStreamEncoder)
+- [x] LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder with TIFF and GIF modes)
+- [x] EntryBuilder pattern with fluent API (oxiarc-core)
+- [x] Serde serialization for Entry types (optional serde feature in oxiarc-core)
+- [~] Streaming with async I/O (partial: DEFLATE streaming GzipStream/ZlibStream; full streaming pipeline pending)
 
 ### Platform
 - [ ] WASM bindings
@@ -187,7 +198,7 @@
 
 - [x] List command
   - [x] JSON output support (--json flag with pretty-printing)
-- [x] Extract command (ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2)
+- [x] Extract command (ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy)
   - [x] Timestamp preservation (--preserve-timestamps, -t)
   - [x] Permission preservation (--preserve-permissions)
   - [x] All metadata preservation (-p for timestamps + permissions)
@@ -196,9 +207,11 @@
 - [x] Info command
 - [x] Detect command
 - [x] Test command (archive integrity)
-- [x] Create command (ZIP, TAR, GZIP, LZH, XZ, LZ4, Zstd, Bzip2)
+- [x] Create command (ZIP, TAR, GZIP, LZH, XZ, LZ4, Zstd, Bzip2, Brotli, Snappy)
   - [x] Stdin/stdout support for single-file formats
-- [x] Convert command (format conversion including 7z and CAB input)
+- [x] Convert command (format conversion including 7z, CAB, Brotli, Snappy input)
+- [x] Dry-run mode (--dry-run, -n for create and extract commands)
+- [x] Sort by ratio (Ratio variant added to SortBy enum)
 - [x] Progress bars and verbose output (extract command with -v/--verbose and -P/--progress)
 - [x] Recursive directory handling
 - [x] Filter patterns (include/exclude)
@@ -219,39 +232,45 @@
 
 ## Test Coverage
 
-- oxiarc-core: 95 tests
-  - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer
-- oxiarc-deflate: 79 tests
-  - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module
-- oxiarc-lzhuf: 54 tests
+- oxiarc-core: 111 tests
+  - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer, EntryBuilder, Serde serialization
+- oxiarc-deflate: 120 tests
+  - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module, streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder, flush modes)
+- oxiarc-lzhuf: 54 tests (34 lib + 20 streaming_integration)
   - LH5 roundtrip encoding/decoding, LZSS, Huffman trees
 - oxiarc-bzip2: 37 tests (2 skipped)
   - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
-- oxiarc-lz4: 99 tests
-  - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression
+- oxiarc-lz4: 110 tests
+  - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression, acceleration parameter tests
 - oxiarc-zstd: 170 tests
   - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression
-- oxiarc-archive: 140 tests
-  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP
+- oxiarc-archive: 165 tests
+  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP, Brotli/Snappy integration
 - oxiarc-lzma: 66 tests
   - LZMA/LZMA2, optimal parsing, range coder, price calculation
-- oxiarc-lzw: 59 tests
-  - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests
+- oxiarc-lzw: 76 tests
+  - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests, streaming encoder/decoder tests
+- oxiarc-brotli: 75 tests
+  - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API
+- oxiarc-snappy: 54 tests
+  - Snappy block format, framed format with CRC32C checksums, streaming Write/Read API
 - oxiarc-cli: 0 tests
-- Total: 799 tests (799 passed, 2 skipped, zero warnings)
+- Total: 1038 tests (1038 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.2.4, 2026-03-16)
+## Code Statistics (v0.2.5, 2026-03-18)
 
 | Crate | Lines of Code |
 |-------|---------------|
-| oxiarc-core | ~2,800 (CRC-32/64 slicing-by-8, optimized DualCrc) |
-| oxiarc-deflate | ~3,000 (Zlib wrapper, Adler-32, async_deflate module, gzip module) |
-| oxiarc-lzhuf | ~1,000 |
-| oxiarc-bzip2 | ~1,600 |
-| oxiarc-lz4 | ~1,600 (official frame, XXHash32, LZ4-HC; refactored frame/ module) |
-| oxiarc-zstd | ~5,500 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
-| oxiarc-archive | ~9,800 (ZIP header refactored into header/mod.rs, reader.rs, types.rs, writer.rs; async_zip module) |
-| oxiarc-cli | ~2,020 |
-| oxiarc-lzma | ~2,900 |
-| oxiarc-lzw | ~1,100 (gif_lzw module, bitstream_lsb module) |
-| **Total** | **~40,406** (127 files) |
+| oxiarc-core | ~3,565 (CRC-32/64 slicing-by-8, optimized DualCrc, EntryBuilder, Serde) |
+| oxiarc-deflate | ~3,479 (Zlib wrapper, Adler-32, async_deflate, gzip, streaming modules) |
+| oxiarc-lzhuf | ~2,746 |
+| oxiarc-bzip2 | ~1,548 |
+| oxiarc-lz4 | ~3,656 (official frame, XXHash32, LZ4-HC, acceleration; refactored frame/ module) |
+| oxiarc-zstd | ~5,741 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
+| oxiarc-brotli | ~3,460 (LZ77, context Huffman, static dictionary, streaming) |
+| oxiarc-snappy | ~1,428 (block format, framed format, CRC32C) |
+| oxiarc-archive | ~7,897 (ZIP header refactored; async_zip module; Brotli/Snappy integration) |
+| oxiarc-cli | ~2,443 |
+| oxiarc-lzma | ~3,868 |
+| oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
+| **Total** | **~47,241** (150 files) |

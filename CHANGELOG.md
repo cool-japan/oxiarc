@@ -5,6 +5,37 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-03-18
+
+### Added
+- **oxiarc-brotli**: New crate — Brotli compression (RFC 7932)
+  - Quality levels 0-11 with static dictionary support
+  - LZ77 and context-dependent Huffman coding
+  - Streaming compression/decompression API
+- **oxiarc-snappy**: New crate — Snappy compression
+  - Block format and framed format with CRC32C checksums
+  - Streaming Write/Read API
+- **oxiarc-deflate**: Streaming compression/decompression
+  - `GzipStreamEncoder`/`GzipStreamDecoder` with flush modes (sync_flush, full_flush, partial_flush)
+  - `ZlibStreamEncoder`/`ZlibStreamDecoder` with configurable block sizes
+- **oxiarc-lz4**: Acceleration parameter (`compress_block_with_accel`) with adaptive skip scaling
+- **oxiarc-lzw**: Streaming encoder/decoder (`LzwStreamEncoder`/`LzwStreamDecoder`, TIFF and GIF modes)
+- **oxiarc-core**: `EntryBuilder` pattern with fluent API; Serde serialization for Entry types (optional `serde` feature)
+- **oxiarc-archive**: Brotli/Snappy archive integration (`BrotliReader`/`BrotliWriter`, `SnappyReader`/`SnappyWriter` with format detection)
+- **oxiarc-cli**: Dry-run mode (`--dry-run`/`-n`), sort by ratio, Brotli/Snappy format support
+
+### Quality
+- Zero clippy warnings (strict mode with `-D warnings`)
+- Zero rustdoc warnings (strict mode with all lint checks)
+- 100% test pass rate (1038 tests)
+- All policies compliant (no unwrap in production code, pure Rust, latest crates, workspace)
+
+### Crates in This Release
+All crates published at version 0.2.5:
+- oxiarc-core, oxiarc-deflate, oxiarc-lzhuf, oxiarc-lzw, oxiarc-lzma
+- oxiarc-bzip2, oxiarc-lz4, oxiarc-zstd, oxiarc-brotli, oxiarc-snappy
+- oxiarc-archive, oxiarc-cli
+
 ## [0.2.4] - 2026-03-16
 
 ### Changed
@@ -312,6 +343,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.2.5]: https://github.com/cool-japan/oxiarc/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/cool-japan/oxiarc/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/cool-japan/oxiarc/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/cool-japan/oxiarc/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxiarc/compare/v0.2.0...v0.2.1

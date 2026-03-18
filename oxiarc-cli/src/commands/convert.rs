@@ -3,9 +3,9 @@
 use crate::commands::create::{CompressionLevel, OutputFormat};
 use crate::utils::ExtractedEntry;
 use oxiarc_archive::{
-    ArchiveFormat, Bzip2Reader, Bzip2Writer, CabReader, Lz4Reader, Lz4Writer, LzhCompressionLevel,
-    LzhWriter, SevenZReader, TarWriter, XzWriter, ZipCompressionLevel, ZipReader, ZipWriter,
-    ZstdReader, ZstdWriter,
+    ArchiveFormat, BrotliReader, BrotliWriter, Bzip2Reader, Bzip2Writer, CabReader, Lz4Reader,
+    Lz4Writer, LzhCompressionLevel, LzhWriter, SevenZReader, SnappyReader, SnappyWriter, TarWriter,
+    XzWriter, ZipCompressionLevel, ZipReader, ZipWriter, ZstdReader, ZstdWriter,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
@@ -40,6 +40,8 @@ pub fn cmd_convert(
             "lz4" => OutputFormat::Lz4,
             "bz2" | "bzip2" => OutputFormat::Bz2,
             "zst" | "zstd" => OutputFormat::Zst,
+            "br" | "brotli" => OutputFormat::Br,
+            "sz" | "snappy" => OutputFormat::Snappy,
             _ => OutputFormat::Zip,
         }
     });
@@ -266,6 +268,57 @@ pub fn cmd_convert(
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
+        OutputFormat::Br => {
+            // Brotli can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Brotli can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let quality = match compression {
+                CompressionLevel::Store => 0,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 11,
+            };
+
+            let brotli_writer = BrotliWriter::with_quality(quality);
+            let compressed = brotli_writer.compress(data)?;
+            std::fs::write(output, compressed)?;
+
+            if verbose {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
+        OutputFormat::Snappy => {
+            // Snappy can only compress a single file
+            let non_dir_entries: Vec<_> = entries.iter().filter(|(_, is_dir, _)| !is_dir).collect();
+
+            if non_dir_entries.len() != 1 {
+                return Err(format!(
+                    "Snappy can only compress a single file, but archive contains {} files",
+                    non_dir_entries.len()
+                )
+                .into());
+            }
+
+            let (name, _, data) = &non_dir_entries[0];
+
+            let snappy_writer = SnappyWriter::new();
+            let compressed = snappy_writer.compress(data)?;
+            std::fs::write(output, compressed)?;
+
+            if verbose {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
+        }
     }
 
     println!("Conversion complete");
@@ -378,6 +431,32 @@ fn extract_all_entries<R: std::io::Read + std::io::Seek>(
             let data = bzip2.decompress()?;
 
             // Use input filename without .bz2 extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Brotli => {
+            let mut brotli = BrotliReader::new(reader)?;
+            let data = brotli.decompress()?;
+
+            // Use input filename without .br extension
+            let name = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            entries.push((name, false, data));
+        }
+        ArchiveFormat::Snappy => {
+            let mut snappy = SnappyReader::new(reader)?;
+            let data = snappy.decompress()?;
+
+            // Use input filename without .sz extension
             let name = input_path
                 .file_stem()
                 .unwrap_or_default()

@@ -5,11 +5,11 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-cli.svg)](https://crates.io/crates/oxiarc-cli)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.4 (2026-03-11)**
+**Version: 0.2.5 (2026-03-18)**
 
 ## Overview
 
-A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, and LZH archives.
+A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, LZH, Brotli, and Snappy archives. Includes dry-run mode for previewing operations without writing files.
 
 ## Installation
 
@@ -118,6 +118,9 @@ oxiarc extract archive.zip
 # Extract to specific directory
 oxiarc extract archive.zip -o output_dir/
 
+# Dry-run mode (preview without writing)
+oxiarc extract archive.zip --dry-run
+
 # Extract specific files (future)
 oxiarc extract archive.zip file1.txt file2.txt
 ```
@@ -173,6 +176,8 @@ Type: Compression (single file)
 | GZIP | Yes | Yes | No |
 | TAR | Yes | No | No |
 | LZH | Yes | No | No |
+| Brotli | Yes | Yes | No |
+| Snappy | Yes | Yes | No |
 
 ## Examples
 

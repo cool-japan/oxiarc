@@ -8,13 +8,15 @@ members = [
     "oxiarc-bzip2",
     "oxiarc-lz4",
     "oxiarc-zstd",
+    "oxiarc-brotli",
     "oxiarc-archive",
     "oxiarc-cli",
     "oxiarc-lzma",
+    "oxiarc-snappy",
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -34,6 +36,8 @@ oxiarc-lzma = { version = "0.2", path ="oxiarc-lzma" }
 oxiarc-bzip2 = { version = "0.2", path ="oxiarc-bzip2" }
 oxiarc-lz4 = { version = "0.2", path ="oxiarc-lz4" }
 oxiarc-zstd = { version = "0.2", path ="oxiarc-zstd" }
+oxiarc-snappy = { version = "0.2", path ="oxiarc-snappy" }
+oxiarc-brotli = { version = "0.2", path ="oxiarc-brotli" }
 oxiarc-archive = { version = "0.2", path ="oxiarc-archive" }
 
 # External dependencies

@@ -2,7 +2,7 @@
 
 ## Completed Features
 
-### BitStream (557 lines)
+### BitStream (601 lines)
 - [x] LSB-first bit packing (standard for DEFLATE/LZH)
 - [x] u64 internal buffer for efficient reads/writes
 - [x] Generic over `Read`/`Write` traits
@@ -22,10 +22,12 @@
 - [x] Efficient bulk copy operations
 - [x] `get(offset)` with negative indexing
 
-### CRC (304 lines)
+### CRC (940 lines)
 - [x] CRC-32 (ZIP/GZIP): polynomial 0xEDB88320 (reflected)
 - [x] CRC-16/ARC (LZH): polynomial 0xA001 (reflected)
 - [x] Pre-computed lookup tables (256 entries)
+- [x] Slicing-by-8 tables and optimizations
+- [x] DualCrc optimization
 - [x] Incremental computation
 - [x] One-shot `compute()` convenience method
 
@@ -75,27 +77,23 @@
 
 ### API
 - [ ] `no_std` support (optional)
-- [ ] Serde serialization for Entry
-- [ ] Builder pattern for Entry
+- [x] Serde serialization for Entry (optional `serde` feature, v0.2.5)
+- [x] Builder pattern for Entry (EntryBuilder with fluent API, v0.2.5)
 
 ## Test Coverage
 
-- bitstream: 10 tests
-- ringbuffer: 5 tests
-- crc: 4 tests
-- traits: 2 tests
-- entry: 2 tests
-- Total: 23 tests
+- Total: 66 tests (CRC-32/64 slicing-by-8, DualCrc optimization, size boundary, bitstream, ringbuffer, entry, traits)
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| bitstream.rs | 557 |
+| crc.rs | 940 |
+| bitstream.rs | 601 |
 | entry.rs | 463 |
 | ringbuffer.rs | 417 |
-| crc.rs | 304 |
 | traits.rs | 283 |
 | error.rs | 228 |
 | lib.rs | 83 |
-| **Total** | **~2,335** |
+| (other) | ~550 |
+| **Total** | **~3,565** |

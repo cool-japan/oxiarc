@@ -45,6 +45,7 @@ pub mod gzip;
 pub mod huffman;
 pub mod inflate;
 pub mod lz77;
+pub mod streaming;
 pub mod tables;
 pub mod zlib;
 
@@ -57,6 +58,7 @@ pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, inflate};
 pub use lz77::{Lz77Encoder, Lz77Token};
+pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
 pub use zlib::{
     Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
     zlib_decompress, zlib_decompress_with_dict, zlib_requires_dictionary,

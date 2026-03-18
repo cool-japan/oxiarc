@@ -28,4 +28,6 @@ pub enum SortBy {
     Size,
     /// Sort by modification date
     Date,
+    /// Sort by compression ratio (compressed_size / original_size)
+    Ratio,
 }

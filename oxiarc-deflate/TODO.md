@@ -71,6 +71,17 @@
   - Level 9: 0.3-253 MB/s
   - Up to 246x compression ratio on highly compressible data
 
+## Completed Features (Phase 3)
+
+### Streaming Compression/Decompression (NEW in 0.2.5)
+- [x] GzipStreamEncoder (Write trait, buffered streaming compression)
+- [x] GzipStreamDecoder (Read trait, eager-read streaming decompression)
+- [x] ZlibStreamEncoder (Write trait, Zlib streaming compression)
+- [x] ZlibStreamDecoder (Read trait, Zlib streaming decompression)
+- [x] Configurable block size (default 128 KiB, via with_block_size())
+- [x] Produces concatenated GZIP/Zlib members
+- [x] Zero-copy streaming pipeline design
+
 ## Future Enhancements
 
 ### Advanced LZ77
@@ -91,14 +102,14 @@
   - [x] Zlib header (CMF/FLG bytes)
   - [x] Compression level indicator
   - [x] Streaming ZlibCompressor/ZlibDecompressor
-- [ ] Gzip wrapper integration
+- [x] Gzip wrapper integration
 - [x] Custom dictionary support
   - [x] Deflater.with_dictionary() and set_dictionary()
   - [x] Inflater.with_dictionary() and set_dictionary()
   - [x] zlib_compress_with_dict() and zlib_decompress_with_dict()
   - [x] FDICT flag support in zlib header
   - [x] Dictionary checksum verification (Adler-32)
-- [ ] Flush modes (sync, full, partial)
+- [x] Flush modes (sync_flush, full_flush, partial_flush for GzipStreamEncoder/ZlibStreamEncoder, v0.2.5)
 
 ### Compliance
 - [ ] Round-trip testing with zlib
@@ -108,25 +119,32 @@
 ## Test Coverage
 
 - inflate: 8 tests
-- deflate: 7 tests (added dynamic Huffman and level comparison tests)
+- deflate: 7 tests
 - huffman: 4 tests
 - lz77: 7 tests
 - tables: 7 tests
-- zlib: 27 tests (Adler-32, roundtrip, levels, streaming, dictionary support)
-- edge_cases: 11 tests
-- Total: 65 tests
+- zlib: 27 tests
+- streaming: ~15 tests (gzip stream, zlib stream)
+- async_deflate: ~12 tests
+- gzip: ~7 tests
+- edge_cases: 14 tests (integration test)
+- Total: 126 tests
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
+| streaming.rs | 1,047 (NEW) |
+| zlib.rs | 931 |
 | huffman.rs | 438 |
 | lz77.rs | 371 |
 | inflate.rs | 349 |
 | deflate.rs | 347 |
 | tables.rs | 311 |
-| lib.rs | 53 |
-| **Total** | **~1,869** |
+| async_deflate.rs | ~300 |
+| gzip.rs | ~250 |
+| lib.rs | ~135 |
+| **Total** | **~3,479** |
 
 ## Known Limitations
 

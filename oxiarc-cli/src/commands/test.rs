@@ -1,7 +1,8 @@
 //! Test command implementation.
 
 use oxiarc_archive::{
-    ArchiveFormat, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, ZipReader, ZstdReader,
+    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, SnappyReader,
+    ZipReader, ZstdReader,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -212,6 +213,56 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
 
             let mut bzip2 = Bzip2Reader::new(reader)?;
             match bzip2.decompress() {
+                Ok(_) => {
+                    ok_count = 1;
+                    if verbose {
+                        println!("  OK: {}", name);
+                    }
+                }
+                Err(e) => {
+                    error_count = 1;
+                    errors.push((name.clone(), e.to_string()));
+                    if verbose {
+                        println!("  FAILED: {} - {}", name, e);
+                    }
+                }
+            }
+        }
+        ArchiveFormat::Brotli => {
+            total_files = 1;
+            let name = archive
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            let mut brotli = BrotliReader::new(reader)?;
+            match brotli.decompress() {
+                Ok(_) => {
+                    ok_count = 1;
+                    if verbose {
+                        println!("  OK: {}", name);
+                    }
+                }
+                Err(e) => {
+                    error_count = 1;
+                    errors.push((name.clone(), e.to_string()));
+                    if verbose {
+                        println!("  FAILED: {} - {}", name, e);
+                    }
+                }
+            }
+        }
+        ArchiveFormat::Snappy => {
+            total_files = 1;
+            let name = archive
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            let mut snappy = SnappyReader::new(reader)?;
+            match snappy.decompress() {
                 Ok(_) => {
                     ok_count = 1;
                     if verbose {

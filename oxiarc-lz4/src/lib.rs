@@ -28,7 +28,7 @@ mod frame;
 pub mod hc;
 pub mod xxhash;
 
-pub use block::{compress_block, decompress_block};
+pub use block::{compress_block, compress_block_hc, compress_block_with_accel, decompress_block};
 pub use frame::{
     BlockMaxSize, FrameDescriptor, LZ4_FRAME_MAGIC, Lz4Compressor, Lz4Decompressor,
     Lz4DictCompressor, Lz4DictDecompressor, Lz4DictFrameDecoder, Lz4DictFrameEncoder, compress,

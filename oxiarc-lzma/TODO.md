@@ -65,10 +65,10 @@
 ## Future Enhancements
 
 ### LZMA2 Support
-- [ ] LZMA2 stream format (chunked)
-- [ ] Uncompressed chunks
-- [ ] Property changes mid-stream
-- [ ] Reset codes
+- [x] LZMA2 stream format (chunked)
+- [x] Uncompressed chunks
+- [x] Property changes mid-stream
+- [x] Reset codes
 
 ### Compression Improvements
 - [x] Better match finding (hash chain optimization)
@@ -111,20 +111,13 @@
 - [ ] Async I/O
 
 ### Integration
-- [ ] 7z container support (via oxiarc-archive)
-- [ ] XZ container support
+- [x] 7z container support (via oxiarc-archive)
+- [x] XZ container support
 - [ ] ZIP method 14 support
 
 ## Test Coverage
 
-- range_coder: 3 tests
-- model: 4 tests
-- encoder: 7 tests (includes hash chain tests)
-- decoder: 2 tests
-- lzma2: 5 tests
-- optimal: 7 tests (price calculation and optimal parser)
-- lib: 13 tests (includes optimal vs greedy comparison)
-- Total: 41 tests
+- Total: 66 tests (range_coder 3, model 4, encoder 7, decoder 2, lzma2 5, optimal 7, lib 13, plus more)
 
 ## Code Statistics
 
@@ -137,7 +130,8 @@
 | model.rs | 390 |
 | range_coder.rs | 361 |
 | lib.rs | 280 |
-| **Total** | **3,565** |
+| (other) | ~303 |
+| **Total** | **~3,868** |
 
 ## Technical Notes
 
@@ -175,8 +169,7 @@ Slot 14+: Distance = ((2 | (slot & 1)) << num_bits) + direct_bits + align_bits
 
 ## Known Limitations
 
-1. LZMA2 format partially implemented (no chunking, property changes)
-2. Optimal parsing uses simplified heuristics (not full DP)
+1. Optimal parsing uses simplified heuristics (not full DP)
 3. Single-threaded only
 4. High memory usage for large dictionaries
 

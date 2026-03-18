@@ -5,7 +5,8 @@ use crate::utils::{create_progress_bar, matches_filters};
 use dialoguer::Confirm;
 use filetime::{FileTime, set_file_mtime};
 use oxiarc_archive::{
-    ArchiveFormat, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, ZipReader, ZstdReader,
+    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, SnappyReader,
+    ZipReader, ZstdReader,
 };
 use oxiarc_core::Entry;
 use std::fs::{self, File};
@@ -117,6 +118,7 @@ pub fn cmd_extract(
     preserve_timestamps: bool,
     preserve_permissions: bool,
     preserve: bool,
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Determine overwrite mode from flags
     let overwrite_mode = if prompt {
@@ -143,6 +145,36 @@ pub fn cmd_extract(
         return Err("--format is required when reading from stdin".into());
     }
 
+    // Dry run for stdin single-file formats: just detect and report
+    if dry_run && from_stdin {
+        let fmt = format_hint.ok_or("--format is required when reading from stdin")?;
+        println!(
+            "[DRY RUN] Would extract from stdin (format: {:?}) to {}",
+            fmt, output
+        );
+        println!("[DRY RUN] No files were extracted.");
+        return Ok(());
+    }
+
+    // Dry run for file-based archives: detect format, list entries, but skip writes
+    if dry_run && !from_stdin {
+        let archive_path = Path::new(archive);
+        let file = File::open(archive_path)?;
+        let mut reader = BufReader::new(file);
+        let (format, _) = ArchiveFormat::detect(&mut reader)?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        return extract_dry_run(
+            reader,
+            format,
+            archive_path,
+            output,
+            files,
+            include,
+            exclude,
+        );
+    }
+
     // For stdin, we need to read all data into memory first
     let (format, data): (ArchiveFormat, Vec<u8>) = if from_stdin {
         let format =
@@ -152,8 +184,10 @@ pub fn cmd_extract(
                 OutputFormat::Bz2 => ArchiveFormat::Bzip2,
                 OutputFormat::Lz4 => ArchiveFormat::Lz4,
                 OutputFormat::Zst => ArchiveFormat::Zstd,
+                OutputFormat::Br => ArchiveFormat::Brotli,
+                OutputFormat::Snappy => ArchiveFormat::Snappy,
                 _ => return Err(
-                    "Only single-file formats (gzip, xz, bz2, lz4, zst) are supported for stdin"
+                    "Only single-file formats (gzip, xz, bz2, lz4, zst, br, snappy) are supported for stdin"
                         .into(),
                 ),
             };
@@ -256,6 +290,14 @@ fn decompress_single_file(
         ArchiveFormat::Bzip2 => {
             let mut bzip2 = Bzip2Reader::new(reader)?;
             Ok(bzip2.decompress()?)
+        }
+        ArchiveFormat::Brotli => {
+            let mut brotli = BrotliReader::new(reader)?;
+            Ok(brotli.decompress()?)
+        }
+        ArchiveFormat::Snappy => {
+            let mut snappy = SnappyReader::new(reader)?;
+            Ok(snappy.decompress()?)
         }
         _ => Err("Unsupported format for stdin/stdout".into()),
     }
@@ -590,6 +632,62 @@ fn extract_archive_format<R: Read + Seek>(
             pb.inc(1);
             pb.finish_with_message("Done");
         }
+        ArchiveFormat::Brotli => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut brotli = BrotliReader::new(reader)?;
+            let data = brotli.decompress()?;
+
+            // Use input filename without .br extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
+        ArchiveFormat::Snappy => {
+            let pb = create_progress_bar(1, progress);
+            pb.set_message("Decompressing");
+
+            let mut snappy = SnappyReader::new(reader)?;
+            let data = snappy.decompress()?;
+
+            // Use input filename without .sz extension
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            if should_extract(&out_name) {
+                let out_path = output.join(&out_name);
+                if should_write_file(&out_path, overwrite_mode, verbose)? {
+                    std::fs::write(&out_path, &data)?;
+                    if verbose {
+                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                    }
+                }
+            } else if verbose {
+                pb.println(format!("  Skipped: {} (filtered)", out_name));
+            }
+            pb.inc(1);
+            pb.finish_with_message("Done");
+        }
         ArchiveFormat::SevenZip => {
             let mut sevenz = SevenZReader::new(reader)?;
             let entries: Vec<_> = sevenz.sevenz_entries().to_vec();
@@ -683,5 +781,167 @@ fn extract_archive_format<R: Read + Seek>(
         }
     }
 
+    Ok(())
+}
+
+/// Dry run mode for extract: show what would be extracted without writing files.
+#[allow(clippy::too_many_arguments)]
+fn extract_dry_run<R: Read + Seek>(
+    reader: R,
+    format: ArchiveFormat,
+    archive_path: &Path,
+    output: &str,
+    files: &[String],
+    include: &[String],
+    exclude: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "[DRY RUN] Would extract {} to {}",
+        archive_path.display(),
+        output
+    );
+
+    let should_extract = |name: &str| -> bool {
+        if !files.is_empty()
+            && !files
+                .iter()
+                .any(|f| name == f || name.starts_with(&format!("{}/", f)))
+        {
+            return false;
+        }
+        matches_filters(name, include, exclude)
+    };
+
+    match format {
+        ArchiveFormat::Zip => {
+            let zip = ZipReader::new(reader)?;
+            let entries: Vec<_> = zip.entries().to_vec();
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                let kind = if entry.is_dir() { "dir " } else { "file" };
+                println!("[DRY RUN]   {} {} ({} bytes)", kind, entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
+        ArchiveFormat::Tar => {
+            let tar = oxiarc_archive::TarReader::new(reader)?;
+            let entries: Vec<_> = tar.entries().to_vec();
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                let kind = if entry.is_dir() { "dir " } else { "file" };
+                println!("[DRY RUN]   {} {} ({} bytes)", kind, entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
+        ArchiveFormat::Lzh => {
+            let lzh = oxiarc_archive::LzhReader::new(reader)?;
+            let entries: Vec<_> = lzh.entries().to_vec();
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                let kind = if entry.is_dir() { "dir " } else { "file" };
+                println!("[DRY RUN]   {} {} ({} bytes)", kind, entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
+        ArchiveFormat::SevenZip => {
+            let sevenz = SevenZReader::new(reader)?;
+            let entries: Vec<_> = sevenz.sevenz_entries().to_vec();
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                let kind = if entry.is_dir { "dir " } else { "file" };
+                println!("[DRY RUN]   {} {} ({} bytes)", kind, entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
+        ArchiveFormat::Cab => {
+            let cab = CabReader::new(reader)?;
+            let entries: Vec<_> = cab.entries().to_vec();
+            let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                let kind = if entry.is_dir() { "dir " } else { "file" };
+                println!("[DRY RUN]   {} {} ({} bytes)", kind, entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
+        ArchiveFormat::Gzip => {
+            let gzip = oxiarc_archive::GzipReader::new(reader)?;
+            let out_name = gzip.header().filename.clone().unwrap_or_else(|| {
+                archive_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Xz => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Lz4 => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Zstd => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Bzip2 => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Brotli => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        ArchiveFormat::Snappy => {
+            let out_name = archive_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            println!("[DRY RUN] Would decompress to: {}", out_name);
+        }
+        _ => {
+            println!("[DRY RUN] Format detection: {}", format);
+        }
+    }
+
+    println!("[DRY RUN] No files were extracted.");
     Ok(())
 }

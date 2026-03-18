@@ -1,0 +1,25 @@
+[package]
+name = "oxiarc-snappy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust Snappy compression implementation with block and framed format support"
+readme = "README.md"
+keywords = ["snappy", "compression", "decompression", "framing", "crc32c"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "snappy_bench"
+harness = false
+
+[lints]
+workspace = true

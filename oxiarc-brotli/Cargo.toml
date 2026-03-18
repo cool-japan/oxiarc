@@ -1,0 +1,28 @@
+[package]
+name = "oxiarc-brotli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust Brotli compression/decompression implementation (RFC 7932) for OxiArc"
+readme = "README.md"
+keywords = ["compression", "brotli", "decompression", "rfc7932", "lz77"]
+categories = ["compression", "encoding"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "brotli_bench"
+harness = false
+
+[features]
+default = []
+
+[lints]
+workspace = true

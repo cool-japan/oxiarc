@@ -5,7 +5,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-lzw.svg)](https://crates.io/crates/oxiarc-lzw)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.4 (2026-03-11) | Tests: 59 passing**
+**Version: 0.2.5 (2026-03-18) | Tests: 76 passing**
 
 ## Overview
 
@@ -120,6 +120,25 @@ let mut decoder = Decoder::new(Config::tiff());
 decoder.decode_bytes(&compressed, &mut output)?;
 ```
 
+### Streaming Encoder/Decoder (New in 0.2.5)
+
+Streaming interfaces for processing data incrementally without buffering entire inputs:
+
+```rust
+use oxiarc_lzw::{StreamingEncoder, StreamingDecoder, Config};
+
+// Streaming encoder - feed data in chunks
+let mut encoder = StreamingEncoder::new(Config::tiff());
+encoder.write_chunk(chunk1, &mut output)?;
+encoder.write_chunk(chunk2, &mut output)?;
+encoder.finish(&mut output)?;
+
+// Streaming decoder - decode data in chunks
+let mut decoder = StreamingDecoder::new(Config::tiff());
+decoder.decode_chunk(chunk1, &mut output)?;
+decoder.decode_chunk(chunk2, &mut output)?;
+```
+
 ## Algorithm
 
 LZW builds a dictionary dynamically:
@@ -144,7 +163,7 @@ LZW builds a dictionary dynamically:
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.2.4"
+oxiarc-lzw = "0.2.5"
 ```
 
 ## Use Cases

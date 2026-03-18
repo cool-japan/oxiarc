@@ -26,6 +26,8 @@ oxiarc-lzma.workspace = true
 oxiarc-lz4.workspace = true
 oxiarc-zstd.workspace = true
 oxiarc-bzip2.workspace = true
+oxiarc-brotli.workspace = true
+oxiarc-snappy.workspace = true
 encoding_rs.workspace = true
 tokio = { workspace = true, optional = true }
 

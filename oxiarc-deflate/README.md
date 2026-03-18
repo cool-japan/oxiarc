@@ -1,13 +1,13 @@
 # oxiarc-deflate
 
-[![Version](https://img.shields.io/badge/version-0.2.4-blue)](https://github.com/cool-japan/oxiarc)
+[![Version](https://img.shields.io/badge/version-0.2.5-blue)](https://github.com/cool-japan/oxiarc)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-**Version 0.2.4** (2026-03-11) — 79 tests passing.
+**Version 0.2.5** (2026-03-18) — 120 tests passing.
 
-**What's new in 0.2.4**: Added `async_deflate` module (async streaming compression/decompression via Tokio) and `gzip` module (GZIP format support wrapping DEFLATE with RFC 1952 headers/trailers).
+**What's new in 0.2.5**: Added streaming support with `GzipStreamEncoder`/`GzipStreamDecoder` and `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes for fine-grained control over compressed output.
 
 ## Overview
 
@@ -43,14 +43,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-deflate = "0.2.4"
+oxiarc-deflate = "0.2.5"
 ```
 
 With async I/O support:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.2.4", features = ["async-io"] }
+oxiarc-deflate = { version = "0.2.5", features = ["async-io"] }
 ```
 
 ## Quick Start

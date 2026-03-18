@@ -41,6 +41,8 @@ pub enum FlushMode {
     Sync,
     /// Full flush - emit and reset encoder state.
     Full,
+    /// Partial flush - emit compressed block without sync marker.
+    Partial,
     /// Finish - complete the stream.
     Finish,
 }

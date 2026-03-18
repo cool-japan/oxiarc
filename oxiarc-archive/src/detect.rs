@@ -29,6 +29,10 @@ pub enum ArchiveFormat {
     Lz4,
     /// Microsoft Cabinet (.cab).
     Cab,
+    /// Brotli compressed file (.br, .brotli).
+    Brotli,
+    /// Snappy compressed file (.sz, .snappy).
+    Snappy,
     /// Unknown format.
     Unknown,
 }
@@ -84,6 +88,13 @@ impl ArchiveFormat {
             return Self::Lz4;
         }
 
+        // Snappy framed: 0xFF 0x06 0x00 0x00 0x73 0x4E 0x61 0x50 0x70 0x59
+        if magic.len() >= 10
+            && magic.starts_with(&[0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59])
+        {
+            return Self::Snappy;
+        }
+
         // CAB: "MSCF" (0x4D 0x53 0x43 0x46)
         if magic.len() >= 4 && magic.starts_with(b"MSCF") {
             return Self::Cab;
@@ -131,6 +142,8 @@ impl ArchiveFormat {
             Self::Zstd => "zst",
             Self::Lz4 => "lz4",
             Self::Cab => "cab",
+            Self::Brotli => "br",
+            Self::Snappy => "sz",
             Self::Unknown => "",
         }
     }
@@ -148,6 +161,8 @@ impl ArchiveFormat {
             Self::Zstd => "application/zstd",
             Self::Lz4 => "application/x-lz4",
             Self::Cab => "application/vnd.ms-cab-compressed",
+            Self::Brotli => "application/x-brotli",
+            Self::Snappy => "application/x-snappy",
             Self::Unknown => "application/octet-stream",
         }
     }
@@ -156,7 +171,13 @@ impl ArchiveFormat {
     pub fn is_compression_only(&self) -> bool {
         matches!(
             self,
-            Self::Gzip | Self::Xz | Self::Bzip2 | Self::Zstd | Self::Lz4
+            Self::Gzip
+                | Self::Xz
+                | Self::Bzip2
+                | Self::Zstd
+                | Self::Lz4
+                | Self::Brotli
+                | Self::Snappy
         )
     }
 
@@ -182,6 +203,8 @@ impl std::fmt::Display for ArchiveFormat {
             Self::Zstd => write!(f, "Zstandard"),
             Self::Lz4 => write!(f, "LZ4"),
             Self::Cab => write!(f, "Cabinet"),
+            Self::Brotli => write!(f, "Brotli"),
+            Self::Snappy => write!(f, "Snappy"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -235,6 +258,28 @@ mod tests {
         // CAB magic: "MSCF"
         let magic = [0x4D, 0x53, 0x43, 0x46];
         assert_eq!(ArchiveFormat::from_magic(&magic), ArchiveFormat::Cab);
+    }
+
+    #[test]
+    fn test_detect_snappy() {
+        let magic = [0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
+        assert_eq!(ArchiveFormat::from_magic(&magic), ArchiveFormat::Snappy);
+    }
+
+    #[test]
+    fn test_brotli_properties() {
+        assert!(ArchiveFormat::Brotli.is_compression_only());
+        assert!(!ArchiveFormat::Brotli.is_archive());
+        assert_eq!(ArchiveFormat::Brotli.extension(), "br");
+        assert_eq!(ArchiveFormat::Brotli.mime_type(), "application/x-brotli");
+    }
+
+    #[test]
+    fn test_snappy_properties() {
+        assert!(ArchiveFormat::Snappy.is_compression_only());
+        assert!(!ArchiveFormat::Snappy.is_archive());
+        assert_eq!(ArchiveFormat::Snappy.extension(), "sz");
+        assert_eq!(ArchiveFormat::Snappy.mime_type(), "application/x-snappy");
     }
 
     #[test]

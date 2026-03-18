@@ -46,33 +46,41 @@
 - [x] Configurable match attempt limits
 - [x] Optimal parsing for level 12 (dynamic programming)
 
+### Acceleration Parameter (NEW in 0.2.5)
+- [x] compress_block_with_accel(input, acceleration) - controls hash miss skip scaling
+- [x] Acceleration values: 1 (default, no extra skipping) to higher values (faster, worse ratio)
+- [x] Adaptive step size: step = 1 + (misses >> accel_shift)
+- [x] accel_shift varies: 6→5→4→3→2→1→0 as acceleration increases
+- [x] Mirrors LZ4_compress_fast acceleration parameter behavior
+- [x] compress_block_hc() wrapper for HC compression levels 1-12
+
 ## Future Enhancements
 
 ### Performance
 - [ ] SIMD-accelerated matching
-- [ ] Parallel compression
+- [x] Parallel compression (rayon-based block-level parallelism)
 - [ ] Streaming with bounded memory
 - [ ] Dictionary support
 
 ## Test Coverage
 
-- block: 7 tests
-- frame: 15 tests (official format, checksums, options)
-- xxhash: 8 tests (one-shot, incremental, seeded)
-- hc: 9 tests (levels, compression ratios, optimal)
-- lib: 6 tests
-- Total: 44 tests
+- block: 12 tests (added acceleration tests)
+- frame: 30 tests (official format, checksums, options, parallel)
+- xxhash: 8 tests
+- hc: 9 tests
+- lib: 51 tests
+- Total: 114 tests
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| block.rs | ~402 |
-| frame.rs | ~786 |
-| xxhash.rs | ~230 |
+| frame/ (multiple files) | ~1,800 |
+| block.rs | ~500 |
 | hc.rs | ~450 |
-| lib.rs | ~103 |
-| **Total** | **~1,350** |
+| xxhash.rs | ~230 |
+| lib.rs | ~676 |
+| **Total** | **~3,656** |
 
 ## LZ4 Format Summary
 
@@ -99,5 +107,4 @@ MMMM: Match length - 4 (0-14, or 15 for extended)
 ## Known Limitations
 
 1. Single-threaded only
-2. No streaming API yet
-3. No dictionary support yet
+2. No dictionary support yet

@@ -75,24 +75,20 @@
 
 ## Test Coverage
 
-- methods: 3 tests
-- lzss: 5 tests
-- huffman: 3 tests
-- encode: 6 tests (including LH5 roundtrip)
-- decode: 2 tests
-- Total: 19 tests
+- Total: 57 tests (34 lib + 20 streaming_integration + 3 doctests)
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| lzss.rs | 302 |
-| huffman.rs | 268 |
-| encode.rs | 239 |
-| decode.rs | 201 |
-| methods.rs | 155 |
-| lib.rs | 42 |
-| **Total** | **~1,207** |
+| lzss.rs | ~500 |
+| huffman.rs | ~500 |
+| encode.rs | ~400 |
+| decode.rs | ~400 |
+| streaming.rs | ~600 |
+| methods.rs | ~200 |
+| lib.rs | ~146 |
+| **Total** | **~2,746** |
 
 ## Method Comparison
 

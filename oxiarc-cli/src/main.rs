@@ -1,6 +1,6 @@
 //! OxiArc CLI - The Oxidized Archiver
 //!
-//! A Pure Rust archive utility supporting ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, and Bzip2 formats.
+//! A Pure Rust archive utility supporting ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, and Snappy formats.
 
 mod commands;
 mod utils;
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 )]
 #[command(long_about = "
 OxiArc is a Pure Rust implementation of common archive formats.
-Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2
+Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2, Brotli, Snappy
 
 Examples:
   oxiarc list archive.zip
@@ -34,10 +34,14 @@ Examples:
   oxiarc extract data.lz4
   oxiarc extract data.zst
   oxiarc extract data.bz2
+  oxiarc extract data.br
+  oxiarc extract data.sz
   oxiarc create archive.zip file1.txt file2.txt
   oxiarc create data.xz file.txt
   oxiarc create data.lz4 file.txt
   oxiarc create data.bz2 file.txt
+  oxiarc create data.br file.txt
+  oxiarc create data.sz file.txt
   oxiarc convert archive.lzh output.zip
   oxiarc convert archive.7z output.zip
   oxiarc test archive.lzh
@@ -68,7 +72,7 @@ enum Commands {
         #[arg(short = 'T', long)]
         tree: bool,
 
-        /// Sort entries by: name, size, or date
+        /// Sort entries by: name, size, date, or ratio
         #[arg(short, long, value_enum, default_value = "name")]
         sort: SortBy,
 
@@ -115,7 +119,7 @@ enum Commands {
         #[arg(short = 'P', long, default_value = "true")]
         progress: bool,
 
-        /// Format hint for stdin (gzip, xz, bz2, lz4, zst)
+        /// Format hint for stdin (gzip, xz, bz2, lz4, zst, br, snappy)
         #[arg(short, long, value_enum)]
         format: Option<OutputFormatArg>,
 
@@ -142,6 +146,10 @@ enum Commands {
         /// Preserve all metadata (timestamps and permissions)
         #[arg(short = 'p', long)]
         preserve: bool,
+
+        /// Dry run: show what would be extracted without writing files
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
 
     /// Test archive integrity
@@ -164,7 +172,7 @@ enum Commands {
         /// Files to add to the archive
         files: Vec<PathBuf>,
 
-        /// Archive format (required for stdout: gzip, xz, bz2, lz4, zst)
+        /// Archive format (required for stdout: gzip, xz, bz2, lz4, zst, br, snappy)
         #[arg(short, long, value_enum)]
         format: Option<OutputFormatArg>,
 
@@ -175,6 +183,10 @@ enum Commands {
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
+
+        /// Dry run: show what would be done without creating the archive
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
 
     /// Show information about an archive
@@ -198,7 +210,7 @@ enum Commands {
         /// Output archive file
         output: PathBuf,
 
-        /// Output format (zip, tar, gzip, lzh, xz, lz4) - auto-detected from extension if not specified
+        /// Output format (zip, tar, gzip, lzh, xz, lz4, br, snappy) - auto-detected from extension if not specified
         #[arg(short, long, value_enum)]
         format: Option<OutputFormatArg>,
 
@@ -239,6 +251,10 @@ enum OutputFormatArg {
     Bz2,
     /// Zstandard compressed file
     Zst,
+    /// Brotli compressed file
+    Br,
+    /// Snappy compressed file
+    Snappy,
 }
 
 impl From<OutputFormatArg> for OutputFormat {
@@ -252,6 +268,8 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::Lz4 => OutputFormat::Lz4,
             OutputFormatArg::Bz2 => OutputFormat::Bz2,
             OutputFormatArg::Zst => OutputFormat::Zst,
+            OutputFormatArg::Br => OutputFormat::Br,
+            OutputFormatArg::Snappy => OutputFormat::Snappy,
         }
     }
 }
@@ -321,6 +339,7 @@ fn main() {
             preserve_timestamps,
             preserve_permissions,
             preserve,
+            dry_run,
         } => cmd_extract(
             &archive,
             &output,
@@ -336,6 +355,7 @@ fn main() {
             preserve_timestamps,
             preserve_permissions,
             preserve,
+            dry_run,
         ),
         Commands::Test { archive, verbose } => cmd_test(&archive, verbose),
         Commands::Create {
@@ -344,12 +364,14 @@ fn main() {
             format,
             compression,
             verbose,
+            dry_run,
         } => cmd_create(
             &archive,
             &files,
             format.map(Into::into),
             compression.into(),
             verbose,
+            dry_run,
         ),
         Commands::Info { archive } => cmd_info(&archive),
         Commands::Detect { file } => cmd_detect(&file),

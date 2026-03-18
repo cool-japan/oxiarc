@@ -1,13 +1,11 @@
 # oxiarc-bzip2
 
-[![Version](https://img.shields.io/badge/version-0.2.4-blue)](https://github.com/cool-japan/oxiarc)
+[![Version](https://img.shields.io/badge/version-0.2.5-blue)](https://github.com/cool-japan/oxiarc)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Pure Rust implementation of BZip2 compression/decompression algorithm.
 
-**Version 0.2.4** (2026-03-11) — 37 tests passing (2 skipped: heavy/long-running).
-
-**What's new in 0.2.4**: SA-IS correctness fix in the Burrows-Wheeler Transform implementation for improved BWT accuracy on pathological inputs.
+**Version 0.2.5** (2026-03-18) — 37 tests passing (2 skipped: heavy/long-running).
 
 ## Overview
 
@@ -75,14 +73,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-bzip2 = "0.2.4"
+oxiarc-bzip2 = "0.2.5"
 ```
 
 With parallel compression enabled:
 
 ```toml
 [dependencies]
-oxiarc-bzip2 = { version = "0.2.4", features = ["parallel"] }
+oxiarc-bzip2 = { version = "0.2.5", features = ["parallel"] }
 ```
 
 ## License

@@ -1,8 +1,8 @@
 //! Create command implementation.
 
 use oxiarc_archive::{
-    Bzip2Writer, Lz4Writer, LzhCompressionLevel, LzhWriter, TarWriter, XzWriter,
-    ZipCompressionLevel, ZipWriter, ZstdWriter,
+    BrotliWriter, Bzip2Writer, Lz4Writer, LzhCompressionLevel, LzhWriter, SnappyWriter, TarWriter,
+    XzWriter, ZipCompressionLevel, ZipWriter, ZstdWriter,
 };
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
@@ -40,6 +40,10 @@ pub enum OutputFormat {
     Bz2,
     /// Zstandard compressed file
     Zst,
+    /// Brotli compressed file
+    Br,
+    /// Snappy compressed file
+    Snappy,
 }
 
 pub fn cmd_create(
@@ -48,8 +52,14 @@ pub fn cmd_create(
     format: Option<OutputFormat>,
     compression: CompressionLevel,
     verbose: bool,
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let to_stdout = archive == "-";
+
+    // Dry run mode: show what would be done and exit
+    if dry_run {
+        return cmd_create_dry_run(archive, files, format, compression);
+    }
 
     // For stdout, format must be specified and only single-file formats are supported
     if to_stdout {
@@ -62,10 +72,12 @@ pub fn cmd_create(
             | OutputFormat::Xz
             | OutputFormat::Bz2
             | OutputFormat::Lz4
-            | OutputFormat::Zst => {}
+            | OutputFormat::Zst
+            | OutputFormat::Br
+            | OutputFormat::Snappy => {}
             _ => {
                 return Err(
-                    "Only single-file formats (gzip, xz, bz2, lz4, zst) are supported for stdout"
+                    "Only single-file formats (gzip, xz, bz2, lz4, zst, br, snappy) are supported for stdout"
                         .into(),
                 );
             }
@@ -80,6 +92,8 @@ pub fn cmd_create(
             | OutputFormat::Bz2
             | OutputFormat::Lz4
             | OutputFormat::Zst
+            | OutputFormat::Br
+            | OutputFormat::Snappy
     );
 
     // Read input data (either from stdin or from a single file for single-file formats)
@@ -132,6 +146,8 @@ pub fn cmd_create(
                 "lz4" => OutputFormat::Lz4,
                 "bz2" | "bzip2" => OutputFormat::Bz2,
                 "zst" | "zstd" => OutputFormat::Zst,
+                "br" | "brotli" => OutputFormat::Br,
+                "sz" | "snappy" => OutputFormat::Snappy,
                 _ => OutputFormat::Zip, // Default to ZIP
             }
         }
@@ -313,10 +329,130 @@ pub fn cmd_create(
                 eprintln!("  Added: {} ({} bytes)", input_name, input_data.len());
             }
         }
+        OutputFormat::Br => {
+            let quality = match compression {
+                CompressionLevel::Store => 0,
+                CompressionLevel::Fast => 1,
+                CompressionLevel::Normal => 6,
+                CompressionLevel::Best => 11,
+            };
+
+            let brotli_writer = BrotliWriter::with_quality(quality);
+            let compressed = brotli_writer.compress(&input_data)?;
+
+            if to_stdout {
+                let stdout = io::stdout();
+                let mut writer = BufWriter::new(stdout.lock());
+                writer.write_all(&compressed)?;
+                writer.flush()?;
+            } else {
+                std::fs::write(archive, &compressed)?;
+            }
+
+            if verbose {
+                eprintln!("  Added: {} ({} bytes)", input_name, input_data.len());
+            }
+        }
+        OutputFormat::Snappy => {
+            let snappy_writer = SnappyWriter::new();
+            let compressed = snappy_writer.compress(&input_data)?;
+
+            if to_stdout {
+                let stdout = io::stdout();
+                let mut writer = BufWriter::new(stdout.lock());
+                writer.write_all(&compressed)?;
+                writer.flush()?;
+            } else {
+                std::fs::write(archive, &compressed)?;
+            }
+
+            if verbose {
+                eprintln!("  Added: {} ({} bytes)", input_name, input_data.len());
+            }
+        }
     }
 
     if !to_stdout && verbose {
         eprintln!("Archive created successfully");
+    }
+    Ok(())
+}
+
+/// Dry run mode for create: show what would be archived without creating the file.
+fn cmd_create_dry_run(
+    archive: &str,
+    files: &[PathBuf],
+    format: Option<OutputFormat>,
+    compression: CompressionLevel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let to_stdout = archive == "-";
+
+    // Determine format
+    let format = format.unwrap_or_else(|| {
+        if to_stdout {
+            OutputFormat::Gzip
+        } else {
+            let ext = PathBuf::from(archive)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            match ext.as_str() {
+                "zip" => OutputFormat::Zip,
+                "tar" => OutputFormat::Tar,
+                "gz" | "gzip" => OutputFormat::Gzip,
+                "lzh" | "lha" => OutputFormat::Lzh,
+                "xz" => OutputFormat::Xz,
+                "lz4" => OutputFormat::Lz4,
+                "bz2" | "bzip2" => OutputFormat::Bz2,
+                "zst" | "zstd" => OutputFormat::Zst,
+                "br" | "brotli" => OutputFormat::Br,
+                "sz" | "snappy" => OutputFormat::Snappy,
+                _ => OutputFormat::Zip,
+            }
+        }
+    });
+
+    println!("[DRY RUN] Would create {:?} archive: {}", format, archive);
+    println!("[DRY RUN] Compression level: {:?}", compression);
+
+    let mut total_size: u64 = 0;
+    let mut file_count: u64 = 0;
+    let mut dir_count: u64 = 0;
+
+    for path in files {
+        collect_dry_run_stats(path, &mut total_size, &mut file_count, &mut dir_count)?;
+    }
+
+    println!(
+        "[DRY RUN] {} file(s), {} directory(ies)",
+        file_count, dir_count
+    );
+    println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+    println!("[DRY RUN] No archive was created.");
+    Ok(())
+}
+
+/// Recursively collect stats for dry run output.
+fn collect_dry_run_stats(
+    path: &PathBuf,
+    total_size: &mut u64,
+    file_count: &mut u64,
+    dir_count: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if path.is_dir() {
+        *dir_count += 1;
+        println!("[DRY RUN]   {}/", path.display());
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            collect_dry_run_stats(&entry.path(), total_size, file_count, dir_count)?;
+        }
+    } else {
+        let metadata = std::fs::metadata(path)?;
+        let size = metadata.len();
+        *total_size += size;
+        *file_count += 1;
+        println!("[DRY RUN]   {} ({} bytes)", path.display(), size);
     }
     Ok(())
 }

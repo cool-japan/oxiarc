@@ -5,11 +5,11 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-zstd.svg)](https://crates.io/crates/oxiarc-zstd)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.4 (2026-03-11) | Tests: 170 passing**
+**Version: 0.2.5 (2026-03-18) | Tests: 170 passing**
 
 ## Overview
 
-Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.2.4 includes improvements to the frame, streaming, and core library modules.
+Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.2.5 includes improvements to the frame, streaming, and core library modules.
 
 ## Features
 
@@ -92,10 +92,10 @@ let decompressed = decoder.decompress(&compressed)?;
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-zstd = "0.2.4"
+oxiarc-zstd = "0.2.5"
 
 # With parallel compression
-oxiarc-zstd = { version = "0.2.4", features = ["parallel"] }
+oxiarc-zstd = { version = "0.2.5", features = ["parallel"] }
 ```
 
 ## Algorithm

@@ -44,15 +44,18 @@
   - [x] LZ4 creation
   - [x] Zstandard creation
   - [x] Bzip2 creation
+  - [x] Brotli creation (.br/.brotli)
+  - [x] Snappy creation (.sz/.snappy)
   - [x] Compression level option
 
 - [x] `test` (alias: `t`) - Test archive integrity (COMPLETED)
   - [x] CRC verification
   - [x] Header validation
   - [x] Report corrupted entries
+  - [x] Brotli and Snappy format testing support
 
 - [x] `convert` - Convert between formats (COMPLETED)
-  - [x] ZIP/TAR/GZIP/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 interconversion
+  - [x] ZIP/TAR/GZIP/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2/Brotli/Snappy interconversion
 
 ### Extract Features
 - [x] TAR extraction
@@ -65,6 +68,8 @@
 - [x] LZ4 extraction
 - [x] Zstandard extraction
 - [x] Bzip2 extraction
+- [x] Brotli extraction (.br/.brotli)
+- [x] Snappy extraction (.sz/.snappy)
 - [x] File pattern filtering (include/exclude)
 - [x] Progress bars
 - [x] Preserve timestamps
@@ -73,28 +78,28 @@
 - [x] Skip existing files
 
 ### List Improvements
-- [ ] JSON output (`--json`)
-- [ ] Sorting options (name, size, date)
-- [ ] Filter by pattern
-- [ ] Show modification times
+- [x] JSON output (`--json`)
+- [x] Sorting options (name, size, date, ratio)
+- [x] Filter by pattern
+- [x] Show modification times
 - [ ] Tree view
 
 ### Create Command Options
-- [ ] Compression level (`-l 0-9`)
-- [ ] Recursive directory inclusion
-- [ ] Exclude patterns
+- [x] Compression level (`-l 0-9`)
+- [x] Recursive directory inclusion
+- [x] Exclude patterns
 - [ ] Store vs. compress threshold
 - [ ] Add files to existing archive
 
 ### User Experience
-- [ ] Progress bars (indicatif)
+- [x] Progress bars (indicatif)
 - [ ] Colored output (colored/termcolor)
 - [ ] Interactive mode
-- [ ] Verbose/quiet modes (`-v`, `-q`)
-- [ ] Dry-run mode (`--dry-run`)
+- [x] Verbose/quiet modes (`-v`, `-q`)
+- [x] Dry-run mode (`--dry-run`, `-n`) for create and extract commands
 
 ### I/O Options
-- [ ] Stdin/stdout support (`-`)
+- [x] Stdin/stdout support (`-`)
 - [ ] Password for encrypted archives
 - [ ] Multi-volume archives
 - [ ] Memory limit option
@@ -119,14 +124,17 @@
 
 | File | Lines |
 |------|-------|
-| main.rs | 1,886 (refactored from 2,004 to meet <2,000 lines policy) |
-| utils.rs | 129 |
-| **Total** | **~2,015** |
+| main.rs | ~1,886 |
+| utils.rs | ~129 |
+| create.rs | ~200 |
+| extract.rs | ~200 |
+| (other modules) | ~28 |
+| **Total** | **~2,443** |
 
 ## Command Reference
 
 ```
-oxiarc 0.1.0
+oxiarc 0.2.5
 The Oxidized Archiver - Pure Rust archive utility
 
 USAGE:
@@ -137,6 +145,9 @@ COMMANDS:
     extract  Extract files from an archive [aliases: x]
     info     Show information about an archive [aliases: i]
     detect   Detect archive format
+    test     Test archive integrity [aliases: t]
+    create   Create an archive [aliases: c]
+    convert  Convert between archive formats
     help     Print help information
 
 OPTIONS:
@@ -146,8 +157,5 @@ OPTIONS:
 
 ## Known Limitations
 
-1. No archive creation yet
-2. TAR/LZH extraction not implemented
-3. No progress indication for large files
-4. No streaming extraction
-5. No encrypted archive support
+1. No encrypted archive support
+2. No interactive mode

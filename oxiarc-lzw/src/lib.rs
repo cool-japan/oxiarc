@@ -69,12 +69,14 @@ mod dictionary;
 mod encoder;
 mod error;
 mod gif_lzw;
+pub mod streaming;
 
 pub use config::LzwConfig;
 pub use decoder::LzwDecoder;
 pub use encoder::LzwEncoder;
 pub use error::{LzwError, Result};
 pub use gif_lzw::{gif_compress, gif_decompress};
+pub use streaming::{LzwStreamDecoder, LzwStreamEncoder, LzwStreamMode};
 
 /// Decompress LZW-compressed data with the given configuration.
 ///

@@ -72,7 +72,7 @@ pub mod mmap;
 // Re-exports for convenience
 pub use bitstream::{BitReader, BitWriter};
 pub use crc::{Crc16, Crc32, Crc64};
-pub use entry::{CompressionMethod, Entry, EntryType, FileAttributes};
+pub use entry::{CompressionMethod, Entry, EntryBuilder, EntryType, FileAttributes};
 pub use error::{OxiArcError, Result};
 pub use ringbuffer::{OutputRingBuffer, RingBuffer};
 pub use traits::{
@@ -100,7 +100,7 @@ pub mod prelude {
     };
     pub use crate::bitstream::{BitReader, BitWriter};
     pub use crate::crc::{Crc16, Crc32};
-    pub use crate::entry::{CompressionMethod, Entry, EntryType};
+    pub use crate::entry::{CompressionMethod, Entry, EntryBuilder, EntryType};
     pub use crate::error::{OxiArcError, Result};
     #[cfg(feature = "mmap")]
     pub use crate::mmap::{MmapOptions, MmapReader};

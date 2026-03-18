@@ -33,6 +33,8 @@ pub struct Deflater {
     finished: bool,
     /// Dictionary Adler-32 checksum (if dictionary is set).
     dictionary_checksum: Option<u32>,
+    /// Pending bits from a partial flush (value, count).
+    pending_bits: (u8, u8),
 }
 
 impl Deflater {
@@ -43,6 +45,7 @@ impl Deflater {
             level: level.min(9),
             finished: false,
             dictionary_checksum: None,
+            pending_bits: (0, 0),
         }
     }
 
@@ -98,6 +101,12 @@ impl Deflater {
         self.lz77.reset();
         self.finished = false;
         self.dictionary_checksum = None;
+        self.pending_bits = (0, 0);
+    }
+
+    /// Reset only the LZ77 state (used by full flush).
+    pub fn reset_lz77(&mut self) {
+        self.lz77.reset();
     }
 
     /// Reset the compressor but keep the dictionary.
@@ -107,11 +116,15 @@ impl Deflater {
         self.lz77.reset();
         self.finished = false;
         self.dictionary_checksum = checksum;
+        self.pending_bits = (0, 0);
     }
 
     /// Compress data.
     pub fn deflate<W: Write>(&mut self, data: &[u8], writer: &mut W, finish: bool) -> Result<()> {
         let mut bit_writer = BitWriter::new(writer);
+
+        // Re-inject any pending bits from a previous partial flush.
+        self.prepend_pending(&mut bit_writer)?;
 
         if self.level == 0 {
             // Store only
@@ -646,6 +659,9 @@ impl Deflater {
     pub fn deflate_sync<W: Write>(&mut self, data: &[u8], writer: &mut W) -> Result<()> {
         let mut bit_writer = BitWriter::new(writer);
 
+        // Re-inject any pending bits from a previous partial flush.
+        self.prepend_pending(&mut bit_writer)?;
+
         // Write the compressed (non-final) block.
         self.write_compressed_block(data, &mut bit_writer, false)?;
 
@@ -657,6 +673,71 @@ impl Deflater {
         bit_writer.write_bits(0xFFFF_u32, 16)?; // NLEN=0xFFFF
         bit_writer.flush()?;
 
+        Ok(())
+    }
+
+    /// Compress data with a partial flush: write a non-final compressed block.
+    ///
+    /// Unlike sync flush, no empty stored block (0x00 0x00 0xFF 0xFF) marker
+    /// is appended. Instead, any pending partial-byte bits from the previous
+    /// partial flush are prepended, and any trailing partial bits are saved
+    /// for the next call.
+    pub fn deflate_partial<W: Write>(&mut self, data: &[u8], writer: &mut W) -> Result<()> {
+        // Write to an intermediate buffer so we can manage bit-level state.
+        let mut buf = Vec::new();
+        {
+            let mut bit_writer = BitWriter::new(&mut buf);
+
+            // Re-inject pending bits from a previous partial flush.
+            if self.pending_bits.1 > 0 {
+                bit_writer.write_bits(self.pending_bits.0 as u32, self.pending_bits.1)?;
+            }
+
+            // Write the compressed (non-final) block.
+            if self.level == 0 {
+                self.write_stored_blocks(data, &mut bit_writer, false)?;
+            } else {
+                self.write_compressed_block(data, &mut bit_writer, false)?;
+            }
+
+            // Determine how many bits are in the last partial byte.
+            let total_bits = bit_writer.bits_written();
+            let remainder = (total_bits % 8) as u8;
+
+            if remainder == 0 {
+                // Exactly byte-aligned; no pending bits.
+                bit_writer.flush()?;
+                self.pending_bits = (0, 0);
+            } else {
+                // Flush complete bytes only (align pads with zeros then flushes).
+                bit_writer.flush()?;
+                self.pending_bits = (0, 0); // reset first
+            }
+            // Drop bit_writer to release the mutable borrow on buf
+            drop(bit_writer);
+
+            // If there were remainder bits, save the partial byte and remove it.
+            if remainder != 0 {
+                if let Some(&last_byte) = buf.last() {
+                    // The valid bits are in the lower `remainder` bits.
+                    let mask = (1u8 << remainder).wrapping_sub(1);
+                    self.pending_bits = (last_byte & mask, remainder);
+                    buf.pop();
+                }
+            }
+        }
+
+        writer.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Re-inject any pending partial-byte bits into a fresh BitWriter,
+    /// used when a non-partial call follows a partial flush.
+    fn prepend_pending<W: Write>(&mut self, bit_writer: &mut BitWriter<W>) -> Result<()> {
+        if self.pending_bits.1 > 0 {
+            bit_writer.write_bits(self.pending_bits.0 as u32, self.pending_bits.1)?;
+            self.pending_bits = (0, 0);
+        }
         Ok(())
     }
 
@@ -708,6 +789,9 @@ impl Compressor for Deflater {
                     self.deflate_sync(input, &mut buffer)?;
                 }
                 self.lz77.reset();
+            }
+            FlushMode::Partial => {
+                self.deflate_partial(input, &mut buffer)?;
             }
             FlushMode::None => {
                 self.deflate(input, &mut buffer, false)?;
@@ -867,6 +951,22 @@ mod tests {
                 prev_size = compressed.len();
             }
         }
+    }
+
+    #[test]
+    fn test_deflate_partial_roundtrip() {
+        // Test that partial flush + finish produces valid DEFLATE
+        let mut deflater = Deflater::new(6);
+        let mut output = Vec::new();
+        deflater
+            .deflate_partial(b"Hello partial!", &mut output)
+            .expect("partial failed");
+        deflater
+            .deflate(b" More data.", &mut output, true)
+            .expect("finish failed");
+
+        let decompressed = inflate(&output).expect("inflate failed");
+        assert_eq!(decompressed, b"Hello partial! More data.");
     }
 
     #[test]

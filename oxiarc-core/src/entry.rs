@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 /// Compression method used for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CompressionMethod {
     /// No compression (stored).
     #[default]
@@ -72,6 +73,7 @@ impl std::fmt::Display for CompressionMethod {
 
 /// Entry type (file, directory, symlink, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EntryType {
     /// Regular file.
     #[default]
@@ -105,6 +107,7 @@ impl EntryType {
 
 /// File attributes/permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileAttributes {
     /// Unix mode bits (rwxrwxrwx).
     pub unix_mode: Option<u32>,
@@ -161,6 +164,7 @@ impl FileAttributes {
 /// The struct is format-agnostic and can represent entries from any supported
 /// archive format (ZIP, TAR, LZH, etc.).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Entry {
     /// The name/path of the entry within the archive.
     pub name: String,
@@ -359,6 +363,200 @@ impl Entry {
     }
 }
 
+/// Builder for constructing `Entry` values with method chaining.
+///
+/// Required fields (`name` and `entry_type`) are set at construction time
+/// via [`EntryBuilder::file`], [`EntryBuilder::directory`], or
+/// [`EntryBuilder::symlink`]. All other fields are optional and have
+/// sensible defaults.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_core::entry::{EntryBuilder, CompressionMethod};
+///
+/// let entry = EntryBuilder::file("readme.txt")
+///     .size(1024)
+///     .compressed_size(512)
+///     .method(CompressionMethod::Deflate)
+///     .crc32(0xDEADBEEF)
+///     .build();
+///
+/// assert!(entry.is_file());
+/// assert_eq!(entry.size, 1024);
+/// ```
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EntryBuilder {
+    name: String,
+    entry_type: EntryType,
+    size: u64,
+    compressed_size: u64,
+    method: CompressionMethod,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    accessed: Option<SystemTime>,
+    attributes: FileAttributes,
+    crc32: Option<u32>,
+    comment: Option<String>,
+    link_target: Option<PathBuf>,
+    offset: u64,
+    extra: Vec<u8>,
+}
+
+impl EntryBuilder {
+    /// Create a builder for a file entry.
+    pub fn file(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entry_type: EntryType::File,
+            size: 0,
+            compressed_size: 0,
+            method: CompressionMethod::Stored,
+            modified: None,
+            created: None,
+            accessed: None,
+            attributes: FileAttributes::default(),
+            crc32: None,
+            comment: None,
+            link_target: None,
+            offset: 0,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Create a builder for a directory entry.
+    pub fn directory(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entry_type: EntryType::Directory,
+            ..Self::file("")
+        }
+    }
+
+    /// Create a builder for a symlink entry.
+    pub fn symlink(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entry_type: EntryType::Symlink,
+            ..Self::file("")
+        }
+    }
+
+    /// Create a builder for a hardlink entry.
+    pub fn hardlink(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entry_type: EntryType::Hardlink,
+            ..Self::file("")
+        }
+    }
+
+    /// Set the uncompressed size.
+    pub fn size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the compressed size.
+    pub fn compressed_size(mut self, size: u64) -> Self {
+        self.compressed_size = size;
+        self
+    }
+
+    /// Set the compression method.
+    pub fn method(mut self, method: CompressionMethod) -> Self {
+        self.method = method;
+        self
+    }
+
+    /// Set the last modification time.
+    pub fn modified(mut self, time: SystemTime) -> Self {
+        self.modified = Some(time);
+        self
+    }
+
+    /// Set the creation time.
+    pub fn created(mut self, time: SystemTime) -> Self {
+        self.created = Some(time);
+        self
+    }
+
+    /// Set the last access time.
+    pub fn accessed(mut self, time: SystemTime) -> Self {
+        self.accessed = Some(time);
+        self
+    }
+
+    /// Set the file attributes.
+    pub fn attributes(mut self, attributes: FileAttributes) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    /// Set the CRC-32 checksum.
+    pub fn crc32(mut self, crc: u32) -> Self {
+        self.crc32 = Some(crc);
+        self
+    }
+
+    /// Set the comment.
+    pub fn comment(mut self, comment: impl Into<String>) -> Self {
+        self.comment = Some(comment.into());
+        self
+    }
+
+    /// Set the link target (for symlinks and hardlinks).
+    pub fn link_target(mut self, target: impl Into<PathBuf>) -> Self {
+        self.link_target = Some(target.into());
+        self
+    }
+
+    /// Set the offset in the archive.
+    pub fn offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Set extra data.
+    pub fn extra(mut self, extra: Vec<u8>) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    /// Build the `Entry`.
+    ///
+    /// This always succeeds because the required fields (`name` and
+    /// `entry_type`) are provided at builder construction time.
+    pub fn build(self) -> Entry {
+        Entry {
+            name: self.name,
+            entry_type: self.entry_type,
+            size: self.size,
+            compressed_size: self.compressed_size,
+            method: self.method,
+            modified: self.modified,
+            created: self.created,
+            accessed: self.accessed,
+            attributes: self.attributes,
+            crc32: self.crc32,
+            comment: self.comment,
+            link_target: self.link_target,
+            offset: self.offset,
+            extra: self.extra,
+        }
+    }
+}
+
+impl Entry {
+    /// Create an `EntryBuilder` for a file with the given name.
+    ///
+    /// This is a convenience shortcut for `EntryBuilder::file(name)`.
+    pub fn builder(name: impl Into<String>) -> EntryBuilder {
+        EntryBuilder::file(name)
+    }
+}
+
 impl Default for Entry {
     fn default() -> Self {
         Self::file("", 0)
@@ -456,5 +654,333 @@ mod tests {
 
         assert!(attrs.is_readonly());
         assert_eq!(attrs.unix_mode, Some(0o755));
+    }
+
+    #[test]
+    fn test_entry_builder_file() {
+        let entry = EntryBuilder::file("test.txt")
+            .size(2048)
+            .compressed_size(1024)
+            .method(CompressionMethod::Deflate)
+            .crc32(0xABCD1234)
+            .build();
+
+        assert!(entry.is_file());
+        assert!(!entry.is_dir());
+        assert_eq!(entry.name, "test.txt");
+        assert_eq!(entry.size, 2048);
+        assert_eq!(entry.compressed_size, 1024);
+        assert_eq!(entry.method, CompressionMethod::Deflate);
+        assert_eq!(entry.crc32, Some(0xABCD1234));
+    }
+
+    #[test]
+    fn test_entry_builder_directory() {
+        let entry = EntryBuilder::directory("my_dir/").build();
+
+        assert!(entry.is_dir());
+        assert!(!entry.is_file());
+        assert_eq!(entry.name, "my_dir/");
+        assert_eq!(entry.size, 0);
+    }
+
+    #[test]
+    fn test_entry_builder_symlink() {
+        let entry = EntryBuilder::symlink("link.txt")
+            .link_target("/usr/bin/target")
+            .build();
+
+        assert!(entry.entry_type.is_symlink());
+        assert_eq!(entry.name, "link.txt");
+        assert_eq!(entry.link_target, Some(PathBuf::from("/usr/bin/target")));
+    }
+
+    #[test]
+    fn test_entry_builder_all_optional_fields() {
+        let now = SystemTime::now();
+        let attrs = FileAttributes::new().with_mode(0o644);
+
+        let entry = EntryBuilder::file("full.txt")
+            .size(5000)
+            .compressed_size(3000)
+            .method(CompressionMethod::Lzma)
+            .modified(now)
+            .created(now)
+            .accessed(now)
+            .attributes(attrs)
+            .crc32(0x12345678)
+            .comment("a test comment")
+            .link_target("nowhere")
+            .offset(4096)
+            .extra(vec![0x01, 0x02, 0x03])
+            .build();
+
+        assert_eq!(entry.name, "full.txt");
+        assert_eq!(entry.size, 5000);
+        assert_eq!(entry.compressed_size, 3000);
+        assert_eq!(entry.method, CompressionMethod::Lzma);
+        assert_eq!(entry.modified, Some(now));
+        assert_eq!(entry.created, Some(now));
+        assert_eq!(entry.accessed, Some(now));
+        assert_eq!(entry.attributes.unix_mode, Some(0o644));
+        assert_eq!(entry.crc32, Some(0x12345678));
+        assert_eq!(entry.comment, Some("a test comment".to_string()));
+        assert_eq!(entry.link_target, Some(PathBuf::from("nowhere")));
+        assert_eq!(entry.offset, 4096);
+        assert_eq!(entry.extra, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_entry_builder_convenience_method() {
+        let entry = Entry::builder("quick.txt").size(100).build();
+
+        assert!(entry.is_file());
+        assert_eq!(entry.name, "quick.txt");
+        assert_eq!(entry.size, 100);
+    }
+
+    #[test]
+    fn test_entry_builder_hardlink() {
+        let entry = EntryBuilder::hardlink("hardlink.txt")
+            .link_target("/original/file")
+            .build();
+
+        assert_eq!(entry.entry_type, EntryType::Hardlink);
+        assert_eq!(entry.link_target, Some(PathBuf::from("/original/file")));
+    }
+
+    #[test]
+    fn test_entry_builder_defaults() {
+        let entry = EntryBuilder::file("default.txt").build();
+
+        assert_eq!(entry.size, 0);
+        assert_eq!(entry.compressed_size, 0);
+        assert_eq!(entry.method, CompressionMethod::Stored);
+        assert_eq!(entry.modified, None);
+        assert_eq!(entry.created, None);
+        assert_eq!(entry.accessed, None);
+        assert_eq!(entry.crc32, None);
+        assert_eq!(entry.comment, None);
+        assert_eq!(entry.link_target, None);
+        assert_eq!(entry.offset, 0);
+        assert!(entry.extra.is_empty());
+    }
+
+    #[cfg(feature = "serde")]
+    mod serde_tests {
+        use super::*;
+        use std::time::{Duration, SystemTime};
+
+        #[test]
+        fn test_compression_method_roundtrip() {
+            let methods = [
+                CompressionMethod::Stored,
+                CompressionMethod::Deflate,
+                CompressionMethod::Lh0,
+                CompressionMethod::Lh4,
+                CompressionMethod::Lh5,
+                CompressionMethod::Lh6,
+                CompressionMethod::Lh7,
+                CompressionMethod::Lzma,
+                CompressionMethod::Lzma2,
+                CompressionMethod::Bzip2,
+                CompressionMethod::Zstd,
+                CompressionMethod::Unknown(42),
+            ];
+
+            for method in &methods {
+                let json = serde_json::to_string(method)
+                    .unwrap_or_else(|e| panic!("failed to serialize {:?}: {}", method, e));
+                let deserialized: CompressionMethod = serde_json::from_str(&json)
+                    .unwrap_or_else(|e| panic!("failed to deserialize {:?}: {}", json, e));
+                assert_eq!(*method, deserialized);
+            }
+        }
+
+        #[test]
+        fn test_entry_type_roundtrip() {
+            let types = [
+                EntryType::File,
+                EntryType::Directory,
+                EntryType::Symlink,
+                EntryType::Hardlink,
+                EntryType::Unknown,
+            ];
+
+            for entry_type in &types {
+                let json = serde_json::to_string(entry_type)
+                    .unwrap_or_else(|e| panic!("failed to serialize {:?}: {}", entry_type, e));
+                let deserialized: EntryType = serde_json::from_str(&json)
+                    .unwrap_or_else(|e| panic!("failed to deserialize {:?}: {}", json, e));
+                assert_eq!(*entry_type, deserialized);
+            }
+        }
+
+        #[test]
+        fn test_file_attributes_roundtrip() {
+            let attrs = FileAttributes {
+                unix_mode: Some(0o755),
+                dos_attributes: Some(0x20),
+                uid: Some(1000),
+                gid: Some(1000),
+            };
+
+            let json = serde_json::to_string(&attrs)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            let deserialized: FileAttributes = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize: {}", e));
+            assert_eq!(attrs, deserialized);
+
+            // Also test empty attributes
+            let empty = FileAttributes::default();
+            let json = serde_json::to_string(&empty)
+                .unwrap_or_else(|e| panic!("failed to serialize empty: {}", e));
+            let deserialized: FileAttributes = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize empty: {}", e));
+            assert_eq!(empty, deserialized);
+        }
+
+        #[test]
+        fn test_entry_roundtrip_minimal() {
+            let entry = Entry::file("test.txt", 1024);
+
+            let json = serde_json::to_string(&entry)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            let deserialized: Entry = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize: {}", e));
+
+            assert_eq!(entry.name, deserialized.name);
+            assert_eq!(entry.entry_type, deserialized.entry_type);
+            assert_eq!(entry.size, deserialized.size);
+            assert_eq!(entry.compressed_size, deserialized.compressed_size);
+            assert_eq!(entry.method, deserialized.method);
+        }
+
+        #[test]
+        fn test_entry_roundtrip_full() {
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_699_000_000);
+            let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_100_000);
+
+            let entry = Entry {
+                name: "subdir/data.bin".to_string(),
+                entry_type: EntryType::File,
+                size: 8192,
+                compressed_size: 4096,
+                method: CompressionMethod::Deflate,
+                modified: Some(modified),
+                created: Some(created),
+                accessed: Some(accessed),
+                attributes: FileAttributes {
+                    unix_mode: Some(0o644),
+                    dos_attributes: Some(0x20),
+                    uid: Some(1000),
+                    gid: Some(100),
+                },
+                crc32: Some(0xDEAD_BEEF),
+                comment: Some("test comment".to_string()),
+                link_target: None,
+                offset: 512,
+                extra: vec![0x01, 0x02, 0x03],
+            };
+
+            let json = serde_json::to_string_pretty(&entry)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            let deserialized: Entry = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize: {}", e));
+
+            assert_eq!(entry.name, deserialized.name);
+            assert_eq!(entry.entry_type, deserialized.entry_type);
+            assert_eq!(entry.size, deserialized.size);
+            assert_eq!(entry.compressed_size, deserialized.compressed_size);
+            assert_eq!(entry.method, deserialized.method);
+            assert_eq!(entry.modified, deserialized.modified);
+            assert_eq!(entry.created, deserialized.created);
+            assert_eq!(entry.accessed, deserialized.accessed);
+            assert_eq!(entry.attributes, deserialized.attributes);
+            assert_eq!(entry.crc32, deserialized.crc32);
+            assert_eq!(entry.comment, deserialized.comment);
+            assert_eq!(entry.link_target, deserialized.link_target);
+            assert_eq!(entry.offset, deserialized.offset);
+            assert_eq!(entry.extra, deserialized.extra);
+        }
+
+        #[test]
+        fn test_entry_directory_roundtrip() {
+            let entry = Entry::directory("my_folder/");
+
+            let json = serde_json::to_string(&entry)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            let deserialized: Entry = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize: {}", e));
+
+            assert_eq!(entry.name, deserialized.name);
+            assert_eq!(entry.entry_type, deserialized.entry_type);
+            assert!(deserialized.is_dir());
+        }
+
+        #[test]
+        fn test_entry_with_symlink_roundtrip() {
+            let entry = Entry {
+                name: "link.txt".to_string(),
+                entry_type: EntryType::Symlink,
+                size: 0,
+                compressed_size: 0,
+                method: CompressionMethod::Stored,
+                modified: None,
+                created: None,
+                accessed: None,
+                attributes: FileAttributes::default(),
+                crc32: None,
+                comment: None,
+                link_target: Some(std::path::PathBuf::from("target.txt")),
+                offset: 0,
+                extra: Vec::new(),
+            };
+
+            let json = serde_json::to_string(&entry)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            let deserialized: Entry = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize: {}", e));
+
+            assert_eq!(entry.link_target, deserialized.link_target);
+            assert_eq!(entry.entry_type, deserialized.entry_type);
+        }
+
+        #[test]
+        fn test_entry_builder_serde_roundtrip() {
+            let builder = EntryBuilder::file("readme.txt")
+                .size(2048)
+                .compressed_size(1024)
+                .method(CompressionMethod::Lh5)
+                .crc32(0xCAFE_BABE);
+
+            let json = serde_json::to_string(&builder)
+                .unwrap_or_else(|e| panic!("failed to serialize builder: {}", e));
+            let deserialized: EntryBuilder = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize builder: {}", e));
+
+            // Verify by building both and comparing
+            let entry1 = builder.build();
+            let entry2 = deserialized.build();
+            assert_eq!(entry1.name, entry2.name);
+            assert_eq!(entry1.size, entry2.size);
+            assert_eq!(entry1.compressed_size, entry2.compressed_size);
+            assert_eq!(entry1.method, entry2.method);
+            assert_eq!(entry1.crc32, entry2.crc32);
+        }
+
+        #[test]
+        fn test_compression_method_json_representation() {
+            // Verify that the default externally-tagged representation produces readable JSON
+            let stored_json = serde_json::to_string(&CompressionMethod::Stored)
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            assert_eq!(stored_json, "\"Stored\"");
+
+            let unknown_json = serde_json::to_string(&CompressionMethod::Unknown(99))
+                .unwrap_or_else(|e| panic!("failed to serialize: {}", e));
+            assert!(unknown_json.contains("Unknown"));
+            assert!(unknown_json.contains("99"));
+        }
     }
 }
