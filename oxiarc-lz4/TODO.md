@@ -46,7 +46,7 @@
 - [x] Configurable match attempt limits
 - [x] Optimal parsing for level 12 (dynamic programming)
 
-### Acceleration Parameter (NEW in 0.2.5)
+### Acceleration Parameter (NEW in 0.2.6)
 - [x] compress_block_with_accel(input, acceleration) - controls hash miss skip scaling
 - [x] Acceleration values: 1 (default, no extra skipping) to higher values (faster, worse ratio)
 - [x] Adaptive step size: step = 1 + (misses >> accel_shift)

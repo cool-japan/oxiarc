@@ -77,8 +77,8 @@
 
 ### API
 - [ ] `no_std` support (optional)
-- [x] Serde serialization for Entry (optional `serde` feature, v0.2.5)
-- [x] Builder pattern for Entry (EntryBuilder with fluent API, v0.2.5)
+- [x] Serde serialization for Entry (optional `serde` feature, v0.2.6)
+- [x] Builder pattern for Entry (EntryBuilder with fluent API, v0.2.6)
 
 ## Test Coverage
 

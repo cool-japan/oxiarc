@@ -1,6 +1,6 @@
 # oxiarc-brotli - Development Status
 
-## Completed Features (v0.2.5)
+## Completed Features (v0.2.6)
 
 ### Core Compression (RFC 7932)
 - [x] LZ77 compression engine with backward references

@@ -62,11 +62,16 @@ impl<'a> BitReader<'a> {
     }
 
     /// Peek at the next `n` bits without consuming them.
+    ///
+    /// Near the end of the stream, fewer than `n` bits may be available.
+    /// In that case, the missing bits are treated as 0 (Brotli padding).
+    /// This is safe for Huffman LUT lookup since `drop_bits` only drops
+    /// the actual code length, not the full `n` bits.
     pub fn peek_bits(&mut self, n: u32) -> BrotliResult<u32> {
         if n == 0 {
             return Ok(0);
         }
-        self.ensure_bits(n)?;
+        self.ensure_bits_for_peek(n)?;
         let mask = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
         Ok((self.bit_buf as u32) & mask)
     }
@@ -91,6 +96,28 @@ impl<'a> BitReader<'a> {
         // Try to fill more
         self.fill_buffer();
         if self.bits_in_buf >= n {
+            Ok(())
+        } else {
+            Err(BrotliError::UnexpectedEof)
+        }
+    }
+
+    /// Ensure at least `n` bits are available, allowing zero-padding.
+    /// Used for peek operations where the caller will only consume as many
+    /// bits as are actually in a valid code. Brotli padding bits are 0.
+    fn ensure_bits_for_peek(&mut self, n: u32) -> BrotliResult<()> {
+        if self.bits_in_buf >= n {
+            return Ok(());
+        }
+        self.fill_buffer();
+        if self.bits_in_buf >= n {
+            return Ok(());
+        }
+        // If we have at least 1 bit, allow zero-padding.
+        // Zero padding is safe for Huffman LUT lookup since:
+        // 1. The actual code fits in the bits we have.
+        // 2. Padding zeros won't produce a valid longer code.
+        if self.bits_in_buf > 0 {
             Ok(())
         } else {
             Err(BrotliError::UnexpectedEof)

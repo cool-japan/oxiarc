@@ -1,11 +1,11 @@
 # oxiarc-lzhuf
 
-[![Version](https://img.shields.io/badge/version-0.2.5-blue)](https://github.com/cool-japan/oxiarc)
+[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-**Version 0.2.5** (2026-03-18) — 54 tests passing.
+**Version 0.2.6** (2026-03-18) — 54 tests passing.
 
 ## Overview
 
@@ -162,7 +162,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzhuf = "0.2.5"
+oxiarc-lzhuf = "0.2.6"
 ```
 
 ## Compatibility

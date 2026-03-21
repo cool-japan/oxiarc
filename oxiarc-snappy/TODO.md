@@ -1,6 +1,6 @@
 # oxiarc-snappy - Development Status
 
-## Completed Features (v0.2.5)
+## Completed Features (v0.2.6)
 
 ### Block Format
 - [x] Snappy block compression with hash-based matching

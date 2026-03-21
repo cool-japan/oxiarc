@@ -10,7 +10,9 @@
 use crate::bit_writer::BitWriter;
 use crate::context::ContextMode;
 use crate::error::{BrotliError, BrotliResult};
-use crate::huffman::{build_huffman_tree, encode_symbol, write_simple_prefix_code};
+use crate::huffman::{
+    build_huffman_tree, encode_symbol, write_prefix_code_and_build_tree, write_simple_prefix_code,
+};
 use crate::lz77::{Lz77Command, Lz77Params, lz77_compress};
 
 /// Brotli compression parameters.
@@ -43,9 +45,9 @@ impl BrotliParams {
                 self.quality
             )));
         }
-        if self.lgwin < 10 || self.lgwin > 24 {
+        if self.lgwin < 16 || self.lgwin > 24 {
             return Err(BrotliError::InvalidParameter(format!(
-                "lgwin {} out of range [10, 24]",
+                "lgwin {} out of range [16, 24]",
                 self.lgwin
             )));
         }
@@ -147,31 +149,13 @@ fn encode_empty_stream() -> BrotliResult<Vec<u8>> {
 /// - Otherwise 3 more bits to encode other values
 fn write_window_bits(writer: &mut BitWriter, lgwin: u32) -> BrotliResult<()> {
     if lgwin == 16 {
+        // Single 0 bit.
         writer.write_bit(false)?;
-    } else if lgwin == 17 {
-        writer.write_bits(0b0001, 4)?;
-    } else if (18..=21).contains(&lgwin) {
-        // Encode as: lower bit = 1, then 3 bits for (lgwin - 17).
+    } else if (17..=24).contains(&lgwin) {
+        // RFC 7932: flag bit = 1, then 3 bits for (lgwin - 17).
+        // Encoding: flag(1) | ((lgwin-17) << 1) packed into 4 bits LSB-first.
         let n = lgwin - 17;
         writer.write_bits(n << 1 | 1, 4)?;
-    } else if lgwin == 22 {
-        writer.write_bits(0b1001, 4)?;
-    } else if lgwin == 10 {
-        writer.write_bits(0b0001_0001, 7)?;
-    } else if lgwin == 11 {
-        writer.write_bits(0b0011_0001, 7)?;
-    } else if lgwin == 12 {
-        writer.write_bits(0b0101_0001, 7)?;
-    } else if lgwin == 13 {
-        writer.write_bits(0b0111_0001, 7)?;
-    } else if lgwin == 14 {
-        writer.write_bits(0b1001_0001, 7)?;
-    } else if lgwin == 15 {
-        writer.write_bits(0b1011_0001, 7)?;
-    } else if lgwin == 23 {
-        writer.write_bits(0b1101, 4)?;
-    } else if lgwin == 24 {
-        writer.write_bits(0b1111, 4)?;
     } else {
         return Err(BrotliError::InvalidWindowSize(lgwin));
     }
@@ -199,6 +183,7 @@ fn encode_meta_block(
     if is_last {
         // ISEMPTY = 0 for non-empty last block.
         // (ISEMPTY bit is only present when ISLAST=1)
+        writer.write_bit(false)?;
     }
 
     // For low quality, use uncompressed meta-blocks.
@@ -335,11 +320,11 @@ fn encode_compressed_meta_block(
         }
     }
 
-    // Build Huffman trees.
-    let literal_tree = build_huffman_tree(&literal_freqs, 256)?;
-    let ic_tree = build_huffman_tree(&ic_freqs, 704)?;
+    // Build Huffman trees from frequencies (used for complex prefix codes).
+    let literal_tree_freq = build_huffman_tree(&literal_freqs, 256)?;
+    let ic_tree_freq = build_huffman_tree(&ic_freqs, 704)?;
 
-    // Write literal prefix code.
+    // Write literal prefix code and get the actual tree used for encoding.
     let literal_non_zero: Vec<u16> = literal_freqs
         .iter()
         .enumerate()
@@ -347,13 +332,10 @@ fn encode_compressed_meta_block(
         .map(|(i, _)| i as u16)
         .collect();
 
-    if literal_non_zero.len() <= 4 {
-        write_simple_prefix_code(writer, &literal_non_zero, 256)?;
-    } else {
-        write_complex_prefix_code_for_tree(writer, &literal_tree)?;
-    }
+    let literal_tree =
+        write_prefix_code_and_build_tree(writer, &literal_non_zero, &literal_tree_freq, 256)?;
 
-    // Write insert-and-copy prefix code.
+    // Write insert-and-copy prefix code and get the actual tree used for encoding.
     let ic_non_zero: Vec<u16> = ic_freqs
         .iter()
         .enumerate()
@@ -361,15 +343,11 @@ fn encode_compressed_meta_block(
         .map(|(i, _)| i as u16)
         .collect();
 
-    if ic_non_zero.len() <= 4 {
-        write_simple_prefix_code(writer, &ic_non_zero, 704)?;
-    } else {
-        write_complex_prefix_code_for_tree(writer, &ic_tree)?;
-    }
+    let ic_tree = write_prefix_code_and_build_tree(writer, &ic_non_zero, &ic_tree_freq, 704)?;
 
-    // Write distance prefix code (if needed).
+    // Write distance prefix code and get the actual tree used for encoding.
     if has_distances {
-        let dist_tree = build_huffman_tree(&dist_freqs, 64)?;
+        let dist_tree_freq = build_huffman_tree(&dist_freqs, 64)?;
         let dist_non_zero: Vec<u16> = dist_freqs
             .iter()
             .enumerate()
@@ -377,14 +355,11 @@ fn encode_compressed_meta_block(
             .map(|(i, _)| i as u16)
             .collect();
 
-        if dist_non_zero.len() <= 4 {
-            write_simple_prefix_code(writer, &dist_non_zero, 64)?;
-        } else {
-            write_complex_prefix_code_for_tree(writer, &dist_tree)?;
-        }
+        let dist_tree =
+            write_prefix_code_and_build_tree(writer, &dist_non_zero, &dist_tree_freq, 64)?;
 
         // Write the actual command data.
-        for ic in &ic_commands {
+        for ic in ic_commands.iter() {
             let ic_code = insert_copy_length_code(ic.insert_length, ic.copy_length);
             encode_symbol(writer, &ic_tree, ic_code)?;
 
@@ -426,15 +401,6 @@ fn encode_compressed_meta_block(
     Ok(())
 }
 
-/// Write a complex prefix code for a Huffman tree.
-fn write_complex_prefix_code_for_tree(
-    writer: &mut BitWriter,
-    tree: &crate::huffman::HuffmanTree,
-) -> BrotliResult<()> {
-    // Use the existing complex prefix code writer.
-    crate::huffman::write_complex_prefix_code(writer, tree)
-}
-
 /// An insert-and-copy command.
 #[derive(Debug, Clone)]
 struct InsertCopyCommand {
@@ -448,7 +414,14 @@ struct InsertCopyCommand {
     literals: Vec<u8>,
 }
 
+/// Maximum copy length encodable in a single IC command's copy-cat field.
+/// Per the copy length table (cat 0-7), maximum is 17.
+const MAX_IC_COPY_LENGTH: usize = 17;
+
 /// Build insert-and-copy commands from LZ77 command sequence.
+///
+/// Long backward references (copy_length > MAX_IC_COPY_LENGTH) are split into
+/// multiple IC commands so that each copy fits within the encodable range.
 fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand> {
     let mut result = Vec::new();
     let mut literals = Vec::new();
@@ -459,12 +432,31 @@ fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand
                 literals.push(*b);
             }
             Lz77Command::Reference { length, distance } => {
-                result.push(InsertCopyCommand {
-                    insert_length: literals.len(),
-                    copy_length: *length,
-                    distance: *distance,
-                    literals: std::mem::take(&mut literals),
-                });
+                let mut remaining_copy = *length;
+                let mut first = true;
+                while remaining_copy > 0 {
+                    let chunk = remaining_copy.min(MAX_IC_COPY_LENGTH);
+                    remaining_copy -= chunk;
+
+                    if first {
+                        // First chunk: emit all accumulated literals.
+                        result.push(InsertCopyCommand {
+                            insert_length: literals.len(),
+                            copy_length: chunk,
+                            distance: *distance,
+                            literals: std::mem::take(&mut literals),
+                        });
+                        first = false;
+                    } else {
+                        // Continuation chunks: no literals (insert_length=0).
+                        result.push(InsertCopyCommand {
+                            insert_length: 0,
+                            copy_length: chunk,
+                            distance: *distance,
+                            literals: Vec::new(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -482,109 +474,131 @@ fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand
     result
 }
 
+/// Compute the insert length category and extra-bit count for the given insert length.
+/// Returns (category, extra_bits, base_value) matching decode_insert_length_short.
+fn insert_length_cat(insert_length: usize) -> (usize, u32, usize) {
+    match insert_length {
+        0 => (0, 0, 0),
+        1 => (1, 0, 1),
+        2 => (2, 0, 2),
+        3 => (3, 0, 3),
+        4..=5 => (4, 1, 4),
+        6..=7 => (5, 1, 6),
+        8..=11 => (6, 2, 8),
+        12..=15 => (7, 2, 12),
+        16..=23 => (8, 3, 16),
+        24..=31 => (9, 3, 24),
+        32..=47 => (10, 4, 32),
+        48..=63 => (11, 4, 48),
+        64..=95 => (12, 5, 64),
+        96..=127 => (13, 5, 96),
+        128..=191 => (14, 6, 128),
+        _ => (15, 7, 192),
+    }
+}
+
+/// Compute the copy length category and extra-bit count for the given copy length.
+/// Returns (category, extra_bits, base_value) matching decode_copy_length_short.
+fn copy_length_cat(copy_length: usize) -> (usize, u32, usize) {
+    match copy_length {
+        0..=2 => (0, 0, 2),
+        3 => (1, 0, 3),
+        4 => (2, 0, 4),
+        5 => (3, 0, 5),
+        6..=7 => (4, 1, 6),
+        8..=9 => (5, 1, 8),
+        10..=13 => (6, 2, 10),
+        _ => (7, 2, 14),
+    }
+}
+
 /// Compute the insert-and-copy length code.
 ///
 /// Per RFC 7932 Section 5, the insert-and-copy length is encoded
-/// as a single symbol from a combined alphabet.
+/// as a single symbol from a combined alphabet. The symbol encodes
+/// category indices for both insert and copy lengths, with extra bits
+/// appended afterward. This matches decode_insert_copy_lengths exactly.
 fn insert_copy_length_code(insert_length: usize, copy_length: usize) -> u16 {
-    // Simplified encoding: use a combined code.
-    // Insert length categories:
-    let insert_cat = match insert_length {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4..=5 => 4,
-        6..=7 => 5,
-        _ => 6,
-    };
+    let (insert_cat, _, _) = insert_length_cat(insert_length);
+    let (copy_cat, _, _) = copy_length_cat(copy_length);
 
-    // Copy length categories:
-    let copy_cat = match copy_length {
-        0 => 0,
-        1 => 0,
-        2 => 0,
-        3 => 0,
-        4 => 1,
-        5 => 2,
-        6..=7 => 3,
-        8..=11 => 4,
-        _ => 5,
-    };
-
-    // Combined code: insert_cat * 8 + copy_cat
+    // Symbols 0-127: short codes (insert_cat 0-15, copy_cat 0-7).
     let code = insert_cat * 8 + copy_cat;
     code.min(703) as u16
 }
 
 /// Write extra bits for insert length.
+/// Must match decode_insert_length_short/extended exactly.
 fn write_insert_length_extra(writer: &mut BitWriter, insert_length: usize) -> BrotliResult<()> {
-    match insert_length {
-        0..=3 => Ok(()), // No extra bits.
-        4..=5 => writer.write_bits((insert_length - 4) as u32, 1),
-        6..=7 => writer.write_bits((insert_length - 6) as u32, 1),
-        8..=15 => writer.write_bits((insert_length - 8) as u32, 3),
-        16..=31 => writer.write_bits((insert_length - 16) as u32, 4),
-        32..=63 => writer.write_bits((insert_length - 32) as u32, 5),
-        _ => {
-            // Large insert: write as variable length.
-            writer.write_bits(insert_length.min(255) as u32, 8)
-        }
+    let (_, extra_bits, base) = insert_length_cat(insert_length);
+    if extra_bits == 0 {
+        Ok(())
+    } else {
+        writer.write_bits((insert_length - base) as u32, extra_bits)
     }
 }
 
 /// Write extra bits for copy length.
+/// Must match decode_copy_length_short exactly.
 fn write_copy_length_extra(writer: &mut BitWriter, copy_length: usize) -> BrotliResult<()> {
-    match copy_length {
-        0..=5 => Ok(()), // No extra bits.
-        6..=7 => writer.write_bits((copy_length - 6) as u32, 1),
-        8..=11 => writer.write_bits((copy_length - 8) as u32, 2),
-        12..=19 => writer.write_bits((copy_length - 12) as u32, 3),
-        _ => writer.write_bits(copy_length.min(255) as u32, 8),
+    let (_, extra_bits, base) = copy_length_cat(copy_length);
+    if extra_bits == 0 {
+        Ok(())
+    } else {
+        writer.write_bits((copy_length - base) as u32, extra_bits)
+    }
+}
+
+/// Compute the distance code and extra bits for encoding a distance value.
+///
+/// Uses the RFC 7932 Section 4 format with npostfix=0, ndirect=0:
+/// - Codes 16+: distance is encoded with a hcode and extra bits.
+/// - The distance is NOT encoded using ring buffer references (codes 0-15).
+///
+/// Returns (dist_code, extra_bits_value, extra_bits_count).
+fn distance_encoding(distance: usize) -> (u16, u32, u32) {
+    // With ndirect=0 and npostfix=0, direct distance encoding starts at code 16.
+    // For hcode in 0..:
+    //   nbits = 1 + (hcode >> 1)
+    //   offset = ((2 + (hcode & 1)) << nbits) - 4
+    //   distance range: [offset+1, offset+(1<<nbits)]
+    //   dist_code = 16 + hcode
+    //   extra = distance - (offset + 1)
+
+    let d = distance as u64;
+    // Find the hcode:
+    let mut hcode = 0u32;
+    loop {
+        let nbits = 1 + (hcode >> 1);
+        let offset = ((2u64 + ((hcode & 1) as u64)) << nbits) - 4;
+        let low = offset + 1;
+        let high = offset + (1u64 << nbits);
+        if d >= low && d <= high {
+            let extra = (d - low) as u32;
+            let dist_code = (16 + hcode) as u16;
+            return (dist_code, extra, nbits);
+        }
+        hcode += 1;
+        if hcode > 60 {
+            // Safety: return a large code with many bits.
+            return (63u16, distance as u32, 24);
+        }
     }
 }
 
 /// Compute the distance code for a backward reference distance.
+/// Returns the dist_code to use in the prefix code tree lookup.
 fn distance_code(distance: usize) -> u16 {
-    // Distance codes 0-15 are short codes (from distance ring buffer).
-    // Codes 16+ encode the actual distance with extra bits.
-    // For simplicity, we use direct encoding.
-    match distance {
-        1 => 0,
-        2 => 1,
-        3 => 2,
-        4 => 3,
-        5..=6 => 4,
-        7..=8 => 5,
-        9..=12 => 6,
-        13..=16 => 7,
-        17..=24 => 8,
-        25..=32 => 9,
-        _ => {
-            // Larger distances: use higher codes.
-            let bits = 32 - (distance as u32).leading_zeros();
-            (bits + 6).min(63) as u16
-        }
-    }
+    distance_encoding(distance).0
 }
 
 /// Write extra bits for a distance code.
 fn write_distance_extra(writer: &mut BitWriter, distance: usize) -> BrotliResult<()> {
-    match distance {
-        1..=4 => Ok(()), // No extra bits for short distances.
-        5..=6 => writer.write_bits((distance - 5) as u32, 1),
-        7..=8 => writer.write_bits((distance - 7) as u32, 1),
-        9..=12 => writer.write_bits((distance - 9) as u32, 2),
-        13..=16 => writer.write_bits((distance - 13) as u32, 2),
-        17..=24 => writer.write_bits((distance - 17) as u32, 3),
-        25..=32 => writer.write_bits((distance - 25) as u32, 3),
-        _ => {
-            // Variable-length encoding for large distances.
-            let bits = 32 - (distance as u32).leading_zeros();
-            let extra_bits = bits.saturating_sub(1);
-            let base = 1u32 << (bits - 1);
-            writer.write_bits(distance as u32 - base, extra_bits)
-        }
+    let (_, extra_val, extra_bits) = distance_encoding(distance);
+    if extra_bits == 0 {
+        Ok(())
+    } else {
+        writer.write_bits(extra_val, extra_bits)
     }
 }
 
@@ -640,8 +654,10 @@ mod tests {
 
     #[test]
     fn test_params_validation() {
-        let mut params = BrotliParams::default();
-        params.quality = 12;
+        let mut params = BrotliParams {
+            quality: 12,
+            ..Default::default()
+        };
         assert!(params.validate().is_err());
 
         params.quality = 6;
@@ -681,9 +697,25 @@ mod tests {
 
     #[test]
     fn test_distance_code() {
-        assert_eq!(distance_code(1), 0);
-        assert_eq!(distance_code(2), 1);
+        // With ndirect=0, npostfix=0: all distances use codes >=16.
+        // hcode=0: nbits=1, offset=0, range [1,2], code=16
+        // hcode=1: nbits=1, offset=2, range [3,4], code=17
+        assert_eq!(distance_code(1), 16);
+        assert_eq!(distance_code(2), 16);
+        assert_eq!(distance_code(3), 17);
         assert!(distance_code(100) < 64);
+
+        // Verify round-trip: encode and check distance recovery.
+        for dist in [1, 2, 3, 4, 5, 10, 51, 100, 306] {
+            let (code, extra_val, extra_bits) = distance_encoding(dist);
+            // Verify the decode formula: distance = (offset + extra) + 1
+            let hcode = (code as u32).saturating_sub(16);
+            let nbits = 1 + (hcode >> 1);
+            assert_eq!(nbits, extra_bits, "dist={dist}");
+            let offset = ((2u64 + ((hcode & 1) as u64)) << nbits) - 4;
+            let decoded = offset + extra_val as u64 + 1;
+            assert_eq!(decoded as usize, dist, "dist={dist} code={code}");
+        }
     }
 
     #[test]
@@ -697,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_window_bits() {
-        for lgwin in 10..=24 {
+        for lgwin in 16..=24 {
             let mut writer = BitWriter::new();
             let result = write_window_bits(&mut writer, lgwin);
             assert!(result.is_ok(), "failed for lgwin={lgwin}");

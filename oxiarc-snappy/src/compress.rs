@@ -440,7 +440,7 @@ mod tests {
         let mut out = Vec::new();
         emit_literal(&data, &mut out);
         // Should use the 60-tag format with one extra length byte
-        assert_eq!(out[0], (60 << 2) | 0x00);
+        assert_eq!(out[0], (60 << 2));
         assert_eq!(out[1], 255); // 256 - 1 = 255
     }
 

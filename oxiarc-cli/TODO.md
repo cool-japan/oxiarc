@@ -134,7 +134,7 @@
 ## Command Reference
 
 ```
-oxiarc 0.2.5
+oxiarc 0.2.6
 The Oxidized Archiver - Pure Rust archive utility
 
 USAGE:

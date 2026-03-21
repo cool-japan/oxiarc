@@ -5,11 +5,11 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-lz4.svg)](https://crates.io/crates/oxiarc-lz4)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.5 (2026-03-18) | Tests: 110 passing**
+**Version: 0.2.6 (2026-03-18) | Tests: 110 passing**
 
 ## Overview
 
-LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.2.5 adds an acceleration parameter for tuning compression speed vs ratio, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
+LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.2.6 adds an acceleration parameter for tuning compression speed vs ratio, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
 
 ## Features
 
@@ -82,10 +82,10 @@ let compressed = compress_parallel(&data)?;
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-lz4 = "0.2.5"
+oxiarc-lz4 = "0.2.6"
 
 # With parallel compression
-oxiarc-lz4 = { version = "0.2.5", features = ["parallel"] }
+oxiarc-lz4 = { version = "0.2.6", features = ["parallel"] }
 ```
 
 ## Use Cases

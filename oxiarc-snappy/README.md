@@ -13,7 +13,7 @@ Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 
 ```toml
 [dependencies]
-oxiarc-snappy = "0.2.5"
+oxiarc-snappy = "0.2.6"
 ```
 
 ## Tests

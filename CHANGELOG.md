@@ -5,6 +5,27 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-03-21
+
+### Added
+- **oxiarc-brotli**: `write_prefix_code_and_build_tree()` — unified prefix code writing and Huffman tree construction for encoder use
+- **oxiarc-brotli**: Comprehensive roundtrip tests for compress/decompress (simple, binary pattern, uniform data)
+
+### Fixed
+- **oxiarc-brotli**: `is_single_symbol()` now correctly identifies true single-symbol Huffman trees (all code lengths must be 0); previously returned true for trees with exactly one non-zero code length, causing incorrect decoding
+- **oxiarc-brotli**: Kraft inequality tracker changed to `i32` to prevent potential overflow in complex prefix code reading
+
+### Quality
+- Zero clippy warnings (strict mode with `-D warnings`)
+- Zero rustdoc warnings (strict mode with all lint checks)
+- All policies compliant (no unwrap in production code, pure Rust, latest crates, workspace)
+
+### Crates in This Release
+All crates published at version 0.2.6:
+- oxiarc-core, oxiarc-deflate, oxiarc-lzhuf, oxiarc-lzw, oxiarc-lzma
+- oxiarc-bzip2, oxiarc-lz4, oxiarc-zstd, oxiarc-brotli, oxiarc-snappy
+- oxiarc-archive, oxiarc-cli
+
 ## [0.2.5] - 2026-03-18
 
 ### Added
@@ -343,6 +364,7 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.2.6]: https://github.com/cool-japan/oxiarc/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/cool-japan/oxiarc/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/cool-japan/oxiarc/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/cool-japan/oxiarc/compare/v0.2.2...v0.2.3

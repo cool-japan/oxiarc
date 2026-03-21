@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use oxiarc_snappy::{compress, decompress};
+use std::hint::black_box;
 
 fn bench_compress(c: &mut Criterion) {
     let data: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();

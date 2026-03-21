@@ -5,7 +5,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-archive.svg)](https://crates.io/crates/oxiarc-archive)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.5 (2026-03-18) | Tests: 165 passing**
+**Version: 0.2.6 (2026-03-18) | Tests: 165 passing**
 
 ## Overview
 
@@ -88,7 +88,7 @@ Supported async compression methods: `Stored`, `Deflate`.
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.2.5"
+oxiarc-archive = "0.2.6"
 
 # With memory-mapped I/O
 oxiarc-archive = { version = "0.2.4", features = ["mmap"] }

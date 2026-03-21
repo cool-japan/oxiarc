@@ -5,7 +5,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-lzw.svg)](https://crates.io/crates/oxiarc-lzw)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Version: 0.2.5 (2026-03-18) | Tests: 76 passing**
+**Version: 0.2.6 (2026-03-18) | Tests: 76 passing**
 
 ## Overview
 
@@ -120,7 +120,7 @@ let mut decoder = Decoder::new(Config::tiff());
 decoder.decode_bytes(&compressed, &mut output)?;
 ```
 
-### Streaming Encoder/Decoder (New in 0.2.5)
+### Streaming Encoder/Decoder (New in 0.2.6)
 
 Streaming interfaces for processing data incrementally without buffering entire inputs:
 
@@ -163,7 +163,7 @@ LZW builds a dictionary dynamically:
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.2.5"
+oxiarc-lzw = "0.2.6"
 ```
 
 ## Use Cases

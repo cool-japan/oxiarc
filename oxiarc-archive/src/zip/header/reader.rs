@@ -433,7 +433,7 @@ impl<R: Read + Seek> ZipReader<R> {
     /// Extract raw compressed bytes for an entry without decompressing.
     ///
     /// This is useful for async decompression workflows where the decompression
-    /// step is performed separately (e.g., via [`crate::async_zip`]).
+    /// step is performed separately (e.g., via `async_zip`).
     ///
     /// # Arguments
     ///

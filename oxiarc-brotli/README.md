@@ -14,7 +14,7 @@ Pure Rust Brotli compression library (RFC 7932), part of the OxiArc ecosystem.
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.2.5"
+oxiarc-brotli = "0.2.6"
 ```
 
 ## Tests

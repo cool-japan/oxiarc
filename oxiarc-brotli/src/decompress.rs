@@ -248,8 +248,6 @@ fn decompress_compressed_block(
         // Read insert-and-copy length symbol.
         let ic_tree_idx = ic_block_type.min(ic_trees.len() - 1);
         let ic_symbol = ic_trees[ic_tree_idx].decode_symbol(reader)?;
-
-        // Decode insert length and copy length from the symbol.
         let (insert_length, copy_length) = decode_insert_copy_lengths(reader, ic_symbol, npostfix)?;
 
         // Read and output literals.
@@ -365,27 +363,12 @@ fn read_window_bits(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
         return Ok(16);
     }
 
+    // RFC 7932: read 3 more bits; WBITS = next_three + 17.
     let next_three = reader.read_bits(3)?;
-    match next_three {
-        0 => {
-            // Could be WBITS = 17 or a small window.
-            let extra = reader.read_bits(3)?;
-            if extra == 0 {
-                Ok(17)
-            } else {
-                // WBITS = 8 + extra for small windows.
-                Ok(8 + extra)
-            }
-        }
-        1 => Ok(18),
-        2 => Ok(10),
-        3 => Ok(19),
-        4 => Ok(11),
-        5 => Ok(20),
-        6 => Ok(12),
-        7 => Ok(21),
-        _ => Err(BrotliError::InvalidWindowSize(next_three)),
+    if next_three > 7 {
+        return Err(BrotliError::InvalidWindowSize(next_three));
     }
+    Ok(next_three + 17)
 }
 
 /// Read a block type count.

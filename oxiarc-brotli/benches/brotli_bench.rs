@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use oxiarc_brotli::compress;
+use std::hint::black_box;
 
 fn bench_compress_small(c: &mut Criterion) {
     let data = b"Hello, Brotli! This is a benchmark for compression.";

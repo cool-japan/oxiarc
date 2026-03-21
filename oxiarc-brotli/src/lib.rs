@@ -170,6 +170,42 @@ mod tests {
     }
 
     #[test]
+    fn test_compress_decompress_roundtrip_simple() {
+        let data = b"Hello, world! This is a test of Brotli compression.".repeat(10);
+        let compressed = compress(&data, 1).expect("should compress");
+        let decompressed = decompress(&compressed).expect("should decompress");
+        assert_eq!(decompressed, data.as_slice(), "round-trip mismatch");
+    }
+
+    #[test]
+    fn test_compress_decompress_binary_pattern() {
+        for size in [100, 1000, 10000] {
+            let data: Vec<u8> = (0..size).map(|i| ((i * 137) % 256) as u8).collect();
+            let compressed = compress(&data, 6).unwrap_or_else(|e| {
+                panic!("should compress binary size={size}: {e}");
+            });
+            let decompressed = decompress(&compressed).unwrap_or_else(|e| {
+                panic!("should decompress binary size={size}: {e}");
+            });
+            assert_eq!(decompressed, data, "binary {size} round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn test_compress_decompress_uniform() {
+        for size in [1, 10, 50, 100, 1000] {
+            let data = vec![42u8; size];
+            let compressed = compress(&data, 1).unwrap_or_else(|e| {
+                panic!("should compress size={size}: {e}");
+            });
+            let decompressed = decompress(&compressed).unwrap_or_else(|e| {
+                panic!("should decompress size={size}: {e}");
+            });
+            assert_eq!(decompressed, data, "uniform {size} round-trip mismatch");
+        }
+    }
+
+    #[test]
     fn test_brotli_params_window_size() {
         let params = BrotliParams {
             lgwin: 16,

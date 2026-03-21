@@ -99,7 +99,7 @@
 - [x] Zstd frame read/write support
 - [x] Bzip2 stream read/write support
 
-### Brotli / Snappy Archive (NEW in v0.2.5)
+### Brotli / Snappy Archive (NEW in v0.2.6)
 - [x] BrotliReader for decompression (.br/.brotli)
 - [x] BrotliWriter for compression (.br/.brotli)
 - [x] SnappyReader for decompression (.sz/.snappy)

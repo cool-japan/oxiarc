@@ -73,7 +73,7 @@
 
 ## Completed Features (Phase 3)
 
-### Streaming Compression/Decompression (NEW in 0.2.5)
+### Streaming Compression/Decompression (NEW in 0.2.6)
 - [x] GzipStreamEncoder (Write trait, buffered streaming compression)
 - [x] GzipStreamDecoder (Read trait, eager-read streaming decompression)
 - [x] ZlibStreamEncoder (Write trait, Zlib streaming compression)
@@ -109,7 +109,7 @@
   - [x] zlib_compress_with_dict() and zlib_decompress_with_dict()
   - [x] FDICT flag support in zlib header
   - [x] Dictionary checksum verification (Adler-32)
-- [x] Flush modes (sync_flush, full_flush, partial_flush for GzipStreamEncoder/ZlibStreamEncoder, v0.2.5)
+- [x] Flush modes (sync_flush, full_flush, partial_flush for GzipStreamEncoder/ZlibStreamEncoder, v0.2.6)
 
 ### Compliance
 - [ ] Round-trip testing with zlib

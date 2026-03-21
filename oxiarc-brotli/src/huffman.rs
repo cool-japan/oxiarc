@@ -176,10 +176,15 @@ impl HuffmanTree {
         self.decode_symbol_slow(reader)
     }
 
-    /// Check if this is a single-symbol tree (no bits needed to decode).
+    /// Check if this is a true single-symbol tree (code_length = 0, no bits consumed).
+    ///
+    /// Returns true only when the tree was created via `single_symbol()` (all code_lengths are 0,
+    /// with the LUT pre-filled). A tree with one symbol at code_length=1 is NOT single-symbol
+    /// here — it still requires reading 1 bit per symbol.
     fn is_single_symbol(&self) -> bool {
-        let non_zero = self.code_lengths.iter().filter(|&&cl| cl > 0).count();
-        non_zero <= 1
+        // A true single-symbol tree has ALL code lengths = 0.
+        // The LUT was pre-filled by single_symbol() with (sym, 0) entries.
+        self.code_lengths.iter().all(|&cl| cl == 0) && !self.lut.is_empty() && self.lut[0].1 == 0
     }
 
     /// Slow path for decoding codes longer than LUT_BITS.
@@ -358,7 +363,7 @@ fn read_complex_prefix_code(
 
     // Read code lengths for code-length codes (each is 2-5 bits using a special scheme).
     // Per the spec, we read at most (num_code_length_codes - hskip) code lengths.
-    let mut space = 32; // Kraft inequality tracker
+    let mut space = 32i32; // Kraft inequality tracker
     let mut num_non_zero = 0;
 
     for &idx in &CODE_LENGTH_CODE_ORDER[start..num_code_length_codes] {
@@ -608,6 +613,52 @@ fn compute_code_lengths(
     Ok(code_lengths)
 }
 
+/// Write a prefix code for the given set of non-zero symbols and return the Huffman tree
+/// that matches what was written to the stream (so the encoder can use it for symbol encoding).
+/// Uses simple prefix code for 1-4 symbols, complex prefix code otherwise.
+pub fn write_prefix_code_and_build_tree(
+    writer: &mut BitWriter,
+    non_zero_symbols: &[u16],
+    full_tree: &HuffmanTree,
+    alphabet_size: u32,
+) -> BrotliResult<HuffmanTree> {
+    if non_zero_symbols.len() <= 4 {
+        // Write simple prefix code and build the corresponding tree.
+        write_simple_prefix_code(writer, non_zero_symbols, alphabet_size)?;
+
+        // Build the tree that matches the simple prefix code assignment.
+        let mut code_lengths = vec![0u8; alphabet_size as usize];
+        let nsym = non_zero_symbols.len();
+        match nsym {
+            1 => {
+                return HuffmanTree::single_symbol(non_zero_symbols[0], alphabet_size);
+            }
+            2 => {
+                code_lengths[non_zero_symbols[0] as usize] = 1;
+                code_lengths[non_zero_symbols[1] as usize] = 1;
+            }
+            3 => {
+                code_lengths[non_zero_symbols[0] as usize] = 1;
+                code_lengths[non_zero_symbols[1] as usize] = 2;
+                code_lengths[non_zero_symbols[2] as usize] = 2;
+            }
+            4 => {
+                // write_simple_prefix_code always writes tree_select=true for 4 symbols,
+                // which means all 4 get 2-bit codes.
+                for &s in non_zero_symbols {
+                    code_lengths[s as usize] = 2;
+                }
+            }
+            _ => {}
+        }
+        HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
+    } else {
+        // Write complex prefix code (uses the full tree's code lengths).
+        write_complex_prefix_code(writer, full_tree)?;
+        Ok(full_tree.clone())
+    }
+}
+
 /// Encode a Huffman tree as a simple prefix code to the bit writer.
 pub fn write_simple_prefix_code(
     writer: &mut BitWriter,
@@ -667,17 +718,48 @@ pub fn write_complex_prefix_code(writer: &mut BitWriter, tree: &HuffmanTree) -> 
         cl_freqs[cl as usize] += 1;
     }
 
-    // Build Huffman tree for code lengths (max code length 5 for code-length codes).
-    let cl_tree = build_huffman_tree_limited(&cl_freqs, 18, 5)?;
+    // Count distinct non-zero code-length values.
+    let distinct_cl_values: Vec<usize> = cl_freqs
+        .iter()
+        .enumerate()
+        .filter(|&(_, &f)| f > 0)
+        .map(|(v, _)| v)
+        .collect();
+
+    // Build code-length-of-code-length (cl_code_lengths) array:
+    // These are written into the bitstream as the Huffman tree for decoding code lengths.
+    // Each entry is the number of bits used to encode that code-length symbol.
+    // With max code length 5 for these meta-codes.
+    let cl_tree = if distinct_cl_values.len() == 1 {
+        // Special case: only one distinct code-length value.
+        // We cannot use a true single-symbol Huffman tree (code_length=0) because the
+        // decoder requires at least one non-zero entry. Use code_length=1 for that symbol,
+        // matching the Brotli spec for single-symbol code-length alphabets.
+        let sym = distinct_cl_values[0];
+        let mut cl_code_lengths = vec![0u8; 18];
+        cl_code_lengths[sym] = 1;
+        HuffmanTree::from_code_lengths(&cl_code_lengths, 18)?
+    } else {
+        // Build Huffman tree for code lengths (max code length 5 for code-length codes).
+        build_huffman_tree_limited(&cl_freqs, 18, 5)?
+    };
 
     // Write code-length code lengths in the prescribed order.
+    // Mirror the decoder's early-stop logic: stop as soon as space reaches 0
+    // (Kraft inequality is satisfied), so encoder and decoder stay in sync.
+    let mut space = 32i32;
     for &idx in &CODE_LENGTH_CODE_ORDER {
+        if space <= 0 {
+            break;
+        }
         let cl = cl_tree.code_lengths.get(idx).copied().unwrap_or(0);
         write_code_length_value(writer, cl)?;
+        if cl != 0 {
+            space -= 32 >> cl;
+        }
     }
 
     // Now encode the actual code lengths using the code-length tree.
-    // For simplicity, write each code length as a literal symbol.
     for &cl in &tree.code_lengths {
         encode_symbol(writer, &cl_tree, cl as u16)?;
     }
@@ -692,14 +774,21 @@ pub fn write_complex_prefix_code(writer: &mut BitWriter, tree: &HuffmanTree) -> 
 fn write_code_length_value(writer: &mut BitWriter, value: u8) -> BrotliResult<()> {
     // Clamp to valid range 0-5.
     let clamped = value.min(5);
+    // Encoding must match read_code_length_value (LSB-first bit ordering):
+    //   0: bits(0,0)       => 0b00  (2 bits)
+    //   1: bits(1,1,0)     => 0b011 (3 bits)  [v0=3,v1=0 → reader returns 1]
+    //   2: bits(0,1)       => 0b10  (2 bits)  [v0=2 → reader returns 2]
+    //   3: bits(1,0,1)     => 0b101 (3 bits)  [v0=1,v1=1 → reader returns 3]
+    //   4: bits(1,0,0)     => 0b001 (3 bits)  [v0=1,v1=0 → reader returns 4]
+    //   5: bits(1,1,1)     => 0b111 (3 bits)  [v0=3,v1=1 → reader returns 5]
     match clamped {
-        0 => writer.write_bits(0, 2),     // 00
-        1 => writer.write_bits(0b111, 3), // 11 + 1
-        2 => writer.write_bits(0b10, 2),  // 10
-        3 => writer.write_bits(0b101, 3), // 01 + 1
-        4 => writer.write_bits(0b001, 3), // 01 + 0
-        5 => writer.write_bits(0b011, 3), // 11 + 0
-        _ => Ok(()),                      // unreachable due to clamp
+        0 => writer.write_bits(0, 2),
+        1 => writer.write_bits(0b011, 3),
+        2 => writer.write_bits(0b10, 2),
+        3 => writer.write_bits(0b101, 3),
+        4 => writer.write_bits(0b001, 3),
+        5 => writer.write_bits(0b111, 3),
+        _ => Ok(()),
     }
 }
 

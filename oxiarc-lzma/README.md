@@ -1,13 +1,13 @@
 # oxiarc-lzma
 
-[![Version](https://img.shields.io/badge/version-0.2.5-blue)](https://github.com/cool-japan/oxiarc)
+[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-**Version 0.2.5** (2026-03-18) — 66 tests passing.
+**Version 0.2.6** (2026-03-18) — 66 tests passing.
 
-**What's new in 0.2.5**: Encoder improvements including probability model refinements and optimal parsing enhancements for better compression ratios on structured data.
+**What's new in 0.2.6**: Encoder improvements including probability model refinements and optimal parsing enhancements for better compression ratios on structured data.
 
 ## Overview
 
@@ -198,7 +198,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.2.5"
+oxiarc-lzma = "0.2.6"
 ```
 
 ## Modules

@@ -2,6 +2,7 @@
 
 ## Version History
 
+- **v0.2.6** (2026-03-21): Brotli fixes: is_single_symbol() bug fix, write_prefix_code_and_build_tree() function, Kraft inequality i32 fix, comprehensive roundtrip tests.
 - **v0.2.5** (2026-03-18): New codecs: Brotli (RFC 7932) with quality levels 0-11, static dictionary, streaming; Snappy with block and framed formats, CRC32C. DEFLATE streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder) with flush modes (sync_flush, full_flush, partial_flush). LZ4 acceleration parameter for compress_block_with_accel(). LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder, TIFF and GIF modes). Brotli/Snappy archive integration (BrotliReader/BrotliWriter, SnappyReader/SnappyWriter with format detection). EntryBuilder pattern with fluent API. Serde serialization for Entry types (optional feature). CLI: dry-run mode (--dry-run/-n), sort by ratio, Brotli/Snappy format support. Total: 1038 tests, ~47,241 lines, 150 files.
 - **v0.2.4** (2026-03-16): Dependency updates (clap 4.5→4.6, clap_complete 4.5→4.6), clippy fixes (collapsible match guards, sort_by→sort_by_key, redundant .max(0)). Total: 799 tests, ~40,406 lines, 127 files.
 - **v0.2.3** (2026-03-11): Async ZIP (async_zip), async deflate (async_deflate), GZip module, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb). Total: 799 tests, ~39,417 lines, 127 files.
@@ -250,14 +251,14 @@
   - LZMA/LZMA2, optimal parsing, range coder, price calculation
 - oxiarc-lzw: 76 tests
   - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests, streaming encoder/decoder tests
-- oxiarc-brotli: 75 tests
+- oxiarc-brotli: 78 tests
   - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API
 - oxiarc-snappy: 54 tests
   - Snappy block format, framed format with CRC32C checksums, streaming Write/Read API
 - oxiarc-cli: 0 tests
-- Total: 1038 tests (1038 passed, 2 skipped, zero warnings)
+- Total: 1041 tests (1041 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.2.5, 2026-03-18)
+## Code Statistics (v0.2.6, 2026-03-18)
 
 | Crate | Lines of Code |
 |-------|---------------|
@@ -273,4 +274,4 @@
 | oxiarc-cli | ~2,443 |
 | oxiarc-lzma | ~3,868 |
 | oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
-| **Total** | **~47,241** (150 files) |
+| **Total** | **~47,303** (150 files) |
