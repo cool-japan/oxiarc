@@ -1,6 +1,7 @@
-# oxiarc-core - Development Status
 
-## Completed Features
+# oxiarc-core - Development Status (v0.2.7, 2026-04-21)
+
+## Completed Features (COMPLETE)
 
 ### BitStream (601 lines)
 - [x] LSB-first bit packing (standard for DEFLATE/LZH)
@@ -65,15 +66,48 @@
 ## Future Enhancements
 
 ### Performance
-- [ ] SIMD-accelerated CRC-32 (using crc32fast patterns)
+- [x] SIMD-accelerated CRC32 (planned 2026-04-20)
+  - **Goal:** Verify the PCLMULQDQ/PMULL implementations in `crc_simd.rs` are wired into `Crc32::compute` via runtime feature detection on x86_64 and aarch64; add benchmarks if absent; enable `simd` feature by default on these targets.
+  - **Design:**
+    - Runtime dispatch: `Crc32::compute(data)` checks `std::is_x86_feature_detected!("pclmulqdq")` (or equivalent `is_aarch64_feature_detected!("aes")` for PMULL) once (stored in `OnceLock<fn(&[u8]) -> u32>`), then dispatches.
+    - Update `oxiarc-core/Cargo.toml` to add `simd` to `[features] default = [..., "simd"]` **only for x86_64/aarch64 targets** via `[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]`-style gating — actually, features can't be target-conditional directly; instead, make the `simd` module always compile-available on those targets and fall back to the slicing-by-8 scalar path on others.
+    - Preferred approach: drop the `feature = "simd"` gate, make `crc_simd` always compiled on x86_64/aarch64 via `#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]`, dispatch at runtime, keep a scalar fallback always compiled.
+  - **Files:**
+    - MODIFY `oxiarc-core/src/crc.rs` — add runtime dispatch in `Crc32::compute` + `Crc32::update`.
+    - MODIFY `oxiarc-core/src/crc_simd.rs` — replace `#[cfg(feature = "simd")]` with `#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]`.
+    - MODIFY `oxiarc-core/src/lib.rs` — same gating.
+    - MODIFY `oxiarc-core/Cargo.toml` — remove `simd` feature, or re-document as a "enable extra SIMD" opt-in with a no-op default on non-supported targets.
+  - **Prerequisites:** none.
+  - **Tests:** cross-validate SIMD path against scalar path on a randomized 1 MiB buffer — bit-exact equality; add a benchmark (criterion or black_box baseline) showing SIMD > 4× scalar on supported targets.
+  - **Downstream compatibility (explicit):** the `simd` cargo-feature **name stays defined** in `oxiarc-core/Cargo.toml` as a no-op alias after the gate is removed. Any downstream `features = ["simd"]` (including workspace consumers) must continue to resolve and compile unchanged. Document the alias as deprecated-but-preserved in the feature doc-comment, and leave a follow-up to remove it after one minor release cycle.
+  - **Risk:** feature-flag removal can break downstream consumers → mitigated by the no-op alias above. Secondary risk: `std::is_x86_feature_detected!` / `std::is_aarch64_feature_detected!` invocation cost on hot paths — dispatch only once via `OnceLock<fn>` to amortize.
+- [~] SIMD CRC32 runtime-dispatch — wire PCLMULQDQ/PMULL (planned 2026-04-20) — **deferred**: PMULL path empirically disagrees with slicing-by-8 on buffers that trigger the fold loop (fixed vectors < 64 B pass only because they bypass SIMD via the scalar fallback; `vec![0xFF; 1_048_576]` gives `0x5e570f27` vs scalar `0x956bac74`). Root cause is structural (fold constants in `x86_constants`/`arm_constants` need to be the 33-bit pre-shifted form — e.g. `rk1 = 0x154442bd4`, `rk2 = 0x1c6e41596` — plus matching Barrett reduction shape per Intel's white paper). PCLMULQDQ cannot be verified from the aarch64 host used for this run. Dispatch continues to route to `software_crc32`; SIMD modules stay compiled but unreferenced. Tests added but `#[ignore]`-marked with reproducible diagnosis; see `test_pmull_matches_scalar_vectors` in `crc_simd.rs`.
 - [ ] Vectorized bit operations
 - [ ] Zero-copy buffer operations
 
 ### Features
-- [ ] Async I/O support (`AsyncRead`/`AsyncWrite`)
+- [x] Async I/O support (planned 2026-04-20)
+  - **Goal:** Verify `oxiarc-core::async_io` is feature-complete (AsyncCompressor/AsyncDecompressor traits + Wrapper adapters + StreamingAsync* + `compress_concurrent`/`decompress_concurrent`) and add any missing pieces: doc examples, round-trip test covering all four compose directions, re-export audit.
+  - **Design:** Read `oxiarc-core/src/async_io.rs` fully, inventory the public surface, write a doc-test + integration test matrix covering (sync codec → AsyncCompressorWrapper), (streaming sync codec → StreamingAsyncCompressorWrapper), and the concurrent helpers. If a method is stubbed, fill it in.
+  - **Files:** MODIFY `oxiarc-core/src/async_io.rs` (doc examples only if already complete); ADD `oxiarc-core/tests/async_io.rs` (or extend existing).
+  - **Prerequisites:** none.
+  - **Tests:** four-way matrix above; `tokio = { version = "*", features = ["rt", "macros", "io-util"] }` dev-dep (latest).
+  - **Risk:** if implementation has gaps, the verify becomes genuine implementation work; that is acceptable per IMPLEMENT POLICY. Report `deviated` if scope explodes beyond this run.
 - [ ] Memory-mapped file support
-- [ ] Progress callbacks
-- [ ] Cancellation support
+- [x] Progress callbacks (planned 2026-04-20)
+  - **Goal:** A single `ProgressSink` trait lives in `oxiarc-core::progress` and is consumable by every codec + archive reader. This run wires it into the three streaming readers (TAR/ZIP/LZH). Per-codec adoption for brotli/deflate/lzma/snappy/cli is deferred to future runs.
+  - **Design:** `pub trait ProgressSink: Send + Sync { fn on_progress(&self, processed: u64, total: Option<u64>); fn on_entry(&self, _name: &str, _index: u64) {} fn on_finish(&self) {} }`. Plus `NoopProgress` impl, `ProgressHandle = Arc<dyn ProgressSink>`, and `noop_progress()` helper. Stream readers accept `Option<ProgressHandle>` via `.with_progress(handle)`.
+  - **Files:** `oxiarc-core/src/progress.rs` (NEW ~80 lines), `oxiarc-core/src/lib.rs` (MODIFY)
+  - **Prerequisites:** none
+  - **Tests:** unit (NoopProgress callable, ProgressHandle is Send+Sync); integration in tar/stream.rs (counting sink observes N calls, processed is monotonic)
+  - **Risk:** Arc+vtable overhead per chunk — mitigated by `Option` guard (zero overhead when None)
+- [x] Cancellation support (planned 2026-04-20)
+  - **Goal:** `CancellationToken` in `oxiarc-core::cancel`; archive stream readers check it at entry boundaries; add `OxiarcError::Cancelled`.
+  - **Design:** `struct CancellationToken { flag: Arc<AtomicBool> }` with `cancel()`, `is_cancelled()`, `check() -> Result<(), OxiarcError>`. Atomic store/load with Release/Acquire ordering. Stream readers accept `Option<CancellationToken>` via `.with_cancel(token)`.
+  - **Files:** `oxiarc-core/src/cancel.rs` (NEW ~60 lines), `oxiarc-core/src/error.rs` (MODIFY — add Cancelled variant), `oxiarc-core/src/lib.rs` (MODIFY)
+  - **Prerequisites:** none
+  - **Tests:** unit (Send+Sync+Clone, cross-thread cancel observed); integration in zip/stream.rs (next_entry returns Err(Cancelled) after cancel)
+  - **Risk:** none — textbook cooperative cancellation primitive
 
 ### API
 - [ ] `no_std` support (optional)

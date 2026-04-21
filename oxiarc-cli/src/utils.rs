@@ -1,15 +1,12 @@
-//! Utility functions for the CLI.
-
 use crate::commands::SortBy;
+use crate::style::Styler;
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
-use oxiarc_core::Entry;
+use oxiarc_core::{Entry, EntryType};
 use std::collections::BTreeMap;
 
-/// An extracted entry: (filename, is_directory, file_contents).
 pub type ExtractedEntry = (String, bool, Vec<u8>);
 
-/// Create a progress bar with standard styling.
 pub fn create_progress_bar(len: u64, enable: bool) -> ProgressBar {
     if !enable {
         return ProgressBar::hidden();
@@ -25,11 +22,7 @@ pub fn create_progress_bar(len: u64, enable: bool) -> ProgressBar {
     pb
 }
 
-/// Check if a filename matches the filter patterns.
-/// - If include patterns are specified, the name must match at least one
-/// - If exclude patterns are specified, the name must not match any
 pub fn matches_filters(name: &str, include: &[String], exclude: &[String]) -> bool {
-    // Check exclude patterns first
     for pattern_str in exclude {
         if let Ok(pattern) = Pattern::new(pattern_str) {
             if pattern.matches(name) {
@@ -38,12 +31,10 @@ pub fn matches_filters(name: &str, include: &[String], exclude: &[String]) -> bo
         }
     }
 
-    // If no include patterns, include everything (that wasn't excluded)
     if include.is_empty() {
         return true;
     }
 
-    // Check include patterns
     for pattern_str in include {
         if let Ok(pattern) = Pattern::new(pattern_str) {
             if pattern.matches(name) {
@@ -55,7 +46,6 @@ pub fn matches_filters(name: &str, include: &[String], exclude: &[String]) -> bo
     false
 }
 
-/// Filter entries based on include/exclude patterns.
 pub fn filter_entries(entries: &[Entry], include: &[String], exclude: &[String]) -> Vec<Entry> {
     if include.is_empty() && exclude.is_empty() {
         return entries.to_vec();
@@ -68,13 +58,13 @@ pub fn filter_entries(entries: &[Entry], include: &[String], exclude: &[String])
         .collect()
 }
 
-/// Print entries in a formatted table.
-pub fn print_entries(entries: &[Entry], verbose: bool) {
+pub fn print_entries(entries: &[Entry], verbose: bool, styler: &Styler) {
     if verbose {
-        println!(
+        let header_text = format!(
             "{:>10} {:>10} {:>6} {:>8}  Name",
-            "Size", "Compressed", "Ratio", "Method",
+            "Size", "Compressed", "Ratio", "Method"
         );
+        println!("{}", styler.header(&header_text));
         println!("{}", "-".repeat(60));
 
         let mut total_size = 0u64;
@@ -87,22 +77,26 @@ pub fn print_entries(entries: &[Entry], verbose: bool) {
                 "-".to_string()
             };
 
-            let type_prefix = if entry.is_dir() {
-                "d "
-            } else if entry.entry_type == oxiarc_core::EntryType::Symlink {
-                "l "
+            let (type_prefix, styled_name) = if entry.is_dir() {
+                ("d ", format!("{}", styler.dir_entry(&entry.name)))
+            } else if entry.entry_type == EntryType::Symlink {
+                ("l ", format!("{}", styler.symlink_entry(&entry.name)))
             } else {
-                "  "
+                ("  ", format!("{}", styler.file_entry(&entry.name)))
             };
 
+            let size_str = format!("{:>10}", entry.size);
+            let compressed_str = format!("{:>10}", entry.compressed_size);
+            let ratio_str = format!("{:>6}", ratio);
+
             println!(
-                "{:>10} {:>10} {:>6} {:>8}  {}{}",
-                entry.size,
-                entry.compressed_size,
-                ratio,
+                "{} {} {} {:>8}  {}{}",
+                styler.size(&size_str),
+                styler.size(&compressed_str),
+                ratio_str,
                 entry.method.name(),
                 type_prefix,
-                entry.name
+                styled_name
             );
 
             total_size += entry.size;
@@ -115,21 +109,27 @@ pub fn print_entries(entries: &[Entry], verbose: bool) {
         } else {
             0.0
         };
-        println!(
+        let total_line = format!(
             "{:>10} {:>10} {:>5.1}%          {} files",
             total_size,
             total_compressed,
             total_ratio,
             entries.len()
         );
+        println!("{}", styler.size(&total_line));
     } else {
         for entry in entries {
-            println!("{}", entry.name);
+            if entry.is_dir() {
+                println!("{}", styler.dir_entry(&entry.name));
+            } else if entry.entry_type == EntryType::Symlink {
+                println!("{}", styler.symlink_entry(&entry.name));
+            } else {
+                println!("{}", styler.file_entry(&entry.name));
+            }
         }
     }
 }
 
-/// Sort entries by the specified criteria.
 pub fn sort_entries(entries: &mut [Entry], sort_by: SortBy, reverse: bool) {
     match sort_by {
         SortBy::Name => {
@@ -165,14 +165,10 @@ pub fn sort_entries(entries: &mut [Entry], sort_by: SortBy, reverse: bool) {
     }
 }
 
-/// Represents a node in the directory tree.
 #[derive(Debug, Default)]
 struct TreeNode {
-    /// Children indexed by name.
     children: BTreeMap<String, TreeNode>,
-    /// Entry data if this is a file/directory leaf.
     entry: Option<Entry>,
-    /// Whether this is a directory (has children or ends with /).
     is_dir: bool,
 }
 
@@ -192,32 +188,25 @@ impl TreeNode {
         let child = self.children.entry(part.to_string()).or_default();
 
         if idx == parts.len() - 1 {
-            // This is the final part
             child.entry = Some(entry.clone());
             child.is_dir = entry.is_dir();
         } else {
-            // Intermediate directory
             child.is_dir = true;
             child.insert_parts(parts, idx + 1, entry);
         }
     }
 }
 
-/// Print entries as a directory tree.
-pub fn print_tree(entries: &[Entry], verbose: bool) {
-    // Build the tree structure
+pub fn print_tree(entries: &[Entry], verbose: bool, styler: &Styler) {
     let mut root = TreeNode::default();
     for entry in entries {
         root.insert(&entry.name, entry.clone());
     }
 
-    // Print the tree
-    print_tree_node(&root, "", verbose, true);
+    print_tree_node(&root, "", verbose, true, styler);
 }
 
-/// Recursively print a tree node.
-fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool) {
-    // Sort children: directories first, then files, both alphabetically
+fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool, styler: &Styler) {
     let mut children: Vec<(&String, &TreeNode)> = node.children.iter().collect();
     children.sort_by(|a, b| match (a.1.is_dir, b.1.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
@@ -228,7 +217,6 @@ fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool) 
     for (i, (name, child)) in children.iter().enumerate() {
         let is_last_child = i == children.len() - 1;
 
-        // Determine the prefix for this item
         let (current_prefix, next_prefix) = if is_root {
             ("".to_string(), "".to_string())
         } else if is_last_child {
@@ -237,8 +225,13 @@ fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool) 
             (format!("{}{}── ", prefix, "├"), format!("{}│   ", prefix))
         };
 
-        // Format the entry line
         let type_indicator = if child.is_dir { "/" } else { "" };
+
+        let styled_name = if child.is_dir {
+            format!("{}", styler.dir_entry(name))
+        } else {
+            format!("{}", styler.file_entry(name))
+        };
 
         if verbose {
             if let Some(ref entry) = child.entry {
@@ -249,23 +242,24 @@ fn print_tree_node(node: &TreeNode, prefix: &str, verbose: bool, is_root: bool) 
                 };
                 println!(
                     "{}{}{} [{}]",
-                    current_prefix, name, type_indicator, size_str
+                    current_prefix,
+                    styled_name,
+                    type_indicator,
+                    styler.size(&size_str)
                 );
             } else {
-                println!("{}{}{}", current_prefix, name, type_indicator);
+                println!("{}{}{}", current_prefix, styled_name, type_indicator);
             }
         } else {
-            println!("{}{}{}", current_prefix, name, type_indicator);
+            println!("{}{}{}", current_prefix, styled_name, type_indicator);
         }
 
-        // Recursively print children
         if child.is_dir {
-            print_tree_node(child, &next_prefix, verbose, false);
+            print_tree_node(child, &next_prefix, verbose, false, styler);
         }
     }
 }
 
-/// Format file size in human-readable format.
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -278,6 +272,6 @@ fn format_size(size: u64) -> String {
     } else if size >= KB {
         format!("{:.1} KB", size as f64 / KB as f64)
     } else {
-        format!("{} B", size)
+        format!("{size} B")
     }
 }

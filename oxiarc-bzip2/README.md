@@ -1,15 +1,18 @@
-# oxiarc-bzip2
 
-[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+# oxiarc-bzip2 [Stable]
 
 Pure Rust implementation of BZip2 compression/decompression algorithm.
 
-**Version 0.2.6** (2026-03-18) — 37 tests passing (2 skipped: heavy/long-running).
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
+
+**Version 0.2.7** (2026-04-21) — 41 tests passing.
 
 ## Overview
 
 BZip2 is a high-compression algorithm based on the Burrows-Wheeler Transform (BWT) and Huffman coding, offering better compression ratios than DEFLATE at the cost of speed.
+
 
 ## Features
 
@@ -18,6 +21,8 @@ BZip2 is a high-compression algorithm based on the Burrows-Wheeler Transform (BW
 - **Compression levels 1-9** - Adjustable block sizes (100KB-900KB)
 - **Streaming API** - Process data in chunks
 - **One-shot API** - Convenient functions for simple cases
+
+All features are implemented and tested. API is stable.
 
 ## Quick Start
 

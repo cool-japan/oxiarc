@@ -1,7 +1,9 @@
 //! BZip2 encoder.
 
 use crate::{BLOCK_MAGIC, BZIP2_MAGIC, CompressionLevel, EOS_MAGIC, bwt, huffman, mtf, rle};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::Result;
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::{BitWriter, Crc32};
 use std::io::Write;
 
@@ -9,12 +11,23 @@ use std::io::Write;
 use rayon::prelude::*;
 
 /// BZip2 encoder.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`BzEncoder::with_progress`] / [`BzEncoder::with_cancel`] builders.
 pub struct BzEncoder<W: Write> {
     writer: BitWriter<W>,
     #[allow(dead_code)]
     level: CompressionLevel,
     block_crc: u32,
     combined_crc: u32,
+    /// Optional progress sink. Notified with cumulative uncompressed bytes
+    /// after each block is successfully written.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token. Checked before each block is encoded.
+    cancel: Option<CancellationToken>,
+    /// Cumulative uncompressed bytes successfully encoded.
+    bytes_processed: u64,
 }
 
 impl<W: Write> BzEncoder<W> {
@@ -36,13 +49,41 @@ impl<W: Write> BzEncoder<W> {
             level,
             block_crc: 0,
             combined_crc: 0,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         })
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(cumulative_uncompressed_bytes, None)` is
+    /// called once after each block is successfully encoded. `on_finish()`
+    /// is called after the stream footer is written in [`BzEncoder::finish`].
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked at the start of each [`BzEncoder::write_block`]
+    /// call. If cancelled, `write_block` returns [`oxiarc_core::error::OxiArcError::Cancelled`]
+    /// before any bytes for that block are written.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Write a data block.
     pub fn write_block(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
+        }
+
+        // Cooperative cancellation check before starting the block.
+        if let Some(ref token) = self.cancel {
+            token.check()?;
         }
 
         // Calculate CRC
@@ -188,6 +229,12 @@ impl<W: Write> BzEncoder<W> {
             self.write_code(code, len)?;
         }
 
+        // Update cumulative uncompressed byte count and notify progress.
+        self.bytes_processed = self.bytes_processed.saturating_add(data.len() as u64);
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_processed, None);
+        }
+
         Ok(())
     }
 
@@ -213,6 +260,11 @@ impl<W: Write> BzEncoder<W> {
 
         // Flush any remaining bits
         self.writer.flush()?;
+
+        // Notify progress completion.
+        if let Some(ref handle) = self.progress {
+            handle.on_finish();
+        }
 
         self.writer.into_inner()
     }
@@ -460,6 +512,65 @@ mod tests {
         let result = compress(b"hello world", CompressionLevel::new(1)).unwrap();
         assert!(result.len() > 10);
         assert_eq!(&result[0..2], &BZIP2_MAGIC);
+    }
+
+    #[test]
+    fn test_encoder_with_progress_builder() {
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            finish_count: AtomicU64,
+            last_processed: AtomicU64,
+        }
+
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+                self.last_processed.store(processed, Ordering::SeqCst);
+            }
+            fn on_finish(&self) {
+                self.finish_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            finish_count: AtomicU64::new(0),
+            last_processed: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        let output = Vec::new();
+        let mut encoder = BzEncoder::new(output, CompressionLevel::new(1))
+            .expect("encoder should construct")
+            .with_progress(handle);
+        encoder
+            .write_block(b"hello progress world")
+            .expect("write_block should succeed");
+        let _ = encoder.finish().expect("finish should succeed");
+
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.last_processed.load(Ordering::SeqCst), 20);
+    }
+
+    #[test]
+    fn test_encoder_with_cancel_builder() {
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::error::OxiArcError;
+
+        let token = CancellationToken::new();
+        let output = Vec::new();
+        let mut encoder = BzEncoder::new(output, CompressionLevel::new(1))
+            .expect("encoder should construct")
+            .with_cancel(token.clone());
+
+        token.cancel();
+        let result = encoder.write_block(b"should not compress");
+        assert!(matches!(result, Err(OxiArcError::Cancelled)));
     }
 
     #[test]

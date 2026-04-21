@@ -14,6 +14,9 @@
 //! - Uncompressed (raw bytes)
 //! - Compressed (LZ77 + Huffman encoded commands)
 
+use oxiarc_core::cancel::CancellationToken;
+use oxiarc_core::progress::ProgressHandle;
+
 use crate::bit_reader::BitReader;
 use crate::context::{
     ContextMap, ContextMode, NUM_DISTANCE_CONTEXTS, distance_context_id, literal_context_id,
@@ -30,6 +33,24 @@ const MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
 
 /// Decompress a Brotli-compressed byte slice.
 pub fn decompress(data: &[u8]) -> BrotliResult<Vec<u8>> {
+    decompress_with_hooks(data, None, None)
+}
+
+/// Decompress with optional per-meta-block progress and cancellation hooks.
+///
+/// Called by [`decompress`] (with `None`/`None`) and by streaming types
+/// that carry a [`ProgressHandle`] or [`CancellationToken`].
+///
+/// Progress fires after each meta-block is decoded; `processed` is the
+/// number of output bytes produced so far; `total` is `None` because
+/// the uncompressed length is generally not known ahead of time.
+///
+/// Cancellation is checked at the start of each meta-block iteration.
+pub(crate) fn decompress_with_hooks(
+    data: &[u8],
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+) -> BrotliResult<Vec<u8>> {
     if data.is_empty() {
         return Err(BrotliError::UnexpectedEof);
     }
@@ -47,6 +68,11 @@ pub fn decompress(data: &[u8]) -> BrotliResult<Vec<u8>> {
 
     // Process meta-blocks.
     loop {
+        // Check for cancellation at each meta-block boundary.
+        if let Some(token) = cancel {
+            token.check().map_err(BrotliError::from)?;
+        }
+
         let is_last = reader.read_bit()?;
 
         if is_last {
@@ -104,6 +130,12 @@ pub fn decompress(data: &[u8]) -> BrotliResult<Vec<u8>> {
                     let byte = reader.read_bits(8)? as u8;
                     output.push(byte);
                 }
+
+                // Report progress after this uncompressed meta-block.
+                if let Some(handle) = progress {
+                    handle.on_progress(output.len() as u64, None);
+                }
+
                 continue;
             }
         } else {
@@ -119,6 +151,12 @@ pub fn decompress(data: &[u8]) -> BrotliResult<Vec<u8>> {
                     let byte = reader.read_bits(8)? as u8;
                     output.push(byte);
                 }
+
+                // Report progress after this uncompressed last meta-block.
+                if let Some(handle) = progress {
+                    handle.on_progress(output.len() as u64, None);
+                }
+
                 if is_last {
                     break;
                 }
@@ -135,6 +173,11 @@ pub fn decompress(data: &[u8]) -> BrotliResult<Vec<u8>> {
             &mut dist_ring,
             &mut dist_ring_idx,
         )?;
+
+        // Report progress after each compressed meta-block.
+        if let Some(handle) = progress {
+            handle.on_progress(output.len() as u64, None);
+        }
 
         if is_last {
             break;

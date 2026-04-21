@@ -143,6 +143,38 @@ impl Inflater {
         self.inflate(&mut bit_reader)
     }
 
+    /// Decompress data from a caller-owned [`BitReader`] and also report
+    /// how many whole bytes of the underlying byte-stream the DEFLATE
+    /// data consumed.
+    ///
+    /// DEFLATE is bit-aligned but this method rounds the consumed-bit
+    /// count up to the next whole byte — this is the byte count needed
+    /// by formats that place a byte-aligned trailer immediately after
+    /// the compressed stream (e.g., ZIP's data-descriptor per APPNOTE
+    /// §4.3.9).
+    ///
+    /// Because the `BitReader` is owned by the caller, any further reads
+    /// on the SAME `BitReader` after this method returns will correctly
+    /// drain its internal buffer before touching the underlying reader —
+    /// no bytes are lost to the DEFLATE prefetch.
+    ///
+    /// On return, `reader` is aligned to the next byte boundary
+    /// (intra-byte padding bits have been skipped). Reads via the
+    /// `BitReader` continue from that byte boundary.
+    pub fn inflate_consumed<R: Read>(
+        &mut self,
+        reader: &mut BitReader<R>,
+    ) -> Result<(Vec<u8>, u64)> {
+        let bits_before = reader.bits_read();
+        let decompressed = self.inflate(reader)?;
+        // Align to the byte boundary so byte-aligned structures following
+        // the DEFLATE stream start at a clean offset.
+        reader.align_to_byte();
+        let bits_after = reader.bits_read();
+        let consumed = (bits_after - bits_before).div_ceil(8);
+        Ok((decompressed, consumed))
+    }
+
     /// Decompress data from a bit reader.
     pub fn inflate<R: Read>(&mut self, reader: &mut BitReader<R>) -> Result<Vec<u8>> {
         while !self.final_block {
@@ -435,6 +467,35 @@ mod tests {
 
         let result = inflate(&compressed).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_inflate_consumed_stored() -> Result<()> {
+        // A stored block followed by trailing bytes that must remain
+        // readable via the same BitReader after inflate completes.
+        // Block: BFINAL=1, BTYPE=00, LEN=5, NLEN=!5, "Hello" = 10 bytes.
+        let mut data = vec![
+            0x01, // BFINAL=1, BTYPE=00, padding
+            0x05, 0x00, // LEN=5
+            0xFA, 0xFF, // NLEN
+            b'H', b'e', b'l', b'l', b'o',
+        ];
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let cursor = std::io::Cursor::new(&data);
+        let mut bit_reader = BitReader::new(cursor);
+        let mut inflater = Inflater::new();
+        let (decompressed, consumed) = inflater.inflate_consumed(&mut bit_reader)?;
+        assert_eq!(decompressed, b"Hello");
+        // Stored block wire length: 1 header + 2 LEN + 2 NLEN + 5 data = 10 bytes
+        assert_eq!(consumed, 10);
+
+        // The 4 trailer bytes must be readable via the BitReader
+        // (they drain from its buffer first, then the underlying cursor).
+        let mut trailer = [0u8; 4];
+        bit_reader.read_bytes(&mut trailer)?;
+        assert_eq!(&trailer, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        Ok(())
     }
 
     // Note: More comprehensive tests would require generating valid

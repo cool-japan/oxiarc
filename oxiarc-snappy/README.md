@@ -1,6 +1,11 @@
-# oxiarc-snappy
+
+# oxiarc-snappy [Stable]
 
 Pure Rust Snappy compression library, part of the OxiArc ecosystem.
+
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
 ## Features
 
@@ -9,21 +14,6 @@ Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 - Streaming Write/Read API
 - Pure Rust — no C dependencies
 
-## Usage
+All features are implemented and tested. API is stable.
 
-```toml
-[dependencies]
-oxiarc-snappy = "0.2.6"
-```
-
-## Tests
-
-54 tests passing.
-
-## License
-
-Apache-2.0
-
-## Authors
-
-COOLJAPAN OU (Team Kitasan)
+**Version: 0.2.7 (2026-04-21) | 57 tests passing**

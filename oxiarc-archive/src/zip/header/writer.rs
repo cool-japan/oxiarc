@@ -11,10 +11,23 @@ use super::types::{
     ZIP64_MARKER_16, ZIP64_MARKER_32, ZipCompressionLevel,
 };
 use oxiarc_core::Crc32;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_deflate::deflate;
+use oxiarc_lzma::{LzmaEncoder, LzmaLevel};
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// General-purpose bit flag bit 1: LZMA EOS marker present.
+const FLAG_LZMA_EOS: u16 = 0x0002;
+
+/// LZMA method-14 version bytes written into the method-14 header.
+const LZMA_METHOD14_MAJOR_VER: u8 = 0x13;
+const LZMA_METHOD14_MINOR_VER: u8 = 0x00;
+
+/// Fixed dict_size for LZMA compression when writing ZIP entries.
+/// 16 MB — a good balance between speed and compression ratio.
+const LZMA_DICT_SIZE: u32 = 1 << 24;
 
 /// ZIP archive writer.
 pub struct ZipWriter<W: Write> {
@@ -23,6 +36,7 @@ pub struct ZipWriter<W: Write> {
     offset: u64,
     compression: ZipCompressionLevel,
     finished: bool,
+    progress: Option<ProgressHandle>,
 }
 
 impl<W: Write> ZipWriter<W> {
@@ -34,7 +48,14 @@ impl<W: Write> ZipWriter<W> {
             offset: 0,
             compression: ZipCompressionLevel::default(),
             finished: false,
+            progress: None,
         }
+    }
+
+    /// Attach a progress handle to this writer.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
     }
 
     /// Set the compression level for subsequent files.
@@ -47,6 +68,16 @@ impl<W: Write> ZipWriter<W> {
         self.add_file_with_options(name, data, self.compression)
     }
 
+    /// Add a file with Stored (no compression) regardless of the writer's
+    /// configured compression level.
+    ///
+    /// Useful when the caller has already determined that compression is not
+    /// worthwhile — e.g. the CLI `--compress-threshold` flag routes small
+    /// files here so they skip deflate entirely.
+    pub fn add_file_stored(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        self.add_file_with_options(name, data, ZipCompressionLevel::Store)
+    }
+
     /// Add a file with specific compression.
     pub fn add_file_with_options(
         &mut self,
@@ -54,6 +85,12 @@ impl<W: Write> ZipWriter<W> {
         data: &[u8],
         compression: ZipCompressionLevel,
     ) -> Result<()> {
+        // Progress: notify about entry start
+        let file_index = self.entries.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(name, file_index);
+        }
+
         let crc32 = Crc32::compute(data);
 
         // Get current time for DOS format
@@ -189,6 +226,151 @@ impl<W: Write> ZipWriter<W> {
             external_attr: 0o100644 << 16, // Regular file, rw-r--r--
             local_header_offset,
         });
+
+        // Progress: notify about bytes written
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(uncompressed_size, None);
+        }
+
+        Ok(())
+    }
+
+    /// Add a file to the archive compressed with LZMA (method 14).
+    ///
+    /// The data is compressed using LZMA and stored per APPNOTE §5.8.8:
+    /// - Local file header has compression method = 14
+    /// - General-purpose bit flag bit 1 is set (EOS marker present in stream)
+    /// - Compressed data starts with `[major_ver][minor_ver][props_size_le16][5-byte-props][stream]`
+    pub fn add_file_lzma(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        // Progress: notify about entry start
+        let file_index = self.entries.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(name, file_index);
+        }
+
+        let crc32 = Crc32::compute(data);
+        let (mtime, mdate) = Self::current_dos_time();
+
+        // Compress using LZMA — the encoder always emits an EOS marker
+        let encoder = LzmaEncoder::new(LzmaLevel::DEFAULT, LZMA_DICT_SIZE);
+        let props = encoder.properties();
+        let lzma_stream = encoder
+            .compress(data)
+            .map_err(|e| OxiArcError::invalid_header(format!("LZMA compression failed: {}", e)))?;
+
+        // Build the 5-byte props block: [props_byte][dict_size_le32]
+        let mut props_block = [0u8; 5];
+        props_block[0] = props.to_byte();
+        props_block[1..5].copy_from_slice(&LZMA_DICT_SIZE.to_le_bytes());
+
+        // Build the method-14 header: [major][minor][props_size_le16][props_block]
+        let props_size: u16 = 5;
+        let mut method14_payload = Vec::with_capacity(4 + 5 + lzma_stream.len());
+        method14_payload.push(LZMA_METHOD14_MAJOR_VER);
+        method14_payload.push(LZMA_METHOD14_MINOR_VER);
+        method14_payload.extend_from_slice(&props_size.to_le_bytes());
+        method14_payload.extend_from_slice(&props_block);
+        method14_payload.extend_from_slice(&lzma_stream);
+
+        let compressed_size = method14_payload.len() as u64;
+        let uncompressed_size = data.len() as u64;
+        let local_header_offset = self.offset;
+
+        // Version needed: 63 for LZMA (per APPNOTE §4.4.3.2)
+        let needs_zip64 = compressed_size >= ZIP64_MARKER_32 as u64
+            || uncompressed_size >= ZIP64_MARKER_32 as u64
+            || local_header_offset >= ZIP64_MARKER_32 as u64;
+
+        // Version 63 required for LZMA regardless of Zip64 status
+        let version_needed: u16 = 63;
+
+        let filename_bytes = name.as_bytes();
+
+        // Build Zip64 extra field if needed
+        let mut local_extra = Vec::new();
+        if needs_zip64 {
+            local_extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
+            local_extra.extend_from_slice(&16u16.to_le_bytes());
+            local_extra.extend_from_slice(&uncompressed_size.to_le_bytes());
+            local_extra.extend_from_slice(&compressed_size.to_le_bytes());
+        }
+
+        let compressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            compressed_size as u32
+        };
+        let uncompressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            uncompressed_size as u32
+        };
+
+        // General-purpose bit flag: bit 1 = EOS marker present in LZMA stream
+        let flags: u16 = FLAG_LZMA_EOS;
+        // Compression method 14 = LZMA
+        let method: u16 = 14;
+
+        // Signature
+        self.writer
+            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+        // Version needed
+        self.writer.write_all(&version_needed.to_le_bytes())?;
+        // Flags (bit 1 = EOS marker present)
+        self.writer.write_all(&flags.to_le_bytes())?;
+        // Compression method (14 = LZMA)
+        self.writer.write_all(&method.to_le_bytes())?;
+        // Modification time
+        self.writer.write_all(&mtime.to_le_bytes())?;
+        // Modification date
+        self.writer.write_all(&mdate.to_le_bytes())?;
+        // CRC-32
+        self.writer.write_all(&crc32.to_le_bytes())?;
+        // Compressed size
+        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        // Uncompressed size
+        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        // Filename length
+        self.writer
+            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+        // Extra field length
+        self.writer
+            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
+        // Filename
+        self.writer.write_all(filename_bytes)?;
+        // Extra field
+        self.writer.write_all(&local_extra)?;
+        // Compressed LZMA data (method-14 format)
+        self.writer.write_all(&method14_payload)?;
+
+        // Update offset (30 = local header fixed size)
+        self.offset +=
+            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + compressed_size;
+
+        // Store central directory entry
+        self.entries.push(CentralDirEntry {
+            version_made_by: 0x031E, // Unix, version 3.0
+            version_needed,
+            flags,
+            method,
+            mtime,
+            mdate,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            filename: name.to_string(),
+            extra: Vec::new(),
+            comment: String::new(),
+            disk_start: 0,
+            internal_attr: 0,
+            external_attr: 0o100644 << 16,
+            local_header_offset,
+        });
+
+        // Progress: notify about bytes written
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(uncompressed_size, None);
+        }
 
         Ok(())
     }

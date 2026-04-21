@@ -23,6 +23,8 @@ mod tests {
     use super::writer::ZipWriter;
     use oxiarc_deflate::deflate;
     use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_compression_method() {
@@ -1017,6 +1019,309 @@ mod tests {
         }
 
         eprintln!("\nAll compressions/decompressions succeeded!");
+        Ok(())
+    }
+
+    // =======================================================================
+    // LZMA (method 14) Tests
+    // =======================================================================
+
+    #[test]
+    fn test_zip_lzma_roundtrip() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_file_lzma("hello.txt", b"Hello from LZMA!")?;
+            writer.add_file_lzma("data.bin", b"Binary data with LZMA compression: AAAAABBBBB")?;
+            writer.add_file_lzma("empty.txt", b"")?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        assert_eq!(reader.entries().len(), 3);
+
+        let entry0 = reader.entries()[0].clone();
+        assert_eq!(entry0.name, "hello.txt");
+        let data0 = reader.extract(&entry0)?;
+        assert_eq!(&data0, b"Hello from LZMA!");
+
+        let entry1 = reader.entries()[1].clone();
+        assert_eq!(entry1.name, "data.bin");
+        let data1 = reader.extract(&entry1)?;
+        assert_eq!(&data1, b"Binary data with LZMA compression: AAAAABBBBB");
+
+        let entry2 = reader.entries()[2].clone();
+        assert_eq!(entry2.name, "empty.txt");
+        let data2 = reader.extract(&entry2)?;
+        assert!(data2.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_zip_lzma_header_structure() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_file_lzma("test.txt", b"Test data for header inspection.")?;
+            writer.finish()?;
+        }
+
+        // Verify binary structure:
+        // Offset 0: PK\x03\x04 (LFH signature)
+        assert_eq!(&output[0..4], &[0x50, 0x4B, 0x03, 0x04]);
+
+        // Offset 6: general-purpose bit flag — bit 1 must be set (EOS marker)
+        let gp_flag = u16::from_le_bytes([output[6], output[7]]);
+        assert_ne!(
+            gp_flag & 0x0002,
+            0,
+            "gp_flag bit 1 (EOS marker) must be set"
+        );
+
+        // Offset 8: compression method — must be 0x0E 0x00 (14 = LZMA)
+        assert_eq!(output[8], 0x0E, "method low byte must be 14");
+        assert_eq!(output[9], 0x00, "method high byte must be 0");
+
+        // Find start of compressed data: 30 (fixed header) + filename_len + extra_len
+        let filename_len = u16::from_le_bytes([output[26], output[27]]) as usize;
+        let extra_len = u16::from_le_bytes([output[28], output[29]]) as usize;
+        let data_start = 30 + filename_len + extra_len;
+
+        // First 4 bytes of compressed data = method-14 header: [major=0x13][minor=0x00][props_size=5 LE16]
+        assert_eq!(
+            output[data_start], 0x13,
+            "method-14 major version must be 0x13"
+        );
+        assert_eq!(
+            output[data_start + 1],
+            0x00,
+            "method-14 minor version must be 0x00"
+        );
+        let props_size = u16::from_le_bytes([output[data_start + 2], output[data_start + 3]]);
+        assert_eq!(props_size, 5, "props_size must be 5");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_zip_lzma_compressible_data() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Highly compressible data
+        let data = "AAAAAABBBBBBCCCCCCDDDDDDEEEEEE".repeat(100);
+        let data_bytes = data.as_bytes();
+
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_file_lzma("large.txt", data_bytes)?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+
+        assert_eq!(reader.entries().len(), 1);
+        let entry = reader.entries()[0].clone();
+        assert!(
+            entry.compressed_size < entry.size,
+            "LZMA should compress repetitive data"
+        );
+
+        let extracted = reader.extract(&entry)?;
+        assert_eq!(extracted, data_bytes);
+
+        Ok(())
+    }
+
+    // =======================================================================
+    // Progress Callback Tests
+    // =======================================================================
+
+    /// A counting progress sink for testing.
+    struct CountingSink {
+        entry_count: AtomicU64,
+        progress_count: AtomicU64,
+        last_processed: AtomicU64,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                entry_count: AtomicU64::new(0),
+                progress_count: AtomicU64::new(0),
+                last_processed: AtomicU64::new(0),
+            }
+        }
+
+        fn entry_count(&self) -> u64 {
+            self.entry_count.load(Ordering::SeqCst)
+        }
+
+        fn progress_count(&self) -> u64 {
+            self.progress_count.load(Ordering::SeqCst)
+        }
+
+        fn last_processed(&self) -> u64 {
+            self.last_processed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl oxiarc_core::progress::ProgressSink for CountingSink {
+        fn on_progress(&self, processed: u64, _total: Option<u64>) {
+            self.progress_count.fetch_add(1, Ordering::SeqCst);
+            self.last_processed.store(processed, Ordering::SeqCst);
+        }
+
+        fn on_entry(&self, _name: &str, _index: u64) {
+            self.entry_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_zip_progress() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Write 3 files with progress tracking
+        let write_sink = Arc::new(CountingSink::new());
+        let write_handle: oxiarc_core::ProgressHandle = write_sink.clone();
+
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output).with_progress(write_handle);
+            writer.add_file("alpha.txt", b"Content A")?;
+            writer.add_file("beta.txt", b"Content B is longer than A")?;
+            writer.add_file("gamma.txt", b"Content C")?;
+            writer.finish()?;
+        }
+
+        // Verify write-side progress: on_entry called 3 times, on_progress called 3 times
+        assert_eq!(
+            write_sink.entry_count(),
+            3,
+            "on_entry must be called once per file added"
+        );
+        assert_eq!(
+            write_sink.progress_count(),
+            3,
+            "on_progress must be called once per file added"
+        );
+        assert_eq!(
+            write_sink.last_processed(),
+            9,
+            "last processed should be uncompressed size of gamma.txt"
+        );
+
+        // Read back with progress tracking
+        let read_sink = Arc::new(CountingSink::new());
+        let read_handle: oxiarc_core::ProgressHandle = read_sink.clone();
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?.with_progress(read_handle);
+
+        assert_eq!(reader.entries().len(), 3);
+        let entries: Vec<_> = reader.entries().to_vec();
+
+        for entry in entries.iter() {
+            let data = reader.extract(entry)?;
+            assert!(!data.is_empty());
+        }
+
+        // Verify read-side progress: on_entry and on_progress each called 3 times
+        assert_eq!(
+            read_sink.entry_count(),
+            3,
+            "on_entry must be called once per extracted file"
+        );
+        assert!(
+            read_sink.progress_count() >= 3,
+            "on_progress must be called at least once per extracted file"
+        );
+
+        Ok(())
+    }
+
+    // ---- Lenient-mode tests ----
+
+    /// Craft a ZIP with a single stored entry whose compressed-payload
+    /// byte has been flipped so that the CRC-32 check fails. Strict
+    /// mode must abort with `CrcMismatch`; lenient mode must return
+    /// the (corrupted) payload and record exactly one warning of kind
+    /// [`crate::lenient::LenientWarningKind::CrcMismatch`].
+    #[test]
+    fn test_zip_lenient_crc_mismatch() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Step 1: build a minimal single-entry ZIP via the writer.
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_file_with_options(
+                "corrupt.bin",
+                b"hello, world",
+                ZipCompressionLevel::Store,
+            )?;
+            writer.finish()?;
+        }
+
+        // Step 2: locate the stored payload inside the archive and
+        // flip one byte. The payload lives immediately after the local
+        // file header (30 bytes fixed + filename_len + extra_len).
+        //
+        // Local file header layout (we read the variable-length field
+        // lengths directly so the test remains correct even if the
+        // writer grows an extra field):
+        //   [0..4]   PK\x03\x04 signature
+        //   [26..28] filename_len (u16 LE)
+        //   [28..30] extra_len    (u16 LE)
+        //   [30..]   filename, extra, data, …
+        let filename_len = u16::from_le_bytes([output[26], output[27]]) as usize;
+        let extra_len = u16::from_le_bytes([output[28], output[29]]) as usize;
+        let data_start = 30 + filename_len + extra_len;
+
+        // Flip the first payload byte.
+        output[data_start] ^= 0xFF;
+
+        // Step 3: strict mode must reject.
+        {
+            let cursor = Cursor::new(output.clone());
+            let mut strict = ZipReader::new(cursor)?;
+            let entry = strict.entries()[0].clone();
+            let err = strict
+                .extract(&entry)
+                .expect_err("strict extract must fail with CrcMismatch on corrupted payload");
+            match err {
+                oxiarc_core::error::OxiArcError::CrcMismatch { .. } => {}
+                other => panic!("unexpected error variant: {:?}", other),
+            }
+        }
+
+        // Step 4: lenient mode must succeed and record a warning.
+        {
+            let cursor = Cursor::new(output);
+            let mut lenient = ZipReader::new(cursor)?.lenient(true);
+            let entry = lenient.entries()[0].clone();
+            let data = lenient.extract(&entry)?;
+
+            // The payload is returned even though the CRC does not
+            // match — so its first byte is the flipped one.
+            assert_eq!(
+                data.len(),
+                b"hello, world".len(),
+                "extracted payload length matches stored size"
+            );
+            assert_ne!(
+                data, b"hello, world",
+                "payload differs from original — we flipped a byte"
+            );
+
+            let warnings = lenient.warnings();
+            assert_eq!(warnings.len(), 1, "exactly one warning expected");
+            assert_eq!(warnings[0].format, "ZIP");
+            assert_eq!(warnings[0].entry_name.as_deref(), Some("corrupt.bin"));
+            match warnings[0].kind {
+                crate::lenient::LenientWarningKind::CrcMismatch { .. } => {}
+                ref other => panic!("unexpected warning kind: {:?}", other),
+            }
+        }
+
         Ok(())
     }
 }

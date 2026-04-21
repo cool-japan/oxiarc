@@ -1,6 +1,7 @@
-# oxiarc-lzhuf - Development Status
 
-## Completed Features
+# oxiarc-lzhuf - Development Status (v0.2.7, 2026-04-21)
+
+## Completed Features (COMPLETE)
 
 ### Methods
 - [x] `LzhMethod` enum (Lh0, Lh4, Lh5, Lh6, Lh7)
@@ -65,7 +66,15 @@
 
 ### Features
 - [ ] Streaming decompression
-- [ ] Progress callbacks
+- [x] Progress callbacks (planned 2026-04-20)
+  - **Goal:** `encode_lzh` / `decode_lzh` batch APIs gain an optional `ProgressHandle` parameter OR a `.with_progress()` builder on the `LzhuffEncoder`/`LzhuffDecoder` streaming types in `streaming.rs`.
+  - **Design:**
+    - Preferred API: add `.with_progress(handle)` to the streaming encode/decode types that live in `oxiarc-lzhuf/src/streaming.rs` (1479 lines, full streaming implementation). Avoid changing the batch-API signatures.
+    - Emit `on_progress(input_consumed, None)` at each block boundary during encode; `on_progress(output_produced, original_size_if_known)` during decode.
+  - **Files:** MODIFY `oxiarc-lzhuf/src/streaming.rs`.
+  - **Prerequisites:** core primitive already in.
+  - **Tests:** streaming encode + decode round-trip; counting sink observes ≥1 call per block; total-consumed ≈ input length.
+  - **Risk:** file is large but already well-structured; additions are localized.
 - [ ] Custom dictionary initialization
 
 ### Compatibility

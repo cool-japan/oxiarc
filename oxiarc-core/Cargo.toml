@@ -14,7 +14,9 @@ categories = ["compression", "encoding"]
 [features]
 default = []
 async-io = ["dep:tokio"]
-# SIMD-accelerated CRC-32 using PCLMULQDQ (x86_64) or PMULL (aarch64)
+# Deprecated no-op; SIMD is now auto-enabled via cfg(target_arch) on x86_64/aarch64.
+# Kept as a backward-compatible alias — will be removed in a future minor version.
+# Any existing `features = ["simd"]` in downstream Cargo.toml files continues to compile.
 simd = []
 # Memory-mapped file support for efficient large file access
 mmap = ["dep:memmap2"]

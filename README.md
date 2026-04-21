@@ -116,14 +116,14 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.2.6"  # For archive format support
-oxiarc-deflate = "0.2.6"  # For DEFLATE compression
-oxiarc-lzma = "0.2.6"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.2.6"    # For Bzip2 compression
-oxiarc-lz4 = "0.2.6"      # For LZ4 compression
-oxiarc-zstd = "0.2.6"     # For Zstandard compression
-oxiarc-brotli = "0.2.6"   # For Brotli compression
-oxiarc-snappy = "0.2.6"   # For Snappy compression
+oxiarc-archive = "0.2.7"  # For archive format support
+oxiarc-deflate = "0.2.7"  # For DEFLATE compression
+oxiarc-lzma = "0.2.7"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.2.7"    # For Bzip2 compression
+oxiarc-lz4 = "0.2.7"      # For LZ4 compression
+oxiarc-zstd = "0.2.7"     # For Zstandard compression
+oxiarc-brotli = "0.2.7"   # For Brotli compression
+oxiarc-snappy = "0.2.7"   # For Snappy compression
 ```
 
 ## Quick Start
@@ -244,23 +244,26 @@ Modern compression format:
 - Quality levels 0-11 (fast to best compression)
 - Streaming compression/decompression API
 
-### Snappy
 
-Google's fast compression:
-- Simple LZ77 variant optimized for speed
-- Block format for in-memory compression
-- Framed format with CRC32C checksums
-- Streaming Write/Read API
+## Status
 
-### Async DEFLATE and GZip (0.2.3)
+| Crate           | Status  | Public API | Tests Passing |
+|-----------------|---------|------------|---------------|
+| oxiarc-core     | Stable  | 216        | 122           |
+| oxiarc-deflate  | Stable  | 111        | 121           |
+| oxiarc-lzhuf    | Stable  | 74         | 56            |
+| oxiarc-bzip2    | Stable  | 39         | 41            |
+| oxiarc-lz4      | Stable  | 100        | 110           |
+| oxiarc-zstd     | Stable  | 150        | 170           |
+| oxiarc-lzma     | Stable  | 130        | 68            |
+| oxiarc-archive  | Stable  | 361        | 263           |
+| oxiarc-lzw      | Stable  | 67         | 76            |
+| oxiarc-brotli   | Stable  | 75         | 92            |
+| oxiarc-snappy   | Stable  | 19         | 57            |
+| oxiarc-cli      | Stable  | 42         | 30            |
+| **Total**       |         | **1394**   | **1206**      |
 
-Async I/O support in `oxiarc-deflate` (enabled via `async-io` feature):
-- `async_deflate` module: non-blocking DEFLATE compress/decompress
-- `gzip` module: streaming GZip encode/decode with RFC 1952 compliance
-- Compatible with tokio and async-std runtimes
-
-### Streaming DEFLATE/GZip/Zlib (0.2.5)
-
+All crates are feature-complete, tested, and API-stable as of v0.2.7 (2026-04-21).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes

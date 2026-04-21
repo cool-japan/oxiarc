@@ -1,6 +1,7 @@
-# oxiarc-archive - Development Status
 
-## Completed Features
+# oxiarc-archive - Development Status (v0.2.7, 2026-04-21)
+
+## Completed Features (COMPLETE)
 
 ### Format Detection (~300 lines)
 - [x] `ArchiveFormat` enum
@@ -112,12 +113,24 @@
 - [ ] ZIP encryption (traditional)
 - [ ] ZIP encryption (AES)
 - [ ] Split/multi-part archives
+- [x] ZIP streaming reader — data-descriptor (flag bit 3) support (planned 2026-04-20) — DEFLATE+bit3 works, Stored+bit3 still requires Seek
 
 ### TAR Improvements
-- [ ] Sparse files
+- [x] TAR sparse file support (GNU old-format + PAX GNU.sparse.*) (planned 2026-04-20) — materializes logical content with zero-fill; hole-preservation on disk is out of scope
 
 ### LZH Improvements
-- [ ] Level 3 headers
+- [x] Level 3 headers (planned 2026-04-20)
+  - **Goal:** `LzhWriter` can emit level-3 headers via a builder option; reader already handles level 3. Complete the bidirectional support with a round-trip test.
+  - **Design:**
+    - `LzhWriter::with_header_level(level: u8) -> Self` builder (level ∈ {0, 1, 2, 3}); default stays at level 1 for compatibility.
+    - New `LzhWriter::write_level3_header(name, compressed, original_size, crc16, mtime, method)` method — mirrors `write_level1_header` at line 578 but emits the level-3 structure (4-byte word-size prefix, method-id, 4-byte compressed/original sizes, 4-byte mtime-unix, attributes, level=3, reserved=0x20, filename via extension header 0x01, crc16 via extension header 0x02, etc.).
+    - Dispatch in `add_file` / `add_stream` based on configured level.
+  - **Files:**
+    - MODIFY `oxiarc-archive/src/lzh/mod.rs` (add level-3 writer method + builder; ~150 LoC).
+  - **Prerequisites:** none.
+  - **Tests:** round-trip — write 3 files at level 3, read back via `LzhReader`, verify names/sizes/crcs match. Extend `test_level3_header_parsing` with a writer-side symmetric test.
+  - **Risk:** level-3 extension-header encoding is fiddly (common header, extension header size in 4 bytes). Mitigated by reading the level-3 reader code (already implemented at lines 120-230) as the authoritative reference format — the writer is its inverse.
+- [x] LZH extension headers — 0x40/0x41/0x42/0x43/0x44/0x46/0x50 read + write (planned 2026-04-20)
 - [ ] More extension headers
 
 ### New Formats
@@ -125,11 +138,52 @@
 - [ ] ISO 9660 read support
 
 ### General
-- [ ] Streaming extraction (without buffering entire file)
-- [ ] Async I/O for more formats (currently ZIP only)
-- [ ] Progress callbacks
-- [ ] Memory-mapped files
+- [x] Streaming extraction (without buffering entire file) (completed 2026-04-20)
+  - **Goal:** Three archive formats expose a streaming-extraction API that reads one entry at a time without holding the full archive in memory and without requiring `Seek`. TAR: formalize the in-flight `TarStreamReader`. ZIP: new `ZipStreamReader`. LZH: new `LzhStreamReader`. All three return per-entry readers that implement `std::io::Read`, drop-safely skip unread data, and report progress / honor cancellation via the new core primitives.
+  - **Design:**
+    - **TAR** — move the *already-written* `TarStreamReader` code from `oxiarc-archive/src/tar/mod.rs` into a new `oxiarc-archive/src/tar/stream.rs` file. No API change — `pub use` from `tar/mod.rs` preserved, `lib.rs` re-export unchanged. This frees the mainline `tar/mod.rs` (1365 lines after the recent +284 addition) from further growth.
+    - **ZIP** — new `oxiarc-archive/src/zip/stream.rs`. `ZipStreamReader<R: Read>` walks local file headers inline (signature `PK\x03\x04`). For each entry: parse LFH, detect general-purpose flag bit 3 (data-descriptor), construct the appropriate decompressor (STORE pass-through or DEFLATE via `oxiarc_deflate::streaming::Inflater`), yield a `ZipStreamEntry<'_, R>: Read`. **Critical: data-descriptor path must be codec-EOF-driven.** When bit 3 is set the LFH size fields are zero; decompress until the codec reports end-of-stream, then read the trailing `PK\x07\x08` descriptor (12 or 16 bytes depending on Zip64 via extra-field inspection). Do NOT scan for the `PK\x07\x08` signature in the compressed stream — the byte sequence can legitimately appear inside DEFLATE output and will false-match. Spec ref: PKWARE APPNOTE.TXT §4.3.9. Initial methods: STORE (method 0) + DEFLATE (method 8); others return `OxiarcError::UnsupportedMethod`.
+    - **LZH** — new `oxiarc-archive/src/lzh/stream.rs`. `LzhStreamReader<R: Read>` walks LZH level-0/1/2 headers sequentially. Per entry: parse header, read declared packed size bytes, hand back to decompressor per method (-lh0- passthrough, -lh5-/-lh6-/-lh7- via `oxiarc_lzhuf`). Yield `LzhStreamEntry<'_, R>: Read`. Level-3 headers return `UnsupportedHeader`.
+    - **Plumbing (all three):** per-entry reader tracks `pending_skip` remaining bytes; `Drop` impl consumes them. Optional `Arc<dyn ProgressSink>` and `CancellationToken` from oxiarc-core.
+  - **Files:** `tar/mod.rs` (MODIFY), `tar/stream.rs` (NEW), `zip/stream.rs` (NEW), `zip/mod.rs` (MODIFY), `lzh/stream.rs` (NEW), `lzh/mod.rs` (MODIFY), `src/lib.rs` (MODIFY)
+  - **Prerequisites:** `ProgressSink` trait in `oxiarc-core::progress`; `CancellationToken` in `oxiarc-core::cancel`
+  - **Tests:** TAR (3 existing + 4 new), ZIP (7 new), LZH (6 new), cross-format round-trip for each format
+  - **Risk:** ZIP data-descriptor path is subtle (Zip64 may use 16-byte form); mitigated by explicit Zip64 extra-field detection. LZH level-3 returns error, never panics.
+- [x] Async I/O support for more formats (planned 2026-04-20)
+  - **Goal:** Replicate the `async_zip` pattern (`read_zip_entry_async`, `decompress_zip_entry_async`, `read_zip_entry_from_reader_async`) for TAR and LZH under `oxiarc-archive/src/async_tar.rs` and `async_lzh.rs`, gated on `async-io` feature.
+  - **Design:**
+    - `async_tar.rs` — `read_tar_entry_async(path, index) -> Future<Result<Vec<u8>>>`, `read_tar_entries_async(path) -> Future<Result<Vec<TarEntry>>>` via `tokio::task::spawn_blocking` wrapping sync reads. Mirrors `async_zip` structure.
+    - `async_lzh.rs` — same pattern.
+    - Re-export from `lib.rs` under `#[cfg(feature = "async-io")]`.
+  - **Files:**
+    - NEW `oxiarc-archive/src/async_tar.rs` (~120 lines).
+    - NEW `oxiarc-archive/src/async_lzh.rs` (~120 lines).
+    - MODIFY `oxiarc-archive/src/lib.rs` — add conditional `pub mod`s + re-exports.
+    - MODIFY `oxiarc-archive/Cargo.toml` — confirm `tokio` is a workspace dep gated by `async-io` feature.
+  - **Prerequisites:** none; async_zip pattern is the reference.
+  - **Tests:** one round-trip per format — write archive via sync API, read asynchronously via new APIs, compare contents.
+  - **Risk:** `spawn_blocking` is the pragmatic choice (full async streams would require tokio-aware codec internals, which is out of scope here). Document this trade-off in module docs.
+- [x] Progress callbacks (planned 2026-04-20)
+  - **Goal:** **Core container-format** readers/writers in `oxiarc-archive` accept an optional `ProgressHandle` and emit `on_progress` per read/write chunk, plus `on_entry(name, index)` at entry boundaries. Scope narrowed to five formats: **ZIP, TAR, LZH, gzip, CAB**. Streaming readers already expose `.with_progress()`; non-streaming readers/writers gain the same builder method.
+  - **Out of scope (deferred):** thin codec wrappers in `oxiarc-archive` around `oxiarc-bzip2` / `oxiarc-xz` / `oxiarc-zstd` / `oxiarc-lz4` / `oxiarc-brotli` / `oxiarc-snappy`, and the 7z reader. The underlying codec crates get their own progress wiring via items 2-5; propagating that into the archive-crate wrappers is a cleanup follow-up that should land in a dedicated pass once all codec-side APIs settle.
+  - **Design:**
+    - Add `.with_progress(handle: ProgressHandle)` + internal `Option<ProgressHandle>` field to `ZipReader`, `ZipWriter`, `TarReader`, `TarWriter`, `LzhReader`, `LzhWriter`, `GzipReader`, `CabReader`.
+    - Progress sites: for readers, at each entry extract / per read chunk; for writers, at each entry add / per write chunk.
+    - `on_entry(name, entry_index)` fires once per entry (zero-indexed) for multi-entry formats (ZIP, TAR, LZH, CAB). Gzip is single-stream — emit `on_entry(filename_from_gz_header_or_"<stream>", 0)` once.
+    - `on_progress(processed, total)` fires at least once per 16 KiB chunk.
+  - **Files:**
+    - MODIFY `oxiarc-archive/src/zip/header/reader.rs` (add `progress: Option<ProgressHandle>` field, `.with_progress()` builder, emit hooks in `extract`/`extract_to`)
+    - MODIFY `oxiarc-archive/src/zip/header/writer.rs` (similar)
+    - MODIFY `oxiarc-archive/src/tar/mod.rs` (TarReader + TarWriter; streaming reader already wired)
+    - MODIFY `oxiarc-archive/src/lzh/mod.rs` (LzhReader + LzhWriter; streaming reader already wired)
+    - MODIFY `oxiarc-archive/src/gzip/mod.rs`, `cab/mod.rs` (reader side only — CAB has no writer)
+  - **Prerequisites:** `ProgressSink` already in `oxiarc-core` (landed previous run).
+  - **Tests:** counting-sink fixture verifies monotonic `processed`, exactly-once `on_entry` per entry, and matching entry names; one test per format that has progress wiring (5 formats × read, 4 formats × write = 9 tests).
+  - **Risk:** API addition only; existing tests keep passing because `Option<ProgressHandle>` defaults to `None`. Mitigation: run full archive crate test suite.
+- [x] Memory-mapped files (planned 2026-04-20) — `open_zip_mmap`, `open_tar_mmap`, `open_lzh_mmap` live
+- [x] Archive-crate codec wrappers forward progress/cancellation (planned 2026-04-20) — `BrotliReader`/`BrotliWriter`, `Bzip2Reader`/`Bzip2Writer`, `SnappyReader`/`SnappyWriter`, `Lz4Reader`/`Lz4Writer`, `XzReader`/`XzWriter`, `ZstdReader`/`ZstdWriter` all grew `.with_progress(ProgressHandle)` / `.with_cancel(CancellationToken)` builders. Brotli/Snappy forward to streaming builders on `oxiarc-brotli::BrotliCompressor/Decompressor` and `oxiarc-snappy::FrameEncoder/Decoder`. Bzip2 forwards to new `BzEncoder`/`BzDecoder` builders added to `oxiarc-bzip2` in the same pass (reference implementation; per-block progress). LZ4/XZ/Zstd use wrapper self-emission (one-shot `on_progress`+`on_finish`, cancel-check before the compress/decompress call) because `oxiarc-lz4`, `oxiarc-lzma::Lzma2Encoder/Decoder`, and `oxiarc-zstd::ZstdEncoder` still lack builder hooks — upgrading those crates to per-chunk builders is deferred follow-up. Tests: `{brotli,bzip2,lz4,snappy,xz,zstd}::tests::test_*_progress_forwarding` and matching `*_cancel_forwarding`.
 - [ ] Archive repair/recovery
+- [x] Lenient-mode corruption recovery — ZIP/TAR/LZH readers .lenient(bool) + CLI --lenient flag on extract/list (planned 2026-04-20)
 
 ## Test Coverage
 
@@ -175,7 +229,9 @@
 
 1. No support for encrypted ZIP archives (traditional or AES)
 2. No split/multi-part ZIP archive support
-3. TAR sparse files not supported
+3. TAR sparse: read support lands hole-preserving extraction via in-memory
+   materialization (GNU old-format + PAX `GNU.sparse.*`); writer-side sparse
+   emission and on-disk hole-punching during extraction remain out of scope.
 4. LZH level 3 headers not supported
 5. No RAR format support
 6. 7z and CAB are read-only (no create/write)

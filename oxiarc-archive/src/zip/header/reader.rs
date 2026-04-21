@@ -10,24 +10,68 @@ use super::types::{
     ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_32,
     get_entry_aes_encryption_info, is_entry_encrypted, is_entry_traditional_encrypted,
 };
+use crate::lenient::{LenientWarning, LenientWarningKind};
 use oxiarc_core::entry::CompressionMethod as CoreMethod;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::{Crc32, Entry, EntryType, FileAttributes};
 use oxiarc_deflate::inflate;
-use std::io::{Read, Seek, SeekFrom};
+use oxiarc_lzma::{LzmaProperties, decompress_raw as lzma_decompress_raw};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// ZIP archive reader.
 pub struct ZipReader<R: Read + Seek> {
     reader: R,
     entries: Vec<Entry>,
+    progress: Option<ProgressHandle>,
+    /// Monotonic counter for entries extracted (used with progress callbacks).
+    extract_index: u64,
+    /// When `true`, CRC-32 mismatches during extraction are recorded in
+    /// [`ZipReader::warnings`] instead of returning an error. Disabled
+    /// by default; toggle via [`ZipReader::lenient`].
+    lenient: bool,
+    /// Accumulated non-fatal warnings emitted while operating in
+    /// lenient mode.
+    warnings: Vec<LenientWarning>,
 }
 
 impl<R: Read + Seek> ZipReader<R> {
     /// Create a new ZIP reader.
     pub fn new(mut reader: R) -> Result<Self> {
         let entries = Self::read_entries(&mut reader)?;
-        Ok(Self { reader, entries })
+        Ok(Self {
+            reader,
+            entries,
+            progress: None,
+            extract_index: 0,
+            lenient: false,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Attach a progress handle to this reader.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Enable or disable lenient-mode extraction.
+    ///
+    /// When enabled, CRC-32 mismatches during extraction are recorded
+    /// in [`ZipReader::warnings`] and the (possibly corrupted) payload
+    /// is returned to the caller anyway. When disabled (default), a
+    /// CRC-32 mismatch aborts the extraction with
+    /// [`OxiArcError::CrcMismatch`].
+    pub fn lenient(mut self, enabled: bool) -> Self {
+        self.lenient = enabled;
+        self
+    }
+
+    /// Return the accumulated non-fatal warnings from lenient-mode
+    /// operations.
+    pub fn warnings(&self) -> &[LenientWarning] {
+        &self.warnings
     }
 
     /// Read all entries from the archive.
@@ -404,7 +448,22 @@ impl<R: Read + Seek> ZipReader<R> {
     }
 
     /// Extract an entry.
+    ///
+    /// If a progress handle is attached, `on_entry` is called with the current
+    /// extraction index and `on_progress` is called after decompression completes.
     pub fn extract(&mut self, entry: &Entry) -> Result<Vec<u8>> {
+        let entry_index = self.extract_index;
+        self.extract_index += 1;
+        self.extract_impl(entry, entry_index)
+    }
+
+    /// Internal extract implementation that carries the entry index for progress reporting.
+    fn extract_impl(&mut self, entry: &Entry, entry_index: u64) -> Result<Vec<u8>> {
+        // Progress: notify about entry start
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&entry.name, entry_index);
+        }
+
         // Seek to data
         self.reader.seek(SeekFrom::Start(entry.offset))?;
 
@@ -416,6 +475,7 @@ impl<R: Read + Seek> ZipReader<R> {
         let decompressed = match entry.method {
             CoreMethod::Stored => compressed,
             CoreMethod::Deflate => inflate(&compressed)?,
+            CoreMethod::Lzma => Self::decompress_lzma(&compressed, entry.size)?,
             _ => return Err(OxiArcError::unsupported_method(format!("{}", entry.method))),
         };
 
@@ -423,11 +483,87 @@ impl<R: Read + Seek> ZipReader<R> {
         if let Some(expected_crc) = entry.crc32 {
             let actual_crc = Crc32::compute(&decompressed);
             if actual_crc != expected_crc {
-                return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                if self.lenient {
+                    self.warnings.push(LenientWarning {
+                        format: "ZIP",
+                        entry_name: Some(entry.name.clone()),
+                        kind: LenientWarningKind::CrcMismatch {
+                            expected: expected_crc,
+                            computed: actual_crc,
+                        },
+                        message: format!(
+                            "CRC-32 mismatch for entry {:?}: expected {:#010x}, computed {:#010x}",
+                            entry.name, expected_crc, actual_crc
+                        ),
+                    });
+                } else {
+                    return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                }
             }
         }
 
+        // Progress: notify about completion
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(decompressed.len() as u64, Some(entry.size));
+        }
+
         Ok(decompressed)
+    }
+
+    /// Decompress LZMA (method 14) data.
+    ///
+    /// Method-14 format per APPNOTE §5.8.8:
+    /// `[major_ver: u8][minor_ver: u8][props_size: u16_le][lzma_props: props_size bytes][lzma_stream: ...]`
+    ///
+    /// The 5-byte props are: `[lc_lp_pb_byte: u8][dict_size: u32_le]`.
+    fn decompress_lzma(compressed_data: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
+        // Need at least 4 bytes for the method-14 header
+        if compressed_data.len() < 4 {
+            return Err(OxiArcError::invalid_header(
+                "LZMA method-14 header too short",
+            ));
+        }
+
+        let _major_ver = compressed_data[0];
+        let _minor_ver = compressed_data[1];
+        let props_size = u16::from_le_bytes([compressed_data[2], compressed_data[3]]) as usize;
+
+        if compressed_data.len() < 4 + props_size {
+            return Err(OxiArcError::invalid_header("LZMA props truncated"));
+        }
+
+        // props_size must be at least 5 bytes (1 byte props + 4 bytes dict_size)
+        if props_size < 5 {
+            return Err(OxiArcError::invalid_header(
+                "LZMA method-14 props_size too small (expected >= 5)",
+            ));
+        }
+
+        let props_bytes = &compressed_data[4..4 + props_size];
+        let stream = &compressed_data[4 + props_size..];
+
+        // Parse LzmaProperties from the single props byte
+        let props = LzmaProperties::from_byte(props_bytes[0])
+            .ok_or_else(|| OxiArcError::invalid_header("Invalid LZMA properties byte"))?;
+
+        // dict_size is the next 4 bytes in LE
+        let dict_size = u32::from_le_bytes([
+            props_bytes[1],
+            props_bytes[2],
+            props_bytes[3],
+            props_bytes[4],
+        ]);
+
+        // Decode using the known uncompressed size so we terminate cleanly
+        // whether or not an EOS marker is present in the stream
+        let size_hint = if uncompressed_size > 0 {
+            Some(uncompressed_size)
+        } else {
+            None
+        };
+
+        let cursor = Cursor::new(stream);
+        lzma_decompress_raw(cursor, props, dict_size, size_hint)
     }
 
     /// Extract raw compressed bytes for an entry without decompressing.

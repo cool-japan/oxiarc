@@ -537,4 +537,244 @@ mod tests {
             }
         }
     }
+
+    /// Test that progress callbacks fire during encode and decode, values are monotone,
+    /// and the final reported byte count is close to the input size.
+    #[test]
+    fn test_lzma_progress_callbacks() {
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::{Arc, Mutex};
+
+        /// A progress sink that records every `(processed, total)` call in order.
+        struct RecordingSink {
+            calls: Mutex<Vec<(u64, Option<u64>)>>,
+        }
+
+        impl RecordingSink {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    calls: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn calls(&self) -> Vec<(u64, Option<u64>)> {
+                self.calls.lock().expect("mutex poisoned").clone()
+            }
+        }
+
+        impl ProgressSink for RecordingSink {
+            fn on_progress(&self, processed: u64, total: Option<u64>) {
+                self.calls
+                    .lock()
+                    .expect("mutex poisoned")
+                    .push((processed, total));
+            }
+        }
+
+        // 100 KB of pseudo-random data (reproducible)
+        let data: Vec<u8> = {
+            let mut buf = Vec::with_capacity(100_000);
+            let mut x: u32 = 0xDEAD_BEEF;
+            for _ in 0..100_000 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                buf.push((x >> 24) as u8);
+            }
+            buf
+        };
+
+        // --- Compress with recording sink ---
+        let enc_sink = RecordingSink::new();
+        let enc_handle: ProgressHandle = enc_sink.clone();
+
+        let dict_size = LzmaLevel::new(3).dict_size();
+        let compressed = {
+            use crate::encoder::LzmaEncoder;
+            let mut output = Vec::new();
+            let props = LzmaEncoder::new(LzmaLevel::new(3), dict_size).properties();
+
+            // Write LZMA header (for decompress_bytes compatibility)
+            output.push(props.to_byte());
+            output.extend_from_slice(&dict_size.to_le_bytes());
+            output.extend_from_slice(&(data.len() as u64).to_le_bytes());
+
+            let enc = LzmaEncoder::new(LzmaLevel::new(3), dict_size).with_progress(enc_handle);
+            let raw = enc.compress(&data).expect("encode failed");
+            output.extend_from_slice(&raw);
+            output
+        };
+
+        let enc_calls = enc_sink.calls();
+        assert!(
+            !enc_calls.is_empty(),
+            "encoder must emit at least one progress call"
+        );
+
+        // Verify monotone non-decreasing processed values
+        for window in enc_calls.windows(2) {
+            assert!(
+                window[1].0 >= window[0].0,
+                "encoder progress must be non-decreasing: {} -> {}",
+                window[0].0,
+                window[1].0
+            );
+        }
+
+        // Final call should be close to input size (within 1 byte)
+        let enc_final = enc_calls.last().expect("must have at least one call").0;
+        assert!(
+            enc_final >= data.len() as u64 - 1,
+            "final encoder progress ({}) should be close to input size ({})",
+            enc_final,
+            data.len()
+        );
+
+        // All encoder calls should carry Some(total) == data.len()
+        for (_, total) in &enc_calls {
+            assert_eq!(
+                *total,
+                Some(data.len() as u64),
+                "encoder total must be input size"
+            );
+        }
+
+        // --- Decompress with recording sink ---
+        let dec_sink = RecordingSink::new();
+        let dec_handle: ProgressHandle = dec_sink.clone();
+
+        let decompressed = {
+            use crate::decoder::LzmaDecoder;
+            use std::io::Cursor;
+            let decoder = LzmaDecoder::from_header(Cursor::new(&compressed))
+                .expect("from_header failed")
+                .with_progress(dec_handle);
+            decoder.decompress().expect("decompress failed")
+        };
+
+        assert_eq!(decompressed, data, "round-trip must be lossless");
+
+        let dec_calls = dec_sink.calls();
+        assert!(
+            !dec_calls.is_empty(),
+            "decoder must emit at least one progress call"
+        );
+
+        // Verify monotone non-decreasing values
+        for window in dec_calls.windows(2) {
+            assert!(
+                window[1].0 >= window[0].0,
+                "decoder progress must be non-decreasing: {} -> {}",
+                window[0].0,
+                window[1].0
+            );
+        }
+
+        // Final decoded bytes should match decompressed length
+        let dec_final = dec_calls.last().expect("must have at least one call").0;
+        assert_eq!(
+            dec_final,
+            data.len() as u64,
+            "final decoder progress must equal decompressed size"
+        );
+
+        // Verify that a noop token doesn't break anything
+        let _: Vec<u8> = {
+            use crate::encoder::LzmaEncoder;
+            let token = CancellationToken::new();
+            let mut out = Vec::new();
+            let props = LzmaEncoder::new(LzmaLevel::new(3), dict_size).properties();
+            out.push(props.to_byte());
+            out.extend_from_slice(&dict_size.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            let raw = LzmaEncoder::new(LzmaLevel::new(3), dict_size)
+                .with_cancel(token)
+                .compress(&data)
+                .expect("encode with noop cancel failed");
+            out.extend_from_slice(&raw);
+            out
+        };
+    }
+
+    /// Test that a pre-cancelled token causes `Err(OxiArcError::Cancelled)` immediately.
+    /// Also tests mid-decode cancellation using a progress-triggered cancel.
+    #[test]
+    fn test_lzma_cancellation() {
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::error::OxiArcError;
+        use oxiarc_core::progress::ProgressSink;
+        use std::io::Cursor;
+        use std::sync::Arc;
+
+        // Build a valid compressed buffer (small, fast)
+        let original = b"Hello, cancellation test!".repeat(40);
+        let compressed = compress(&original, LzmaLevel::new(3)).expect("compress failed");
+
+        // --- Pre-cancel: token already cancelled before decode starts ---
+        {
+            use crate::decoder::LzmaDecoder;
+            let token = CancellationToken::new();
+            token.cancel(); // cancel BEFORE decode
+
+            let decoder = LzmaDecoder::from_header(Cursor::new(&compressed))
+                .expect("from_header failed")
+                .with_cancel(token);
+
+            let result = decoder.decompress();
+            assert!(
+                matches!(result, Err(OxiArcError::Cancelled)),
+                "pre-cancelled token must produce Cancelled error, got: {:?}",
+                result
+            );
+        }
+
+        // --- Mid-decode cancel via progress sink trigger ---
+        // We use a CountingSink that cancels the token after the first progress callback.
+        {
+            use crate::decoder::LzmaDecoder;
+            use oxiarc_core::progress::ProgressHandle;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            // Build a larger input to ensure multiple checkpoints
+            let large_original: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
+            let large_compressed =
+                compress(&large_original, LzmaLevel::new(3)).expect("large compress failed");
+
+            let token = CancellationToken::new();
+            let token_for_sink = token.clone();
+            let triggered = Arc::new(AtomicBool::new(false));
+            let triggered_clone = triggered.clone();
+
+            struct TriggerCancel {
+                token: CancellationToken,
+                triggered: Arc<AtomicBool>,
+            }
+
+            impl ProgressSink for TriggerCancel {
+                fn on_progress(&self, _processed: u64, _total: Option<u64>) {
+                    // Cancel on the very first callback so the next check fires quickly
+                    if !self.triggered.load(Ordering::Relaxed) {
+                        self.triggered.store(true, Ordering::Relaxed);
+                        self.token.cancel();
+                    }
+                }
+            }
+
+            let sink: ProgressHandle = Arc::new(TriggerCancel {
+                token: token_for_sink,
+                triggered: triggered_clone,
+            });
+
+            let decoder = LzmaDecoder::from_header(Cursor::new(&large_compressed))
+                .expect("from_header failed")
+                .with_progress(sink)
+                .with_cancel(token);
+
+            let result = decoder.decompress();
+            assert!(
+                matches!(result, Err(OxiArcError::Cancelled)),
+                "mid-decode cancel via progress sink must produce Cancelled error, got: {:?}",
+                result
+            );
+        }
+    }
 }

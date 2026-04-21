@@ -42,6 +42,7 @@ pub mod bzip2;
 pub mod cab;
 pub mod detect;
 pub mod gzip;
+pub mod lenient;
 pub mod lz4;
 pub mod lzh;
 pub mod sevenz;
@@ -52,6 +53,12 @@ pub mod zip;
 pub mod zstd;
 
 #[cfg(feature = "async-io")]
+pub mod async_lzh;
+
+#[cfg(feature = "async-io")]
+pub mod async_tar;
+
+#[cfg(feature = "async-io")]
 pub mod async_zip;
 
 // Re-exports
@@ -60,13 +67,19 @@ pub use bzip2::{Bzip2Reader, Bzip2Writer};
 pub use cab::CabReader;
 pub use detect::ArchiveFormat;
 pub use gzip::{GzipHeader, GzipReader};
+pub use lenient::{LenientWarning, LenientWarningKind};
 pub use lz4::{Lz4Reader, Lz4Writer};
-pub use lzh::{LzhCompressionLevel, LzhHeader, LzhReader, LzhWriter};
+pub use lzh::{
+    LzhCompressionLevel, LzhHeader, LzhReader, LzhStreamEntry, LzhStreamReader, LzhWriter,
+};
 pub use sevenz::{SevenZEntry, SevenZReader};
 pub use snappy::{SnappyReader, SnappyWriter};
-pub use tar::{TarHeader, TarReader, TarWriter};
+pub use tar::{TarHeader, TarReader, TarStreamEntry, TarStreamReader, TarWriter};
 pub use xz::{XzReader, XzWriter};
-pub use zip::{LocalFileHeader, ZipCompressionLevel, ZipReader, ZipWriter};
+pub use zip::{
+    LocalFileHeader, ZipCompressionLevel, ZipReader, ZipStreamEntry, ZipStreamEntryMeta,
+    ZipStreamReader, ZipWriter,
+};
 pub use zstd::{ZstdReader, ZstdWriter};
 
 // Optional feature re-exports
@@ -76,9 +89,27 @@ pub use zstd::{ZstdReader, ZstdWriter};
 #[cfg(feature = "mmap")]
 pub use zip::open_zip_mmap;
 
+/// Memory-mapped TAR reader convenience function.
+/// Open a TAR archive via memory-mapped I/O.
+#[cfg(feature = "mmap")]
+pub use tar::open_tar_mmap;
+
+/// Memory-mapped LZH reader convenience function.
+/// Open a LZH archive via memory-mapped I/O.
+#[cfg(feature = "mmap")]
+pub use lzh::open_lzh_mmap;
+
 /// Re-export MmapReader when the mmap feature is enabled.
 #[cfg(feature = "mmap")]
 pub use oxiarc_core::mmap::{MmapOptions, MmapReader};
+
+/// Async TAR entry reading functions.
+#[cfg(feature = "async-io")]
+pub use async_tar::{read_tar_entries_async, read_tar_entry_async};
+
+/// Async LZH entry reading functions.
+#[cfg(feature = "async-io")]
+pub use async_lzh::{read_lzh_entries_async, read_lzh_entry_async};
 
 /// Async ZIP entry reading functions.
 #[cfg(feature = "async-io")]

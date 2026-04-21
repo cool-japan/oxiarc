@@ -440,6 +440,33 @@ pub mod arm {
 ///
 /// SIMD support will be re-enabled after the PCLMULQDQ fold constants for CRC-32 IEEE
 /// (polynomial 0x04C11DB7) are properly computed and verified against test vectors.
+///
+/// ## Verification attempt 2026-04-20
+///
+/// Added fixed + stress test vectors covering empty, "123456789", the fox
+/// pangram, and 1 MiB / 63 / 64 / 65 / 128-byte synthetic buffers
+/// (`test_pmull_matches_scalar_vectors`, `test_pclmulqdq_matches_scalar_vectors`).
+///
+/// Empirical result on aarch64 (the host used for this verification pass):
+/// - Fixed vectors < 64 bytes pass — they bypass PMULL via the scalar
+///   fallback inside `arm::crc32_pmull` (and `x86::crc32_pclmulqdq`).
+/// - Stress buffers that exercise the PMULL fold loop DO NOT match the
+///   slicing-by-8 scalar path. Example: `vec![0xFF; 1_048_576]` produces
+///   `0x5e570f27` under PMULL vs `0x956bac74` under slicing-by-8.
+///
+/// Diagnosis (not applied, to avoid shipping unverified changes): the
+/// constants in `x86_constants` / `arm_constants` are 32/33-bit. For the
+/// bit-reflected ISO 3309 polynomial, the canonical Intel-white-paper form
+/// uses 33-bit pre-shifted values (`rk1 = 0x154442bd4`,
+/// `rk2 = 0x1c6e41596`, etc.) combined with a specific Barrett reduction
+/// shape. Fixing this is a multi-line structural change (constants +
+/// `fold_128*` + `barrett_reduce*`), not a single-constant tweak, and
+/// PCLMULQDQ cannot be empirically verified from an aarch64 host.
+///
+/// Decision: dispatch continues to route to `software_crc32`; SIMD modules
+/// remain compiled but unreferenced on the hot path. The failing tests are
+/// marked `#[ignore]` with the diagnosis above so that a future work item
+/// has a concrete, reproducible target.
 pub struct SimdCrc32Dispatcher {
     #[cfg(target_arch = "x86_64")]
     _use_pclmulqdq: bool,
@@ -703,5 +730,176 @@ mod tests {
     fn test_arm_simd_availability() {
         let available = arm::is_supported();
         println!("ARM PMULL available: {}", available);
+    }
+
+    /// Standard CRC-32 test vectors (ISO 3309 / ZIP / GZIP polynomial).
+    ///
+    /// Values XORed with `0xFFFFFFFF` match the published check values:
+    /// - empty string:   0x00000000
+    /// - "123456789":    0xCBF43926
+    /// - "The quick brown fox jumps over the lazy dog": 0x414FA339
+    ///
+    /// The internal (pre-final-XOR) form is what `software_crc32` and the SIMD
+    /// paths return. We initialise the internal state with `0xFFFFFFFF` and
+    /// compare against the final (XORed) CRC.
+    fn fixed_vectors() -> Vec<(&'static str, Vec<u8>, u32)> {
+        vec![
+            ("empty", vec![], 0x00000000),
+            ("123456789", b"123456789".to_vec(), 0xCBF43926),
+            (
+                "fox",
+                b"The quick brown fox jumps over the lazy dog".to_vec(),
+                0x414FA339,
+            ),
+        ]
+    }
+
+    /// Larger buffers for stress testing. We do not hard-code the expected
+    /// CRC — instead we compare SIMD vs the already-trusted scalar path.
+    fn stress_buffers() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("1MiB_FF", vec![0xFFu8; 1_048_576]),
+            ("1MiB_seq", (0..=255u8).cycle().take(1_048_576).collect()),
+            ("65537_00", vec![0u8; 65537]),
+            ("63_seq", (0..63u8).collect()),
+            ("64_seq", (0..64u8).collect()),
+            ("65_seq", (0..65u8).collect()),
+            ("127_seq", (0..127u8).collect()),
+            ("128_seq", (0..=127u8).collect()),
+        ]
+    }
+
+    /// Verify the scalar path matches the published ISO 3309 check values.
+    /// This is the baseline that the SIMD path must then agree with.
+    #[test]
+    fn test_scalar_matches_standard_vectors() {
+        for (name, data, expected) in fixed_vectors().iter() {
+            let crc = software_crc32(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+            assert_eq!(
+                crc, *expected,
+                "scalar CRC-32 mismatch on {}: got {:08x}, expected {:08x}",
+                name, crc, expected
+            );
+        }
+    }
+
+    /// Verify PCLMULQDQ CRC-32 matches both the published check values and
+    /// the scalar reference across fixed + stress vectors.
+    ///
+    /// Compiled on x86_64; skipped at runtime if PCLMULQDQ is unavailable.
+    ///
+    /// Currently `#[ignore]` — the fold constants / Barrett reduction shape in
+    /// `x86::crc32_pclmulqdq` do not match the bit-reflected ISO 3309
+    /// convention used by the scalar path (verified on aarch64 — PMULL path
+    /// has the same structural issue; see `test_pmull_matches_scalar_vectors`
+    /// below). The SIMD path is left intact but NOT wired into dispatch.
+    /// Un-ignore this test once `x86::crc32_pclmulqdq` (and `arm::crc32_pmull`)
+    /// use validated reflected-mode constants (typically pre-shifted by x^1,
+    /// i.e. 33-bit values) per Intel's "Fast CRC Computation Using PCLMULQDQ".
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "SIMD fold constants pending verification — see comment"]
+    fn test_pclmulqdq_matches_scalar_vectors() {
+        if !x86::is_supported() {
+            eprintln!("PCLMULQDQ not available on this CPU; skipping.");
+            return;
+        }
+
+        // Fixed vectors with known answers.
+        for (name, data, expected) in fixed_vectors().iter() {
+            let scalar = software_crc32(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+            assert_eq!(scalar, *expected, "scalar mismatch on {}", name);
+
+            // SAFETY: `is_supported()` returned true above, so PCLMULQDQ +
+            // SSE4.1 are available.
+            let simd = unsafe { x86::crc32_pclmulqdq(0xFFFFFFFF, data) } ^ 0xFFFFFFFF;
+            assert_eq!(
+                simd,
+                scalar,
+                "SIMD mismatch on {} (len={}): got {:08x}, expected {:08x}",
+                name,
+                data.len(),
+                simd,
+                scalar
+            );
+        }
+
+        // Larger stress buffers — compare SIMD against scalar reference.
+        for (name, data) in stress_buffers().iter() {
+            let scalar = software_crc32(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+            // SAFETY: as above.
+            let simd = unsafe { x86::crc32_pclmulqdq(0xFFFFFFFF, data) } ^ 0xFFFFFFFF;
+            assert_eq!(
+                simd,
+                scalar,
+                "SIMD mismatch on {} (len={}): got {:08x}, scalar {:08x}",
+                name,
+                data.len(),
+                simd,
+                scalar
+            );
+        }
+    }
+
+    /// Verify PMULL CRC-32 matches both the published check values and
+    /// the scalar reference across fixed + stress vectors.
+    ///
+    /// Compiled on aarch64; skipped at runtime if PMULL (AES crypto) is unavailable.
+    ///
+    /// Currently `#[ignore]` — empirically on aarch64 (2026-04-20), fixed
+    /// vectors < SIMD_THRESHOLD (64 bytes) pass because they bypass PMULL via
+    /// the scalar fallback, but every stress buffer that actually exercises
+    /// the PMULL fold loop disagrees with the scalar path. Example:
+    /// `1MiB_FF` produces `0x5e570f27` under PMULL vs `0x956bac74` under
+    /// slicing-by-8. The fold constants (`K1`, `K2`, `K5`, `K6`, `MU`, `POLY`)
+    /// in `arm_constants` are 32/33-bit values; for the bit-reflected ISO 3309
+    /// polynomial, Intel's white paper (and verified references such as
+    /// crc32fast / Linux `lib/crc32.c`) require 33-bit pre-shifted values
+    /// (the canonical `rk1 = 0x154442bd4`, `rk2 = 0x1c6e41596`, etc. with the
+    /// accompanying Barrett shape). The SIMD path is left intact but NOT
+    /// wired into dispatch. Un-ignore once constants + reduction are fixed.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "SIMD fold constants pending verification — see comment"]
+    fn test_pmull_matches_scalar_vectors() {
+        if !arm::is_supported() {
+            eprintln!("PMULL not available on this CPU; skipping.");
+            return;
+        }
+
+        // Fixed vectors with known answers.
+        for (name, data, expected) in fixed_vectors().iter() {
+            let scalar = software_crc32(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+            assert_eq!(scalar, *expected, "scalar mismatch on {}", name);
+
+            // SAFETY: `is_supported()` returned true above, so PMULL/NEON/AES
+            // are available.
+            let simd = unsafe { arm::crc32_pmull(0xFFFFFFFF, data) } ^ 0xFFFFFFFF;
+            assert_eq!(
+                simd,
+                scalar,
+                "SIMD mismatch on {} (len={}): got {:08x}, expected {:08x}",
+                name,
+                data.len(),
+                simd,
+                scalar
+            );
+        }
+
+        // Larger stress buffers — compare SIMD against scalar reference.
+        for (name, data) in stress_buffers().iter() {
+            let scalar = software_crc32(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
+            // SAFETY: as above.
+            let simd = unsafe { arm::crc32_pmull(0xFFFFFFFF, data) } ^ 0xFFFFFFFF;
+            assert_eq!(
+                simd,
+                scalar,
+                "SIMD mismatch on {} (len={}): got {:08x}, scalar {:08x}",
+                name,
+                data.len(),
+                simd,
+                scalar
+            );
+        }
     }
 }

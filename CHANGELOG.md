@@ -5,6 +5,36 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-04-21
+
+### Added
+- **oxiarc-cli**: `oxiarc add` command for appending files to existing archives (ZIP, TAR, LZH formats); supports `--dry-run` and `--verbose` options
+- **oxiarc-archive**: `lenient` mode enhancements — robust handling of malformed/partial archives in list and extract operations
+- **oxiarc-archive**: `LzhExtensions` module for extended LZH archive manipulation (appending, rewriting entries)
+- **oxiarc-archive**: Async LZH and TAR streaming support (`async_lzh.rs`, `async_tar.rs`)
+- **oxiarc-core**: `CancellationToken` cooperative cancellation for archive operations
+- **oxiarc-core**: `ProgressHandle` / `ProgressSink` progress reporting infrastructure
+- **oxiarc-cli**: Man page generation (`man` subcommand via `clap_mangen`)
+- **oxiarc-cli**: Colored output with ANSI support (`style.rs`, respects `NO_COLOR`/`--no-color`)
+- **oxiarc-cli**: Windows long path support and reserved filename handling during extraction
+
+### Testing
+- End-to-end tests for ZIP AES-256 and ZipCrypto encryption (`zip_encryption_e2e.rs`)
+- Progress callbacks and cancellation tests for Brotli (`progress_cancel.rs`)
+- CLI integration tests: add command, color output, man page generation, password extraction, lenient mode, compression threshold, tree listing, Windows filenames
+
+### Quality
+- Zero clippy warnings (strict mode with `-D warnings`)
+- Zero rustdoc warnings
+- All policies compliant (no unwrap in production code, pure Rust, latest crates, workspace)
+- Updated: `clap` 4.6.1, `tokio` 1.52.1
+
+### Crates in This Release
+All crates published at version 0.2.7:
+- oxiarc-core, oxiarc-deflate, oxiarc-lzhuf, oxiarc-lzw, oxiarc-lzma
+- oxiarc-bzip2, oxiarc-lz4, oxiarc-zstd, oxiarc-brotli, oxiarc-snappy
+- oxiarc-archive, oxiarc-cli
+
 ## [0.2.6] - 2026-03-21
 
 ### Added

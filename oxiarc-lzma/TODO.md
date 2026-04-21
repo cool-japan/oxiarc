@@ -1,6 +1,7 @@
-# oxiarc-lzma - Development Status
 
-## Completed Features
+# oxiarc-lzma - Development Status (v0.2.7, 2026-04-21)
+
+## Completed Features (COMPLETE)
 
 ### Range Coder (363 lines)
 - [x] `RangeEncoder` with 64-bit accumulator
@@ -106,14 +107,45 @@
 
 ### Features
 - [ ] Custom dictionary initialization
-- [ ] Progress callbacks
-- [ ] Cancellation support
+- [x] Progress callbacks (planned 2026-04-20)
+  - **Goal:** `LzmaEncoder`, `LzmaDecoder`, and `LzmaStreaming*` types accept `ProgressHandle` AND `CancellationToken`. Two TODO items closed in one move.
+  - **Design:**
+    - `.with_progress(handle)` + `.with_cancel(token)` builders on encode/decode types.
+    - Emit `on_progress(input_consumed, Some(total))` where total is known at input-size level (encoder knows input size; decoder may know uncompressed_size from container).
+    - `token.check()?` at every range-coder normalize boundary or every N iterations (N = 4096 bytes to keep overhead <1%).
+  - **Files:** MODIFY `oxiarc-lzma/src/encode.rs`, `decode.rs`, `streaming.rs` (exact names TBD during implementation).
+  - **Prerequisites:** both core primitives already in.
+  - **Tests:** round-trip counting sink; cancellation fixture cancels mid-decode and observes `OxiArcError::Cancelled`.
+  - **Risk:** cancellation granularity — too fine adds overhead, too coarse delays. Mitigated by picking 4 KiB input-chunk granularity (tuned to amortize check cost).
 - [ ] Async I/O
 
 ### Integration
 - [x] 7z container support (via oxiarc-archive)
 - [x] XZ container support
-- [ ] ZIP method 14 support
+- [x] ZIP method 14 (LZMA) support (planned 2026-04-20)
+  - **Goal:** `ZipReader` decompresses entries with method=14 (LZMA); `ZipWriter` can emit method=14 entries when configured. `oxiarc_lzma` is the codec backend. Both sides interoperate with 7-Zip and Info-ZIP `unzip` built with LZMA support.
+  - **Design:**
+    - **Format (APPNOTE §5.8.8):** method-14 entry compressed data is `[major_ver: u8][minor_ver: u8][props_size: u16_le][lzma_props: props_size bytes][lzma_stream: N bytes]`. `props_size` is always 5 for standard LZMA. `lzma_props` is the 5-byte `(lc/lp/pb packed, dict_size[4 LE])` header as defined by the LZMA SDK.
+    - **EOS-marker semantics (APPNOTE §4.4.4, general-purpose bit 1):** for method=14, bit 1 of the local-file-header general-purpose-bit-flag word controls whether the LZMA stream carries an end-of-stream marker. If bit 1 is set → EOS marker is present and terminates the stream. If bit 1 is clear → no EOS marker, extraction stops at `compressed_size` bytes.
+    - **Our choice on write:** always emit with EOS marker + set bit 1 in the LFH gp-flag. This matches 7-Zip's default output and is the interop-safe path (Info-ZIP's `unzip` historically preferred EOS-bearing streams). Store the reported `compressed_size` anyway (header is authoritative for skipping), but the decoder terminates on the marker.
+    - **Our choice on read:** honour bit 1 — call `oxiarc_lzma::decompress_raw` in EOS-aware mode when set, in known-size mode when clear. Report `OxiArcError::Malformed("method 14 without EOS and without known size")` if both the gp-flag bit 1 is clear and `compressed_size` is zero/unknown (ZIP64 streaming edge case).
+    - Extend `zip::header::types::CompressionMethod` with `Lzma` variant (value 14) + `from_u16` + `to_core()` mappings.
+    - In `zip/header/reader.rs` decompress path (line ~417), add `CoreMethod::Lzma` branch: parse the 4-byte prefix + 5-byte props, then call `oxiarc_lzma::decompress_raw` with the appropriate EOS mode.
+    - Writer: `ZipWriter::add_file_lzma(name, data)` (simple default path) + `ZipWriter::add_file_with_method(name, data, Method::Lzma)` (generic). Writer implementation: compress with `oxiarc_lzma::compress_raw` producing `[5-byte props][stream-with-EOS]`, then prepend the 4-byte `[major, minor, props_size_le_u16]` header, set LFH gp-flag bit 1, set compression_method=14.
+    - Add `oxiarc-lzma.workspace = true` to `oxiarc-archive/Cargo.toml` if not already.
+  - **Files:**
+    - MODIFY `oxiarc-archive/src/zip/header/types.rs` — add `Lzma` variant to `CompressionMethod` + `from_u16`/`to_core()`.
+    - MODIFY `oxiarc-archive/src/zip/header/reader.rs` — decompress dispatch that honours gp-flag bit 1.
+    - MODIFY `oxiarc-archive/src/zip/header/writer.rs` — compress dispatch + `add_file_lzma` API + set gp-flag bit 1 + emit 4-byte method-14 prefix.
+    - MODIFY `oxiarc-archive/Cargo.toml` — add `oxiarc-lzma` dep if missing.
+    - MODIFY `oxiarc-core/src/entry.rs` — add `Lzma` to core `CompressionMethod` enum.
+  - **Prerequisites:** `oxiarc-lzma` must expose a raw-stream compress/decompress API that accepts/emits the 5-byte props header **and** supports both EOS-aware and known-size decode modes. Audit during implementation: `compress_raw` / `decompress_raw` already exist in `oxiarc-lzma` (confirmed); verify the decode path's EOS-mode knob, add one if missing.
+  - **Tests:**
+    - Round-trip: write ZIP with 3 LZMA-method files via `ZipWriter`, read back via `ZipReader`, byte-for-byte match.
+    - Interop-write fixture: produce a ZIP and verify structural correctness (LFH gp-flag bit 1 set, method = 14, 4+5-byte prefix, EOS marker at stream end by inspecting the last 5 bytes of LZMA stream).
+    - Interop-read fixture: hand-craft a 4+5-byte prefix + an `oxiarc_lzma::compress_raw` output manually wrapped into a ZIP LFH — confirm `ZipReader` extracts correctly.
+    - Edge case: entry with gp-flag bit 1 clear (no-EOS / known-size) — verify decode terminates at `compressed_size`.
+  - **Risk:** LZMA SDK version bytes (`major`, `minor`) vary across tools; 7-Zip emits `0x13 0x00` (= 19.0), Info-ZIP emits others. Accept any version on read (we rely on the props, not the version). On write, emit whichever `oxiarc-lzma` currently reports — document as "SDK-version-opaque" in the module doc.
 
 ## Test Coverage
 

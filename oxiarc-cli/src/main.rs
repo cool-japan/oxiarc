@@ -3,16 +3,19 @@
 //! A Pure Rust archive utility supporting ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, and Snappy formats.
 
 mod commands;
+mod style;
 mod utils;
+mod windows;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use commands::{
-    CompressionLevel, OutputFormat, SortBy, cmd_convert, cmd_create, cmd_detect, cmd_extract,
-    cmd_info, cmd_list, cmd_test,
+    CompressionLevel, OutputFormat, SortBy, cmd_add, cmd_convert, cmd_create, cmd_detect,
+    cmd_extract, cmd_info, cmd_list, cmd_man, cmd_test,
 };
 use std::io;
 use std::path::PathBuf;
+use style::{ColorChoice, Styler};
 
 #[derive(Parser)]
 #[command(name = "oxiarc")]
@@ -47,9 +50,13 @@ Examples:
   oxiarc test archive.lzh
   oxiarc info archive.7z
 ")]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Control color output
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
+    color: ColorChoice,
 }
 
 #[derive(Subcommand)]
@@ -87,6 +94,10 @@ enum Commands {
         /// Exclude files matching pattern (glob syntax)
         #[arg(short = 'X', long)]
         exclude: Vec<String>,
+
+        /// Continue on corruption when reading the archive (emit warnings to stderr)
+        #[arg(long)]
+        lenient: bool,
     },
 
     /// Extract files from an archive
@@ -150,6 +161,19 @@ enum Commands {
         /// Dry run: show what would be extracted without writing files
         #[arg(short = 'n', long)]
         dry_run: bool,
+
+        /// Password for encrypted entries (prompts interactively if omitted)
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Refuse to extract entries whose basename is a Windows reserved name
+        /// (CON, NUL, COM1.., LPT1..). Default: append '_' to the stem.
+        #[arg(long)]
+        strict_names: bool,
+
+        /// Continue on corruption (CRC mismatch, bad TAR checksum, etc.) with warnings instead of errors
+        #[arg(long)]
+        lenient: bool,
     },
 
     /// Test archive integrity
@@ -180,11 +204,36 @@ enum Commands {
         #[arg(short = 'l', long, value_enum, default_value = "normal")]
         compression: CompressionLevelArg,
 
+        /// Files smaller than this (bytes) are stored, not compressed (ZIP only; 0 disables)
+        #[arg(long, default_value_t = 0)]
+        compress_threshold: u64,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
 
         /// Dry run: show what would be done without creating the archive
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+
+    /// Add files to an existing archive (ZIP, TAR, LZH)
+    Add {
+        /// Existing archive file to append to
+        archive: PathBuf,
+
+        /// Files to add to the archive
+        files: Vec<PathBuf>,
+
+        /// Compression level (used when the archive format supports it)
+        #[arg(short = 'l', long, value_enum, default_value = "normal")]
+        compression: CompressionLevelArg,
+
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Dry run: show planned changes without modifying the archive
         #[arg(short = 'n', long)]
         dry_run: bool,
     },
@@ -229,6 +278,12 @@ enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: Shell,
+    },
+
+    /// Generate man pages for all subcommands
+    Man {
+        /// Directory to write man pages into (default: ./man)
+        out_dir: Option<PathBuf>,
     },
 }
 
@@ -301,6 +356,7 @@ impl From<CompressionLevelArg> for CompressionLevel {
 
 fn main() {
     let cli = Cli::parse();
+    let styler = Styler::new(cli.color);
 
     let result = match cli.command {
         Commands::List {
@@ -312,6 +368,7 @@ fn main() {
             reverse,
             include,
             exclude,
+            lenient,
         } => {
             let options = commands::list::ListOptions {
                 verbose,
@@ -321,8 +378,9 @@ fn main() {
                 reverse,
                 include: &include,
                 exclude: &exclude,
+                lenient,
             };
-            cmd_list(&archive, &options)
+            cmd_list(&archive, &options, &styler)
         }
         Commands::Extract {
             archive,
@@ -340,22 +398,31 @@ fn main() {
             preserve_permissions,
             preserve,
             dry_run,
+            password,
+            strict_names,
+            lenient,
         } => cmd_extract(
-            &archive,
-            &output,
-            &files,
-            &include,
-            &exclude,
-            verbose,
-            progress,
-            format.map(Into::into),
-            overwrite,
-            skip_existing,
-            prompt,
-            preserve_timestamps,
-            preserve_permissions,
-            preserve,
-            dry_run,
+            commands::extract::ExtractArgs {
+                archive: &archive,
+                output: &output,
+                files: &files,
+                include: &include,
+                exclude: &exclude,
+                verbose,
+                progress,
+                format_hint: format.map(Into::into),
+                overwrite,
+                skip_existing,
+                prompt,
+                preserve_timestamps,
+                preserve_permissions,
+                preserve,
+                dry_run,
+                password,
+                strict_names,
+                lenient,
+            },
+            &styler,
         ),
         Commands::Test { archive, verbose } => cmd_test(&archive, verbose),
         Commands::Create {
@@ -363,6 +430,7 @@ fn main() {
             files,
             format,
             compression,
+            compress_threshold,
             verbose,
             dry_run,
         } => cmd_create(
@@ -370,11 +438,19 @@ fn main() {
             &files,
             format.map(Into::into),
             compression.into(),
+            compress_threshold,
             verbose,
             dry_run,
         ),
-        Commands::Info { archive } => cmd_info(&archive),
-        Commands::Detect { file } => cmd_detect(&file),
+        Commands::Add {
+            archive,
+            files,
+            compression,
+            verbose,
+            dry_run,
+        } => cmd_add(&archive, &files, compression.into(), verbose, dry_run),
+        Commands::Info { archive } => cmd_info(&archive, &styler),
+        Commands::Detect { file } => cmd_detect(&file, &styler),
         Commands::Convert {
             input,
             output,
@@ -393,10 +469,18 @@ fn main() {
             generate(shell, &mut cmd, "oxiarc", &mut io::stdout());
             return;
         }
+        Commands::Man { out_dir } => {
+            let cmd = Cli::command();
+            if let Err(e) = cmd_man(cmd, out_dir) {
+                eprintln!("{}: {e}", styler.error("Error"));
+                std::process::exit(1);
+            }
+            return;
+        }
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        eprintln!("{}: {}", styler.error("Error"), e);
         std::process::exit(1);
     }
 }

@@ -116,6 +116,10 @@ pub enum OxiArcError {
         /// Description of the encoding error.
         message: String,
     },
+
+    /// Operation was cancelled by the caller.
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 /// Result type alias for OxiArc operations.

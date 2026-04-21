@@ -7,6 +7,7 @@ use crate::methods::LzhMethod;
 use crate::methods::constants::{NC, NT};
 use oxiarc_core::RingBuffer;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::traits::DecompressStatus;
 
 /// Maximum code length for LZH Huffman codes.
@@ -396,7 +397,6 @@ struct PendingMatch {
 }
 
 /// Streaming LZH decoder with full state preservation.
-#[derive(Debug)]
 pub struct StreamingLzhDecoder {
     /// Compression method.
     method: LzhMethod,
@@ -428,6 +428,25 @@ pub struct StreamingLzhDecoder {
     pending_match: Option<PendingMatch>,
     /// Last error (if any).
     last_error: Option<String>,
+    /// Optional progress sink for reporting decode progress at block boundaries.
+    progress: Option<ProgressHandle>,
+}
+
+impl std::fmt::Debug for StreamingLzhDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingLzhDecoder")
+            .field("method", &self.method)
+            .field("uncompressed_size", &self.uncompressed_size)
+            .field("bytes_decoded", &self.bytes_decoded)
+            .field("phase", &self.phase)
+            .field("block_size", &self.block_size)
+            .field("block_bytes_decoded", &self.block_bytes_decoded)
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "<ProgressHandle>"),
+            )
+            .finish()
+    }
 }
 
 impl StreamingLzhDecoder {
@@ -461,7 +480,18 @@ impl StreamingLzhDecoder {
             p_tree_state: None,
             pending_match: None,
             last_error: None,
+            progress: None,
         }
+    }
+
+    /// Attach a progress sink to this decoder.
+    ///
+    /// The sink will be called with `on_progress(output_produced, Some(uncompressed_size))`
+    /// at each block boundary during decoding. `output_produced` is the cumulative number
+    /// of uncompressed bytes emitted up to that block boundary.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
     }
 
     /// Reset the decoder.
@@ -647,9 +677,17 @@ impl StreamingLzhDecoder {
                             ));
                         }
                         BlockDecodeResult::BlockDone => {
+                            // Emit progress at each block boundary.
+                            if let Some(ref sink) = self.progress {
+                                sink.on_progress(self.bytes_decoded, Some(self.uncompressed_size));
+                            }
                             self.phase = DecoderPhase::Ready;
                         }
                         BlockDecodeResult::AllDone => {
+                            // Emit final progress when all data has been decoded.
+                            if let Some(ref sink) = self.progress {
+                                sink.on_progress(self.bytes_decoded, Some(self.uncompressed_size));
+                            }
                             self.phase = DecoderPhase::Done;
                         }
                     }
@@ -678,6 +716,13 @@ impl StreamingLzhDecoder {
         } else {
             DecompressStatus::NeedsOutput
         };
+
+        // Emit progress for stored data after each chunk that produces output.
+        if to_copy > 0 {
+            if let Some(ref sink) = self.progress {
+                sink.on_progress(self.bytes_decoded, Some(self.uncompressed_size));
+            }
+        }
 
         Ok((to_copy, to_copy, status))
     }
@@ -835,7 +880,11 @@ impl StreamingLzhDecoder {
                                 let state = self.c_tree_state.as_mut().ok_or_else(|| {
                                     OxiArcError::corrupted(0, "C-tree state missing")
                                 })?;
-                                state.pt_lengths[state.pt_i] = len as u8;
+                                // Guard against out-of-bounds access caused by skip
+                                // advancing pt_i past the pt_lengths buffer size.
+                                if state.pt_i < state.pt_lengths.len() {
+                                    state.pt_lengths[state.pt_i] = len as u8;
+                                }
                                 if len == 7 {
                                     state.phase = CTreePhase::ReadPTTreeExtendedLength;
                                     break;
@@ -892,7 +941,10 @@ impl StreamingLzhDecoder {
                                 .c_tree_state
                                 .as_mut()
                                 .ok_or_else(|| OxiArcError::corrupted(0, "C-tree state missing"))?;
-                            state.pt_lengths[state.pt_i] += 1;
+                            // Guard against out-of-bounds access.
+                            if state.pt_i < state.pt_lengths.len() {
+                                state.pt_lengths[state.pt_i] += 1;
+                            }
                             // Continue reading extended length
                         }
                         Some(false) => {
@@ -1475,5 +1527,97 @@ mod tests {
         }
 
         assert_eq!(output, data);
+    }
+
+    /// A simple progress sink that counts calls and records the last `processed` value.
+    struct CountingSink {
+        calls: std::sync::atomic::AtomicU64,
+        last_processed: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                last_processed: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u64 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn last_processed(&self) -> u64 {
+            self.last_processed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl oxiarc_core::progress::ProgressSink for CountingSink {
+        fn on_progress(&self, processed: u64, _total: Option<u64>) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.last_processed
+                .store(processed, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_progress_callbacks_decode() {
+        use std::sync::Arc;
+
+        // Use Lh0 (stored / no-compression) so we exercise the stored-data path of
+        // the streaming decoder.  That path is well-tested and is the only decode
+        // path the streaming decoder exposes that is known-good.  Progress is
+        // emitted after each chunk that produces output.
+        //
+        // We use a buffer of 40 'A' bytes so the test is small, fast, and
+        // deterministic.  `total = Some(uncompressed_size)` is forwarded so callers
+        // can track percentage.
+        let input: Vec<u8> = vec![b'A'; 40];
+        let input_size = input.len();
+
+        // For Lh0, the "encoded" stream is just the raw bytes.
+        let encoded = input.clone();
+
+        let sink = Arc::new(CountingSink::new());
+        let handle: oxiarc_core::progress::ProgressHandle = sink.clone();
+
+        let mut decoder =
+            StreamingLzhDecoder::new(LzhMethod::Lh0, input_size as u64).with_progress(handle);
+
+        let mut output = Vec::with_capacity(input_size);
+        let mut input_pos = 0;
+        let mut buf = vec![0u8; 32768];
+
+        loop {
+            let (consumed, produced, status) = decoder
+                .decompress(&encoded[input_pos..], &mut buf)
+                .expect("decompress failed");
+            input_pos += consumed;
+            output.extend_from_slice(&buf[..produced]);
+            match status {
+                DecompressStatus::Done => break,
+                DecompressStatus::NeedsInput if input_pos >= encoded.len() => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(output, input, "decoded output must match original input");
+
+        // Progress must have been called at least once.
+        assert!(
+            sink.call_count() >= 1,
+            "on_progress must be called at least once; calls = {}",
+            sink.call_count()
+        );
+
+        // After consuming all 40 bytes, last_processed must equal the full input size.
+        assert_eq!(
+            sink.last_processed(),
+            input_size as u64,
+            "last processed ({}) should equal input size ({})",
+            sink.last_processed(),
+            input_size
+        );
     }
 }

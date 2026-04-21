@@ -2,6 +2,7 @@
 
 use oxiarc_core::Crc32;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_deflate::{deflate, inflate};
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -215,13 +216,25 @@ pub struct GzipReader<R: Read> {
     reader: R,
     /// Parsed header.
     header: GzipHeader,
+    /// Optional progress handle.
+    progress: Option<ProgressHandle>,
 }
 
 impl<R: Read> GzipReader<R> {
     /// Create a new GZIP reader.
     pub fn new(mut reader: R) -> Result<Self> {
         let header = GzipHeader::read(&mut reader)?;
-        Ok(Self { reader, header })
+        Ok(Self {
+            reader,
+            header,
+            progress: None,
+        })
+    }
+
+    /// Attach a progress callback handle.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
     }
 
     /// Get the header.
@@ -231,6 +244,17 @@ impl<R: Read> GzipReader<R> {
 
     /// Decompress the data.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
+        // Emit entry start progress
+        let stream_name = self
+            .header
+            .filename
+            .as_deref()
+            .unwrap_or("<stream>")
+            .to_string();
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&stream_name, 0);
+        }
+
         // Read all remaining data (compressed + trailer)
         let mut compressed = Vec::new();
         self.reader.read_to_end(&mut compressed)?;
@@ -265,6 +289,12 @@ impl<R: Read> GzipReader<R> {
                     decompressed.len()
                 ),
             ));
+        }
+
+        // Emit completion progress
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(decompressed.len() as u64, None);
+            handle.on_finish();
         }
 
         Ok(decompressed)
@@ -427,5 +457,51 @@ mod tests {
         let decompressed = reader.decompress().unwrap();
 
         assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_gzip_progress() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Sink {
+            entries: Mutex<Vec<String>>,
+            progress_calls: Mutex<u64>,
+            finish_called: Mutex<bool>,
+        }
+
+        impl oxiarc_core::progress::ProgressSink for Sink {
+            fn on_progress(&self, _processed: u64, _total: Option<u64>) {
+                *self.progress_calls.lock().unwrap() += 1;
+            }
+            fn on_entry(&self, name: &str, _index: u64) {
+                self.entries.lock().unwrap().push(name.to_string());
+            }
+            fn on_finish(&self) {
+                *self.finish_called.lock().unwrap() = true;
+            }
+        }
+
+        let sink = Arc::new(Sink::default());
+        let handle: oxiarc_core::progress::ProgressHandle = sink.clone();
+
+        let original = b"Hello, progress world!";
+        let compressed = compress_with_filename(original, "hello.txt", 6).unwrap();
+
+        let mut reader = GzipReader::new(Cursor::new(compressed))
+            .unwrap()
+            .with_progress(handle);
+        let decompressed = reader.decompress().unwrap();
+
+        assert_eq!(&decompressed, original);
+
+        // on_entry should have been called once with the filename
+        {
+            let entries = sink.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1, "expected on_entry called once");
+            assert_eq!(entries[0], "hello.txt");
+        }
+        assert!(*sink.finish_called.lock().unwrap(), "on_finish not called");
+        assert_eq!(*sink.progress_calls.lock().unwrap(), 1);
     }
 }

@@ -47,6 +47,8 @@ pub enum CompressionMethod {
     Stored,
     /// Deflate compression.
     Deflate,
+    /// LZMA (method 14) as specified in APPNOTE §5.8.8.
+    Lzma,
     /// Unknown method.
     Unknown(u16),
 }
@@ -57,6 +59,7 @@ impl CompressionMethod {
         match value {
             0 => Self::Stored,
             8 => Self::Deflate,
+            14 => Self::Lzma,
             _ => Self::Unknown(value),
         }
     }
@@ -66,7 +69,19 @@ impl CompressionMethod {
         match self {
             Self::Stored => CoreMethod::Stored,
             Self::Deflate => CoreMethod::Deflate,
+            Self::Lzma => CoreMethod::Lzma,
             Self::Unknown(id) => CoreMethod::Unknown(*id),
+        }
+    }
+}
+
+impl std::fmt::Display for CompressionMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stored => write!(f, "Stored"),
+            Self::Deflate => write!(f, "Deflate"),
+            Self::Lzma => write!(f, "LZMA"),
+            Self::Unknown(id) => write!(f, "Unknown({})", id),
         }
     }
 }

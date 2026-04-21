@@ -7,6 +7,9 @@
 //! - Distance short codes
 //! - Meta-block formatting
 
+use oxiarc_core::cancel::CancellationToken;
+use oxiarc_core::progress::ProgressHandle;
+
 use crate::bit_writer::BitWriter;
 use crate::context::ContextMode;
 use crate::error::{BrotliError, BrotliResult};
@@ -91,6 +94,25 @@ pub fn compress(data: &[u8], quality: u32) -> BrotliResult<Vec<u8>> {
 
 /// Compress data using Brotli with full parameter control.
 pub fn compress_with_params(data: &[u8], params: &BrotliParams) -> BrotliResult<Vec<u8>> {
+    compress_with_hooks(data, params, None, None)
+}
+
+/// Compress data with optional per-meta-block progress and cancellation hooks.
+///
+/// Called by [`compress_with_params`] (with `None`/`None`) and by streaming
+/// types that carry a [`ProgressHandle`] or [`CancellationToken`].
+///
+/// Progress fires after each meta-block is written; `processed` is the
+/// approximate number of compressed bytes emitted so far, `total` is `None`
+/// because the final size is not known ahead of time.
+///
+/// Cancellation is checked at the start of each meta-block iteration.
+pub(crate) fn compress_with_hooks(
+    data: &[u8],
+    params: &BrotliParams,
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+) -> BrotliResult<Vec<u8>> {
     params.validate()?;
 
     if data.is_empty() {
@@ -107,12 +129,23 @@ pub fn compress_with_params(data: &[u8], params: &BrotliParams) -> BrotliResult<
     let mut offset = 0;
 
     while offset < data.len() {
+        // Check for cancellation at each meta-block boundary.
+        if let Some(token) = cancel {
+            token.check().map_err(BrotliError::from)?;
+        }
+
         let end = (offset + block_size).min(data.len());
         let block = &data[offset..end];
         let is_last = end == data.len();
 
         encode_meta_block(&mut writer, block, data, offset, params, is_last)?;
         offset = end;
+
+        // Report progress: approximate compressed bytes produced so far.
+        if let Some(handle) = progress {
+            let bytes_out = writer.output().len() as u64;
+            handle.on_progress(bytes_out, None);
+        }
     }
 
     Ok(writer.finish())

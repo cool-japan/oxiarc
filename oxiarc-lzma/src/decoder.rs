@@ -7,8 +7,13 @@ use crate::model::{
     LzmaModel, LzmaProperties, MATCH_LEN_MIN, State,
 };
 use crate::range_coder::RangeDecoder;
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use std::io::Read;
+
+/// Granularity for progress reporting and cancellation checks (bytes).
+const PROGRESS_GRANULARITY: u64 = 4096;
 
 /// Maximum dictionary size (4 GB).
 pub const DICT_SIZE_MAX: u32 = 0xFFFF_FFFF;
@@ -70,6 +75,12 @@ pub struct LzmaDecoder<R: Read> {
     uncompressed_size: Option<u64>,
     /// Bytes decoded.
     bytes_decoded: u64,
+    /// Optional progress sink for reporting decoding progress.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token for cooperative cancellation.
+    cancel: Option<CancellationToken>,
+    /// Bytes decoded at the last progress/cancel checkpoint.
+    last_checkpoint: u64,
 }
 
 impl<R: Read> LzmaDecoder<R> {
@@ -87,7 +98,40 @@ impl<R: Read> LzmaDecoder<R> {
             rep: [0; 4],
             uncompressed_size: None,
             bytes_decoded: 0,
+            progress: None,
+            cancel: None,
+            last_checkpoint: 0,
         })
+    }
+
+    /// Attach a progress sink; called for every ~4096 bytes decompressed.
+    ///
+    /// The `on_progress` callback receives `(bytes_produced, uncompressed_size_if_known)`.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token; checked every ~4096 bytes decompressed.
+    ///
+    /// If the token is cancelled the decoder returns `Err(OxiArcError::Cancelled)`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Check cancellation and emit progress if a checkpoint boundary has been crossed.
+    fn check_progress_and_cancel(&mut self) -> Result<()> {
+        if self.bytes_decoded.saturating_sub(self.last_checkpoint) >= PROGRESS_GRANULARITY {
+            self.last_checkpoint = self.bytes_decoded;
+            if let Some(ref h) = self.progress {
+                h.on_progress(self.bytes_decoded, self.uncompressed_size);
+            }
+            if let Some(ref t) = self.cancel {
+                t.check()?;
+            }
+        }
+        Ok(())
     }
 
     /// Create decoder from LZMA header.
@@ -251,6 +295,11 @@ impl<R: Read> LzmaDecoder<R> {
     pub fn decompress(mut self) -> Result<Vec<u8>> {
         let mut output = Vec::new();
 
+        // Check cancellation before starting (pre-decompress check)
+        if let Some(ref t) = self.cancel {
+            t.check()?;
+        }
+
         loop {
             // Check if we've reached the end
             if let Some(size) = self.uncompressed_size {
@@ -289,6 +338,7 @@ impl<R: Read> LzmaDecoder<R> {
                 output.push(byte);
                 self.bytes_decoded += 1;
                 self.state.update_literal();
+                self.check_progress_and_cancel()?;
             } else {
                 // Match or rep
                 let is_rep = self.rc.decode_bit(&mut self.model.is_rep[state_idx])?;
@@ -345,6 +395,7 @@ impl<R: Read> LzmaDecoder<R> {
                             output.push(byte);
                             self.bytes_decoded += 1;
                             self.state.update_short_rep();
+                            self.check_progress_and_cancel()?;
                             continue;
                         }
 
@@ -402,7 +453,13 @@ impl<R: Read> LzmaDecoder<R> {
                     output.push(byte);
                     self.bytes_decoded += 1;
                 }
+                self.check_progress_and_cancel()?;
             }
+        }
+
+        // Final progress notification
+        if let Some(ref h) = self.progress {
+            h.on_progress(self.bytes_decoded, self.uncompressed_size);
         }
 
         Ok(output)

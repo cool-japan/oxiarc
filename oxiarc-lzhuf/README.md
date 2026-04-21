@@ -1,11 +1,21 @@
 # oxiarc-lzhuf
 
-[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-**Version 0.2.6** (2026-03-18) — 54 tests passing.
+**Version 0.2.7** (2026-04-21) — 54 tests passing.
+
+# oxiarc-lzhuf [Stable]
+
+Pure Rust implementation of LZH (LZSS + Huffman) compression.
+
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
+
+**Version 0.2.7** (2026-04-21) — 56 tests passing.
 
 ## Overview
 
@@ -15,11 +25,16 @@ This crate implements the core compression algorithm, separate from the archive 
 
 ## Features
 
+
+## Features
+
 - **Pure Rust** - No C bindings or unsafe code
 - **Multiple methods** - lh0, lh4, lh5, lh6, lh7
 - **Dual Huffman trees** - Codes + Offsets
 - **Configurable window sizes** - 4KB to 64KB
 - **Streaming and one-shot APIs**
+
+All features are implemented and tested. API is stable.
 
 ## Quick Start
 

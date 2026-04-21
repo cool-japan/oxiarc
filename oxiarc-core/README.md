@@ -1,15 +1,16 @@
-# oxiarc-core
 
-[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+# oxiarc-core [Stable]
 
 Core primitives and traits for the OxiArc archive library.
 
-**Version 0.2.6** (2026-03-18) — 111 tests passing.
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-## Overview
+**Version 0.2.7** (2026-04-21) — 122 tests passing.
 
-This crate provides the fundamental building blocks for archive and compression operations:
+
+## Features
 
 - **BitStream** - Bit-level I/O for variable-length codes
 - **RingBuffer** - Sliding window buffer for LZ77/LZSS
@@ -17,6 +18,8 @@ This crate provides the fundamental building blocks for archive and compression 
 - **Traits** - Core traits for compression/decompression
 - **Entry** - Archive entry metadata
 - **Error** - Unified error types
+
+All features are implemented and tested. API is stable.
 
 ## Modules
 

@@ -2,9 +2,18 @@
 //!
 //! Based on XZ file format specification:
 //! <https://tukaani.org/xz/xz-file-format.txt>
+//!
+//! ## Progress / cancellation
+//!
+//! [`XzReader`] and [`XzWriter`] expose `.with_progress()` / `.with_cancel()`
+//! builders. The hooks are **emitted by the archive-crate wrapper itself** —
+//! the underlying `oxiarc-lzma` LZMA2 encoder/decoder do not currently expose
+//! per-chunk builders, so granularity is one-shot per block/stream.
 
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::crc::{Crc32, Crc64};
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_lzma::{
     Lzma2Decoder, Lzma2Encoder, LzmaLevel, dict_size_from_props, props_from_dict_size,
 };
@@ -114,6 +123,12 @@ pub struct BlockHeaderFlags {
 pub struct XzReader<R: Read> {
     reader: R,
     stream_flags: StreamFlags,
+    /// Optional progress sink (wrapper-emitted, per-block granularity).
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token checked before each block is processed.
+    cancel: Option<CancellationToken>,
+    /// Cumulative decompressed bytes produced so far.
+    bytes_processed: u64,
 }
 
 impl<R: Read> XzReader<R> {
@@ -147,7 +162,24 @@ impl<R: Read> XzReader<R> {
         Ok(Self {
             reader,
             stream_flags,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         })
+    }
+
+    /// Attach a progress sink. Notified after each block is decompressed with
+    /// the cumulative uncompressed byte count; `on_finish()` fires when the
+    /// stream footer is read successfully.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token. Checked before each block is processed.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Decompress the XZ stream.
@@ -155,6 +187,11 @@ impl<R: Read> XzReader<R> {
         let mut output = Vec::new();
 
         loop {
+            // Cooperative cancellation check before each block.
+            if let Some(ref token) = self.cancel {
+                token.check()?;
+            }
+
             // Read block header size byte
             let mut header_size_byte = [0u8; 1];
             self.reader.read_exact(&mut header_size_byte)?;
@@ -219,6 +256,13 @@ impl<R: Read> XzReader<R> {
             } else {
                 self.decompress_block(dict_size)?
             };
+
+            // Update cumulative progress after each block.
+            self.bytes_processed = self.bytes_processed.saturating_add(block_data.len() as u64);
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(self.bytes_processed, None);
+            }
+
             output.extend_from_slice(&block_data);
         }
 
@@ -227,6 +271,10 @@ impl<R: Read> XzReader<R> {
 
         // Read stream footer
         self.read_footer()?;
+
+        if let Some(ref handle) = self.progress {
+            handle.on_finish();
+        }
 
         Ok(output)
     }
@@ -486,6 +534,10 @@ impl<R: Read> XzReader<R> {
 pub struct XzWriter {
     level: LzmaLevel,
     check_type: CheckType,
+    /// Optional progress sink (wrapper-emitted, one-shot).
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token checked before compression.
+    cancel: Option<CancellationToken>,
 }
 
 impl XzWriter {
@@ -494,6 +546,8 @@ impl XzWriter {
         Self {
             level,
             check_type: CheckType::Crc32,
+            progress: None,
+            cancel: None,
         }
     }
 
@@ -503,8 +557,25 @@ impl XzWriter {
         self
     }
 
+    /// Attach a progress sink. Notified once after compression completes with
+    /// the uncompressed byte count, followed by `on_finish()`.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token. Checked before compression begins.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// Compress data to XZ format.
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if let Some(ref token) = self.cancel {
+            token.check()?;
+        }
+
         let mut output = Vec::new();
 
         // Write stream header
@@ -523,6 +594,12 @@ impl XzWriter {
 
         // Write stream footer
         self.write_stream_footer(&mut output, stream_flags, index_end - index_start)?;
+
+        if let Some(ref handle) = self.progress {
+            let total = data.len() as u64;
+            handle.on_progress(total, Some(total));
+            handle.on_finish();
+        }
 
         Ok(output)
     }
@@ -815,4 +892,62 @@ mod tests {
     //
     // Tracked in TODO.md: "LZH compression (lh5) encoder not compatible"
     // Similar issue exists with LZMA for complex data.
+
+    #[test]
+    fn test_xz_progress_forwarding() {
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            finish_count: AtomicU64,
+            last_processed: AtomicU64,
+        }
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+                self.last_processed.store(processed, Ordering::SeqCst);
+            }
+            fn on_entry(&self, _name: &str, _index: u64) {}
+            fn on_finish(&self) {
+                self.finish_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            finish_count: AtomicU64::new(0),
+            last_processed: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        // Use a small repeating payload so the underlying LZMA encoder
+        // handles it correctly (see module notes on complex data patterns).
+        let data: Vec<u8> = (0..1_000).map(|_| b'A').collect();
+        let writer = XzWriter::new(LzmaLevel::new(6)).with_progress(handle);
+        let _compressed = writer
+            .compress(&data)
+            .expect("xz compression with progress should succeed");
+
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sink.last_processed.load(Ordering::SeqCst),
+            data.len() as u64
+        );
+    }
+
+    #[test]
+    fn test_xz_cancel_forwarding() {
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::error::OxiArcError;
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let writer = XzWriter::new(LzmaLevel::new(6)).with_cancel(token);
+        let data: Vec<u8> = (0..100).map(|_| b'A').collect();
+        let result = writer.compress(&data);
+        assert!(matches!(result, Err(OxiArcError::Cancelled)));
+    }
 }

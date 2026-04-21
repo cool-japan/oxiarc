@@ -2,20 +2,24 @@
 
 use clap::ValueEnum;
 
+pub mod add;
 pub mod convert;
 pub mod create;
 pub mod detect;
 pub mod extract;
 pub mod info;
 pub mod list;
+pub mod man;
 pub mod test;
 
+pub use add::cmd_add;
 pub use convert::cmd_convert;
 pub use create::{CompressionLevel, OutputFormat, cmd_create};
 pub use detect::cmd_detect;
 pub use extract::cmd_extract;
 pub use info::cmd_info;
 pub use list::cmd_list;
+pub use man::cmd_man;
 pub use test::cmd_test;
 
 /// Sort order for list command.

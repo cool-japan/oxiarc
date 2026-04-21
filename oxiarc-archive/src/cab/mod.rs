@@ -37,6 +37,7 @@ mod header;
 
 use crate::ArchiveFormat;
 use header::{CabFile, CabFolder, CabHeader, CompressionType};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::{CompressionMethod, Entry, EntryType, FileAttributes, OxiArcError, Result};
 use oxiarc_deflate::inflate;
 use std::io::{Read, Seek, SeekFrom};
@@ -48,6 +49,8 @@ pub struct CabReader<R> {
     folders: Vec<CabFolder>,
     files: Vec<CabFile>,
     entries: Vec<Entry>,
+    /// Optional progress handle.
+    progress: Option<ProgressHandle>,
 }
 
 impl<R: Read + Seek> CabReader<R> {
@@ -127,7 +130,15 @@ impl<R: Read + Seek> CabReader<R> {
             folders,
             files,
             entries,
+            progress: None,
         })
+    }
+
+    /// Attach a progress callback handle.
+    /// Progress is reported when `extract` or `extract_by_index` is called.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
     }
 
     /// Get all entries in the archive.
@@ -162,15 +173,26 @@ impl<R: Read + Seek> CabReader<R> {
 
     /// Extract a file by entry.
     pub fn extract(&mut self, entry: &Entry) -> Result<Vec<u8>> {
-        // Find the file entry
-        let file = self
+        // Find the file entry and its index
+        let (index, file) = self
             .files
             .iter()
-            .find(|f| f.name == entry.name)
-            .ok_or_else(|| OxiArcError::corrupted(0, format!("File not found: {}", entry.name)))?
-            .clone();
+            .enumerate()
+            .find(|(_, f)| f.name == entry.name)
+            .map(|(i, f)| (i, f.clone()))
+            .ok_or_else(|| OxiArcError::corrupted(0, format!("File not found: {}", entry.name)))?;
 
-        self.extract_file(&file)
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&entry.name, index as u64);
+        }
+
+        let data = self.extract_file(&file)?;
+
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(data.len() as u64, Some(entry.size));
+        }
+
+        Ok(data)
     }
 
     /// Extract a file by index.
@@ -182,7 +204,18 @@ impl<R: Read + Seek> CabReader<R> {
             ));
         }
         let file = self.files[index].clone();
-        self.extract_file(&file)
+
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(&file.name, index as u64);
+        }
+
+        let data = self.extract_file(&file)?;
+
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(data.len() as u64, None);
+        }
+
+        Ok(data)
     }
 
     /// Extract a specific file.
@@ -325,5 +358,119 @@ mod tests {
     fn test_cab_magic() {
         // MSCF magic number
         assert_eq!(header::MAGIC, *b"MSCF");
+    }
+
+    /// Build a minimal stored CAB in memory.
+    ///
+    /// Layout (84 bytes total):
+    ///   CFHEADER  36 bytes  @ 0
+    ///   CFFOLDER   8 bytes  @ 36
+    ///   CFFILE    26 bytes  @ 44   (16 fixed + "hello.txt\0")
+    ///   CFDATA    14 bytes  @ 70   (8 fixed + 6 data bytes)
+    fn minimal_stored_cab() -> Vec<u8> {
+        let mut cab = vec![0u8; 84];
+
+        // --- CFHEADER (offset 0, 36 bytes) ---
+        // Magic "MSCF"
+        cab[0..4].copy_from_slice(b"MSCF");
+        // reserved1 [4..8] = 0
+        // cabinet_size [8..12]
+        cab[8..12].copy_from_slice(&84u32.to_le_bytes());
+        // reserved2 [12..16] = 0
+        // files_offset [16..20] = 44
+        cab[16..20].copy_from_slice(&44u32.to_le_bytes());
+        // reserved3 [20..24] = 0
+        // version_minor [24] = 3
+        cab[24] = 3;
+        // version_major [25] = 1
+        cab[25] = 1;
+        // num_folders [26..28] = 1
+        cab[26..28].copy_from_slice(&1u16.to_le_bytes());
+        // num_files [28..30] = 1
+        cab[28..30].copy_from_slice(&1u16.to_le_bytes());
+        // flags [30..32] = 0
+        // set_id [32..34] = 0
+        // cabinet_index [34..36] = 0
+
+        // --- CFFOLDER (offset 36, 8 bytes) ---
+        // data_offset [36..40] = 70  (CFDATA starts at byte 70)
+        cab[36..40].copy_from_slice(&70u32.to_le_bytes());
+        // num_data_blocks [40..42] = 1
+        cab[40..42].copy_from_slice(&1u16.to_le_bytes());
+        // compression_type [42..44] = 0 (stored / None)
+
+        // --- CFFILE (offset 44, 16 fixed + 10 name bytes = 26) ---
+        // uncompressed_size [44..48] = 6
+        cab[44..48].copy_from_slice(&6u32.to_le_bytes());
+        // folder_offset [48..52] = 0
+        // folder_index [52..54] = 0
+        // date [54..56] = 0
+        // time [56..58] = 0
+        // attributes [58..60] = 0x80 (ATTR_NAME_IS_UTF)
+        cab[58..60].copy_from_slice(&0x0080u16.to_le_bytes());
+        // name [60..70] = "hello.txt\0"
+        cab[60..70].copy_from_slice(b"hello.txt\0");
+
+        // --- CFDATA (offset 70, 8 fixed + 6 data = 14) ---
+        // checksum [70..74] = 0
+        // compressed_size [74..76] = 6
+        cab[74..76].copy_from_slice(&6u16.to_le_bytes());
+        // uncompressed_size [76..78] = 6
+        cab[76..78].copy_from_slice(&6u16.to_le_bytes());
+        // data [78..84] = "Hello!"
+        cab[78..84].copy_from_slice(b"Hello!");
+
+        cab
+    }
+
+    #[test]
+    fn test_cab_progress() {
+        use oxiarc_core::progress::ProgressSink;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct CountingSink {
+            entries: Mutex<Vec<String>>,
+            progress_calls: Mutex<u64>,
+        }
+
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, _processed: u64, _total: Option<u64>) {
+                *self.progress_calls.lock().expect("lock poisoned") += 1;
+            }
+            fn on_entry(&self, name: &str, _index: u64) {
+                self.entries
+                    .lock()
+                    .expect("lock poisoned")
+                    .push(name.to_string());
+            }
+            fn on_finish(&self) {}
+        }
+
+        let sink = Arc::new(CountingSink::default());
+        let handle: oxiarc_core::progress::ProgressHandle = sink.clone();
+
+        let cab_bytes = minimal_stored_cab();
+        let cursor = std::io::Cursor::new(cab_bytes);
+        let mut reader = CabReader::new(cursor)
+            .expect("CAB parse failed")
+            .with_progress(handle);
+
+        let entries = reader.entries().to_vec();
+        assert_eq!(entries.len(), 1, "expected 1 entry");
+
+        let data = reader.extract(&entries[0]).expect("extraction failed");
+        assert_eq!(data, b"Hello!");
+
+        {
+            let entries_seen = sink.entries.lock().expect("lock poisoned");
+            assert_eq!(entries_seen.len(), 1, "on_entry should fire exactly once");
+            assert_eq!(entries_seen[0], "hello.txt");
+        }
+        assert_eq!(
+            *sink.progress_calls.lock().expect("lock poisoned"),
+            1,
+            "on_progress should fire once"
+        );
     }
 }

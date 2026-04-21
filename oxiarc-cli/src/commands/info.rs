@@ -1,22 +1,24 @@
-//! Info command implementation.
-
+use crate::style::Styler;
 use oxiarc_archive::{ArchiveFormat, CabReader, SevenZReader, ZipReader};
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
-pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_info(archive: &PathBuf, styler: &Styler) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(archive)?;
     let mut reader = BufReader::new(file);
 
     let (format, _) = ArchiveFormat::detect(&mut reader)?;
     let metadata = std::fs::metadata(archive)?;
 
-    println!("Archive Information");
-    println!("===================");
-    println!("File: {}", archive.display());
+    println!("{}", styler.header("Archive Information"));
+    println!("{}", styler.header("==================="));
+    println!("File: {}", styler.path(&archive.display().to_string()));
     println!("Format: {}", format);
-    println!("Size: {} bytes", metadata.len());
+    println!(
+        "Size: {}",
+        styler.size(&format!("{} bytes", metadata.len()))
+    );
     println!("MIME type: {}", format.mime_type());
 
     reader.seek(SeekFrom::Start(0))?;
@@ -29,7 +31,7 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             let total_compressed: u64 = entries.iter().map(|e| e.compressed_size).sum();
 
             println!();
-            println!("Contents:");
+            println!("{}", styler.header("Contents:"));
             println!(
                 "  Files: {}",
                 entries.iter().filter(|e| e.is_file()).count()
@@ -38,8 +40,14 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 "  Directories: {}",
                 entries.iter().filter(|e| e.is_dir()).count()
             );
-            println!("  Total size: {} bytes", total_size);
-            println!("  Compressed size: {} bytes", total_compressed);
+            println!(
+                "  Total size: {}",
+                styler.size(&format!("{total_size} bytes"))
+            );
+            println!(
+                "  Compressed size: {}",
+                styler.size(&format!("{total_compressed} bytes"))
+            );
             if total_size > 0 {
                 println!(
                     "  Compression ratio: {:.1}%",
@@ -52,9 +60,9 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             let header = gzip.header();
 
             println!();
-            println!("GZIP Header:");
+            println!("{}", styler.header("GZIP Header:"));
             if let Some(name) = &header.filename {
-                println!("  Original filename: {}", name);
+                println!("  Original filename: {}", styler.path(name));
             }
             if header.mtime > 0 {
                 println!("  Modification time: {} (Unix timestamp)", header.mtime);
@@ -66,7 +74,7 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             let total_size: u64 = entries.iter().map(|e| e.size).sum();
 
             println!();
-            println!("Contents:");
+            println!("{}", styler.header("Contents:"));
             println!(
                 "  Files: {}",
                 entries.iter().filter(|e| e.is_file()).count()
@@ -75,7 +83,10 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 "  Directories: {}",
                 entries.iter().filter(|e| e.is_dir()).count()
             );
-            println!("  Total size: {} bytes", total_size);
+            println!(
+                "  Total size: {}",
+                styler.size(&format!("{total_size} bytes"))
+            );
         }
         ArchiveFormat::Cab => {
             let cab = CabReader::new(reader)?;
@@ -84,12 +95,15 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             let total_size: u64 = entries.iter().map(|e| e.size).sum();
 
             println!();
-            println!("Cabinet Info:");
+            println!("{}", styler.header("Cabinet Info:"));
             println!("  Version: {}.{}", major, minor);
             println!("  Folders: {}", cab.num_folders());
-            println!("  Cabinet size: {} bytes", cab.cabinet_size());
+            println!(
+                "  Cabinet size: {}",
+                styler.size(&format!("{} bytes", cab.cabinet_size()))
+            );
             println!();
-            println!("Contents:");
+            println!("{}", styler.header("Contents:"));
             println!(
                 "  Files: {}",
                 entries.iter().filter(|e| e.is_file()).count()
@@ -98,7 +112,10 @@ pub fn cmd_info(archive: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 "  Directories: {}",
                 entries.iter().filter(|e| e.is_dir()).count()
             );
-            println!("  Total size: {} bytes", total_size);
+            println!(
+                "  Total size: {}",
+                styler.size(&format!("{total_size} bytes"))
+            );
         }
         _ => {}
     }

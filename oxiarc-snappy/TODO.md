@@ -1,6 +1,6 @@
-# oxiarc-snappy - Development Status
+# oxiarc-snappy - Development Status (v0.2.7, 2026-04-21)
 
-## Completed Features (v0.2.6)
+## Completed Features (COMPLETE)
 
 ### Block Format
 - [x] Snappy block compression with hash-based matching
@@ -38,7 +38,13 @@
 
 ### Features
 - [ ] Dictionary support
-- [ ] Progress callbacks
+- [x] Progress callbacks (planned 2026-04-20)
+  - **Goal:** `FrameEncoder`/`FrameDecoder` (frame format with CRC32C + chunks) accept `ProgressHandle`; emit `on_progress(processed, None)` per chunk (64 KiB max in Snappy frame).
+  - **Design:** Same pattern as brotli. `.with_progress(handle)` builder on both Frame types. Hook inside per-chunk read/write loop.
+  - **Files:** MODIFY `oxiarc-snappy/src/frame.rs` (or equivalent — locate during implementation).
+  - **Prerequisites:** core primitive already in.
+  - **Tests:** counting-sink on encode + decode; assert `processed` is monotonic and ≈ input size.
+  - **Risk:** none significant.
 - [ ] Async I/O support
 
 ### Compatibility

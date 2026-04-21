@@ -19,18 +19,29 @@
 //! let compressed = writer.compress(&data).unwrap();
 //! ```
 
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use std::io::Read;
 
 /// Zstandard magic number.
 pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Zstandard file reader.
+///
+/// Progress/cancellation is emitted by the wrapper itself (the underlying
+/// `oxiarc-zstd` crate does not yet expose builder hooks). Granularity is
+/// therefore one-shot: a single `on_progress` call after decompression
+/// completes, followed by `on_finish`.
 pub struct ZstdReader {
     /// Buffered data.
     data: Vec<u8>,
     /// Content size (if known from header).
     content_size: Option<u64>,
+    /// Optional progress sink (wrapper-emitted, one-shot).
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token checked before decompression.
+    cancel: Option<CancellationToken>,
 }
 
 impl ZstdReader {
@@ -55,7 +66,24 @@ impl ZstdReader {
         // Try to parse content size from header
         let content_size = parse_content_size(&data);
 
-        Ok(Self { data, content_size })
+        Ok(Self {
+            data,
+            content_size,
+            progress: None,
+            cancel: None,
+        })
+    }
+
+    /// Attach a progress sink. Emitted once after decompression completes.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token. Checked before decompression begins.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Get the content size if known from header.
@@ -65,7 +93,16 @@ impl ZstdReader {
 
     /// Decompress the entire file.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
-        oxiarc_zstd::decompress(&self.data)
+        if let Some(ref token) = self.cancel {
+            token.check()?;
+        }
+        let output = oxiarc_zstd::decompress(&self.data)?;
+        if let Some(ref handle) = self.progress {
+            let total = output.len() as u64;
+            handle.on_progress(total, Some(total));
+            handle.on_finish();
+        }
+        Ok(output)
     }
 }
 
@@ -73,9 +110,18 @@ impl ZstdReader {
 ///
 /// Creates Zstandard compressed files using raw blocks.
 /// The output is valid Zstd that any decoder can read.
+///
+/// Progress/cancellation is emitted by the wrapper itself (the underlying
+/// `oxiarc-zstd` crate does not yet expose builder hooks). Granularity is
+/// therefore one-shot: a single `on_progress` call after compression
+/// completes, followed by `on_finish`.
 pub struct ZstdWriter {
     /// Internal encoder.
     encoder: oxiarc_zstd::ZstdEncoder,
+    /// Optional progress sink (wrapper-emitted, one-shot).
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token checked before compression.
+    cancel: Option<CancellationToken>,
 }
 
 impl ZstdWriter {
@@ -83,6 +129,8 @@ impl ZstdWriter {
     pub fn new() -> Self {
         Self {
             encoder: oxiarc_zstd::ZstdEncoder::new(),
+            progress: None,
+            cancel: None,
         }
     }
 
@@ -92,9 +140,30 @@ impl ZstdWriter {
         self
     }
 
+    /// Attach a progress sink. Emitted once after compression completes.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token. Checked before compression begins.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// Compress data to Zstandard format.
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        self.encoder.compress(data)
+        if let Some(ref token) = self.cancel {
+            token.check()?;
+        }
+        let output = self.encoder.compress(data)?;
+        if let Some(ref handle) = self.progress {
+            let total = data.len() as u64;
+            handle.on_progress(total, Some(total));
+            handle.on_finish();
+        }
+        Ok(output)
     }
 }
 
@@ -329,5 +398,60 @@ mod tests {
         let decompressed = decompress(&compressed).unwrap();
 
         assert_eq!(decompressed, original.as_slice());
+    }
+
+    #[test]
+    fn test_zstd_progress_forwarding() {
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            finish_count: AtomicU64,
+            last_processed: AtomicU64,
+        }
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+                self.last_processed.store(processed, Ordering::SeqCst);
+            }
+            fn on_entry(&self, _name: &str, _index: u64) {}
+            fn on_finish(&self) {
+                self.finish_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            finish_count: AtomicU64::new(0),
+            last_processed: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        let original = b"Testing zstd progress forwarding via wrapper.";
+        let writer = ZstdWriter::new().with_progress(handle);
+        let _compressed = writer
+            .compress(original)
+            .expect("zstd compression with progress should succeed");
+
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sink.last_processed.load(Ordering::SeqCst),
+            original.len() as u64
+        );
+    }
+
+    #[test]
+    fn test_zstd_cancel_forwarding() {
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::error::OxiArcError;
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let writer = ZstdWriter::new().with_cancel(token);
+        let result = writer.compress(b"should be cancelled before compressing");
+        assert!(matches!(result, Err(OxiArcError::Cancelled)));
     }
 }

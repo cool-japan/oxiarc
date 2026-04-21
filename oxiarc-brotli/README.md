@@ -1,6 +1,11 @@
-# oxiarc-brotli
+
+# oxiarc-brotli [Stable]
 
 Pure Rust Brotli compression library (RFC 7932), part of the OxiArc ecosystem.
+
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
 ## Features
 
@@ -10,21 +15,6 @@ Pure Rust Brotli compression library (RFC 7932), part of the OxiArc ecosystem.
 - Streaming compression/decompression API
 - Pure Rust — no C dependencies
 
-## Usage
+All features are implemented and tested. API is stable.
 
-```toml
-[dependencies]
-oxiarc-brotli = "0.2.6"
-```
-
-## Tests
-
-75 tests passing.
-
-## License
-
-Apache-2.0
-
-## Authors
-
-COOLJAPAN OU (Team Kitasan)
+**Version: 0.2.7 (2026-04-21) | 92 tests passing**

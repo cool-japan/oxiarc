@@ -3,11 +3,35 @@
 //! Provides `Write`-based streaming compression and `Read`-based
 //! streaming decompression, suitable for processing large data
 //! that doesn't fit in memory.
+//!
+//! ## Progress and Cancellation
+//!
+//! Both `BrotliCompressor` and `BrotliDecompressor` support optional
+//! progress reporting and cooperative cancellation via `oxiarc-core` primitives:
+//!
+//! ```rust,no_run
+//! use std::io::Write;
+//! use oxiarc_brotli::streaming::BrotliCompressor;
+//! use oxiarc_brotli::compress::BrotliParams;
+//! use oxiarc_core::{CancellationToken, noop_progress};
+//!
+//! let token = CancellationToken::new();
+//! let mut output = Vec::new();
+//! let params = BrotliParams::default();
+//! let mut compressor = BrotliCompressor::new(&mut output, params)
+//!     .with_progress(noop_progress())
+//!     .with_cancel(token.clone());
+//! compressor.write_all(b"Hello, Brotli!").unwrap();
+//! let _ = compressor.finish();
+//! ```
 
 use std::io::{self, Read, Write};
 
-use crate::compress::{BrotliParams, compress_with_params};
-use crate::decompress::decompress;
+use oxiarc_core::cancel::CancellationToken;
+use oxiarc_core::progress::ProgressHandle;
+
+use crate::compress::{BrotliParams, compress_with_hooks};
+use crate::decompress::decompress_with_hooks;
 use crate::error::BrotliError;
 
 /// Default buffer size for streaming operations (256KB).
@@ -18,6 +42,9 @@ const DEFAULT_BUF_SIZE: usize = 256 * 1024;
 /// Data written to this compressor is buffered and compressed
 /// in blocks. Call `finish()` to flush all remaining data and
 /// write the final Brotli stream.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`].
 ///
 /// # Example
 ///
@@ -41,6 +68,12 @@ pub struct BrotliCompressor<W: Write> {
     buffer: Vec<u8>,
     /// Whether any data has been written (used for multi-block streams).
     has_written: bool,
+    /// Optional progress sink; receives `on_progress` once per `finish()`.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token; checked at the start of `finish()`.
+    cancel: Option<CancellationToken>,
+    /// Cumulative compressed bytes emitted so far.
+    bytes_out: u64,
 }
 
 impl<W: Write> BrotliCompressor<W> {
@@ -51,6 +84,9 @@ impl<W: Write> BrotliCompressor<W> {
             params,
             buffer: Vec::with_capacity(DEFAULT_BUF_SIZE),
             has_written: false,
+            progress: None,
+            cancel: None,
+            bytes_out: 0,
         }
     }
 
@@ -62,7 +98,31 @@ impl<W: Write> BrotliCompressor<W> {
             params,
             buffer: Vec::with_capacity(actual_size),
             has_written: false,
+            progress: None,
+            cancel: None,
+            bytes_out: 0,
         }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(bytes_out, None)` is called after each
+    /// compressed block is written to the inner writer.  Since the
+    /// compressor buffers all input until `finish()`, progress fires
+    /// once per `finish()` call.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked at the start of `finish()`. If it has been
+    /// cancelled, `finish()` returns an I/O error with the message
+    /// `"operation cancelled"`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Finish compression and return the inner writer.
@@ -78,16 +138,27 @@ impl<W: Write> BrotliCompressor<W> {
 
     /// Internal finish implementation.
     fn do_finish(&mut self) -> io::Result<()> {
-        // Compress all buffered data as a single Brotli stream.
+        // Compress all buffered data, threading progress/cancel hooks into
+        // the per-meta-block loop inside compress_with_hooks.
         let all_data = std::mem::take(&mut self.buffer);
 
-        let compressed = compress_with_params(&all_data, &self.params)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let compressed = compress_with_hooks(
+            &all_data,
+            &self.params,
+            self.progress.as_ref(),
+            self.cancel.as_ref(),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let compressed_len = compressed.len() as u64;
 
         if let Some(ref mut writer) = self.inner {
             writer.write_all(&compressed)?;
             writer.flush()?;
         }
+
+        // Update cumulative bytes_out so callers can inspect final total.
+        self.bytes_out += compressed_len;
 
         Ok(())
     }
@@ -121,6 +192,9 @@ impl<W: Write> Drop for BrotliCompressor<W> {
 /// Reads compressed data from the inner reader and produces
 /// decompressed output.
 ///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`].
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -141,6 +215,10 @@ pub struct BrotliDecompressor<R: Read> {
     output_pos: usize,
     /// Whether decompression is complete.
     finished: bool,
+    /// Optional progress sink; receives `on_progress` after decompression.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token; checked before decompression starts.
+    cancel: Option<CancellationToken>,
 }
 
 impl<R: Read> BrotliDecompressor<R> {
@@ -151,10 +229,31 @@ impl<R: Read> BrotliDecompressor<R> {
             output_buf: Vec::new(),
             output_pos: 0,
             finished: false,
+            progress: None,
+            cancel: None,
         }
     }
 
-    /// Read all compressed input and decompress it.
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(bytes_in_consumed, Some(bytes_in_consumed))` is
+    /// called once after the entire compressed input has been decompressed.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before decompression begins. If it has been
+    /// cancelled, reading returns an I/O error with the message
+    /// `"operation cancelled"`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Read all compressed input and decompress it, threading hooks per meta-block.
     fn decompress_all(&mut self) -> io::Result<()> {
         if self.finished {
             return Ok(());
@@ -169,9 +268,10 @@ impl<R: Read> BrotliDecompressor<R> {
             return Ok(());
         }
 
-        // Decompress.
-        self.output_buf = decompress(&compressed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        // Decompress with per-meta-block progress and cancellation hooks.
+        self.output_buf =
+            decompress_with_hooks(&compressed, self.progress.as_ref(), self.cancel.as_ref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
         self.output_pos = 0;
         self.finished = true;
 
@@ -208,7 +308,7 @@ pub fn compress_to_writer<W: Write>(
         quality,
         ..BrotliParams::default()
     };
-    let compressed = compress_with_params(data, &params)?;
+    let compressed = compress_with_hooks(data, &params, None, None)?;
     writer.write_all(&compressed).map_err(BrotliError::from)?;
     Ok(())
 }
@@ -219,7 +319,7 @@ pub fn decompress_from_reader<R: Read>(reader: &mut R) -> Result<Vec<u8>, Brotli
     reader
         .read_to_end(&mut compressed)
         .map_err(BrotliError::from)?;
-    decompress(&compressed)
+    decompress_with_hooks(&compressed, None, None)
 }
 
 #[cfg(test)]
@@ -295,5 +395,66 @@ mod tests {
         let result = compress_to_writer(b"test", &mut output, 0);
         assert!(result.is_ok());
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_compressor_with_progress_builder() {
+        use oxiarc_core::noop_progress;
+        let mut output = Vec::new();
+        let params = BrotliParams {
+            quality: 0,
+            ..BrotliParams::default()
+        };
+        let mut compressor =
+            BrotliCompressor::new(&mut output, params).with_progress(noop_progress());
+        compressor.write_all(b"progress test data").ok();
+        let _ = compressor.finish();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_compressor_with_cancel_builder() {
+        use oxiarc_core::cancel::CancellationToken;
+        let mut output = Vec::new();
+        let params = BrotliParams {
+            quality: 0,
+            ..BrotliParams::default()
+        };
+        let token = CancellationToken::new();
+        let mut compressor = BrotliCompressor::new(&mut output, params).with_cancel(token);
+        compressor.write_all(b"cancel test data").ok();
+        let _ = compressor.finish();
+        // Completed without cancellation.
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_decompressor_with_progress_builder() {
+        use crate::compress::compress;
+        use oxiarc_core::noop_progress;
+
+        let data = b"hello decompressor progress";
+        let compressed = compress(data, 0).expect("compress");
+        let decompressor = BrotliDecompressor::new(&compressed[..]).with_progress(noop_progress());
+        let mut output = Vec::new();
+        let mut d = decompressor;
+        d.read_to_end(&mut output).expect("decompress");
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn test_decompressor_with_cancel_builder() {
+        use crate::compress::compress;
+        use oxiarc_core::cancel::CancellationToken;
+
+        let data = b"hello decompressor cancel";
+        let compressed = compress(data, 0).expect("compress");
+        let token = CancellationToken::new();
+        let decompressor = BrotliDecompressor::new(&compressed[..]).with_cancel(token);
+        let mut output = Vec::new();
+        let mut d = decompressor;
+        d.read_to_end(&mut output)
+            .expect("decompress without cancel");
+        assert_eq!(output, data);
     }
 }

@@ -7,6 +7,7 @@ use crate::methods::LzhMethod;
 use crate::methods::constants::{NC, NT};
 use oxiarc_core::BitWriter;
 use oxiarc_core::error::Result;
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::traits::{CompressStatus, Compressor, FlushMode};
 use std::io::Write;
 
@@ -17,7 +18,6 @@ const MAX_CODE_LEN: usize = 16;
 const BLOCK_SIZE: usize = 0x4000; // 16KB
 
 /// LZH encoder.
-#[derive(Debug)]
 pub struct LzhEncoder {
     /// Compression method.
     method: LzhMethod,
@@ -25,6 +25,21 @@ pub struct LzhEncoder {
     lzss: LzssEncoder,
     /// Whether encoding is finished.
     finished: bool,
+    /// Optional progress sink for reporting encode progress at block boundaries.
+    progress: Option<ProgressHandle>,
+}
+
+impl std::fmt::Debug for LzhEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LzhEncoder")
+            .field("method", &self.method)
+            .field("finished", &self.finished)
+            .field(
+                "progress",
+                &self.progress.as_ref().map(|_| "<ProgressHandle>"),
+            )
+            .finish()
+    }
 }
 
 impl LzhEncoder {
@@ -38,12 +53,23 @@ impl LzhEncoder {
             method,
             lzss: LzssEncoder::new(window_size, min_match, max_match),
             finished: false,
+            progress: None,
         }
     }
 
     /// Create a default encoder (lh5).
     pub fn lh5() -> Self {
         Self::new(LzhMethod::Lh5)
+    }
+
+    /// Attach a progress sink to this encoder.
+    ///
+    /// The sink will be called with `on_progress(input_consumed, None)` at
+    /// each block boundary during encoding. `input_consumed` is the cumulative
+    /// number of uncompressed bytes processed up to that block boundary.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
     }
 
     /// Reset the encoder.
@@ -92,7 +118,7 @@ impl LzhEncoder {
 
     /// Encode tokens to the bitstream.
     fn encode_tokens<W: Write>(
-        &self,
+        &mut self,
         tokens: &[LzssToken],
         writer: &mut BitWriter<W>,
         np: usize,
@@ -100,6 +126,9 @@ impl LzhEncoder {
         if tokens.is_empty() {
             return Ok(());
         }
+
+        // Cumulative uncompressed bytes consumed across all blocks so far.
+        let mut total_input_consumed: u64 = 0;
 
         // Process in blocks
         let mut pos = 0;
@@ -117,6 +146,14 @@ impl LzhEncoder {
             }
 
             self.encode_block(block_tokens, writer, np, block_size)?;
+
+            total_input_consumed += block_size as u64;
+
+            // Emit progress at each block boundary.
+            if let Some(ref sink) = self.progress {
+                sink.on_progress(total_input_consumed, None);
+            }
+
             pos = block_end;
         }
 
@@ -850,5 +887,76 @@ mod tests {
         let encoded = encode_lzh(data, LzhMethod::Lh5).unwrap();
         let decoded = decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// A simple progress sink for test purposes.
+    struct CountingSink {
+        calls: std::sync::atomic::AtomicU64,
+        last_processed: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                last_processed: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u64 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn last_processed(&self) -> u64 {
+            self.last_processed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl oxiarc_core::progress::ProgressSink for CountingSink {
+        fn on_progress(&self, processed: u64, _total: Option<u64>) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.last_processed
+                .store(processed, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_progress_callbacks_encode() {
+        use std::sync::Arc;
+
+        // Use the same repeating pattern as test_lh5_roundtrip_repeated (known to
+        // roundtrip correctly with Lh5): 40 bytes of 'A'. LZSS will find a match
+        // on the second + 'A', so Huffman tables are non-trivial. The entire input
+        // fits in one block, so we expect exactly one on_progress call.
+        let input: Vec<u8> = vec![b'A'; 40];
+        let input_size = input.len();
+
+        let sink = Arc::new(CountingSink::new());
+        let handle: oxiarc_core::progress::ProgressHandle = sink.clone();
+
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5).with_progress(handle);
+        let encoded = encoder.compress_to_vec(&input).expect("encode failed");
+
+        // Verify roundtrip using the non-streaming decoder.
+        let decoded =
+            decode_lzh(&encoded, LzhMethod::Lh5, input_size as u64).expect("decode failed");
+        assert_eq!(decoded, input, "decoded output must match original input");
+
+        // Progress must have been called at least once.
+        assert!(
+            sink.call_count() >= 1,
+            "on_progress must be called at least once; calls = {}",
+            sink.call_count()
+        );
+
+        // The last `processed` value should equal the input size exactly (single block).
+        assert_eq!(
+            sink.last_processed(),
+            input_size as u64,
+            "last processed ({}) should equal input size ({})",
+            sink.last_processed(),
+            input_size
+        );
     }
 }

@@ -46,11 +46,13 @@ pub enum OutputFormat {
     Snappy,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_create(
     archive: &str,
     files: &[PathBuf],
     format: Option<OutputFormat>,
     compression: CompressionLevel,
+    compress_threshold: u64,
     verbose: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -177,7 +179,7 @@ pub fn cmd_create(
             zip.set_compression(level);
 
             for path in files {
-                add_path_to_zip(&mut zip, path, path, verbose)?;
+                add_path_to_zip(&mut zip, path, path, verbose, compress_threshold)?;
             }
 
             zip.finish()?;
@@ -462,6 +464,7 @@ fn add_path_to_zip<W: std::io::Write>(
     path: &PathBuf,
     base: &PathBuf,
     verbose: bool,
+    compress_threshold: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if path.is_dir() {
         let name = path
@@ -477,7 +480,7 @@ fn add_path_to_zip<W: std::io::Write>(
 
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            add_path_to_zip(zip, &entry.path(), base, verbose)?;
+            add_path_to_zip(zip, &entry.path(), base, verbose, compress_threshold)?;
         }
     } else {
         let name = path
@@ -487,9 +490,16 @@ fn add_path_to_zip<W: std::io::Write>(
             .replace('\\', "/");
 
         let data = std::fs::read(path)?;
-        zip.add_file(&name, &data)?;
-        if verbose {
-            println!("  Added: {} ({} bytes)", name, data.len());
+        if compress_threshold > 0 && (data.len() as u64) < compress_threshold {
+            zip.add_file_stored(&name, &data)?;
+            if verbose {
+                println!("  Added: {} ({} bytes, stored)", name, data.len());
+            }
+        } else {
+            zip.add_file(&name, &data)?;
+            if verbose {
+                println!("  Added: {} ({} bytes)", name, data.len());
+            }
         }
     }
     Ok(())

@@ -1,6 +1,6 @@
-# oxiarc-lz4 - Development Status
+# oxiarc-lz4 - Development Status (v0.2.7, 2026-04-21)
 
-## Completed Features
+## Completed Features (COMPLETE)
 
 ### Block Format
 - [x] Block compression with hash chain matching

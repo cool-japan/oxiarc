@@ -1,9 +1,9 @@
-//! List command implementation.
-
 use super::SortBy;
+use crate::style::Styler;
 use crate::utils::{filter_entries, print_entries, print_tree, sort_entries};
 use oxiarc_archive::{
-    ArchiveFormat, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, ZipReader, ZstdReader,
+    ArchiveFormat, Bzip2Reader, CabReader, LenientWarning, Lz4Reader, SevenZReader, ZipReader,
+    ZstdReader,
 };
 use oxiarc_core::Entry;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,6 @@ use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
-/// JSON serializable entry data for archive listings.
 #[derive(Debug, Serialize, Deserialize)]
 struct EntryJson {
     name: String,
@@ -47,7 +46,6 @@ impl EntryJson {
     }
 }
 
-/// JSON output for archive listing.
 #[derive(Debug, Serialize, Deserialize)]
 struct ArchiveListJson {
     archive: String,
@@ -58,7 +56,6 @@ struct ArchiveListJson {
     metadata: Option<serde_json::Value>,
 }
 
-/// Options for listing archive contents.
 pub struct ListOptions<'a> {
     pub verbose: bool,
     pub json: bool,
@@ -67,45 +64,71 @@ pub struct ListOptions<'a> {
     pub reverse: bool,
     pub include: &'a [String],
     pub exclude: &'a [String],
+    /// Continue on corruption (CRC mismatch, bad TAR checksum) with
+    /// warnings instead of errors. Warnings are emitted to stderr in
+    /// yellow after the listing completes.
+    pub lenient: bool,
+}
+
+/// Print accumulated lenient-mode warnings to stderr. No-op for empty
+/// slices (common case — lenient is a silent no-op on clean archives).
+fn print_warnings(warnings: &[LenientWarning], styler: &Styler) {
+    for w in warnings {
+        let msg = format!("warning: {} [{}]", w.message, w.format);
+        eprintln!("{}", styler.warning(&msg));
+    }
 }
 
 pub fn cmd_list(
     archive: &PathBuf,
-    options: &ListOptions,
+    options: &ListOptions<'_>,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(archive)?;
     let mut reader = BufReader::new(file);
 
-    // Detect format
     let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
 
     if options.json {
-        // JSON output mode
-        return cmd_list_json(archive, format, reader, options);
+        return cmd_list_json(archive, format, reader, options, styler);
     }
 
-    println!("Archive: {} ({})", archive.display(), format);
+    println!(
+        "Archive: {} ({})",
+        styler.path(&archive.display().to_string()),
+        format
+    );
     println!();
 
     match format {
         ArchiveFormat::Zip => {
-            let zip = ZipReader::new(reader)?;
+            let zip = ZipReader::new(reader)?.lenient(options.lenient);
             let mut filtered = filter_entries(zip.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
-            display_entries(&filtered, options.verbose, options.tree);
+            display_entries(&filtered, options.verbose, options.tree, styler);
+            print_warnings(zip.warnings(), styler);
         }
         ArchiveFormat::Tar => {
-            let tar = oxiarc_archive::TarReader::new(reader)?;
+            // TarReader scans eagerly in `new`, so lenient-header-scan support
+            // requires the dedicated `new_lenient` constructor — chaining
+            // `.lenient(true)` after `new(reader)?` would not re-run the scan.
+            let tar = if options.lenient {
+                oxiarc_archive::TarReader::new_lenient(reader)?
+            } else {
+                oxiarc_archive::TarReader::new(reader)?
+            };
             let mut filtered = filter_entries(tar.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
-            display_entries(&filtered, options.verbose, options.tree);
+            display_entries(&filtered, options.verbose, options.tree, styler);
+            print_warnings(tar.warnings(), styler);
         }
         ArchiveFormat::Lzh => {
-            let lzh = oxiarc_archive::LzhReader::new(reader)?;
+            let lzh = oxiarc_archive::LzhReader::new(reader)?.lenient(options.lenient);
             let mut filtered = filter_entries(&lzh.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
-            display_entries(&filtered, options.verbose, options.tree);
+            display_entries(&filtered, options.verbose, options.tree, styler);
+            print_warnings(lzh.warnings(), styler);
         }
         ArchiveFormat::Gzip => {
             let gzip = oxiarc_archive::GzipReader::new(reader)?;
@@ -150,13 +173,13 @@ pub fn cmd_list(
             let sevenz = SevenZReader::new(reader)?;
             let mut filtered = filter_entries(&sevenz.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
-            display_entries(&filtered, options.verbose, options.tree);
+            display_entries(&filtered, options.verbose, options.tree, styler);
         }
         ArchiveFormat::Cab => {
             let cab = CabReader::new(reader)?;
             let mut filtered = filter_entries(cab.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
-            display_entries(&filtered, options.verbose, options.tree);
+            display_entries(&filtered, options.verbose, options.tree, styler);
         }
         _ => {
             println!("Unsupported format: {}", format);
@@ -166,21 +189,20 @@ pub fn cmd_list(
     Ok(())
 }
 
-/// Display entries in either table or tree format.
-fn display_entries(entries: &[Entry], verbose: bool, tree: bool) {
+fn display_entries(entries: &[Entry], verbose: bool, tree: bool, styler: &Styler) {
     if tree {
-        print_tree(entries, verbose);
+        print_tree(entries, verbose, styler);
     } else {
-        print_entries(entries, verbose);
+        print_entries(entries, verbose, styler);
     }
 }
 
-/// Output archive listing as JSON.
 fn cmd_list_json<R: std::io::Read + std::io::Seek>(
     archive: &std::path::Path,
     format: ArchiveFormat,
     reader: R,
-    options: &ListOptions,
+    options: &ListOptions<'_>,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = ArchiveListJson {
         archive: archive.display().to_string(),
@@ -189,24 +211,36 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
         metadata: None,
     };
 
+    // Accumulate lenient-mode warnings separately so we can emit them on
+    // stderr after the JSON payload lands on stdout. Keeping them off the
+    // JSON document preserves stdout as pure machine-readable output.
+    let mut pending_warnings: Vec<LenientWarning> = Vec::new();
+
     match format {
         ArchiveFormat::Zip => {
-            let zip = ZipReader::new(reader)?;
+            let zip = ZipReader::new(reader)?.lenient(options.lenient);
             let mut filtered = filter_entries(zip.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
+            pending_warnings.extend(zip.warnings().iter().cloned());
         }
         ArchiveFormat::Tar => {
-            let tar = oxiarc_archive::TarReader::new(reader)?;
+            let tar = if options.lenient {
+                oxiarc_archive::TarReader::new_lenient(reader)?
+            } else {
+                oxiarc_archive::TarReader::new(reader)?
+            };
             let mut filtered = filter_entries(tar.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
+            pending_warnings.extend(tar.warnings().iter().cloned());
         }
         ArchiveFormat::Lzh => {
-            let lzh = oxiarc_archive::LzhReader::new(reader)?;
+            let lzh = oxiarc_archive::LzhReader::new(reader)?.lenient(options.lenient);
             let mut filtered = filter_entries(&lzh.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
+            pending_warnings.extend(lzh.warnings().iter().cloned());
         }
         ArchiveFormat::Gzip => {
             let gzip = oxiarc_archive::GzipReader::new(reader)?;
@@ -266,9 +300,10 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    // Pretty-print JSON output
     let json_output = serde_json::to_string_pretty(&output)?;
     println!("{}", json_output);
+
+    print_warnings(&pending_warnings, styler);
 
     Ok(())
 }

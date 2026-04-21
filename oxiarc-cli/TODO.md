@@ -1,6 +1,6 @@
-# oxiarc-cli - Development Status
+# oxiarc-cli - Development Status (v0.2.7, 2026-04-21)
 
-## Completed Features
+## Completed Features (COMPLETE)
 
 ### Commands
 - [x] `list` (alias: `l`) - List archive contents
@@ -82,25 +82,31 @@
 - [x] Sorting options (name, size, date, ratio)
 - [x] Filter by pattern
 - [x] Show modification times
-- [ ] Tree view
+- [x] Tree view (verified 2026-04-20 with `cli_tree.rs` integration test — guards `├`/`└` connectors and nested path rendering)
 
 ### Create Command Options
 - [x] Compression level (`-l 0-9`)
 - [x] Recursive directory inclusion
 - [x] Exclude patterns
-- [ ] Store vs. compress threshold
-- [ ] Add files to existing archive
+- [x] Store vs. compress threshold (2026-04-20 — `--compress-threshold N`, files below N bytes bypass deflate; verified with `cli_create_threshold.rs`)
+- [x] Add files to existing archive (2026-04-20 — `oxiarc add <archive> <files>` for ZIP/TAR/LZH, with `--dry-run`; verified with `cli_add.rs`)
 
 ### User Experience
 - [x] Progress bars (indicatif)
-- [ ] Colored output (colored/termcolor)
+- [x] Colored output (colored/termcolor) (planned 2026-04-20) — verified with integration tests across list/info/detect/extract + NO_COLOR env
+  - **Goal:** `oxiarc list`, `oxiarc info`, and `oxiarc detect` produce colored output on terminals, plain output when piped, with a global `--color {auto,always,never}` flag. Errors → red; dirs/files/symlinks → distinct hues.
+  - **Design:** Add `owo-colors` (latest, pure Rust) and `supports-color` (latest, pure Rust) to `oxiarc-cli/Cargo.toml`. New `src/style.rs` (~80 lines) centralizes `ColorChoice` enum, TTY detection (`NO_COLOR`/`FORCE_COLOR` respected), and styled helpers. Root clap command gains `#[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]`. Four commands (`list`, `info`, `detect`, `extract --verbose`) route output through style helpers.
+  - **Files:** `oxiarc-cli/Cargo.toml` (MODIFY +2 deps), `src/style.rs` (NEW), `src/main.rs` (MODIFY), `src/list.rs`, `src/info.rs`, `src/detect.rs`, `src/extract.rs` (MODIFY)
+  - **Prerequisites:** none
+  - **Tests:** unit in style.rs (Auto+no-tty→plain, Always→ANSI, Never→plain); integration via assert_cmd (`oxiarc list --color=never` → no ESC sequences)
+  - **Risk:** owo-colors is pure Rust; no policy issue
 - [ ] Interactive mode
 - [x] Verbose/quiet modes (`-v`, `-q`)
 - [x] Dry-run mode (`--dry-run`, `-n`) for create and extract commands
 
 ### I/O Options
 - [x] Stdin/stdout support (`-`)
-- [ ] Password for encrypted archives
+- [x] Password for encrypted archives (2026-04-20 — `--password` on `extract` plus interactive prompt via `rpassword`; wrong password exits 2; verified with `cli_password.rs`)
 - [ ] Multi-volume archives
 - [ ] Memory limit option
 
@@ -112,8 +118,14 @@
   - [x] Fish completion generation
   - [x] PowerShell completion generation
   - [x] Installation instructions in README
-- [ ] Man page generation
-- [ ] Windows-specific handling
+- [x] Man page generation (planned 2026-04-20) — verified with integration test; generates .TH/.SH-compliant roff files
+  - **Goal:** `oxiarc man [OUTPUT_DIR]` writes mandoc-format man pages (one per subcommand + top-level) to a given directory. Default output dir: `./man/`.
+  - **Design:** Add `clap_mangen = "0.2"` (latest, pure Rust) to `oxiarc-cli/Cargo.toml`. New `src/commands/man.rs` (~70 lines) or `src/man.rs` (mirroring existing command layout) builds `clap_mangen::Man` for each subcommand via `Cli::command()` tree, writes `oxiarc-<subcmd>.1` and `oxiarc.1`.
+  - **Files:** `oxiarc-cli/Cargo.toml` (MODIFY +1 dep), new man command file (MODIFY/NEW), `src/main.rs` (MODIFY — register subcommand)
+  - **Prerequisites:** none
+  - **Tests:** integration via assert_cmd (`oxiarc man /tmp/<tempdir>` → oxiarc.1 and oxiarc-list.1 exist, start with `.TH OXIARC`). Use `std::env::temp_dir()`.
+  - **Risk:** none; clap_mangen is well-trodden
+- [x] Windows-specific handling (2026-04-20 — `src/windows.rs` sanitizes reserved basenames CON/PRN/AUX/NUL/COM1-9/LPT1-9 on extract, appends `_` to stem, `--strict-names` refuses; long paths auto-prefixed with `\\?\` on Windows; verified with `cli_windows_names.rs`)
 
 ## Test Coverage
 

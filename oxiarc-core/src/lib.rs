@@ -55,11 +55,13 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod bitstream;
+pub mod cancel;
 pub mod crc;
-#[cfg(feature = "simd")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod crc_simd;
 pub mod entry;
 pub mod error;
+pub mod progress;
 pub mod ringbuffer;
 pub mod traits;
 
@@ -71,9 +73,11 @@ pub mod mmap;
 
 // Re-exports for convenience
 pub use bitstream::{BitReader, BitWriter};
+pub use cancel::CancellationToken;
 pub use crc::{Crc16, Crc32, Crc64};
 pub use entry::{CompressionMethod, Entry, EntryBuilder, EntryType, FileAttributes};
 pub use error::{OxiArcError, Result};
+pub use progress::{NoopProgress, ProgressHandle, ProgressSink, noop_progress};
 pub use ringbuffer::{OutputRingBuffer, RingBuffer};
 pub use traits::{
     ArchiveReader, ArchiveWriter, CompressStatus, CompressionLevel, Compressor, DecompressStatus,

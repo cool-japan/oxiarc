@@ -1,17 +1,75 @@
 //! Extract command implementation.
 
 use crate::commands::OutputFormat;
+use crate::style::Styler;
 use crate::utils::{create_progress_bar, matches_filters};
+use crate::windows::{long_path_prefix, sanitize_relative_path};
 use dialoguer::Confirm;
 use filetime::{FileTime, set_file_mtime};
 use oxiarc_archive::{
-    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, SnappyReader,
-    ZipReader, ZstdReader,
+    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, LenientWarning, Lz4Reader, SevenZReader,
+    SnappyReader, ZipReader, ZstdReader,
 };
 use oxiarc_core::Entry;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Argument bundle for `cmd_extract`.
+///
+/// Extract grew enough CLI flags that inlining them all in the dispatcher
+/// was triggering clippy's `too_many_arguments`. Packing the values here
+/// keeps the wire-up explicit while flattening the call site in `main.rs`.
+pub struct ExtractArgs<'a> {
+    /// Archive file to extract (use `"-"` for stdin).
+    pub archive: &'a str,
+    /// Output directory (use `"-"` for stdout for single-file formats).
+    pub output: &'a str,
+    /// Specific entry names to extract; empty means all.
+    pub files: &'a [String],
+    /// Glob include patterns.
+    pub include: &'a [String],
+    /// Glob exclude patterns.
+    pub exclude: &'a [String],
+    /// Verbose logging.
+    pub verbose: bool,
+    /// Enable progress bar.
+    pub progress: bool,
+    /// Explicit format hint (required for stdin).
+    pub format_hint: Option<OutputFormat>,
+    /// Always overwrite (kept for CLI backward-compat; currently a no-op).
+    pub overwrite: bool,
+    /// Skip existing output files.
+    pub skip_existing: bool,
+    /// Interactively prompt before overwriting.
+    pub prompt: bool,
+    /// Preserve mtime.
+    pub preserve_timestamps: bool,
+    /// Preserve Unix mode bits.
+    pub preserve_permissions: bool,
+    /// Preserve all metadata (timestamps + permissions).
+    pub preserve: bool,
+    /// Dry run: report what would happen, write nothing.
+    pub dry_run: bool,
+    /// Optional password for encrypted entries; prompts interactively if
+    /// `None` and an encrypted entry is encountered.
+    pub password: Option<String>,
+    /// Refuse to sanitize Windows-reserved basenames (error instead).
+    pub strict_names: bool,
+    /// Continue on corruption (CRC mismatch, bad TAR checksum, etc.)
+    /// with warnings instead of errors. Warnings are emitted to stderr
+    /// in yellow after extraction completes.
+    pub lenient: bool,
+}
+
+/// Print accumulated lenient-mode warnings to stderr. No-op for empty
+/// slices (common case — lenient is a silent no-op on clean archives).
+fn print_warnings(warnings: &[LenientWarning], styler: &Styler) {
+    for w in warnings {
+        let msg = format!("warning: {} [{}]", w.message, w.format);
+        eprintln!("{}", styler.warning(&msg));
+    }
+}
 
 /// Overwrite mode for file extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,24 +160,31 @@ fn apply_metadata(
 }
 
 /// Filter entries by include/exclude patterns.
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_extract(
-    archive: &str,
-    output: &str,
-    files: &[String],
-    include: &[String],
-    exclude: &[String],
-    verbose: bool,
-    progress: bool,
-    format_hint: Option<OutputFormat>,
-    _overwrite: bool,
-    skip_existing: bool,
-    prompt: bool,
-    preserve_timestamps: bool,
-    preserve_permissions: bool,
-    preserve: bool,
-    dry_run: bool,
+    args: ExtractArgs<'_>,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ExtractArgs {
+        archive,
+        output,
+        files,
+        include,
+        exclude,
+        verbose,
+        progress,
+        format_hint,
+        overwrite: _overwrite,
+        skip_existing,
+        prompt,
+        preserve_timestamps,
+        preserve_permissions,
+        preserve,
+        dry_run,
+        password,
+        strict_names,
+        lenient,
+    } = args;
+
     // Determine overwrite mode from flags
     let overwrite_mode = if prompt {
         OverwriteMode::Prompt
@@ -214,10 +279,10 @@ pub fn cmd_extract(
             let file = File::open(archive_path)?;
             let mut reader = BufReader::new(file);
             reader.seek(SeekFrom::Start(0))?;
-            return extract_archive_format(
+            return extract_archive_format(ExtractArchiveArgs {
                 reader,
                 format,
-                Path::new(output),
+                output: Path::new(output),
                 files,
                 include,
                 exclude,
@@ -227,7 +292,11 @@ pub fn cmd_extract(
                 overwrite_mode,
                 preserve_timestamps,
                 preserve_permissions,
-            );
+                password,
+                strict_names,
+                lenient,
+                styler,
+            });
         }
     };
 
@@ -263,6 +332,64 @@ pub fn cmd_extract(
     }
 
     unreachable!("Should have been handled above");
+}
+
+/// Helper that resolves the output filesystem path for an archive entry,
+/// applying Windows reserved-name sanitization and long-path prefixing.
+fn resolve_output_path(
+    output_root: &Path,
+    entry_name: &str,
+    strict_names: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let sanitized = sanitize_relative_path(entry_name, strict_names)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let joined = output_root.join(&sanitized);
+    Ok(long_path_prefix(&joined))
+}
+
+/// Resolve a password either from the CLI flag or interactive prompt.
+///
+/// Returns the password bytes. If the CLI flag is `None`, prompts on the
+/// controlling terminal via `rpassword`. Exits with status `2` if the prompt
+/// fails (e.g. no TTY available).
+fn resolve_password(cli_password: Option<String>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if let Some(pw) = cli_password {
+        return Ok(pw.into_bytes());
+    }
+    match rpassword::prompt_password("Password: ") {
+        Ok(pw) => Ok(pw.into_bytes()),
+        Err(e) => {
+            eprintln!(
+                "error: could not read password from terminal: {} (use --password=... for non-interactive use)",
+                e
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Argument bundle passed to `extract_archive_format`. Prevents a tangle of
+/// positional arguments.
+struct ExtractArchiveArgs<'a, R: Read + Seek> {
+    reader: R,
+    format: ArchiveFormat,
+    output: &'a Path,
+    files: &'a [String],
+    include: &'a [String],
+    exclude: &'a [String],
+    verbose: bool,
+    progress: bool,
+    archive_path: &'a Path,
+    overwrite_mode: OverwriteMode,
+    preserve_timestamps: bool,
+    preserve_permissions: bool,
+    password: Option<String>,
+    strict_names: bool,
+    /// Whether to continue past per-entry corruption, recording
+    /// warnings on the reader instead of aborting.
+    lenient: bool,
+    /// Styler used to colorize any warnings emitted after extraction.
+    styler: &'a Styler,
 }
 
 /// Decompress a single-file format from a byte slice.
@@ -317,21 +444,27 @@ fn extract_single_file_to_writer<W: Write>(
 }
 
 /// Extract archive formats (non-streaming).
-#[allow(clippy::too_many_arguments)]
 fn extract_archive_format<R: Read + Seek>(
-    mut reader: R,
-    format: ArchiveFormat,
-    output: &Path,
-    files: &[String],
-    include: &[String],
-    exclude: &[String],
-    verbose: bool,
-    progress: bool,
-    archive_path: &Path,
-    overwrite_mode: OverwriteMode,
-    preserve_timestamps: bool,
-    preserve_permissions: bool,
+    args: ExtractArchiveArgs<'_, R>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ExtractArchiveArgs {
+        mut reader,
+        format,
+        output,
+        files,
+        include,
+        exclude,
+        verbose,
+        progress,
+        archive_path,
+        overwrite_mode,
+        preserve_timestamps,
+        preserve_permissions,
+        password,
+        strict_names,
+        lenient,
+        styler,
+    } = args;
     println!(
         "Extracting {} to {}",
         archive_path.display(),
@@ -354,31 +487,59 @@ fn extract_archive_format<R: Read + Seek>(
 
     match format {
         ArchiveFormat::Zip => {
-            let mut zip = ZipReader::new(reader)?;
+            let mut zip = ZipReader::new(reader)?.lenient(lenient);
             let entries: Vec<_> = zip.entries().to_vec();
 
             // Filter entries
             let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
             let total = to_extract.len() as u64;
 
+            // Resolve password if any encrypted entries are in the selection.
+            let needs_password = to_extract
+                .iter()
+                .any(|e| ZipReader::<std::io::Cursor<&[u8]>>::is_encrypted(e));
+            let password_bytes: Option<Vec<u8>> = if needs_password {
+                Some(resolve_password(password)?)
+            } else {
+                None
+            };
+
             let pb = create_progress_bar(total, progress);
             pb.set_message("files");
 
             for entry in to_extract {
                 if entry.is_dir() {
-                    let dir_path = output.join(entry.sanitized_name());
+                    let dir_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = output.join(entry.sanitized_name());
+                    let file_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
 
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
-                        let data = zip.extract(entry)?;
+                        let data = if ZipReader::<std::io::Cursor<&[u8]>>::is_encrypted(entry) {
+                            let pw = password_bytes
+                                .as_deref()
+                                .ok_or("encrypted entry but no password provided")?;
+                            match zip.extract_encrypted(entry, pw) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    eprintln!(
+                                        "error: failed to decrypt {}: {} (likely wrong password)",
+                                        entry.name, e
+                                    );
+                                    std::process::exit(2);
+                                }
+                            }
+                        } else {
+                            zip.extract(entry)?
+                        };
                         std::fs::write(&file_path, data)?;
                         apply_metadata(
                             &file_path,
@@ -397,6 +558,7 @@ fn extract_archive_format<R: Read + Seek>(
                 pb.inc(1);
             }
             pb.finish_with_message("Done");
+            print_warnings(zip.warnings(), styler);
         }
         ArchiveFormat::Gzip => {
             let pb = create_progress_bar(1, progress);
@@ -430,7 +592,13 @@ fn extract_archive_format<R: Read + Seek>(
             pb.finish_with_message("Done");
         }
         ArchiveFormat::Tar => {
-            let mut tar = oxiarc_archive::TarReader::new(reader)?;
+            // TarReader scans eagerly in `new`, so lenient scanning
+            // requires the dedicated `new_lenient` constructor.
+            let mut tar = if lenient {
+                oxiarc_archive::TarReader::new_lenient(reader)?
+            } else {
+                oxiarc_archive::TarReader::new(reader)?
+            };
             let entries: Vec<_> = tar.entries().to_vec();
 
             let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
@@ -441,13 +609,15 @@ fn extract_archive_format<R: Read + Seek>(
 
             for entry in to_extract {
                 if entry.is_dir() {
-                    let dir_path = output.join(entry.sanitized_name());
+                    let dir_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = output.join(entry.sanitized_name());
+                    let file_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -472,9 +642,10 @@ fn extract_archive_format<R: Read + Seek>(
                 pb.inc(1);
             }
             pb.finish_with_message("Done");
+            print_warnings(tar.warnings(), styler);
         }
         ArchiveFormat::Lzh => {
-            let mut lzh = oxiarc_archive::LzhReader::new(reader)?;
+            let mut lzh = oxiarc_archive::LzhReader::new(reader)?.lenient(lenient);
             let entries: Vec<_> = lzh.entries().to_vec();
 
             let to_extract: Vec<_> = entries.iter().filter(|e| should_extract(&e.name)).collect();
@@ -485,13 +656,15 @@ fn extract_archive_format<R: Read + Seek>(
 
             for entry in to_extract {
                 if entry.is_dir() {
-                    let dir_path = output.join(entry.sanitized_name());
+                    let dir_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = output.join(entry.sanitized_name());
+                    let file_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -516,6 +689,7 @@ fn extract_archive_format<R: Read + Seek>(
                 pb.inc(1);
             }
             pb.finish_with_message("Done");
+            print_warnings(lzh.warnings(), styler);
         }
         ArchiveFormat::Xz => {
             let pb = create_progress_bar(1, progress);
@@ -704,13 +878,13 @@ fn extract_archive_format<R: Read + Seek>(
 
             for (i, entry) in to_extract {
                 if entry.is_dir {
-                    let dir_path = output.join(&entry.name);
+                    let dir_path = resolve_output_path(output, &entry.name, strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = output.join(&entry.name);
+                    let file_path = resolve_output_path(output, &entry.name, strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -743,13 +917,13 @@ fn extract_archive_format<R: Read + Seek>(
 
             for entry in to_extract {
                 if entry.is_dir() {
-                    let dir_path = output.join(&entry.name);
+                    let dir_path = resolve_output_path(output, &entry.name, strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = output.join(&entry.name);
+                    let file_path = resolve_output_path(output, &entry.name, strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }

@@ -1,16 +1,29 @@
 //! BZip2 decoder.
 
 use crate::{BLOCK_MAGIC, BZIP2_MAGIC, EOS_MAGIC, bwt, huffman, mtf, rle};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::{BitReader, Crc32};
 use std::io::Read;
 
 /// BZip2 decoder.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`BzDecoder::with_progress`] / [`BzDecoder::with_cancel`] builders.
 pub struct BzDecoder<R: Read> {
     reader: BitReader<R>,
     block_size: usize,
     combined_crc: u32,
     finished: bool,
+    /// Optional progress sink. Notified with cumulative decompressed bytes
+    /// after each block is produced.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token. Checked before each block is read.
+    cancel: Option<CancellationToken>,
+    /// Cumulative decompressed bytes produced so far.
+    bytes_processed: u64,
 }
 
 impl<R: Read> BzDecoder<R> {
@@ -45,13 +58,37 @@ impl<R: Read> BzDecoder<R> {
             block_size,
             combined_crc: 0,
             finished: false,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         })
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(cumulative_decompressed_bytes, None)` is
+    /// called once per decoded block. `on_finish()` is invoked when the
+    /// end-of-stream marker is processed.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token. Checked before each block is read.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Read and decode the next block.
     pub fn read_block(&mut self) -> Result<Option<Vec<u8>>> {
         if self.finished {
             return Ok(None);
+        }
+
+        // Cooperative cancellation check before reading.
+        if let Some(ref token) = self.cancel {
+            token.check()?;
         }
 
         // Read block/stream marker (6 bytes as bits)
@@ -68,6 +105,9 @@ impl<R: Read> BzDecoder<R> {
                 return Err(OxiArcError::crc_mismatch(stored_crc, self.combined_crc));
             }
             self.finished = true;
+            if let Some(ref handle) = self.progress {
+                handle.on_finish();
+            }
             return Ok(None);
         }
 
@@ -206,6 +246,12 @@ impl<R: Read> BzDecoder<R> {
         // Update combined CRC
         self.combined_crc = self.combined_crc.rotate_left(1) ^ block_crc;
 
+        // Update cumulative decompressed byte count and notify progress.
+        self.bytes_processed = self.bytes_processed.saturating_add(data.len() as u64);
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_processed, None);
+        }
+
         Ok(Some(data))
     }
 
@@ -253,5 +299,67 @@ mod tests {
         assert!(decoder.is_ok());
         let decoder = decoder.unwrap();
         assert_eq!(decoder.block_size(), 900_000);
+    }
+
+    #[test]
+    fn test_decoder_with_progress_builder() {
+        use crate::{CompressionLevel, compress};
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            finish_count: AtomicU64,
+        }
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, _processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+            }
+            fn on_finish(&self) {
+                self.finish_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            finish_count: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        let original = b"progress tracking through the decoder";
+        let compressed =
+            compress(original, CompressionLevel::new(1)).expect("compress should succeed");
+        let mut decoder = BzDecoder::new(Cursor::new(&compressed))
+            .expect("decoder should construct")
+            .with_progress(handle);
+
+        let mut output = Vec::new();
+        while let Some(block) = decoder.read_block().expect("read_block should succeed") {
+            output.extend_from_slice(&block);
+        }
+        assert_eq!(output, original);
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_decoder_with_cancel_builder() {
+        use crate::{CompressionLevel, compress};
+        use oxiarc_core::cancel::CancellationToken;
+        use oxiarc_core::error::OxiArcError;
+
+        let original = b"cancel before the first block";
+        let compressed =
+            compress(original, CompressionLevel::new(1)).expect("compress should succeed");
+
+        let token = CancellationToken::new();
+        let mut decoder = BzDecoder::new(Cursor::new(&compressed))
+            .expect("decoder should construct")
+            .with_cancel(token.clone());
+
+        token.cancel();
+        let result = decoder.read_block();
+        assert!(matches!(result, Err(OxiArcError::Cancelled)));
     }
 }

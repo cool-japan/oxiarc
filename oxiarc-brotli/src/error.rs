@@ -36,6 +36,8 @@ pub enum BrotliError {
     InvalidContextMap(String),
     /// Invalid prefix code.
     InvalidPrefixCode(String),
+    /// Operation cancelled by the caller.
+    Cancelled,
 }
 
 impl fmt::Display for BrotliError {
@@ -61,6 +63,7 @@ impl fmt::Display for BrotliError {
             BrotliError::DictionaryError(msg) => write!(f, "dictionary error: {msg}"),
             BrotliError::InvalidContextMap(msg) => write!(f, "invalid context map: {msg}"),
             BrotliError::InvalidPrefixCode(msg) => write!(f, "invalid prefix code: {msg}"),
+            BrotliError::Cancelled => write!(f, "operation cancelled"),
         }
     }
 }
@@ -99,7 +102,18 @@ impl From<BrotliError> for OxiArcError {
                 max_distance,
             } => OxiArcError::invalid_distance(distance, max_distance),
             BrotliError::InvalidHuffmanCode(msg) => OxiArcError::corrupted(0, msg),
+            BrotliError::Cancelled => OxiArcError::Cancelled,
             other => OxiArcError::corrupted(0, other.to_string()),
+        }
+    }
+}
+
+impl From<OxiArcError> for BrotliError {
+    fn from(err: OxiArcError) -> Self {
+        match err {
+            OxiArcError::Io(e) => BrotliError::Io(e),
+            OxiArcError::Cancelled => BrotliError::Cancelled,
+            other => BrotliError::CorruptedData(other.to_string()),
         }
     }
 }

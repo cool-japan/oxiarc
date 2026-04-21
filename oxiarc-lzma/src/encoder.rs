@@ -16,8 +16,13 @@ use crate::model::{
 };
 use crate::optimal::{MatchCandidate, MatchType, OptimalParser, ProbabilityModels};
 use crate::range_coder::RangeEncoder;
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::Result;
+use oxiarc_core::progress::ProgressHandle;
 use std::collections::VecDeque;
+
+/// Granularity for progress reporting and cancellation checks (bytes).
+const PROGRESS_GRANULARITY: u64 = 4096;
 
 /// Maximum match length for fast mode.
 const MATCH_LEN_MAX: usize = 273;
@@ -119,6 +124,12 @@ pub struct LzmaEncoder {
     price_update_counter: u32,
     /// Pending DP decisions for the current block (optimal parsing only).
     dp_pending: VecDeque<(MatchType, usize)>,
+    /// Optional progress sink for reporting encoding progress.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token for cooperative cancellation.
+    cancel: Option<CancellationToken>,
+    /// Bytes processed at the last progress/cancel checkpoint.
+    last_checkpoint: u64,
 }
 
 impl LzmaEncoder {
@@ -152,7 +163,42 @@ impl LzmaEncoder {
             use_optimal,
             price_update_counter: 0,
             dp_pending: VecDeque::new(),
+            progress: None,
+            cancel: None,
+            last_checkpoint: 0,
         }
+    }
+
+    /// Attach a progress sink; called for every ~4096 bytes compressed.
+    ///
+    /// The `on_progress` callback receives `(bytes_consumed, Some(total_input_size))`.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token; checked every ~4096 bytes compressed.
+    ///
+    /// If the token is cancelled the encoder returns `Err(OxiArcError::Cancelled)`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Check cancellation and emit progress if a checkpoint boundary has been crossed.
+    ///
+    /// `total` is the total number of input bytes (known at compress time).
+    fn check_progress_and_cancel(&mut self, total: u64) -> Result<()> {
+        if self.bytes_encoded.saturating_sub(self.last_checkpoint) >= PROGRESS_GRANULARITY {
+            self.last_checkpoint = self.bytes_encoded;
+            if let Some(ref h) = self.progress {
+                h.on_progress(self.bytes_encoded, Some(total));
+            }
+            if let Some(ref t) = self.cancel {
+                t.check()?;
+            }
+        }
+        Ok(())
     }
 
     /// Get properties.
@@ -774,6 +820,7 @@ impl LzmaEncoder {
     /// Compress data.
     pub fn compress(mut self, data: &[u8]) -> Result<Vec<u8>> {
         let mut i = 0;
+        let total = data.len() as u64;
 
         // Initialize prices for optimal parser
         if self.use_optimal {
@@ -783,6 +830,11 @@ impl LzmaEncoder {
                 parser.update_prices(&models);
                 self.optimal_parser = Some(parser);
             }
+        }
+
+        // Check cancellation before starting (pre-compress check)
+        if let Some(ref t) = self.cancel {
+            t.check()?;
         }
 
         while i < data.len() {
@@ -851,6 +903,8 @@ impl LzmaEncoder {
                 self.update_hash(data, i);
 
                 i += 1;
+
+                self.check_progress_and_cancel(total)?;
             } else if let Some((is_rep, idx_or_dist, len)) = match_info {
                 self.rc
                     .encode_bit(&mut self.model.is_match[state_idx][pos_state], 1);
@@ -922,7 +976,14 @@ impl LzmaEncoder {
                 }
 
                 i += len as usize;
+
+                self.check_progress_and_cancel(total)?;
             }
+        }
+
+        // Final progress notification
+        if let Some(ref h) = self.progress {
+            h.on_progress(self.bytes_encoded, Some(total));
         }
 
         // Write end marker

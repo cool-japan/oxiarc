@@ -14,7 +14,10 @@
 //! let data = reader.decompress().unwrap();
 //! ```
 
+use oxiarc_bzip2::{BzDecoder, BzEncoder};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use std::io::Read;
 
 /// Bzip2 magic bytes ("BZh").
@@ -26,6 +29,10 @@ pub struct Bzip2Reader {
     data: Vec<u8>,
     /// Block size from header (1-9).
     block_size_level: u8,
+    /// Optional progress sink forwarded to the underlying BzDecoder.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token forwarded to the underlying BzDecoder.
+    cancel: Option<CancellationToken>,
 }
 
 impl Bzip2Reader {
@@ -76,7 +83,21 @@ impl Bzip2Reader {
         Ok(Self {
             data,
             block_size_level,
+            progress: None,
+            cancel: None,
         })
+    }
+
+    /// Attach a progress sink forwarded to the underlying BzDecoder.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token forwarded to the underlying BzDecoder.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Get the block size level (1-9).
@@ -91,7 +112,24 @@ impl Bzip2Reader {
 
     /// Decompress the entire file.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
-        oxiarc_bzip2::decompress(&self.data[..])
+        // Fast-path when no hooks are attached: keep using the free function
+        // so that output/behaviour is unchanged from before this feature.
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_bzip2::decompress(&self.data[..]);
+        }
+
+        let mut decoder = BzDecoder::new(&self.data[..])?;
+        if let Some(handle) = self.progress.clone() {
+            decoder = decoder.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            decoder = decoder.with_cancel(token);
+        }
+        let mut output = Vec::new();
+        while let Some(block) = decoder.read_block()? {
+            output.extend_from_slice(&block);
+        }
+        Ok(output)
     }
 }
 
@@ -99,6 +137,10 @@ impl Bzip2Reader {
 pub struct Bzip2Writer {
     /// Compression level (1-9).
     level: oxiarc_bzip2::CompressionLevel,
+    /// Optional progress sink forwarded to the underlying BzEncoder.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token forwarded to the underlying BzEncoder.
+    cancel: Option<CancellationToken>,
 }
 
 impl Bzip2Writer {
@@ -106,6 +148,8 @@ impl Bzip2Writer {
     pub fn new() -> Self {
         Self {
             level: oxiarc_bzip2::CompressionLevel::default(),
+            progress: None,
+            cancel: None,
         }
     }
 
@@ -113,6 +157,8 @@ impl Bzip2Writer {
     pub fn with_level(level: u8) -> Self {
         Self {
             level: oxiarc_bzip2::CompressionLevel::new(level),
+            progress: None,
+            cancel: None,
         }
     }
 
@@ -121,9 +167,43 @@ impl Bzip2Writer {
         self.level = oxiarc_bzip2::CompressionLevel::new(level);
     }
 
+    /// Attach a progress sink forwarded to the underlying BzEncoder.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token forwarded to the underlying BzEncoder.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// Compress data.
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        oxiarc_bzip2::compress(data, self.level)
+        // Fast-path when no hooks are attached so output bytes match the
+        // free function verbatim.
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_bzip2::compress(data, self.level);
+        }
+
+        let block_size = self.level.block_size();
+        let output = Vec::new();
+        let mut encoder = BzEncoder::new(output, self.level)?;
+        if let Some(handle) = self.progress.clone() {
+            encoder = encoder.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            encoder = encoder.with_cancel(token);
+        }
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + block_size).min(data.len());
+            encoder.write_block(&data[offset..end])?;
+            offset = end;
+        }
+        encoder.finish()
     }
 }
 
@@ -218,5 +298,63 @@ mod tests {
         let compressed = compress(empty).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, empty);
+    }
+
+    #[test]
+    fn test_bzip2_progress_forwarding() {
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            last_processed: AtomicU64,
+            finish_count: AtomicU64,
+        }
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+                self.last_processed.store(processed, Ordering::SeqCst);
+            }
+            fn on_entry(&self, _name: &str, _index: u64) {}
+            fn on_finish(&self) {
+                self.finish_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            last_processed: AtomicU64::new(0),
+            finish_count: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        // 64 KiB fits in a single 100 KiB block (level 1), so we get at
+        // least one progress notification + one finish.
+        let data = vec![0x42u8; 64 * 1024];
+        let writer = Bzip2Writer::with_level(1).with_progress(handle);
+        let compressed = writer
+            .compress(&data)
+            .expect("bzip2 compression with progress should succeed");
+
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+        assert!(sink.last_processed.load(Ordering::SeqCst) > 0);
+
+        // Round-trip sanity.
+        let roundtrip = decompress(&compressed).expect("roundtrip should succeed");
+        assert_eq!(roundtrip, data);
+    }
+
+    #[test]
+    fn test_bzip2_cancel_forwarding() {
+        use oxiarc_core::cancel::CancellationToken;
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let data = vec![0x55u8; 1024];
+        let writer = Bzip2Writer::with_level(1).with_cancel(token);
+        let result = writer.compress(&data);
+        assert!(result.is_err(), "cancelled bzip2 compress must fail");
     }
 }

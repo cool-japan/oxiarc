@@ -1,13 +1,25 @@
-# oxiarc-archive
+
+# oxiarc-archive [Stable]
 
 Container format support for OxiArc - parsing and extraction of archive formats.
 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-archive.svg)](https://crates.io/crates/oxiarc-archive)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.6 (2026-03-18) | Tests: 165 passing**
+**Version: 0.2.7 (2026-04-21) | 263 tests passing**
 
-## Overview
+
+## Features
+
+- Header parsing and validation
+- Entry enumeration
+- File extraction
+- Format auto-detection
+- Async ZIP entry reading (async-io feature)
+- Brotli and Snappy compression support
+
+All features are implemented and tested. API is stable.
 
 This crate handles the container/wrapper aspects of archive formats:
 - Header parsing and validation

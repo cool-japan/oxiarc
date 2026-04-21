@@ -10,6 +10,9 @@
 
 use std::io::{self, Read, Write};
 
+use oxiarc_core::cancel::CancellationToken;
+use oxiarc_core::progress::ProgressHandle;
+
 use crate::compress;
 use crate::crc32c::masked_crc32c;
 use crate::decompress;
@@ -55,6 +58,12 @@ pub struct FrameEncoder<W: Write> {
     inner: Option<W>,
     buffer: Vec<u8>,
     header_written: bool,
+    /// Optional progress sink; receives cumulative bytes processed per chunk.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token; checked before each chunk is written.
+    cancel: Option<CancellationToken>,
+    /// Cumulative uncompressed bytes that have been encoded into chunks.
+    bytes_processed: u64,
 }
 
 impl<W: Write> FrameEncoder<W> {
@@ -66,7 +75,25 @@ impl<W: Write> FrameEncoder<W> {
             inner: Some(inner),
             buffer: Vec::with_capacity(MAX_UNCOMPRESSED_CHUNK_SIZE),
             header_written: false,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
+    }
+
+    /// Attach a progress sink that will receive `on_progress` callbacks once
+    /// per encoded chunk.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.  The token is checked before each chunk
+    /// is written; if it has been cancelled the operation returns an I/O
+    /// error with the message `"operation cancelled"`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Finish encoding and return the underlying writer.
@@ -93,7 +120,7 @@ impl<W: Write> FrameEncoder<W> {
         Ok(())
     }
 
-    /// Flush the internal buffer as one or more compressed chunks.
+    /// Flush the internal buffer as a compressed chunk.
     fn flush_buffer(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -101,8 +128,22 @@ impl<W: Write> FrameEncoder<W> {
 
         self.ensure_header()?;
 
+        // Check cancellation before committing the chunk.
+        if let Some(ref token) = self.cancel {
+            token
+                .check()
+                .map_err(|_| io::Error::other("operation cancelled"))?;
+        }
+
+        let chunk_len = self.buffer.len() as u64;
         let data = std::mem::take(&mut self.buffer);
         self.write_chunk(&data)?;
+
+        // Update the running total and notify the progress sink.
+        self.bytes_processed += chunk_len;
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_processed, None);
+        }
 
         Ok(())
     }
@@ -117,8 +158,8 @@ impl<W: Write> FrameEncoder<W> {
         let checksum = masked_crc32c(data);
         let compressed = compress::compress(data);
 
-        // Use compressed format only if it actually saves space
-        // The compressed data in a chunk includes the 4-byte checksum
+        // Use compressed format only if it actually saves space.
+        // The compressed data in a chunk includes the 4-byte checksum.
         if compressed.len() < data.len() {
             // Compressed chunk
             let chunk_len = 4 + compressed.len(); // 4 bytes checksum + compressed data
@@ -206,6 +247,12 @@ pub struct FrameDecoder<R: Read> {
     header_validated: bool,
     /// Whether we've reached the end of the stream.
     at_eof: bool,
+    /// Optional progress sink; receives cumulative bytes processed per chunk.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token; checked before each chunk is decoded.
+    cancel: Option<CancellationToken>,
+    /// Cumulative decompressed bytes that have been produced.
+    bytes_processed: u64,
 }
 
 impl<R: Read> FrameDecoder<R> {
@@ -217,7 +264,25 @@ impl<R: Read> FrameDecoder<R> {
             output_pos: 0,
             header_validated: false,
             at_eof: false,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
+    }
+
+    /// Attach a progress sink that will receive `on_progress` callbacks once
+    /// per decoded chunk.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.  The token is checked before each chunk
+    /// is decoded; if it has been cancelled the operation returns an I/O
+    /// error with the message `"operation cancelled"`.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Read and validate the stream identifier chunk.
@@ -249,6 +314,13 @@ impl<R: Read> FrameDecoder<R> {
 
     /// Read the next chunk from the stream and decode it into the output buffer.
     fn read_next_chunk(&mut self) -> io::Result<bool> {
+        // Check cancellation before beginning each new chunk.
+        if let Some(ref token) = self.cancel {
+            token
+                .check()
+                .map_err(|_| io::Error::other("operation cancelled"))?;
+        }
+
         // Read chunk header: 1 byte type + 3 bytes length (little-endian)
         let mut chunk_header = [0u8; 4];
         match self.inner.read_exact(&mut chunk_header) {
@@ -268,10 +340,12 @@ impl<R: Read> FrameDecoder<R> {
         match chunk_type {
             CHUNK_TYPE_COMPRESSED => {
                 self.read_compressed_chunk(chunk_len)?;
+                self.emit_chunk_progress();
                 Ok(true)
             }
             CHUNK_TYPE_UNCOMPRESSED => {
                 self.read_uncompressed_chunk(chunk_len)?;
+                self.emit_chunk_progress();
                 Ok(true)
             }
             CHUNK_TYPE_STREAM_ID => {
@@ -292,6 +366,17 @@ impl<R: Read> FrameDecoder<R> {
                 self.inner.read_exact(&mut skip_buf)?;
                 Ok(true)
             }
+        }
+    }
+
+    /// Update `bytes_processed` with the latest chunk size and notify the
+    /// progress sink.  Called after a data chunk has been placed in
+    /// `output_buffer`.
+    fn emit_chunk_progress(&mut self) {
+        let chunk_size = self.output_buffer.len() as u64;
+        self.bytes_processed += chunk_size;
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_processed, None);
         }
     }
 
@@ -613,5 +698,178 @@ mod tests {
         assert_eq!(STREAM_IDENTIFIER[2], 0x00); // length mid
         assert_eq!(STREAM_IDENTIFIER[3], 0x00); // length high
         assert_eq!(&STREAM_IDENTIFIER[4..], b"sNaPpY");
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress-callback tests
+    // -----------------------------------------------------------------------
+
+    use oxiarc_core::cancel::CancellationToken;
+    use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    /// A `ProgressSink` that records call count and each `processed` value.
+    struct CountingSink {
+        calls: AtomicUsize,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProgressSink for CountingSink {
+        fn on_progress(&self, _processed: u64, _total: Option<u64>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A second counting sink that records all processed values for
+    /// strict monotonicity verification.
+    struct MonotonicSink {
+        values: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl MonotonicSink {
+        fn new() -> Self {
+            Self {
+                values: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn values(&self) -> Vec<u64> {
+            self.values
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    impl ProgressSink for MonotonicSink {
+        fn on_progress(&self, processed: u64, _total: Option<u64>) {
+            let mut guard = self.values.lock().unwrap_or_else(|p| p.into_inner());
+            guard.push(processed);
+        }
+    }
+
+    /// Encode + decode a 128 KiB buffer and verify progress callbacks.
+    ///
+    /// A 128 KiB input produces exactly 2 chunks (each 64 KiB), so
+    /// `on_progress` must be called ≥ 2 times for both encode and decode.
+    /// Decode progress values must be strictly non-decreasing.
+    #[test]
+    fn test_progress_counting_sink() {
+        // 128 KiB of pseudo-random-ish data (prevent too-aggressive compression
+        // flattening chunk boundaries).
+        let data: Vec<u8> = (0..131_072u64)
+            .map(|i| (i.wrapping_mul(6_364_136_223_846_793_005_u64) >> 56) as u8)
+            .collect();
+
+        // --- Encode with progress ---
+        let enc_sink = Arc::new(CountingSink::new());
+        let enc_handle: ProgressHandle = enc_sink.clone();
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed).with_progress(enc_handle);
+            encoder
+                .write_all(&data)
+                .expect("encode write should succeed");
+            encoder.finish().expect("encode finish should succeed");
+        }
+
+        assert!(
+            enc_sink.call_count() >= 2,
+            "encoder on_progress called {} times, expected >= 2",
+            enc_sink.call_count()
+        );
+
+        // --- Decode with progress (monotonicity check) ---
+        let dec_sink = Arc::new(MonotonicSink::new());
+        let dec_handle: ProgressHandle = dec_sink.clone();
+
+        let mut decoder = FrameDecoder::new(&compressed[..]).with_progress(dec_handle);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("decode should succeed");
+
+        assert_eq!(output, data, "decoded data must match original");
+
+        let values = dec_sink.values();
+        assert!(
+            values.len() >= 2,
+            "decoder on_progress called {} times, expected >= 2",
+            values.len()
+        );
+        // Verify monotonically non-decreasing
+        for window in values.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "progress values not monotonic: {} followed by {}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation tests
+    // -----------------------------------------------------------------------
+
+    /// A pre-cancelled token must prevent encoding a multi-chunk buffer.
+    #[test]
+    fn test_cancellation_encoder_pre_cancelled() {
+        // 128 KiB buffer → 2 chunks, so cancellation must trigger.
+        let data: Vec<u8> = vec![0xBEu8; 131_072];
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut compressed = Vec::new();
+        let mut encoder = FrameEncoder::new(&mut compressed).with_cancel(token);
+        // write_all may succeed (it only buffers), but finish/flush must fail.
+        let write_result = encoder.write_all(&data);
+        let finish_result = encoder.finish();
+
+        // At least one of write or finish must be Err.
+        let triggered = write_result.is_err() || finish_result.is_err();
+        assert!(
+            triggered,
+            "expected a cancellation error but neither write nor finish returned Err"
+        );
+    }
+
+    /// A pre-cancelled token must prevent decoding.
+    #[test]
+    fn test_cancellation_decoder_pre_cancelled() {
+        // First encode without cancellation.
+        let data: Vec<u8> = vec![0xCAu8; 131_072];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder
+                .write_all(&data)
+                .expect("encode write should succeed");
+            encoder.finish().expect("encode finish should succeed");
+        }
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let mut decoder = FrameDecoder::new(&compressed[..]).with_cancel(token);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+        assert!(result.is_err(), "expected cancellation error from decoder");
     }
 }

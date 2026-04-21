@@ -1,13 +1,23 @@
-# oxiarc-cli
+
+# oxiarc-cli [Stable]
 
 Command-line interface for OxiArc - The Oxidized Archiver.
 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-cli.svg)](https://crates.io/crates/oxiarc-cli)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.6 (2026-03-18)**
+**Version: 0.2.7 (2026-04-21) | 30 tests passing**
 
-## Overview
+
+## Features
+
+- List, extract, and inspect ZIP, GZIP, TAR, LZH, Brotli, and Snappy archives
+- Dry-run mode for previewing operations
+- Progress bars, filters, JSON output
+- Shell completions for bash, zsh, fish, PowerShell
+
+All features are implemented and tested. API is stable.
 
 A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, LZH, Brotli, and Snappy archives. Includes dry-run mode for previewing operations without writing files.
 

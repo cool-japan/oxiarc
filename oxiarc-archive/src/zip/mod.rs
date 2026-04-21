@@ -31,6 +31,8 @@
 pub mod crypto;
 pub mod encryption;
 mod header;
+pub mod stream;
+pub use stream::{ZipStreamEntry, ZipStreamEntryMeta, ZipStreamReader};
 
 pub use crypto::{
     ENCRYPTION_HEADER_SIZE, FLAG_ENCRYPTED, ZipCrypto, ZipCryptoReader, ZipCryptoWriter,

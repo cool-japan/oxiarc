@@ -1,11 +1,13 @@
-# oxiarc-deflate
 
-[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+# oxiarc-deflate [Stable]
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-**Version 0.2.6** (2026-03-18) — 120 tests passing.
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
+
+**Version 0.2.7** (2026-04-21) — 121 tests passing.
 
 **What's new in 0.2.6**: Added streaming support with `GzipStreamEncoder`/`GzipStreamDecoder` and `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes for fine-grained control over compressed output.
 
@@ -20,6 +22,7 @@ DEFLATE is the compression algorithm used in:
 
 This crate provides both compression and decompression with no external dependencies.
 
+
 ## Features
 
 - **Pure Rust** - No C bindings or unsafe code
@@ -29,6 +32,8 @@ This crate provides both compression and decompression with no external dependen
 - **One-shot API** - Convenient functions for simple cases
 - **Async I/O** - `async_deflate` module with Tokio-based async streaming (enable `async-io` feature)
 - **GZIP support** - `gzip` module for RFC 1952 GZIP format encoding/decoding
+
+All features are implemented and tested. API is stable.
 
 ### Cargo Features
 

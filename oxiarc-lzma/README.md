@@ -1,11 +1,13 @@
-# oxiarc-lzma
 
-[![Version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/cool-japan/oxiarc)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+# oxiarc-lzma [Stable]
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-**Version 0.2.6** (2026-03-18) — 66 tests passing.
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![Status](https://img.shields.io/badge/status-Stable-brightgreen)
+
+**Version 0.2.7** (2026-04-21) — 68 tests passing.
 
 **What's new in 0.2.6**: Encoder improvements including probability model refinements and optimal parsing enhancements for better compression ratios on structured data.
 
@@ -22,6 +24,7 @@ It's used in:
 - LZMA SDK (.lzma)
 - Some ZIP archives (method 14)
 
+
 ## Features
 
 - **Pure Rust** - No C bindings, fully safe code
@@ -29,6 +32,8 @@ It's used in:
 - **Configurable levels** - 0-9 compression levels
 - **Streaming API** - Memory-efficient processing
 - **Range Coder** - Precise 11-bit probability model
+
+All features are implemented and tested. API is stable.
 
 ## Quick Start
 

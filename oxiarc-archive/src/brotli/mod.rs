@@ -16,8 +16,11 @@
 //! let data = reader.decompress().unwrap();
 //! ```
 
+use oxiarc_brotli::{BrotliCompressor, BrotliDecompressor, BrotliParams};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
-use std::io::Read;
+use oxiarc_core::progress::ProgressHandle;
+use std::io::{Read, Write};
 
 /// Brotli quality level for Store (no compression).
 pub const BROTLI_QUALITY_STORE: u32 = 0;
@@ -32,6 +35,10 @@ pub const BROTLI_QUALITY_BEST: u32 = 11;
 pub struct BrotliReader {
     /// Buffered compressed data.
     data: Vec<u8>,
+    /// Optional progress sink forwarded to the underlying streaming decompressor.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token forwarded to the underlying streaming decompressor.
+    cancel: Option<CancellationToken>,
 }
 
 impl BrotliReader {
@@ -47,7 +54,11 @@ impl BrotliReader {
             });
         }
 
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            progress: None,
+            cancel: None,
+        })
     }
 
     /// Create a new Brotli reader from raw bytes.
@@ -59,7 +70,23 @@ impl BrotliReader {
             });
         }
 
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            progress: None,
+            cancel: None,
+        })
+    }
+
+    /// Attach a progress sink forwarded to the underlying Brotli decompressor.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token forwarded to the underlying Brotli decompressor.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Get the compressed size.
@@ -69,7 +96,27 @@ impl BrotliReader {
 
     /// Decompress the entire file.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
-        oxiarc_brotli::decompress(&self.data).map_err(OxiArcError::from)
+        // If neither progress nor cancel is attached, keep the previous fast-path
+        // which calls the free function (preserves output-byte behaviour
+        // established by the regression suite).
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_brotli::decompress(&self.data).map_err(OxiArcError::from);
+        }
+
+        // Otherwise, use the streaming decompressor so we can forward hooks
+        // to the underlying codec.
+        let mut decompressor = BrotliDecompressor::new(&self.data[..]);
+        if let Some(handle) = self.progress.clone() {
+            decompressor = decompressor.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            decompressor = decompressor.with_cancel(token);
+        }
+        let mut output = Vec::new();
+        decompressor
+            .read_to_end(&mut output)
+            .map_err(OxiArcError::Io)?;
+        Ok(output)
     }
 }
 
@@ -77,6 +124,10 @@ impl BrotliReader {
 pub struct BrotliWriter {
     /// Compression quality (0-11).
     quality: u32,
+    /// Optional progress sink forwarded to the underlying streaming compressor.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token forwarded to the underlying streaming compressor.
+    cancel: Option<CancellationToken>,
 }
 
 impl BrotliWriter {
@@ -84,13 +135,19 @@ impl BrotliWriter {
     pub fn new() -> Self {
         Self {
             quality: BROTLI_QUALITY_NORMAL,
+            progress: None,
+            cancel: None,
         }
     }
 
     /// Create a new Brotli writer with specified quality (0-11).
     pub fn with_quality(quality: u32) -> Self {
         let clamped = quality.min(11);
-        Self { quality: clamped }
+        Self {
+            quality: clamped,
+            progress: None,
+            cancel: None,
+        }
     }
 
     /// Set compression quality (0-11).
@@ -103,9 +160,46 @@ impl BrotliWriter {
         self.quality
     }
 
+    /// Attach a progress sink forwarded to the underlying Brotli compressor.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token forwarded to the underlying Brotli compressor.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// Compress data.
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        oxiarc_brotli::compress(data, self.quality).map_err(OxiArcError::from)
+        // If no progress/cancel is attached, keep the previous fast-path to
+        // preserve byte-for-byte output across the regression suite.
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_brotli::compress(data, self.quality).map_err(OxiArcError::from);
+        }
+
+        // Otherwise forward to the streaming compressor, mirroring the
+        // quality-to-BrotliParams translation used by the free function.
+        let params = BrotliParams {
+            quality: self.quality,
+            ..BrotliParams::default()
+        };
+
+        let mut output = Vec::new();
+        {
+            let mut compressor = BrotliCompressor::new(&mut output, params);
+            if let Some(handle) = self.progress.clone() {
+                compressor = compressor.with_progress(handle);
+            }
+            if let Some(token) = self.cancel.clone() {
+                compressor = compressor.with_cancel(token);
+            }
+            compressor.write_all(data).map_err(OxiArcError::Io)?;
+            compressor.finish().map_err(OxiArcError::Io)?;
+        }
+        Ok(output)
     }
 }
 
@@ -257,5 +351,54 @@ mod tests {
                 // Decompressor still being improved for some formats
             }
         }
+    }
+
+    #[test]
+    fn test_brotli_progress_forwarding() {
+        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSink {
+            progress_count: AtomicU64,
+            last_processed: AtomicU64,
+        }
+        impl ProgressSink for CountingSink {
+            fn on_progress(&self, processed: u64, _total: Option<u64>) {
+                self.progress_count.fetch_add(1, Ordering::SeqCst);
+                self.last_processed.store(processed, Ordering::SeqCst);
+            }
+            fn on_entry(&self, _name: &str, _index: u64) {}
+            fn on_finish(&self) {}
+        }
+
+        let sink = Arc::new(CountingSink {
+            progress_count: AtomicU64::new(0),
+            last_processed: AtomicU64::new(0),
+        });
+        let handle: ProgressHandle = sink.clone();
+
+        // 64 KiB of a repeating byte exercises the per-meta-block path in
+        // the underlying streaming compressor.
+        let data = vec![0x42u8; 64 * 1024];
+        let writer = BrotliWriter::with_quality(BROTLI_QUALITY_FAST).with_progress(handle);
+        let _compressed = writer
+            .compress(&data)
+            .expect("compression with progress should succeed");
+
+        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
+        assert!(sink.last_processed.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn test_brotli_cancel_forwarding() {
+        use oxiarc_core::cancel::CancellationToken;
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let writer = BrotliWriter::with_quality(BROTLI_QUALITY_FAST).with_cancel(token);
+        // Cancelled token should cause finish() inside compress() to fail.
+        let result = writer.compress(b"this should be cancelled");
+        assert!(result.is_err(), "cancelled compression must return Err");
     }
 }

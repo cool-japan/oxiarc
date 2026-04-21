@@ -1,7 +1,9 @@
-# OxiArc - Development Roadmap
+
+# OxiArc - Development Roadmap (v0.2.7, 2026-04-21)
 
 ## Version History
 
+- **v0.2.7** (2026-04-21): All workspace crates feature-complete, tested, and API-stable. All policies enforced. 1206 tests passing, 1394 public API items.
 - **v0.2.6** (2026-03-21): Brotli fixes: is_single_symbol() bug fix, write_prefix_code_and_build_tree() function, Kraft inequality i32 fix, comprehensive roundtrip tests.
 - **v0.2.5** (2026-03-18): New codecs: Brotli (RFC 7932) with quality levels 0-11, static dictionary, streaming; Snappy with block and framed formats, CRC32C. DEFLATE streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder) with flush modes (sync_flush, full_flush, partial_flush). LZ4 acceleration parameter for compress_block_with_accel(). LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder, TIFF and GIF modes). Brotli/Snappy archive integration (BrotliReader/BrotliWriter, SnappyReader/SnappyWriter with format detection). EntryBuilder pattern with fluent API. Serde serialization for Entry types (optional feature). CLI: dry-run mode (--dry-run/-n), sort by ratio, Brotli/Snappy format support. Total: 1038 tests, ~47,241 lines, 150 files.
 - **v0.2.4** (2026-03-16): Dependency updates (clap 4.5→4.6, clap_complete 4.5→4.6), clippy fixes (collapsible match guards, sort_by→sort_by_key, redundant .max(0)). Total: 799 tests, ~40,406 lines, 127 files.
@@ -11,7 +13,7 @@
 - **v0.2.0**: LZW crate, full Zstandard encoder, Bzip2 parallel compression
 - **v0.1.0**: Initial release — core codecs, archive formats, CLI
 
-## Phase 1: Core Foundation (Complete)
+## Phase 1: Core Foundation (COMPLETE)
 
 - [x] BitStream (LSB-first bit packing)
   - [x] BitReader with u64 buffer
@@ -33,7 +35,7 @@
   - [x] Entry metadata structure
 - [x] Error handling with thiserror
 
-## Phase 2: DEFLATE Codec (Complete with Dynamic Huffman & Zlib)
+## Phase 2: DEFLATE Codec (COMPLETE)
 
 - [x] Huffman trees
   - [x] Canonical Huffman code generation
@@ -83,7 +85,8 @@
 - [x] Archive creation (ZipWriter)
 - [x] Zip64 extensions (large files)
 - [x] Data descriptor support (FLAG_DATA_DESCRIPTOR, central directory based reading)
-- [ ] ZIP encryption (traditional, AES)
+- [x] ZIP encryption (traditional) — ZipCrypto implemented + e2e test (2026-04-20)
+- [x] ZIP encryption (AES) — WinZip AE-2 AES-256 implemented + e2e test (2026-04-20)
 
 ### GZIP
 - [x] Header parsing (RFC 1952)
@@ -189,7 +192,13 @@
 - [x] LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder with TIFF and GIF modes)
 - [x] EntryBuilder pattern with fluent API (oxiarc-core)
 - [x] Serde serialization for Entry types (optional serde feature in oxiarc-core)
-- [~] Streaming with async I/O (partial: DEFLATE streaming GzipStream/ZlibStream; full streaming pipeline pending)
+- [~] Streaming with async I/O (partial: DEFLATE streaming GzipStream/ZlibStream; full streaming pipeline pending) (planned 2026-04-20)
+  - **Goal:** Record the concrete state of play so the next /ultra run can pick up codec-by-codec async streaming coherently. Sync streaming across TAR/ZIP/LZH lands in this run via `archive-streaming-extraction`. Async DEFLATE (`oxiarc_deflate::async_deflate`) and async ZIP (`oxiarc_archive::async_zip`) already exist.
+  - **Design:** Remaining async work tracked as per-crate items: `archive-async-io-more-formats` (TAR-async, LZH-async), `brotli-async-io-support`, `snappy-async-io-support`, `lzma-async-io`, `core-async-io-support`. This top-level item serves as the cross-crate coordination point.
+  - **Files:** `oxiarc/TODO.md` only (meta-item; per-crate tests land with per-crate work)
+  - **Prerequisites:** `archive-streaming-extraction` (this run)
+  - **Tests:** none (meta-item)
+  - **Risk:** none (tracking item only)
 
 ### Platform
 - [ ] WASM bindings
