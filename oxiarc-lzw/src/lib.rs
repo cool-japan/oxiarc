@@ -189,8 +189,9 @@ mod tests {
     #[test]
     fn test_roundtrip_tiff() {
         let original = b"TOBEORNOTTOBEORTOBEORNOT";
-        let compressed = compress_tiff(original).unwrap();
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let compressed = compress_tiff(original).expect("tiff compress roundtrip");
+        let decompressed =
+            decompress_tiff(&compressed, original.len()).expect("tiff decompress roundtrip");
         assert_eq!(decompressed, original);
     }
 
@@ -200,8 +201,9 @@ mod tests {
         let original = b"This is a test of compression! ".repeat(10);
         assert_eq!(original.len(), 310);
 
-        let compressed = compress_tiff(&original).unwrap();
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let compressed = compress_tiff(&original).expect("tiff compress 310 bytes");
+        let decompressed =
+            decompress_tiff(&compressed, original.len()).expect("tiff decompress 310 bytes");
 
         // MUST be 310 bytes (weezl truncates to ~250)
         assert_eq!(
@@ -215,28 +217,30 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let original = b"";
-        let compressed = compress_tiff(original).unwrap();
-        let decompressed = decompress_tiff(&compressed, 0).unwrap();
+        let compressed = compress_tiff(original).expect("tiff compress empty");
+        let decompressed = decompress_tiff(&compressed, 0).expect("tiff decompress empty");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_single_byte() {
         let original = b"A";
-        let compressed = compress_tiff(original).unwrap();
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let compressed = compress_tiff(original).expect("tiff compress single byte");
+        let decompressed =
+            decompress_tiff(&compressed, original.len()).expect("tiff decompress single byte");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_repeating_pattern() {
         let original = vec![b'X'; 1000];
-        let compressed = compress_tiff(&original).unwrap();
+        let compressed = compress_tiff(&original).expect("tiff compress repeating pattern");
 
         // Highly repetitive - should compress well
         assert!(compressed.len() < original.len() / 2);
 
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let decompressed = decompress_tiff(&compressed, original.len())
+            .expect("tiff decompress repeating pattern");
         assert_eq!(decompressed, original);
     }
 
@@ -244,16 +248,18 @@ mod tests {
     fn test_all_byte_values() {
         // FIXED: This test now passes with the decoder bit-width synchronization fix
         let original: Vec<u8> = (0..=255).collect();
-        let compressed = compress_tiff(&original).unwrap();
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let compressed = compress_tiff(&original).expect("tiff compress all bytes");
+        let decompressed =
+            decompress_tiff(&compressed, original.len()).expect("tiff decompress all bytes");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_large_input() {
         let original = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
-        let compressed = compress_tiff(&original).unwrap();
-        let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+        let compressed = compress_tiff(&original).expect("tiff compress large input");
+        let decompressed =
+            decompress_tiff(&compressed, original.len()).expect("tiff decompress large input");
         assert_eq!(decompressed, original);
     }
 }

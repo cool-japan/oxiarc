@@ -380,12 +380,12 @@ mod tests {
 
         // Compress using ZstdWriter
         let writer = ZstdWriter::new();
-        let compressed = writer.compress(original).unwrap();
+        let compressed = writer.compress(original).expect("compress");
 
         // Decompress using ZstdReader
         let cursor = Cursor::new(&compressed);
-        let mut reader = ZstdReader::new(cursor).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = ZstdReader::new(cursor).expect("ZstdReader::new");
+        let decompressed = reader.decompress().expect("decompress");
 
         assert_eq!(decompressed, original);
     }
@@ -394,8 +394,8 @@ mod tests {
     fn test_zstd_compress_decompress_functions() {
         let original = b"Testing compress/decompress functions";
 
-        let compressed = compress(original).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
+        let compressed = compress(original).expect("compress");
+        let decompressed = decompress(&compressed).expect("decompress");
 
         assert_eq!(decompressed, original.as_slice());
     }

@@ -7,19 +7,20 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.7 (2026-04-21) | 30 tests passing**
+**Version: 0.2.8 (2026-05-08) | 37 tests passing**
 
 
 ## Features
 
-- List, extract, and inspect ZIP, GZIP, TAR, LZH, Brotli, and Snappy archives
+- List, extract, and inspect ZIP, GZIP, TAR, LZH, ISO 9660, Brotli, and Snappy archives
 - Dry-run mode for previewing operations
 - Progress bars, filters, JSON output
 - Shell completions for bash, zsh, fish, PowerShell
+- `--memory-limit <BYTES>` option for `extract` and `list` (accepts human-friendly sizes: `100M`, `1G`, etc.) (new in 0.2.8)
 
 All features are implemented and tested. API is stable.
 
-A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, LZH, Brotli, and Snappy archives. Includes dry-run mode for previewing operations without writing files.
+A Pure Rust CLI tool for working with archive files. Supports listing, extracting, and inspecting ZIP, GZIP, TAR, LZH, ISO 9660, Brotli, and Snappy archives. Includes dry-run mode for previewing operations without writing files.
 
 ## Installation
 
@@ -102,6 +103,10 @@ oxiarc list archive.zip
 
 # Verbose with sizes and compression ratios
 oxiarc list -v archive.zip
+
+# Limit memory usage during listing
+oxiarc list --memory-limit 100M archive.zip
+oxiarc list --memory-limit 1G archive.zip
 ```
 
 **Output (verbose):**
@@ -130,6 +135,10 @@ oxiarc extract archive.zip -o output_dir/
 
 # Dry-run mode (preview without writing)
 oxiarc extract archive.zip --dry-run
+
+# Limit memory usage during extraction
+oxiarc extract --memory-limit 512M archive.zip -o output_dir/
+oxiarc extract --memory-limit 2G large.iso -o output_dir/
 
 # Extract specific files (future)
 oxiarc extract archive.zip file1.txt file2.txt
@@ -180,14 +189,15 @@ Type: Compression (single file)
 
 ## Format Support
 
-| Format | list | extract | create |
-|--------|------|---------|--------|
-| ZIP | Yes | Yes | No |
-| GZIP | Yes | Yes | No |
-| TAR | Yes | No | No |
-| LZH | Yes | No | No |
-| Brotli | Yes | Yes | No |
-| Snappy | Yes | Yes | No |
+| Format | list | extract | info | detect | create |
+|--------|------|---------|------|--------|--------|
+| ZIP | Yes | Yes | Yes | Yes | No |
+| GZIP | Yes | Yes | Yes | Yes | No |
+| TAR | Yes | No | Yes | Yes | No |
+| LZH | Yes | No | Yes | Yes | No |
+| ISO 9660 | Yes | No | Yes | Yes | No |
+| Brotli | Yes | Yes | Yes | Yes | No |
+| Snappy | Yes | Yes | Yes | Yes | No |
 
 ## Examples
 
@@ -206,6 +216,18 @@ oxiarc detect mystery.bin
 
 # Verbose listing of TAR
 oxiarc list -v backup.tar
+
+# List contents of an ISO 9660 image
+oxiarc list disc.iso
+
+# Show info about an ISO image
+oxiarc info disc.iso
+
+# Detect ISO 9660 image
+oxiarc detect disc.iso
+
+# Extract with memory limit
+oxiarc extract --memory-limit 1G large_archive.zip -o ./output/
 ```
 
 ## Exit Codes

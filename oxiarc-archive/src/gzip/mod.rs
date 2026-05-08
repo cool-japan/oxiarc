@@ -9,11 +9,11 @@
 //!
 //! // Compress data
 //! let data = b"Hello, World!";
-//! let compressed = gzip::compress(data, 6).unwrap();
+//! let compressed = gzip::compress(data, 6).expect("gzip compress");
 //!
 //! // Decompress data
 //! let mut reader = std::io::Cursor::new(compressed);
-//! let decompressed = gzip::decompress(&mut reader).unwrap();
+//! let decompressed = gzip::decompress(&mut reader).expect("gzip decompress");
 //! assert_eq!(decompressed, data);
 //! ```
 

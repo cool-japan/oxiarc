@@ -78,7 +78,7 @@ pub use crc::{Crc16, Crc32, Crc64};
 pub use entry::{CompressionMethod, Entry, EntryBuilder, EntryType, FileAttributes};
 pub use error::{OxiArcError, Result};
 pub use progress::{NoopProgress, ProgressHandle, ProgressSink, noop_progress};
-pub use ringbuffer::{OutputRingBuffer, RingBuffer};
+pub use ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
 pub use traits::{
     ArchiveReader, ArchiveWriter, CompressStatus, CompressionLevel, Compressor, DecompressStatus,
     Decompressor, FlushMode,
@@ -108,7 +108,7 @@ pub mod prelude {
     pub use crate::error::{OxiArcError, Result};
     #[cfg(feature = "mmap")]
     pub use crate::mmap::{MmapOptions, MmapReader};
-    pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer};
+    pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
     pub use crate::traits::{
         ArchiveReader, ArchiveWriter, CompressionLevel, Compressor, Decompressor,
     };

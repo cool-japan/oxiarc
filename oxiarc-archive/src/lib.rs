@@ -42,6 +42,7 @@ pub mod bzip2;
 pub mod cab;
 pub mod detect;
 pub mod gzip;
+pub mod iso9660;
 pub mod lenient;
 pub mod lz4;
 pub mod lzh;
@@ -67,11 +68,14 @@ pub use bzip2::{Bzip2Reader, Bzip2Writer};
 pub use cab::CabReader;
 pub use detect::ArchiveFormat;
 pub use gzip::{GzipHeader, GzipReader};
+pub use iso9660::{IsoEntry, IsoReader};
 pub use lenient::{LenientWarning, LenientWarningKind};
 pub use lz4::{Lz4Reader, Lz4Writer};
 pub use lzh::{
-    LzhCompressionLevel, LzhHeader, LzhReader, LzhStreamEntry, LzhStreamReader, LzhWriter,
+    LzhCompressionLevel, LzhExtensionMetadata, LzhHeader, LzhReader, LzhStreamEntry,
+    LzhStreamReader, LzhWriter,
 };
+pub use oxiarc_lzhuf::LzhMethod;
 pub use sevenz::{SevenZEntry, SevenZReader};
 pub use snappy::{SnappyReader, SnappyWriter};
 pub use tar::{TarHeader, TarReader, TarStreamEntry, TarStreamReader, TarWriter};

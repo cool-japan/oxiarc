@@ -73,6 +73,27 @@ impl CompressionMethod {
             Self::Unknown(id) => CoreMethod::Unknown(*id),
         }
     }
+
+    /// Convert from core compression method.
+    pub fn from_core(m: &CoreMethod) -> Self {
+        match m {
+            CoreMethod::Stored => Self::Stored,
+            CoreMethod::Deflate => Self::Deflate,
+            CoreMethod::Lzma => Self::Lzma,
+            CoreMethod::Unknown(id) => Self::Unknown(*id),
+            _ => Self::Unknown(0),
+        }
+    }
+
+    /// Convert to u16 wire value.
+    pub fn to_u16(self) -> u16 {
+        match self {
+            Self::Stored => 0,
+            Self::Deflate => 8,
+            Self::Lzma => 14,
+            Self::Unknown(id) => id,
+        }
+    }
 }
 
 impl std::fmt::Display for CompressionMethod {

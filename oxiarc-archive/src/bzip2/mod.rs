@@ -264,17 +264,17 @@ mod tests {
         let original = b"Hello, Bzip2 world!";
 
         // Compress
-        let compressed = compress(original).unwrap();
+        let compressed = compress(original).expect("compress");
         assert!(!compressed.is_empty());
 
         // Decompress via reader
         let cursor = Cursor::new(&compressed);
-        let mut reader = Bzip2Reader::new(cursor).unwrap();
+        let mut reader = Bzip2Reader::new(cursor).expect("Bzip2Reader::new");
 
         assert_eq!(reader.block_size_level(), 9); // Default level
         assert_eq!(reader.block_size(), 900_000);
 
-        let decompressed = reader.decompress().unwrap();
+        let decompressed = reader.decompress().expect("decompress");
         assert_eq!(decompressed, original);
     }
 
@@ -284,10 +284,10 @@ mod tests {
 
         for level in 1..=9 {
             let writer = Bzip2Writer::with_level(level);
-            let compressed = writer.compress(data).unwrap();
+            let compressed = writer.compress(data).expect("compress at level");
 
             // Verify can decompress
-            let decompressed = decompress(&compressed).unwrap();
+            let decompressed = decompress(&compressed).expect("decompress at level");
             assert_eq!(decompressed, data.as_slice());
         }
     }
@@ -295,8 +295,8 @@ mod tests {
     #[test]
     fn test_bzip2_empty() {
         let empty: &[u8] = b"";
-        let compressed = compress(empty).unwrap();
-        let decompressed = decompress(&compressed).unwrap();
+        let compressed = compress(empty).expect("compress empty");
+        let decompressed = decompress(&compressed).expect("decompress empty");
         assert_eq!(decompressed, empty);
     }
 

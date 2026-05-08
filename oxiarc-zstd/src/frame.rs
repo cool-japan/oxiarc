@@ -613,7 +613,7 @@ mod tests {
         data.push(0x20); // Single segment flag
         data.push(5); // Content size = 5
 
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).expect("operation failed");
 
         assert_eq!(header.content_size, Some(5));
         assert!(!header.has_checksum);
@@ -627,7 +627,7 @@ mod tests {
         data.push(0x24); // Single segment + checksum
         data.push(10); // Content size = 10
 
-        let header = parse_frame_header(&data).unwrap();
+        let header = parse_frame_header(&data).expect("operation failed");
 
         assert!(header.has_checksum);
         assert_eq!(header.content_size, Some(10));
@@ -648,9 +648,18 @@ mod tests {
 
     #[test]
     fn test_block_type_parsing() {
-        assert_eq!(BlockType::from_bits(0).unwrap(), BlockType::Raw);
-        assert_eq!(BlockType::from_bits(1).unwrap(), BlockType::Rle);
-        assert_eq!(BlockType::from_bits(2).unwrap(), BlockType::Compressed);
+        assert_eq!(
+            BlockType::from_bits(0).expect("operation failed"),
+            BlockType::Raw
+        );
+        assert_eq!(
+            BlockType::from_bits(1).expect("operation failed"),
+            BlockType::Rle
+        );
+        assert_eq!(
+            BlockType::from_bits(2).expect("operation failed"),
+            BlockType::Compressed
+        );
         assert!(BlockType::from_bits(3).is_err());
     }
 }

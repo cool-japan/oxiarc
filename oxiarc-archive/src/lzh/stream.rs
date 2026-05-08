@@ -202,21 +202,27 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut stream = LzhStreamReader::new(cursor);
 
-        let mut e0 = stream.next_entry().unwrap().unwrap();
+        let mut e0 = stream
+            .next_entry()
+            .expect("next_entry e0")
+            .expect("e0 present");
         assert_eq!(e0.header.filename, "hello.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e0, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e0, &mut out).expect("read_to_end e0");
         assert_eq!(&out, b"Hello");
         drop(e0);
 
-        let mut e1 = stream.next_entry().unwrap().unwrap();
+        let mut e1 = stream
+            .next_entry()
+            .expect("next_entry e1")
+            .expect("e1 present");
         assert_eq!(e1.header.filename, "world.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e1, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e1, &mut out).expect("read_to_end e1");
         assert_eq!(&out, b"World");
         drop(e1);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -226,12 +232,18 @@ mod tests {
         let mut stream = LzhStreamReader::new(cursor);
 
         // Drop first entry without reading
-        let _ = stream.next_entry().unwrap().unwrap();
+        let _ = stream
+            .next_entry()
+            .expect("next_entry skip.txt")
+            .expect("skip.txt present");
 
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry keep.txt")
+            .expect("keep.txt present");
         assert_eq!(entry.header.filename, "keep.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end keep.txt");
         assert_eq!(&out, b"keep this");
     }
 
@@ -245,7 +257,10 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut stream = LzhStreamReader::new(cursor).with_cancel(token_clone);
 
-        let e0 = stream.next_entry().unwrap().unwrap();
+        let e0 = stream
+            .next_entry()
+            .expect("next_entry e0")
+            .expect("e0 present");
         drop(e0);
 
         token.cancel();
@@ -276,7 +291,7 @@ mod tests {
         let buf = build_lzh(&[("f1.txt", b"1"), ("f2.txt", b"2"), ("f3.txt", b"3")]);
         let cursor = Cursor::new(buf);
         let mut stream = LzhStreamReader::new(cursor).with_progress(handle);
-        while let Some(e) = stream.next_entry().unwrap() {
+        while let Some(e) = stream.next_entry().expect("next_entry in progress loop") {
             drop(e);
         }
         assert_eq!(sink.count.load(Ordering::SeqCst), 3);
@@ -287,9 +302,12 @@ mod tests {
         let buf = build_lzh(&[("x.txt", b"content")]);
         let cursor = Cursor::new(buf);
         let mut stream = LzhStreamReader::new(cursor).with_progress(noop_progress());
-        let mut e = stream.next_entry().unwrap().unwrap();
+        let mut e = stream
+            .next_entry()
+            .expect("next_entry x.txt")
+            .expect("x.txt present");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e, &mut out).expect("read_to_end x.txt");
         assert_eq!(&out, b"content");
     }
 
@@ -318,23 +336,27 @@ mod tests {
         {
             let cursor = Cursor::new(buf.clone());
             let mut stream = LzhStreamReader::new(cursor);
-            while let Some(mut entry) = stream.next_entry().unwrap() {
+            while let Some(mut entry) = stream.next_entry().expect("next_entry in stream loop") {
                 let name = entry.header.filename.clone();
                 let mut data = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+                std::io::Read::read_to_end(&mut entry, &mut data)
+                    .expect("read_to_end in stream loop");
                 stream_results.push((name, data));
             }
         }
 
         // Read with LzhReader.
         let cursor = Cursor::new(buf);
-        let mut reader = LzhReader::new(cursor).unwrap();
+        let mut reader = LzhReader::new(cursor).expect("LzhReader::new");
         let entries = reader.entries();
         for (i, (name, expected)) in files.iter().enumerate() {
             assert_eq!(stream_results[i].0, *name);
-            let entry = entries.iter().find(|e| &e.name == name).unwrap();
+            let entry = entries
+                .iter()
+                .find(|e| &e.name == name)
+                .expect("find entry by name");
             let mut actual = Vec::new();
-            reader.extract(entry, &mut actual).unwrap();
+            reader.extract(entry, &mut actual).expect("reader.extract");
             assert_eq!(stream_results[i].1, actual);
             assert_eq!(actual, *expected);
         }

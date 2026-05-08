@@ -156,15 +156,19 @@ mod tests {
         // Manually create a simple LZW stream
         // This is "TOBEORNOTTOBEORTOBEORNOT" compressed
         let config = LzwConfig::TIFF;
-        let mut decoder = LzwDecoder::new(config).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder simple");
 
         // For this test, we'll use the encoder to create valid data
         let original = b"TOBEORNOTTOBEORTOBEORNOT";
-        let mut encoder = LzwEncoder::new(config).unwrap();
-        let compressed = encoder.encode(original).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder for decode test");
+        let compressed = encoder
+            .encode(original)
+            .expect("lzw encode for decode test");
 
         // Now decode it
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode simple");
 
         assert_eq!(decompressed, original);
     }
@@ -173,17 +177,21 @@ mod tests {
     fn test_decode_310_bytes() {
         // THE CRITICAL TEST - this must not truncate!
         let config = LzwConfig::TIFF;
-        let mut decoder = LzwDecoder::new(config).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder 310");
 
         let original = b"This is a test of compression! ".repeat(10);
         assert_eq!(original.len(), 310);
 
         // Encode it first
-        let mut encoder = LzwEncoder::new(config).unwrap();
-        let compressed = encoder.encode(&original).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder 310 decode test");
+        let compressed = encoder
+            .encode(&original)
+            .expect("lzw encode 310 bytes for decode");
 
         // Decode it
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode 310 bytes");
 
         // CRITICAL: Must be 310 bytes, not ~250!
         assert_eq!(
@@ -197,14 +205,18 @@ mod tests {
     #[test]
     fn test_decode_repeating_pattern() {
         let config = LzwConfig::TIFF;
-        let mut decoder = LzwDecoder::new(config).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder repeating pattern");
 
         let original = b"ABABABABABABABABAB";
 
-        let mut encoder = LzwEncoder::new(config).unwrap();
-        let compressed = encoder.encode(original).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder repeating pattern");
+        let compressed = encoder
+            .encode(original)
+            .expect("lzw encode repeating pattern");
 
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode repeating pattern");
 
         assert_eq!(decompressed, original);
     }
@@ -212,14 +224,18 @@ mod tests {
     #[test]
     fn test_decode_single_byte() {
         let config = LzwConfig::TIFF;
-        let mut decoder = LzwDecoder::new(config).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder single byte");
 
         let original = b"A";
 
-        let mut encoder = LzwEncoder::new(config).unwrap();
-        let compressed = encoder.encode(original).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder single byte decode");
+        let compressed = encoder
+            .encode(original)
+            .expect("lzw encode single byte for decode");
 
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode single byte");
 
         assert_eq!(decompressed, original);
     }
@@ -227,14 +243,18 @@ mod tests {
     #[test]
     fn test_decode_all_same() {
         let config = LzwConfig::TIFF;
-        let mut decoder = LzwDecoder::new(config).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder all same");
 
         let original = vec![b'X'; 500];
 
-        let mut encoder = LzwEncoder::new(config).unwrap();
-        let compressed = encoder.encode(&original).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder all same");
+        let compressed = encoder
+            .encode(&original)
+            .expect("lzw encode all same bytes");
 
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode all same bytes");
 
         assert_eq!(decompressed, original);
     }

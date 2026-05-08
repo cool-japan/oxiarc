@@ -1207,7 +1207,8 @@ mod tests {
     fn test_read_number_single_byte() {
         let data = [0x05, 0x00];
         let mut pos = 0;
-        let num = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos).unwrap();
+        let num = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos)
+            .expect("read_number single byte");
         assert_eq!(num, 5);
         assert_eq!(pos, 1);
     }
@@ -1217,7 +1218,8 @@ mod tests {
         // 0x80 means 1 extra byte follows
         let data = [0x80, 0x05];
         let mut pos = 0;
-        let num = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos).unwrap();
+        let num = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos)
+            .expect("read_number two bytes");
         assert_eq!(num, 5);
         assert_eq!(pos, 2);
     }

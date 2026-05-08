@@ -219,13 +219,13 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut writer = Lz4Writer::new(&mut output);
-            writer.write_compressed(data).unwrap();
+            writer.write_compressed(data).expect("write_compressed");
         }
 
         // Decompress
         let cursor = Cursor::new(&output);
-        let mut reader = Lz4Reader::new(cursor).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = Lz4Reader::new(cursor).expect("Lz4Reader::new");
+        let decompressed = reader.decompress().expect("decompress");
 
         assert_eq!(decompressed, data);
     }
@@ -233,10 +233,10 @@ mod tests {
     #[test]
     fn test_lz4_original_size() {
         let data = b"Test data for size check";
-        let compressed = compress(data).unwrap();
+        let compressed = compress(data).expect("compress");
 
         let cursor = Cursor::new(&compressed);
-        let reader = Lz4Reader::new(cursor).unwrap();
+        let reader = Lz4Reader::new(cursor).expect("Lz4Reader::new");
 
         // Content size is now optional in the frame format
         assert_eq!(reader.original_size(), Some(data.len() as u64));
@@ -257,15 +257,17 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut writer = Lz4Writer::new(&mut output);
-            writer.write_compressed(data).unwrap();
+            writer
+                .write_compressed(data)
+                .expect("write_compressed repeated");
         }
 
         // Verify compression happened
         assert!(output.len() < data.len());
 
         let cursor = Cursor::new(&output);
-        let mut reader = Lz4Reader::new(cursor).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = Lz4Reader::new(cursor).expect("Lz4Reader::new");
+        let decompressed = reader.decompress().expect("decompress repeated");
 
         assert_eq!(decompressed, data);
     }

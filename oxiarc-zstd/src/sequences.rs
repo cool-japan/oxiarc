@@ -546,14 +546,14 @@ mod tests {
     #[test]
     fn test_parse_zero_sequences() {
         let data = [0];
-        let header = parse_sequences_header(&data).unwrap();
+        let header = parse_sequences_header(&data).expect("valid sequences header");
         assert_eq!(header.num_sequences, 0);
     }
 
     #[test]
     fn test_parse_small_sequence_count() {
         let data = [10, 0b00000000]; // 10 sequences, all predefined
-        let header = parse_sequences_header(&data).unwrap();
+        let header = parse_sequences_header(&data).expect("valid sequences header");
         assert_eq!(header.num_sequences, 10);
         assert_eq!(header.ll_mode, CompressionMode::Predefined);
         assert_eq!(header.of_mode, CompressionMode::Predefined);

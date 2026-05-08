@@ -7,8 +7,8 @@ use crate::windows::{long_path_prefix, sanitize_relative_path};
 use dialoguer::Confirm;
 use filetime::{FileTime, set_file_mtime};
 use oxiarc_archive::{
-    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, LenientWarning, Lz4Reader, SevenZReader,
-    SnappyReader, ZipReader, ZstdReader,
+    ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, IsoReader, LenientWarning, Lz4Reader,
+    SevenZReader, SnappyReader, ZipReader, ZstdReader,
 };
 use oxiarc_core::Entry;
 use std::fs::{self, File};
@@ -60,6 +60,10 @@ pub struct ExtractArgs<'a> {
     /// with warnings instead of errors. Warnings are emitted to stderr
     /// in yellow after extraction completes.
     pub lenient: bool,
+    /// Optional per-entry memory cap in bytes. Entries whose uncompressed
+    /// size exceeds this limit cause an immediate error rather than
+    /// an out-of-memory allocation.
+    pub memory_limit: Option<u64>,
 }
 
 /// Print accumulated lenient-mode warnings to stderr. No-op for empty
@@ -159,6 +163,26 @@ fn apply_metadata(
     Ok(())
 }
 
+/// Check that `entry_size` does not exceed `memory_limit` (if set).
+///
+/// Returns `Err` with a descriptive message when the limit is exceeded.
+fn check_memory_limit(
+    entry_name: &str,
+    entry_size: u64,
+    memory_limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(limit) = memory_limit {
+        if entry_size > limit {
+            return Err(format!(
+                "entry '{}' requires {} bytes, exceeds --memory-limit {} bytes",
+                entry_name, entry_size, limit
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Filter entries by include/exclude patterns.
 pub fn cmd_extract(
     args: ExtractArgs<'_>,
@@ -183,6 +207,7 @@ pub fn cmd_extract(
         password,
         strict_names,
         lenient,
+        memory_limit,
     } = args;
 
     // Determine overwrite mode from flags
@@ -295,6 +320,7 @@ pub fn cmd_extract(
                 password,
                 strict_names,
                 lenient,
+                memory_limit,
                 styler,
             });
         }
@@ -388,6 +414,8 @@ struct ExtractArchiveArgs<'a, R: Read + Seek> {
     /// Whether to continue past per-entry corruption, recording
     /// warnings on the reader instead of aborting.
     lenient: bool,
+    /// Optional per-entry memory cap in bytes.
+    memory_limit: Option<u64>,
     /// Styler used to colorize any warnings emitted after extraction.
     styler: &'a Styler,
 }
@@ -463,6 +491,7 @@ fn extract_archive_format<R: Read + Seek>(
         password,
         strict_names,
         lenient,
+        memory_limit,
         styler,
     } = args;
     println!(
@@ -523,6 +552,7 @@ fn extract_archive_format<R: Read + Seek>(
                     }
 
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = if ZipReader::<std::io::Cursor<&[u8]>>::is_encrypted(entry) {
                             let pw = password_bytes
                                 .as_deref()
@@ -623,6 +653,7 @@ fn extract_archive_format<R: Read + Seek>(
                     }
 
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = tar.extract_to_vec(entry)?;
                         std::fs::write(&file_path, data)?;
                         apply_metadata(
@@ -670,6 +701,7 @@ fn extract_archive_format<R: Read + Seek>(
                     }
 
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = lzh.extract_to_vec(entry)?;
                         std::fs::write(&file_path, data)?;
                         apply_metadata(
@@ -889,9 +921,16 @@ fn extract_archive_format<R: Read + Seek>(
                         std::fs::create_dir_all(parent)?;
                     }
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = sevenz.extract(i)?;
                         std::fs::write(&file_path, &data)?;
-                        // TODO: Add metadata preservation for 7z format (uses SevenZEntry)
+                        let core_entry = entry.to_entry();
+                        apply_metadata(
+                            &file_path,
+                            &core_entry,
+                            preserve_timestamps,
+                            preserve_permissions,
+                        )?;
                         if verbose {
                             pb.println(format!(
                                 "  Extracted: {} ({} bytes)",
@@ -929,6 +968,7 @@ fn extract_archive_format<R: Read + Seek>(
                     }
 
                     if should_write_file(&file_path, overwrite_mode, verbose)? {
+                        check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = cab.extract(entry)?;
                         std::fs::write(&file_path, &data)?;
                         apply_metadata(
@@ -950,8 +990,43 @@ fn extract_archive_format<R: Read + Seek>(
             }
             pb.finish_with_message("Done");
         }
+        ArchiveFormat::Iso9660 => {
+            let mut iso = IsoReader::new(reader)?;
+            let entries: Vec<_> = iso.entries().to_vec();
+
+            let to_extract: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.is_dir && should_extract(&e.name))
+                .collect();
+            let total = to_extract.len() as u64;
+
+            let pb = create_progress_bar(total, progress);
+            pb.set_message("files");
+
+            for entry in to_extract {
+                let file_path = resolve_output_path(output, &entry.name, strict_names)?;
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if should_write_file(&file_path, overwrite_mode, verbose)? {
+                    check_memory_limit(&entry.name, entry.size, memory_limit)?;
+                    let mut data = Vec::new();
+                    iso.extract(entry, &mut data)?;
+                    std::fs::write(&file_path, &data)?;
+                    if verbose {
+                        pb.println(format!(
+                            "  Extracted: {} ({} bytes)",
+                            entry.name,
+                            data.len()
+                        ));
+                    }
+                }
+                pb.inc(1);
+            }
+            pb.finish_with_message("Done");
+        }
         _ => {
-            println!("Extraction not yet implemented for {}", format);
+            return Err(format!("Extraction not yet implemented for {}", format).into());
         }
     }
 
@@ -1111,6 +1186,21 @@ fn extract_dry_run<R: Read + Seek>(
                 .into_owned();
             println!("[DRY RUN] Would decompress to: {}", out_name);
         }
+        ArchiveFormat::Iso9660 => {
+            let iso = IsoReader::new(reader)?;
+            let entries: Vec<_> = iso.entries().to_vec();
+            let to_extract: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.is_dir && should_extract(&e.name))
+                .collect();
+            println!("[DRY RUN] {} entries would be extracted:", to_extract.len());
+            let mut total_size = 0u64;
+            for entry in &to_extract {
+                println!("[DRY RUN]   file {} ({} bytes)", entry.name, entry.size);
+                total_size += entry.size;
+            }
+            println!("[DRY RUN] Total uncompressed size: {} bytes", total_size);
+        }
         _ => {
             println!("[DRY RUN] Format detection: {}", format);
         }
@@ -1118,4 +1208,63 @@ fn extract_dry_run<R: Read + Seek>(
 
     println!("[DRY RUN] No files were extracted.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::ColorChoice;
+    use std::io::Cursor;
+
+    /// Test A: `ArchiveFormat::Unknown` is the only variant that reaches the
+    /// `_ =>` arm in `extract_archive_format`.  All fourteen named variants
+    /// (Zip, Gzip, Tar, Lzh, SevenZip, Xz, Bzip2, Zstd, Lz4, Cab, Brotli,
+    /// Snappy, Iso9660) are handled by explicit arms; `Unknown` is the only
+    /// reachable catch-all through the CLI.
+    ///
+    /// This test constructs `ExtractArchiveArgs` directly (bypassing detection)
+    /// to verify that the new `Err` return from the `_ =>` arm carries the
+    /// expected message.
+    #[test]
+    fn unknown_format_returns_err() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oxiarc_extract_test_unknown_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let data: &[u8] = b"\x00\x01\x02\x03"; // matches no magic
+        let cursor = Cursor::new(data);
+        let styler = Styler::new(ColorChoice::Never);
+        let archive_path = tmp.join("fake.bin");
+
+        let result = extract_archive_format(ExtractArchiveArgs {
+            reader: cursor,
+            format: ArchiveFormat::Unknown,
+            output: &tmp,
+            files: &[],
+            include: &[],
+            exclude: &[],
+            verbose: false,
+            progress: false,
+            archive_path: &archive_path,
+            overwrite_mode: OverwriteMode::Always,
+            preserve_timestamps: false,
+            preserve_permissions: false,
+            password: None,
+            strict_names: false,
+            lenient: false,
+            memory_limit: None,
+            styler: &styler,
+        });
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(result.is_err(), "expected Err for Unknown format");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Extraction not yet implemented for Unknown"),
+            "unexpected error message: {msg}"
+        );
+    }
 }

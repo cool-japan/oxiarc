@@ -1,4 +1,4 @@
-# oxiarc-lz4 - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-lz4 - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -108,3 +108,12 @@ MMMM: Match length - 4 (0-14, or 15 for extended)
 
 1. Single-threaded only
 2. No dictionary support yet
+
+## Pending
+
+- [x] Add `with_progress` / `with_cancel` builders to lz4 codecs (done 2026-05-06)
+  - **Goal:** `Lz4Compressor`, `Lz4Decompressor`, `Lz4DictFrameEncoder`, `Lz4DictFrameDecoder` gain `with_progress(Arc<dyn ProgressSink>) -> Self` and `with_cancel(CancellationToken) -> Self`. Per-frame-block hooks.
+  - **Design:** Mirror `BzEncoder::with_progress`/`with_cancel` (oxiarc-bzip2/src/encode.rs:63–80). `Option<Arc<dyn ProgressSink>>` + `Option<CancellationToken>` fields. Hook after each block in compress/decompress loops. Lz4Compressor at streaming.rs:11, Lz4Decompressor at streaming.rs:86, Lz4DictFrameEncoder at frame_dict.rs:423, Lz4DictFrameDecoder at frame_dict.rs:493.
+  - **Files:** MODIFY `oxiarc-lz4/src/frame/streaming.rs`, MODIFY `oxiarc-lz4/src/frame/frame_dict.rs`, possibly MODIFY `oxiarc-lz4/Cargo.toml`
+  - **Tests:** `test_lz4_compressor_progress_reports`, `test_lz4_compressor_cancel_aborts`, same for Decompressor/DictFrameEncoder/DictFrameDecoder
+  - **Risk:** low — mechanical builder insertion

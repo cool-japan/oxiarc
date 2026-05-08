@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-cli - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -108,7 +108,12 @@
 - [x] Stdin/stdout support (`-`)
 - [x] Password for encrypted archives (2026-04-20 — `--password` on `extract` plus interactive prompt via `rpassword`; wrong password exits 2; verified with `cli_password.rs`)
 - [ ] Multi-volume archives
-- [ ] Memory limit option
+- [x] CLI `--memory-limit <BYTES>` for extract/list (completed 2026-05-06)
+  - **Goal:** `oxiarc extract --memory-limit 100M` and `oxiarc list --memory-limit 100M` cap peak in-memory allocation per entry. Entry exceeding cap → clear error with entry name + required vs allowed bytes. Default = unlimited.
+  - **Design:** Add `#[arg(long, value_parser = parse_byte_size)] memory_limit: Option<u64>` to `Commands::Extract` and `Commands::List` in main.rs. Helper `parse_byte_size(s: &str) -> Result<u64>`: accepts `100`, `100K`, `100M`, `100G` (decimal multipliers 1000/1_000_000/1_000_000_000). In extract.rs and list.rs pre-flight check: compare `entry.uncompressed_size()` against limit; error: `"entry '{name}' requires {req} bytes, exceeds --memory-limit {lim}"`. Place helper in `oxiarc-cli/src/util.rs` (reuse if exists).
+  - **Files:** MODIFY `oxiarc-cli/src/main.rs`, MODIFY `oxiarc-cli/src/commands/extract.rs`, MODIFY `oxiarc-cli/src/commands/list.rs`, possibly NEW/MODIFY `oxiarc-cli/src/util.rs`
+  - **Tests:** unit `parse_byte_size` tests (100→100, "100K"→100_000, "garbage"→Err); CLI integration: ZIP with 1KB + 1MB + `--memory-limit 10K` → 1KB ok, 1MB errors with entry name; default-unlimited test
+  - **Risk:** very low — pre-flight check only
 
 ### Platform
 - [x] Shell completion scripts (bash, zsh, fish, powershell) - COMPLETED

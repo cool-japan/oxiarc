@@ -23,13 +23,13 @@
 //!
 //! // Buffer-based compression with level
 //! let data = b"Hello, Zstandard!";
-//! let compressed = compress_with_level(data, 3).unwrap();
-//! let decompressed = decompress(&compressed).unwrap();
+//! let compressed = compress_with_level(data, 3).expect("compression failed");
+//! let decompressed = decompress(&compressed).expect("decompression failed");
 //! assert_eq!(decompressed, data);
 //!
 //! // Convenience functions (zstd crate compatible pattern)
-//! let compressed = encode_all(data, 3).unwrap();
-//! let decompressed = decode_all(&compressed).unwrap();
+//! let compressed = encode_all(data, 3).expect("encode_all failed");
+//! let decompressed = decode_all(&compressed).expect("decode_all failed");
 //! assert_eq!(decompressed, data);
 //! ```
 
@@ -164,21 +164,21 @@ mod tests {
 
     #[test]
     fn test_multi_frame_decompress() {
-        let frame1 = compress_with_level(b"Hello ", 3).unwrap();
-        let frame2 = compress_with_level(b"World!", 3).unwrap();
+        let frame1 = compress_with_level(b"Hello ", 3).expect("compression failed");
+        let frame2 = compress_with_level(b"World!", 3).expect("compression failed");
         let mut combined = frame1;
         combined.extend_from_slice(&frame2);
-        let result = decompress_multi_frame(&combined).unwrap();
+        let result = decompress_multi_frame(&combined).expect("decompression failed");
         assert_eq!(result, b"Hello World!");
     }
 
     #[test]
     fn test_skippable_frame_ignored() {
         let skip = write_skippable_frame(b"metadata", 0);
-        let frame = compress_with_level(b"data", 3).unwrap();
+        let frame = compress_with_level(b"data", 3).expect("compression failed");
         let mut combined = skip;
         combined.extend_from_slice(&frame);
-        let result = decompress_multi_frame(&combined).unwrap();
+        let result = decompress_multi_frame(&combined).expect("decompression failed");
         assert_eq!(result, b"data");
     }
 
@@ -189,20 +189,20 @@ mod tests {
         let mut writer = ZstdWriter::new(&mut buf, 3);
         // Write in small chunks.
         for chunk in b"Hello World! ".chunks(3) {
-            writer.write_all(chunk).unwrap();
+            writer.write_all(chunk).expect("write_all failed");
         }
-        writer.finish().unwrap();
-        let decompressed = decompress_multi_frame(&buf).unwrap();
+        writer.finish().expect("finish failed");
+        let decompressed = decompress_multi_frame(&buf).expect("decompression failed");
         assert_eq!(decompressed, b"Hello World! ");
     }
 
     #[test]
     fn test_decompress_frame_returns_consumed() {
-        let frame1 = compress_with_level(b"abc", 1).unwrap();
-        let frame2 = compress_with_level(b"xyz", 1).unwrap();
+        let frame1 = compress_with_level(b"abc", 1).expect("compression failed");
+        let frame2 = compress_with_level(b"xyz", 1).expect("compression failed");
         let mut combined = frame1.clone();
         combined.extend_from_slice(&frame2);
-        let (data, consumed) = decompress_frame(&combined).unwrap();
+        let (data, consumed) = decompress_frame(&combined).expect("decompression failed");
         assert_eq!(data, b"abc");
         assert_eq!(consumed, frame1.len());
     }
@@ -218,22 +218,31 @@ mod tests {
 
     #[test]
     fn test_multi_frame_empty_input() {
-        let result = decompress_multi_frame(&[]).unwrap();
+        let result = decompress_multi_frame(&[]).expect("decompression failed");
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_multi_frame_skippable_only() {
         let skip = write_skippable_frame(b"some metadata", 3);
-        let result = decompress_multi_frame(&skip).unwrap();
+        let result = decompress_multi_frame(&skip).expect("decompression failed");
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_block_type_from_bits() {
-        assert_eq!(BlockType::from_bits(0).unwrap(), BlockType::Raw);
-        assert_eq!(BlockType::from_bits(1).unwrap(), BlockType::Rle);
-        assert_eq!(BlockType::from_bits(2).unwrap(), BlockType::Compressed);
+        assert_eq!(
+            BlockType::from_bits(0).expect("valid block type"),
+            BlockType::Raw
+        );
+        assert_eq!(
+            BlockType::from_bits(1).expect("valid block type"),
+            BlockType::Rle
+        );
+        assert_eq!(
+            BlockType::from_bits(2).expect("valid block type"),
+            BlockType::Compressed
+        );
         assert!(BlockType::from_bits(3).is_err());
     }
 

@@ -7,7 +7,7 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.7 (2026-04-21) | 170 tests passing**
+**Version: 0.2.8 (2026-05-08) | 176 tests passing**
 
 ## Overview
 
@@ -23,6 +23,8 @@ Zstandard is a modern compression algorithm developed by Facebook (Meta), offeri
 - **Dictionary support** - Pre-trained dictionaries for better compression
 - **Checksum support** - XXH64 checksums for data integrity
 - **Streaming API** - Incremental encoder/decoder for large data
+- **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on encoders and stream decoder
+- **Cancellation** - `with_cancel(CancellationToken)` builder for cooperative cancellation
 
 All features are implemented and tested. API is stable.
 
@@ -88,6 +90,28 @@ let mut decoder = Decoder::new();
 let decompressed = decoder.decompress(&compressed)?;
 ```
 
+## Progress Reporting and Cancellation
+
+`ZstdEncoder`, `ZstdStreamEncoder`, and `ZstdStreamDecoder` all expose builder methods for observability and cooperative cancellation:
+
+```rust
+use std::sync::Arc;
+use oxiarc_zstd::{ZstdEncoder, ProgressSink, CancellationToken};
+
+// Progress reporting
+let sink: Arc<dyn ProgressSink> = Arc::new(MyProgressHandler);
+let encoder = ZstdEncoder::new(3).with_progress(sink);
+
+// Cooperative cancellation
+let token = CancellationToken::new();
+let encoder = ZstdEncoder::new(3).with_cancel(token.clone());
+
+// Cancel from another thread
+token.cancel();
+```
+
+The `with_progress` and `with_cancel` builders can be chained together.
+
 ## Features (Cargo)
 
 | Feature | Default | Description |
@@ -97,10 +121,10 @@ let decompressed = decoder.decompress(&compressed)?;
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-zstd = "0.2.6"
+oxiarc-zstd = "0.2.8"
 
 # With parallel compression
-oxiarc-zstd = { version = "0.2.6", features = ["parallel"] }
+oxiarc-zstd = { version = "0.2.8", features = ["parallel"] }
 ```
 
 ## Algorithm

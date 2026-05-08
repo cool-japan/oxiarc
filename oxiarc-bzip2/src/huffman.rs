@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_huffman_table_creation() {
         let lengths = vec![2, 2, 3, 3];
-        let table = HuffmanTable::from_lengths(&lengths).unwrap();
+        let table = HuffmanTable::from_lengths(&lengths).expect("build huffman table from lengths");
         assert_eq!(table.min_len, 2);
         assert_eq!(table.max_len, 3);
     }

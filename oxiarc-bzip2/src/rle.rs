@@ -272,7 +272,7 @@ mod tests {
         let encoded = rle1_encode(data);
         assert_eq!(encoded, data.as_slice());
 
-        let decoded = rle1_decode(&encoded).unwrap();
+        let decoded = rle1_decode(&encoded).expect("rle1 decode no runs");
         assert_eq!(decoded, data.as_slice());
     }
 
@@ -290,7 +290,7 @@ mod tests {
     fn test_rle1_roundtrip() {
         let data = b"aaaaaabbbbbbbbccccccccccc";
         let encoded = rle1_encode(data);
-        let decoded = rle1_decode(&encoded).unwrap();
+        let decoded = rle1_decode(&encoded).expect("rle1 decode roundtrip");
         assert_eq!(decoded, data.as_slice());
     }
 

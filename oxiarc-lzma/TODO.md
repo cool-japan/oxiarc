@@ -1,5 +1,5 @@
 
-# oxiarc-lzma - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-lzma - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -251,3 +251,12 @@ A complete optimal parser would implement:
    - Literal context modeling (previous byte, position)
 
 This would provide compression ratios similar to 7-Zip's LZMA implementation.
+
+## Pending
+
+- [x] Add `with_progress` / `with_cancel` builders to Lzma2 codecs (done 2026-05-06)
+  - **Goal:** `Lzma2Encoder`, `Lzma2Decoder`, `Lzma2ChunkedEncoder` gain builders. Per-chunk hooks. (LZMA1 at encoder.rs:175,183 + decoder.rs:110,118 is the local reference.)
+  - **Design:** `Lzma2Encoder::new` (lzma2.rs:591) + `Lzma2Decoder::new` (lzma2.rs:49) — add private fields, expose builders. Hook in `Lzma2Decoder::decode<R: Read>` (line 65) after each chunk. `Lzma2ChunkedEncoder` (lzma2_chunk.rs:237) — hook per chunk write.
+  - **Files:** MODIFY `oxiarc-lzma/src/lzma2.rs`, MODIFY `oxiarc-lzma/src/lzma2_chunk.rs`, possibly MODIFY `oxiarc-lzma/Cargo.toml`
+  - **Tests:** `test_lzma2_encoder_progress_reports`, `test_lzma2_encoder_cancel_aborts`, same for Lzma2Decoder/Lzma2ChunkedEncoder
+  - **Risk:** low — LZMA1 pattern is local reference

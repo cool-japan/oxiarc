@@ -504,7 +504,7 @@ mod tests {
     fn test_properties_round_trip() {
         let props = LzmaProperties::new(3, 0, 2);
         let byte = props.to_byte();
-        let decoded = LzmaProperties::from_byte(byte).unwrap();
+        let decoded = LzmaProperties::from_byte(byte).expect("valid LZMA operation");
 
         assert_eq!(decoded.lc, 3);
         assert_eq!(decoded.lp, 0);

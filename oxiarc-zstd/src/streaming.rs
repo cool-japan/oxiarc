@@ -17,18 +17,20 @@
 //!
 //! // Compress
 //! let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-//! encoder.write_all(b"Hello, streaming Zstd!").unwrap();
-//! let compressed = encoder.finish().unwrap();
+//! encoder.write_all(b"Hello, streaming Zstd!").expect("write failed");
+//! let compressed = encoder.finish().expect("finish failed");
 //!
 //! // Decompress
 //! let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
 //! let mut output = String::new();
-//! decoder.read_to_string(&mut output).unwrap();
+//! decoder.read_to_string(&mut output).expect("read failed");
 //! assert_eq!(output, "Hello, streaming Zstd!");
 //! ```
 
 use crate::encode::ZstdEncoder;
 use crate::frame::{ZstdDecoder, decompress_multi_frame};
+use oxiarc_core::cancel::CancellationToken;
+use oxiarc_core::progress::ProgressHandle;
 use std::io::{self, Read, Write};
 
 /// Default block size for the incremental encoder (128 KiB).
@@ -44,6 +46,10 @@ const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 ///
 /// The output is a sequence of valid concatenated Zstandard frames and can be
 /// decoded with [`decompress_multi_frame`].
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`ZstdStreamEncoder::with_progress`] / [`ZstdStreamEncoder::with_cancel`] builders.
 ///
 /// **Important:** you *must* call [`finish`](ZstdStreamEncoder::finish) to
 /// flush the final (possibly partial) block. Dropping the encoder without
@@ -61,6 +67,12 @@ pub struct ZstdStreamEncoder<W: Write> {
     finished: bool,
     /// Threshold at which the buffer is automatically flushed.
     block_size: usize,
+    /// Optional progress sink. Notified after each block is flushed.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token. Checked before each block flush.
+    cancel: Option<CancellationToken>,
+    /// Cumulative uncompressed bytes flushed so far.
+    bytes_processed: u64,
 }
 
 impl<W: Write> ZstdStreamEncoder<W> {
@@ -78,6 +90,9 @@ impl<W: Write> ZstdStreamEncoder<W> {
             dict: None,
             finished: false,
             block_size: DEFAULT_BLOCK_SIZE,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
     }
 
@@ -93,6 +108,9 @@ impl<W: Write> ZstdStreamEncoder<W> {
             dict: Some(dict),
             finished: false,
             block_size: DEFAULT_BLOCK_SIZE,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
     }
 
@@ -102,6 +120,26 @@ impl<W: Write> ZstdStreamEncoder<W> {
     /// compressed and written to the inner writer as a Zstandard frame.
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size.max(1);
+        self
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(cumulative_bytes, None)` is called after each
+    /// block is flushed to the inner writer. `on_finish()` is called after
+    /// `finish` flushes the final block.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before each block is compressed and written.
+    /// If cancelled, returns an I/O error wrapping
+    /// [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
         self
     }
 
@@ -120,6 +158,9 @@ impl<W: Write> ZstdStreamEncoder<W> {
             // the single-frame behaviour expected by existing tests).
             self.flush_buffer_unconditional()?;
             self.finished = true;
+            if let Some(ref handle) = self.progress {
+                handle.on_finish();
+            }
         }
         // inner is always Some until finish() is called once.
         self.inner
@@ -129,6 +170,11 @@ impl<W: Write> ZstdStreamEncoder<W> {
 
     /// Compress `data` as a single Zstandard frame and write it to `inner`.
     fn compress_and_write(&mut self, data: &[u8]) -> io::Result<()> {
+        // Cooperative cancellation check before each block.
+        if let Some(ref token) = self.cancel {
+            token.check().map_err(|e| io::Error::other(e.to_string()))?;
+        }
+
         let mut encoder = ZstdEncoder::new();
         encoder.set_level(self.level);
         if let Some(ref dict) = self.dict {
@@ -140,6 +186,12 @@ impl<W: Write> ZstdStreamEncoder<W> {
         if let Some(ref mut w) = self.inner {
             w.write_all(&compressed)?;
         }
+
+        self.bytes_processed += data.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_processed, None);
+        }
+
         Ok(())
     }
 
@@ -203,6 +255,10 @@ impl<W: Write> Write for ZstdStreamEncoder<W> {
 /// All compressed data is read eagerly from the inner reader on the first
 /// `read` call, decompressed into an internal buffer, and then served from
 /// that buffer for subsequent reads.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`ZstdStreamDecoder::with_progress`] / [`ZstdStreamDecoder::with_cancel`] builders.
 pub struct ZstdStreamDecoder<R: Read> {
     /// The wrapped reader providing compressed input.
     inner: R,
@@ -214,6 +270,10 @@ pub struct ZstdStreamDecoder<R: Read> {
     finished: bool,
     /// Optional pre-trained dictionary data for decompression.
     dict: Option<Vec<u8>>,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
 }
 
 impl<R: Read> ZstdStreamDecoder<R> {
@@ -225,6 +285,8 @@ impl<R: Read> ZstdStreamDecoder<R> {
             output_pos: 0,
             finished: false,
             dict: None,
+            progress: None,
+            cancel: None,
         }
     }
 
@@ -239,7 +301,29 @@ impl<R: Read> ZstdStreamDecoder<R> {
             output_pos: 0,
             finished: false,
             dict: if dict.is_empty() { None } else { Some(dict) },
+            progress: None,
+            cancel: None,
         }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(decompressed_bytes, None)` is called once
+    /// after the entire stream is decompressed into the internal buffer.
+    /// `on_finish()` is called at the same point.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before the compressed stream is read and
+    /// decompressed. If cancelled, an I/O error wrapping
+    /// [`oxiarc_core::error::OxiArcError::Cancelled`] is returned.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Read and decompress all compressed data from the inner reader.
@@ -249,6 +333,11 @@ impl<R: Read> ZstdStreamDecoder<R> {
     fn fill_buffer(&mut self) -> io::Result<()> {
         if self.finished || self.output_pos < self.output_buffer.len() {
             return Ok(());
+        }
+
+        // Cooperative cancellation check before reading.
+        if let Some(ref token) = self.cancel {
+            token.check().map_err(|e| io::Error::other(e.to_string()))?;
         }
 
         let mut compressed = Vec::new();
@@ -278,6 +367,12 @@ impl<R: Read> ZstdStreamDecoder<R> {
         };
         self.output_pos = 0;
         self.finished = true;
+
+        let total = self.output_buffer.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(total, None);
+            handle.on_finish();
+        }
 
         Ok(())
     }
@@ -322,15 +417,17 @@ mod tests {
     #[test]
     fn test_stream_encoder_basic() {
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-        encoder.write_all(b"Hello, Zstandard!").unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder
+            .write_all(b"Hello, Zstandard!")
+            .expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
         assert!(!compressed.is_empty());
     }
 
     #[test]
     fn test_stream_encoder_empty() {
         let encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-        let compressed = encoder.finish().unwrap();
+        let compressed = encoder.finish().expect("finish failed");
         // Should produce a valid (minimal) Zstd frame.
         assert!(!compressed.is_empty());
     }
@@ -341,13 +438,13 @@ mod tests {
 
         // Compress
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.write_all(original).expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
 
         // Decompress
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         let mut output = Vec::new();
-        decoder.read_to_end(&mut output).unwrap();
+        decoder.read_to_end(&mut output).expect("read failed");
 
         assert_eq!(output, original.as_slice());
     }
@@ -358,13 +455,13 @@ mod tests {
 
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
         for part in parts {
-            encoder.write_all(part).unwrap();
+            encoder.write_all(part).expect("write failed");
         }
-        let compressed = encoder.finish().unwrap();
+        let compressed = encoder.finish().expect("finish failed");
 
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         let mut output = Vec::new();
-        decoder.read_to_end(&mut output).unwrap();
+        decoder.read_to_end(&mut output).expect("read failed");
 
         assert_eq!(output, b"Hello, streaming Zstd!");
     }
@@ -374,15 +471,15 @@ mod tests {
         let original = b"ABCDEFGHIJ";
 
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.write_all(original).expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
 
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         let mut output = Vec::new();
         let mut buf = [0u8; 3];
 
         loop {
-            let n = decoder.read(&mut buf).unwrap();
+            let n = decoder.read(&mut buf).expect("read failed");
             if n == 0 {
                 break;
             }
@@ -396,7 +493,7 @@ mod tests {
     fn test_stream_decoder_empty_input() {
         let mut decoder = ZstdStreamDecoder::new(&[][..]);
         let mut buf = [0u8; 16];
-        let n = decoder.read(&mut buf).unwrap();
+        let n = decoder.read(&mut buf).expect("read failed");
         assert_eq!(n, 0);
     }
 
@@ -404,13 +501,13 @@ mod tests {
     fn test_stream_encoder_with_dictionary() {
         let dict = b"common pattern data".to_vec();
         let mut encoder = ZstdStreamEncoder::with_dictionary(Vec::new(), 1, dict);
-        encoder.write_all(b"test data").unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.write_all(b"test data").expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
 
         // Should still decompress (dict is a placeholder for now).
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         let mut output = Vec::new();
-        decoder.read_to_end(&mut output).unwrap();
+        decoder.read_to_end(&mut output).expect("read failed");
         assert_eq!(output, b"test data");
     }
 
@@ -418,9 +515,9 @@ mod tests {
     fn test_stream_encoder_buffered_bytes() {
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
         assert_eq!(encoder.buffered_bytes(), 0);
-        encoder.write_all(b"12345").unwrap();
+        encoder.write_all(b"12345").expect("write failed");
         assert_eq!(encoder.buffered_bytes(), 5);
-        encoder.write_all(b"67890").unwrap();
+        encoder.write_all(b"67890").expect("write failed");
         assert_eq!(encoder.buffered_bytes(), 10);
     }
 
@@ -428,7 +525,7 @@ mod tests {
     fn test_stream_encoder_is_finished() {
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
         assert!(!encoder.is_finished());
-        encoder.write_all(b"data").unwrap();
+        encoder.write_all(b"data").expect("write failed");
         assert!(!encoder.is_finished());
         // Cannot check after finish since finish consumes self.
     }
@@ -438,14 +535,14 @@ mod tests {
         let original = b"short";
 
         let mut enc = ZstdStreamEncoder::new(Vec::new(), 1);
-        enc.write_all(original).unwrap();
-        let compressed = enc.finish().unwrap();
+        enc.write_all(original).expect("write failed");
+        let compressed = enc.finish().expect("finish failed");
 
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         assert!(!decoder.is_finished());
 
         let mut out = Vec::new();
-        decoder.read_to_end(&mut out).unwrap();
+        decoder.read_to_end(&mut out).expect("read failed");
         assert!(decoder.is_finished());
     }
 
@@ -454,13 +551,122 @@ mod tests {
         let original: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
 
         let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1);
-        encoder.write_all(&original).unwrap();
-        let compressed = encoder.finish().unwrap();
+        encoder.write_all(&original).expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
 
         let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
         let mut output = Vec::new();
-        decoder.read_to_end(&mut output).unwrap();
+        decoder.read_to_end(&mut output).expect("read failed");
 
         assert_eq!(output, original);
+    }
+
+    use oxiarc_core::cancel::CancellationToken;
+    use oxiarc_core::progress::ProgressSink;
+    use std::sync::{Arc, Mutex};
+
+    type ProgressLog = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
+    struct MockSink(ProgressLog);
+
+    impl ProgressSink for MockSink {
+        fn on_progress(&self, processed: u64, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("lock poisoned")
+                .push((processed, total));
+        }
+    }
+
+    fn make_compressible_data(size: usize) -> Vec<u8> {
+        let pattern = b"ZstdStream test data with repeating pattern ABCDEFGH ";
+        let mut data = Vec::with_capacity(size);
+        while data.len() < size {
+            let remaining = size - data.len();
+            let chunk = &pattern[..remaining.min(pattern.len())];
+            data.extend_from_slice(chunk);
+        }
+        data
+    }
+
+    #[test]
+    fn test_zstd_stream_encoder_progress_reports() {
+        let data = make_compressible_data(1024 * 1024); // 1 MB
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1)
+            .with_progress(sink as oxiarc_core::progress::ProgressHandle);
+        encoder.write_all(&data).expect("write_all failed");
+        encoder.finish().expect("finish failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal input size"
+        );
+    }
+
+    #[test]
+    fn test_zstd_stream_encoder_cancel_aborts() {
+        let data = make_compressible_data(1024 * 1024);
+        let token = CancellationToken::new();
+
+        // Use a small block size so we hit the block boundary quickly.
+        let mut encoder = ZstdStreamEncoder::new(Vec::new(), 1)
+            .with_block_size(4096)
+            .with_cancel(token.clone());
+
+        token.cancel();
+        let result = encoder.write_all(&data);
+        assert!(result.is_err(), "expected cancellation error");
+    }
+
+    #[test]
+    fn test_zstd_stream_decoder_progress_reports() {
+        let data = make_compressible_data(1024 * 1024); // 1 MB
+
+        let mut enc = ZstdStreamEncoder::new(Vec::new(), 1);
+        enc.write_all(&data).expect("write_all failed");
+        let compressed = enc.finish().expect("finish failed");
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let mut decoder = ZstdStreamDecoder::new(&compressed[..])
+            .with_progress(sink as oxiarc_core::progress::ProgressHandle);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read_to_end failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal decompressed size"
+        );
+    }
+
+    #[test]
+    fn test_zstd_stream_decoder_cancel_aborts() {
+        let data = make_compressible_data(1024 * 1024);
+        let mut enc = ZstdStreamEncoder::new(Vec::new(), 1);
+        enc.write_all(&data).expect("write_all failed");
+        let compressed = enc.finish().expect("finish failed");
+
+        let token = CancellationToken::new();
+        let mut decoder = ZstdStreamDecoder::new(&compressed[..]).with_cancel(token.clone());
+        let mut output = Vec::new();
+
+        token.cancel();
+        let result = decoder.read_to_end(&mut output);
+        assert!(result.is_err(), "expected cancellation error");
     }
 }

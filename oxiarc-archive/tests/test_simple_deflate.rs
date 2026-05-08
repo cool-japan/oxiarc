@@ -7,7 +7,7 @@ fn test_simple_deflate() {
     let data = "Test data. ".repeat(50);
     println!("Input size: {}", data.len());
 
-    let compressed = deflate(data.as_bytes(), 6).unwrap();
+    let compressed = deflate(data.as_bytes(), 6).expect("deflate");
     println!("Compressed size: {}", compressed.len());
     println!(
         "First 20 bytes: {:?}",
@@ -43,8 +43,10 @@ fn test_zip_single_file() {
     {
         let mut writer = ZipWriter::new(&mut output);
         writer.set_compression(ZipCompressionLevel::Normal);
-        writer.add_file("test.txt", data.as_bytes()).unwrap();
-        writer.finish().unwrap();
+        writer
+            .add_file("test.txt", data.as_bytes())
+            .expect("add_file test.txt");
+        writer.finish().expect("writer finish");
     }
     println!("ZIP size: {}", output.len());
 
@@ -53,7 +55,7 @@ fn test_zip_single_file() {
     use std::io::Cursor;
 
     let cursor = Cursor::new(output);
-    let mut reader = ZipReader::new(cursor).unwrap();
+    let mut reader = ZipReader::new(cursor).expect("ZipReader::new");
     let entries: Vec<_> = reader.entries().to_vec();
 
     println!("Entry: {}", entries[0].name);

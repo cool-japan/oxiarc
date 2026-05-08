@@ -418,7 +418,7 @@ mod tests {
         // Canonical codes: A=0 (1 bit), B=10 (2 bits), C=11 (2 bits)
         // In LSB-first: A=0, B=01 (reversed from 10), C=11 (reversed from 11)
         let lengths = [1u8, 2, 2];
-        let tree = HuffmanTree::from_code_lengths(&lengths).unwrap();
+        let tree = HuffmanTree::from_code_lengths(&lengths).expect("build huffman tree");
 
         // Test decoding A B C A
         // Bits needed: 0 (A) + 01 (B) + 11 (C) + 0 (A) = 7 bits
@@ -426,10 +426,10 @@ mod tests {
         let data = vec![0b00011010u8];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        assert_eq!(tree.decode(&mut reader).unwrap(), 0); // A
-        assert_eq!(tree.decode(&mut reader).unwrap(), 1); // B
-        assert_eq!(tree.decode(&mut reader).unwrap(), 2); // C
-        assert_eq!(tree.decode(&mut reader).unwrap(), 0); // A
+        assert_eq!(tree.decode(&mut reader).expect("decode symbol A"), 0); // A
+        assert_eq!(tree.decode(&mut reader).expect("decode symbol B"), 1); // B
+        assert_eq!(tree.decode(&mut reader).expect("decode symbol C"), 2); // C
+        assert_eq!(tree.decode(&mut reader).expect("decode symbol A again"), 0); // A
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn test_empty_tree() {
         let lengths: [u8; 4] = [0, 0, 0, 0];
-        let tree = HuffmanTree::from_code_lengths(&lengths).unwrap();
+        let tree = HuffmanTree::from_code_lengths(&lengths).expect("build empty huffman tree");
         assert_eq!(tree.max_code_length, 0);
     }
 
@@ -464,12 +464,12 @@ mod tests {
     fn test_single_symbol() {
         // Single symbol tree
         let lengths = [1u8, 0, 0, 0];
-        let tree = HuffmanTree::from_code_lengths(&lengths).unwrap();
+        let tree = HuffmanTree::from_code_lengths(&lengths).expect("build single symbol tree");
 
         let data = vec![0b00000000u8];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        assert_eq!(tree.decode(&mut reader).unwrap(), 0);
+        assert_eq!(tree.decode(&mut reader).expect("decode single symbol"), 0);
     }
 
     #[test]

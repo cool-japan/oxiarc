@@ -494,14 +494,14 @@ mod tests {
         let data = vec![0xB5];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        assert_eq!(reader.read_bits(1).unwrap(), 1); // LSB first
-        assert_eq!(reader.read_bits(1).unwrap(), 0);
-        assert_eq!(reader.read_bits(1).unwrap(), 1);
-        assert_eq!(reader.read_bits(1).unwrap(), 0);
-        assert_eq!(reader.read_bits(1).unwrap(), 1);
-        assert_eq!(reader.read_bits(1).unwrap(), 1);
-        assert_eq!(reader.read_bits(1).unwrap(), 0);
-        assert_eq!(reader.read_bits(1).unwrap(), 1);
+        assert_eq!(reader.read_bits(1).expect("read bit 1"), 1); // LSB first
+        assert_eq!(reader.read_bits(1).expect("read bit 2"), 0);
+        assert_eq!(reader.read_bits(1).expect("read bit 3"), 1);
+        assert_eq!(reader.read_bits(1).expect("read bit 4"), 0);
+        assert_eq!(reader.read_bits(1).expect("read bit 5"), 1);
+        assert_eq!(reader.read_bits(1).expect("read bit 6"), 1);
+        assert_eq!(reader.read_bits(1).expect("read bit 7"), 0);
+        assert_eq!(reader.read_bits(1).expect("read bit 8"), 1);
     }
 
     #[test]
@@ -509,9 +509,14 @@ mod tests {
         let data = vec![0xFF, 0x00];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        assert_eq!(reader.read_bits(4).unwrap(), 0xF);
-        assert_eq!(reader.read_bits(8).unwrap(), 0x0F); // Crosses byte boundary
-        assert_eq!(reader.read_bits(4).unwrap(), 0x0);
+        assert_eq!(reader.read_bits(4).expect("read 4 bits"), 0xF);
+        assert_eq!(
+            reader
+                .read_bits(8)
+                .expect("read 8 bits crossing byte boundary"),
+            0x0F
+        ); // Crosses byte boundary
+        assert_eq!(reader.read_bits(4).expect("read final 4 bits"), 0x0);
     }
 
     #[test]
@@ -519,10 +524,10 @@ mod tests {
         let data = vec![0xAB];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        assert_eq!(reader.peek_bits(4).unwrap(), 0xB);
-        assert_eq!(reader.peek_bits(4).unwrap(), 0xB); // Same value
-        assert_eq!(reader.read_bits(4).unwrap(), 0xB); // Now consume
-        assert_eq!(reader.peek_bits(4).unwrap(), 0xA);
+        assert_eq!(reader.peek_bits(4).expect("peek 4 bits"), 0xB);
+        assert_eq!(reader.peek_bits(4).expect("peek 4 bits again"), 0xB); // Same value
+        assert_eq!(reader.read_bits(4).expect("read 4 bits"), 0xB); // Now consume
+        assert_eq!(reader.peek_bits(4).expect("peek remaining 4 bits"), 0xA);
     }
 
     #[test]
@@ -531,15 +536,15 @@ mod tests {
         {
             let mut writer = BitWriter::new(&mut output);
             // Write 0b10110101 bit by bit
-            writer.write_bit(true).unwrap(); // 1
-            writer.write_bit(false).unwrap(); // 0
-            writer.write_bit(true).unwrap(); // 1
-            writer.write_bit(false).unwrap(); // 0
-            writer.write_bit(true).unwrap(); // 1
-            writer.write_bit(true).unwrap(); // 1
-            writer.write_bit(false).unwrap(); // 0
-            writer.write_bit(true).unwrap(); // 1
-            writer.flush().unwrap();
+            writer.write_bit(true).expect("write bit"); // 1
+            writer.write_bit(false).expect("write bit"); // 0
+            writer.write_bit(true).expect("write bit"); // 1
+            writer.write_bit(false).expect("write bit"); // 0
+            writer.write_bit(true).expect("write bit"); // 1
+            writer.write_bit(true).expect("write bit"); // 1
+            writer.write_bit(false).expect("write bit"); // 0
+            writer.write_bit(true).expect("write bit"); // 1
+            writer.flush().expect("flush writer");
         }
         assert_eq!(output, vec![0xB5]);
     }
@@ -549,9 +554,9 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut writer = BitWriter::new(&mut output);
-            writer.write_bits(0b101, 3).unwrap();
-            writer.write_bits(0b11001, 5).unwrap();
-            writer.flush().unwrap();
+            writer.write_bits(0b101, 3).expect("write 3 bits");
+            writer.write_bits(0b11001, 5).expect("write 5 bits");
+            writer.flush().expect("flush writer");
         }
         // 3 bits: 101, 5 bits: 11001 -> 11001_101 = 0xCD
         assert_eq!(output, vec![0xCD]);
@@ -562,18 +567,18 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut writer = BitWriter::new(&mut output);
-            writer.write_bits(0b101, 3).unwrap();
-            writer.write_bits(0b1111, 4).unwrap();
-            writer.write_bits(0b10, 2).unwrap();
-            writer.write_bits(0b110011, 6).unwrap();
-            writer.flush().unwrap();
+            writer.write_bits(0b101, 3).expect("write 3 bits");
+            writer.write_bits(0b1111, 4).expect("write 4 bits");
+            writer.write_bits(0b10, 2).expect("write 2 bits");
+            writer.write_bits(0b110011, 6).expect("write 6 bits");
+            writer.flush().expect("flush writer");
         }
 
         let mut reader = BitReader::new(Cursor::new(&output));
-        assert_eq!(reader.read_bits(3).unwrap(), 0b101);
-        assert_eq!(reader.read_bits(4).unwrap(), 0b1111);
-        assert_eq!(reader.read_bits(2).unwrap(), 0b10);
-        assert_eq!(reader.read_bits(6).unwrap(), 0b110011);
+        assert_eq!(reader.read_bits(3).expect("read 3 bits"), 0b101);
+        assert_eq!(reader.read_bits(4).expect("read 4 bits"), 0b1111);
+        assert_eq!(reader.read_bits(2).expect("read 2 bits"), 0b10);
+        assert_eq!(reader.read_bits(6).expect("read 6 bits"), 0b110011);
     }
 
     #[test]
@@ -581,9 +586,9 @@ mod tests {
         let data = vec![0xFF, 0xAA];
         let mut reader = BitReader::new(Cursor::new(data));
 
-        reader.read_bits(3).unwrap(); // Read 3 bits
+        reader.read_bits(3).expect("read 3 bits"); // Read 3 bits
         reader.align_to_byte(); // Skip remaining 5 bits
-        assert_eq!(reader.read_bits(8).unwrap(), 0xAA);
+        assert_eq!(reader.read_bits(8).expect("read byte after align"), 0xAA);
     }
 
     #[test]
@@ -592,10 +597,10 @@ mod tests {
         let mut reader = BitReader::new(Cursor::new(data));
 
         let mut buf = [0u8; 2];
-        reader.read_bytes(&mut buf).unwrap();
+        reader.read_bytes(&mut buf).expect("read first 2 bytes");
         assert_eq!(buf, [0x12, 0x34]);
 
-        reader.read_bytes(&mut buf).unwrap();
+        reader.read_bytes(&mut buf).expect("read next 2 bytes");
         assert_eq!(buf, [0x56, 0x78]);
     }
 }

@@ -2,8 +2,8 @@ use super::SortBy;
 use crate::style::Styler;
 use crate::utils::{filter_entries, print_entries, print_tree, sort_entries};
 use oxiarc_archive::{
-    ArchiveFormat, Bzip2Reader, CabReader, LenientWarning, Lz4Reader, SevenZReader, ZipReader,
-    ZstdReader,
+    ArchiveFormat, Bzip2Reader, CabReader, IsoReader, LenientWarning, Lz4Reader, SevenZReader,
+    ZipReader, ZstdReader,
 };
 use oxiarc_core::Entry;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,10 @@ pub struct ListOptions<'a> {
     /// warnings instead of errors. Warnings are emitted to stderr in
     /// yellow after the listing completes.
     pub lenient: bool,
+    /// Optional per-entry memory cap in bytes. Entries whose uncompressed
+    /// size exceeds this limit cause an immediate error rather than an
+    /// out-of-memory allocation.
+    pub memory_limit: Option<u64>,
 }
 
 /// Print accumulated lenient-mode warnings to stderr. No-op for empty
@@ -181,6 +185,33 @@ pub fn cmd_list(
             sort_entries(&mut filtered, options.sort_by, options.reverse);
             display_entries(&filtered, options.verbose, options.tree, styler);
         }
+        ArchiveFormat::Iso9660 => {
+            let iso = IsoReader::new(reader)?;
+            println!(
+                "ISO 9660 image ({})",
+                if iso.is_joliet() { "Joliet" } else { "Level 1" }
+            );
+            println!("  Volume: {}", iso.volume_id.trim());
+            println!("  Total LBAs: {}", iso.total_lbas);
+            println!();
+            for entry in iso.entries() {
+                if options.memory_limit.is_some_and(|lim| entry.size > lim) {
+                    println!(
+                        "  [SKIP] {} ({} bytes, exceeds --memory-limit)",
+                        entry.name, entry.size
+                    );
+                    continue;
+                }
+                if entry.is_dir {
+                    println!("{}", styler.dir_entry(&format!("{}/", entry.name)));
+                } else {
+                    println!(
+                        "{}",
+                        styler.file_entry(&format!("{} ({} bytes)", entry.name, entry.size))
+                    );
+                }
+            }
+        }
         _ => {
             println!("Unsupported format: {}", format);
         }
@@ -292,6 +323,17 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
             let mut filtered = filter_entries(cab.entries(), options.include, options.exclude);
             sort_entries(&mut filtered, options.sort_by, options.reverse);
             output.entries = Some(filtered.iter().map(EntryJson::from_entry).collect());
+        }
+        ArchiveFormat::Iso9660 => {
+            let iso = IsoReader::new(reader)?;
+            output.metadata = Some(serde_json::json!({
+                "type": "iso9660",
+                "volume_id": iso.volume_id.trim(),
+                "total_lbas": iso.total_lbas,
+                "logical_block_size": iso.logical_block_size,
+                "joliet": iso.is_joliet(),
+                "files": iso.entries().iter().filter(|e| !e.is_dir).count()
+            }));
         }
         _ => {
             output.metadata = Some(serde_json::json!({

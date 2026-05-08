@@ -1,5 +1,5 @@
 
-# oxiarc-core - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-core - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -81,7 +81,12 @@
   - **Tests:** cross-validate SIMD path against scalar path on a randomized 1 MiB buffer — bit-exact equality; add a benchmark (criterion or black_box baseline) showing SIMD > 4× scalar on supported targets.
   - **Downstream compatibility (explicit):** the `simd` cargo-feature **name stays defined** in `oxiarc-core/Cargo.toml` as a no-op alias after the gate is removed. Any downstream `features = ["simd"]` (including workspace consumers) must continue to resolve and compile unchanged. Document the alias as deprecated-but-preserved in the feature doc-comment, and leave a follow-up to remove it after one minor release cycle.
   - **Risk:** feature-flag removal can break downstream consumers → mitigated by the no-op alias above. Secondary risk: `std::is_x86_feature_detected!` / `std::is_aarch64_feature_detected!` invocation cost on hot paths — dispatch only once via `OnceLock<fn>` to amortize.
-- [~] SIMD CRC32 runtime-dispatch — wire PCLMULQDQ/PMULL (planned 2026-04-20) — **deferred**: PMULL path empirically disagrees with slicing-by-8 on buffers that trigger the fold loop (fixed vectors < 64 B pass only because they bypass SIMD via the scalar fallback; `vec![0xFF; 1_048_576]` gives `0x5e570f27` vs scalar `0x956bac74`). Root cause is structural (fold constants in `x86_constants`/`arm_constants` need to be the 33-bit pre-shifted form — e.g. `rk1 = 0x154442bd4`, `rk2 = 0x1c6e41596` — plus matching Barrett reduction shape per Intel's white paper). PCLMULQDQ cannot be verified from the aarch64 host used for this run. Dispatch continues to route to `software_crc32`; SIMD modules stay compiled but unreferenced. Tests added but `#[ignore]`-marked with reproducible diagnosis; see `test_pmull_matches_scalar_vectors` in `crc_simd.rs`.
+- [x] Enable SIMD CRC32 dispatch on aarch64 with corrected fold constants (completed 2026-05-06)
+  - **Goal:** `SimdCrc32Dispatcher::update` routes to `crc32_pmull` on aarch64 when `is_aarch64_feature_detected!("aes")` returns true. Output is bitwise-identical to scalar `software_crc32` for all input lengths 0–4096 bytes. `#[ignore]` removed from `test_pmull_matches_scalar_vectors`; test passes on Apple Silicon. x86_64 PCLMULQDQ path remains but its dispatch branch still returns false — regression test stays `#[ignore]` until a CI x86 runner exists.
+  - **Design:** (1) Pin aarch64 fold constants verbatim from crc32fast or zlib-ng with citation comment. (2) Replace crc_simd.rs lines 262–273 aarch64 constants block. (3) Wire `is_simd_available()` (line 507): on aarch64 return `is_aarch64_feature_detected!("aes")`; keep x86 returning false. (4) `SimdCrc32Dispatcher::update` (lines 543–547): branch to `crc32_pmull` when aarch64+feature, else scalar. (5) `crc.rs` lines 161–164: route through `SimdCrc32Dispatcher` instead of direct `software_crc32`. (6) Un-ignore `test_pmull_matches_scalar_vectors` (line 864); add length-sweep and randomized tests.
+  - **Files:** MODIFY `oxiarc-core/src/crc_simd.rs`, MODIFY `oxiarc-core/src/crc.rs`
+  - **Tests:** un-ignored `test_pmull_matches_scalar_vectors`; `test_pmull_length_sweep` (19 lengths 0–4096); `test_pmull_random_inputs` (100 random vectors, fixed seed); x86 test stays `#[ignore]`
+  - **Risk:** If `is_aarch64_feature_detected!("aes")` unavailable on the toolchain, fall back to `cfg!(target_feature = "aes")`; if neither resolves, keep dispatch off but land corrected constants.
 - [ ] Vectorized bit operations
 - [ ] Zero-copy buffer operations
 

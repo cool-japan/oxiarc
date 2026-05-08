@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_compress_empty() {
-        let result = compress(b"", CompressionLevel::default()).unwrap();
+        let result = compress(b"", CompressionLevel::default()).expect("compress empty input");
         // Should have at least header and footer
         assert!(result.len() >= 10);
         assert_eq!(&result[0..2], &BZIP2_MAGIC);
@@ -509,7 +509,8 @@ mod tests {
 
     #[test]
     fn test_compress_hello() {
-        let result = compress(b"hello world", CompressionLevel::new(1)).unwrap();
+        let result =
+            compress(b"hello world", CompressionLevel::new(1)).expect("compress hello world");
         assert!(result.len() > 10);
         assert_eq!(&result[0..2], &BZIP2_MAGIC);
     }
@@ -578,8 +579,9 @@ mod tests {
     fn test_parallel_roundtrip_basic() {
         use crate::decompress;
         let data = b"Hello, World! Parallel Bzip2 compression test.";
-        let compressed = compress_parallel(data, CompressionLevel::new(1)).unwrap();
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let compressed =
+            compress_parallel(data, CompressionLevel::new(1)).expect("parallel compress basic");
+        let decompressed = decompress(&compressed[..]).expect("decompress parallel basic");
         assert_eq!(decompressed, data.as_slice());
     }
 
@@ -589,8 +591,9 @@ mod tests {
         use crate::decompress;
         // Large data spanning multiple blocks
         let data = vec![0x42u8; 3_000_000];
-        let compressed = compress_parallel(&data, CompressionLevel::new(5)).unwrap();
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let compressed =
+            compress_parallel(&data, CompressionLevel::new(5)).expect("parallel compress large");
+        let decompressed = decompress(&compressed[..]).expect("decompress parallel large");
         assert_eq!(decompressed, data);
     }
 
@@ -601,12 +604,12 @@ mod tests {
         let data = b"Testing parallel vs serial Bzip2 compression.";
         let level = CompressionLevel::new(9);
 
-        let serial = compress(data, level).unwrap();
-        let parallel = compress_parallel(data, level).unwrap();
+        let serial = compress(data, level).expect("serial compress");
+        let parallel = compress_parallel(data, level).expect("parallel compress");
 
         // Both should decompress correctly
-        let serial_decompressed = decompress(&serial[..]).unwrap();
-        let parallel_decompressed = decompress(&parallel[..]).unwrap();
+        let serial_decompressed = decompress(&serial[..]).expect("decompress serial");
+        let parallel_decompressed = decompress(&parallel[..]).expect("decompress parallel");
 
         assert_eq!(serial_decompressed, data.as_slice());
         assert_eq!(parallel_decompressed, data.as_slice());
@@ -617,8 +620,9 @@ mod tests {
     fn test_parallel_empty() {
         use crate::decompress;
         let data: &[u8] = b"";
-        let compressed = compress_parallel(data, CompressionLevel::new(1)).unwrap();
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let compressed =
+            compress_parallel(data, CompressionLevel::new(1)).expect("parallel compress empty");
+        let decompressed = decompress(&compressed[..]).expect("decompress parallel empty");
         assert_eq!(decompressed, data);
     }
 
@@ -640,8 +644,9 @@ mod tests {
         data.truncate(target_size);
 
         // Compress and decompress first block
-        let compressed1 = compress_parallel(&data, CompressionLevel::new(1)).unwrap();
-        let decompressed1 = decompress(&compressed1[..]).unwrap();
+        let compressed1 =
+            compress_parallel(&data, CompressionLevel::new(1)).expect("parallel compress block 1");
+        let decompressed1 = decompress(&compressed1[..]).expect("decompress block 1");
         assert_eq!(decompressed1, data);
 
         // Create second block with different pattern
@@ -654,8 +659,9 @@ mod tests {
         data2.truncate(target_size);
 
         // Compress and decompress second block
-        let compressed2 = compress_parallel(&data2, CompressionLevel::new(1)).unwrap();
-        let decompressed2 = decompress(&compressed2[..]).unwrap();
+        let compressed2 =
+            compress_parallel(&data2, CompressionLevel::new(1)).expect("parallel compress block 2");
+        let decompressed2 = decompress(&compressed2[..]).expect("decompress block 2");
         assert_eq!(decompressed2, data2);
     }
 
@@ -668,12 +674,13 @@ mod tests {
         // This still gives 7200 bytes which is enough to test repeated data compression
         let data = b"aaaaaaaaaaaabbbbbbbbbbbbcccccccccccc".repeat(200);
         // Use level 3 instead of 9 for faster BWT while still testing compression quality
-        let compressed = compress_parallel(&data, CompressionLevel::new(3)).unwrap();
+        let compressed = compress_parallel(&data, CompressionLevel::new(3))
+            .expect("parallel compress repeated data");
 
         // Should compress well
         assert!(compressed.len() < data.len() / 5);
 
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let decompressed = decompress(&compressed[..]).expect("decompress repeated data");
         assert_eq!(decompressed, data);
     }
 
@@ -688,8 +695,9 @@ mod tests {
         // Test only levels 1, 5, 9 instead of all 1-9 to reduce test time by 67%
         // This still covers low, medium, and high compression adequately
         for level in [1, 5, 9] {
-            let compressed = compress_parallel(&data, CompressionLevel::new(level)).unwrap();
-            let decompressed = decompress(&compressed[..]).unwrap();
+            let compressed = compress_parallel(&data, CompressionLevel::new(level))
+                .expect("parallel compress for level");
+            let decompressed = decompress(&compressed[..]).expect("decompress for level");
             assert_eq!(decompressed, data, "Failed for level {}", level);
         }
     }

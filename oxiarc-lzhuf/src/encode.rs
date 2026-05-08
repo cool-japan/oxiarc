@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn test_encode_stored() {
         let data = b"Hello, World!";
-        let encoded = encode_lzh(data, LzhMethod::Lh0).unwrap();
+        let encoded = encode_lzh(data, LzhMethod::Lh0).expect("compression/encoding failed");
         assert_eq!(encoded, data);
     }
 
@@ -829,11 +829,12 @@ mod tests {
         println!("PT-tree codes: {:?}", pt_codes);
 
         // For very short data, it should all be literals
-        let encoded = encode_lzh(data, LzhMethod::Lh5).unwrap();
+        let encoded = encode_lzh(data, LzhMethod::Lh5).expect("compression/encoding failed");
         println!("Encoded {} bytes: {:02x?}", encoded.len(), &encoded);
 
         // Try to decode
-        let decoded = decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).unwrap();
+        let decoded =
+            decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).expect("decompression failed");
         assert_eq!(decoded, data);
     }
 
@@ -875,17 +876,19 @@ mod tests {
         let pt_lengths = enc.build_pt_lengths(&c_lengths, n);
         println!("PT-tree lengths: {:?}", pt_lengths);
 
-        let encoded = encode_lzh(data, LzhMethod::Lh5).unwrap();
+        let encoded = encode_lzh(data, LzhMethod::Lh5).expect("compression/encoding failed");
         println!("Encoded {} bytes", encoded.len());
-        let decoded = decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).unwrap();
+        let decoded =
+            decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).expect("decompression failed");
         assert_eq!(decoded, data);
     }
 
     #[test]
     fn test_lh5_roundtrip_pattern() {
         let data = b"abcabcabcabcabcabcabc";
-        let encoded = encode_lzh(data, LzhMethod::Lh5).unwrap();
-        let decoded = decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).unwrap();
+        let encoded = encode_lzh(data, LzhMethod::Lh5).expect("compression/encoding failed");
+        let decoded =
+            decode_lzh(&encoded, LzhMethod::Lh5, data.len() as u64).expect("decompression failed");
         assert_eq!(decoded, data);
     }
 

@@ -20,5 +20,6 @@
 //! ```
 
 mod header;
+pub(crate) mod sha256;
 
 pub use header::{XzReader, XzWriter, compress, decompress};

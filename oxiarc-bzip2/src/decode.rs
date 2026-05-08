@@ -297,7 +297,7 @@ mod tests {
 
         let decoder = BzDecoder::new(Cursor::new(data));
         assert!(decoder.is_ok());
-        let decoder = decoder.unwrap();
+        let decoder = decoder.expect("decoder should construct with valid header");
         assert_eq!(decoder.block_size(), 900_000);
     }
 

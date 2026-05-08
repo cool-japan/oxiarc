@@ -389,37 +389,39 @@ mod tests {
     #[test]
     fn test_compress_empty() {
         let data: &[u8] = b"";
-        let compressed = compress_block(data).unwrap();
+        let compressed = compress_block(data).expect("block compress empty");
         assert!(compressed.is_empty());
     }
 
     #[test]
     fn test_decompress_empty() {
         let data: &[u8] = b"";
-        let decompressed = decompress_block(data, 0).unwrap();
+        let decompressed = decompress_block(data, 0).expect("block decompress empty");
         assert!(decompressed.is_empty());
     }
 
     #[test]
     fn test_roundtrip_small() {
         let data = b"ab";
-        let compressed = compress_block(data).unwrap();
-        let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        let compressed = compress_block(data).expect("block compress small");
+        let decompressed =
+            decompress_block(&compressed, data.len()).expect("block decompress small");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_simple() {
         let data = b"Hello, World!";
-        let compressed = compress_block(data).unwrap();
-        let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        let compressed = compress_block(data).expect("block compress simple");
+        let decompressed =
+            decompress_block(&compressed, data.len()).expect("block decompress simple");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_repeated() {
         let data = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let compressed = compress_block(data).unwrap();
+        let compressed = compress_block(data).expect("block compress repeated");
         // Repeated data should compress well
         assert!(
             compressed.len() < data.len(),
@@ -427,15 +429,17 @@ mod tests {
             compressed.len(),
             data.len()
         );
-        let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        let decompressed =
+            decompress_block(&compressed, data.len()).expect("block decompress repeated");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_pattern() {
         let data = b"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
-        let compressed = compress_block(data).unwrap();
-        let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        let compressed = compress_block(data).expect("block compress pattern");
+        let decompressed =
+            decompress_block(&compressed, data.len()).expect("block decompress pattern");
         assert_eq!(decompressed, data);
     }
 

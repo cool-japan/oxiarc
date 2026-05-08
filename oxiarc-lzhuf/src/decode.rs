@@ -241,7 +241,8 @@ mod tests {
     #[test]
     fn test_decode_stored() {
         let data = b"Hello, World!";
-        let result = decode_lzh(data, LzhMethod::Lh0, data.len() as u64).unwrap();
+        let result =
+            decode_lzh(data, LzhMethod::Lh0, data.len() as u64).expect("decompression failed");
         assert_eq!(result, data);
     }
 

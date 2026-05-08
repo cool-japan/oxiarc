@@ -354,10 +354,28 @@ impl<R: Read> XzReader<R> {
                 Ok(())
             }
             CheckType::Sha256 => {
-                // SHA-256 verification would require a SHA-256 implementation
-                // For now, skip verification but log a warning
-                #[cfg(debug_assertions)]
-                eprintln!("[XZ] SHA-256 check verification not implemented");
+                if check_bytes.len() < 32 {
+                    return Err(OxiArcError::corrupted(
+                        0,
+                        format!(
+                            "XZ SHA-256 check field too short: {} bytes",
+                            check_bytes.len()
+                        ),
+                    ));
+                }
+                let mut expected = [0u8; 32];
+                expected.copy_from_slice(&check_bytes[..32]);
+                let computed = super::sha256::Sha256::compute(data);
+                if computed != expected {
+                    return Err(OxiArcError::corrupted(
+                        0,
+                        format!(
+                            "SHA-256 mismatch: expected {}, computed {}",
+                            super::sha256::hex32(&expected),
+                            super::sha256::hex32(&computed),
+                        ),
+                    ));
+                }
                 Ok(())
             }
         }
@@ -693,17 +711,19 @@ impl XzWriter {
         }
 
         // Write check
-        if self.check_type != CheckType::None {
-            match self.check_type {
-                CheckType::Crc32 => {
-                    let crc = Crc32::compute(data);
-                    writer.write_all(&crc.to_le_bytes())?;
-                }
-                _ => {
-                    // For other check types, write zeros for now
-                    let size = self.check_type.size();
-                    writer.write_all(&vec![0u8; size])?;
-                }
+        match self.check_type {
+            CheckType::None => {}
+            CheckType::Crc32 => {
+                let crc = Crc32::compute(data);
+                writer.write_all(&crc.to_le_bytes())?;
+            }
+            CheckType::Crc64 => {
+                let crc = Crc64::compute(data);
+                writer.write_all(&crc.to_le_bytes())?;
+            }
+            CheckType::Sha256 => {
+                let digest = super::sha256::Sha256::compute(data);
+                writer.write_all(&digest)?;
             }
         }
 
@@ -824,7 +844,7 @@ mod tests {
     fn test_stream_flags_encode_decode() {
         let flags = StreamFlags::new(CheckType::Crc32);
         let encoded = flags.encode();
-        let decoded = StreamFlags::decode(encoded).unwrap();
+        let decoded = StreamFlags::decode(encoded).expect("StreamFlags::decode");
         assert_eq!(decoded.check_type, CheckType::Crc32);
     }
 
@@ -845,31 +865,31 @@ mod tests {
     #[test]
     fn test_xz_roundtrip_empty() {
         let original: Vec<u8> = vec![];
-        let compressed = compress(&original, 6).unwrap();
+        let compressed = compress(&original, 6).expect("compress empty");
         // XZ header (12) + block + footer (12) = should have XZ structure
         assert!(compressed.len() > 24); // At minimum: header + empty block + footer
         assert_eq!(&compressed[0..6], XZ_MAGIC);
 
-        let decompressed = decompress_slice(&compressed).unwrap();
+        let decompressed = decompress_slice(&compressed).expect("decompress empty");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_xz_roundtrip_hello() {
         let original = b"Hello, World!";
-        let compressed = compress(original, 6).unwrap();
+        let compressed = compress(original, 6).expect("compress hello");
         assert_eq!(&compressed[0..6], XZ_MAGIC);
 
-        let decompressed = decompress_slice(&compressed).unwrap();
+        let decompressed = decompress_slice(&compressed).expect("decompress hello");
         assert_eq!(&decompressed, original);
     }
 
     #[test]
     fn test_xz_roundtrip_single_byte() {
         let original = [0x42u8];
-        let compressed = compress(&original, 6).unwrap();
+        let compressed = compress(&original, 6).expect("compress single byte");
 
-        let decompressed = decompress_slice(&compressed).unwrap();
+        let decompressed = decompress_slice(&compressed).expect("decompress single byte");
         assert_eq!(decompressed, original);
     }
 
@@ -877,11 +897,11 @@ mod tests {
     fn test_xz_roundtrip_repeated_pattern() {
         // Highly compressible data
         let original: Vec<u8> = (0..1000).map(|_| b'A').collect();
-        let compressed = compress(&original, 6).unwrap();
+        let compressed = compress(&original, 6).expect("compress repeated pattern");
         // Should compress well
         assert!(compressed.len() < original.len());
 
-        let decompressed = decompress_slice(&compressed).unwrap();
+        let decompressed = decompress_slice(&compressed).expect("decompress repeated pattern");
         assert_eq!(decompressed, original);
     }
 

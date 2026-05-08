@@ -115,34 +115,38 @@ mod tests {
     #[test]
     fn test_encode_simple() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder");
 
         let original = b"TOBEORNOTTOBEORTOBEORNOT";
-        let compressed = encoder.encode(original).unwrap();
+        let compressed = encoder.encode(original).expect("lzw encode simple");
 
         // Compressed should be smaller (or at least not much larger)
         // For this highly repetitive string, compression should be effective
         assert!(compressed.len() < original.len() * 2);
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode simple");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_encode_310_bytes() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder 310");
 
         let original = b"This is a test of compression! ".repeat(10);
         assert_eq!(original.len(), 310);
 
-        let compressed = encoder.encode(&original).unwrap();
+        let compressed = encoder.encode(&original).expect("lzw encode 310 bytes");
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder 310");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode 310 bytes");
         assert_eq!(decompressed.len(), 310);
         assert_eq!(decompressed, &original[..]);
     }
@@ -150,77 +154,85 @@ mod tests {
     #[test]
     fn test_encode_empty() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder empty");
 
         let original = b"";
-        let compressed = encoder.encode(original).unwrap();
+        let compressed = encoder.encode(original).expect("lzw encode empty");
 
         // Should contain at least EOI code
         assert!(!compressed.is_empty());
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, 0).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder empty");
+        let decompressed = decoder.decode(&compressed, 0).expect("lzw decode empty");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_encode_single_byte() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder single byte");
 
         let original = b"A";
-        let compressed = encoder.encode(original).unwrap();
+        let compressed = encoder.encode(original).expect("lzw encode single byte");
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder single byte");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode single byte");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_encode_repeating() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder repeating");
 
         let original = vec![b'X'; 500];
-        let compressed = encoder.encode(&original).unwrap();
+        let compressed = encoder.encode(&original).expect("lzw encode repeating");
 
         // Highly repetitive data should compress well
         assert!(compressed.len() < original.len() / 2);
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder repeating");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode repeating");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_encode_all_bytes() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder all bytes");
 
         // Test with all possible byte values
         let original: Vec<u8> = (0..=255).collect();
-        let compressed = encoder.encode(&original).unwrap();
+        let compressed = encoder.encode(&original).expect("lzw encode all bytes");
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder all bytes");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode all bytes");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_encode_alternating() {
         let config = LzwConfig::TIFF;
-        let mut encoder = LzwEncoder::new(config).unwrap();
+        let mut encoder = LzwEncoder::new(config).expect("create lzw encoder alternating");
 
         let original = b"ABABABABABABABABAB";
-        let compressed = encoder.encode(original).unwrap();
+        let compressed = encoder.encode(original).expect("lzw encode alternating");
 
         // Verify round-trip
-        let mut decoder = LzwDecoder::new(config).unwrap();
-        let decompressed = decoder.decode(&compressed, original.len()).unwrap();
+        let mut decoder = LzwDecoder::new(config).expect("create lzw decoder alternating");
+        let decompressed = decoder
+            .decode(&compressed, original.len())
+            .expect("lzw decode alternating");
         assert_eq!(decompressed, original);
     }
 }

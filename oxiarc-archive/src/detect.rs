@@ -4,7 +4,7 @@
 //! magic numbers (file signatures).
 
 use oxiarc_core::error::Result;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 /// Known archive formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,8 @@ pub enum ArchiveFormat {
     Brotli,
     /// Snappy compressed file (.sz, .snappy).
     Snappy,
+    /// ISO 9660 CD/DVD image (.iso).
+    Iso9660,
     /// Unknown format.
     Unknown,
 }
@@ -120,13 +122,34 @@ impl ArchiveFormat {
     }
 
     /// Detect format from a reader.
-    pub fn detect<R: Read>(reader: &mut R) -> Result<(Self, Vec<u8>)> {
+    ///
+    /// Reads magic bytes from the current position. For ISO 9660, seeks to
+    /// byte 32768 (LBA 16) to check the CD001 identifier.
+    /// The reader is left at an unspecified position after this call; callers
+    /// should seek back to 0 before further use.
+    pub fn detect<R: Read + Seek>(reader: &mut R) -> Result<(Self, Vec<u8>)> {
         let mut magic = vec![0u8; 262]; // Enough for TAR detection
         let bytes_read = reader.read(&mut magic)?;
         magic.truncate(bytes_read);
 
         let format = Self::from_magic(&magic);
-        Ok((format, magic))
+        if format != Self::Unknown {
+            return Ok((format, magic));
+        }
+
+        // ISO 9660 detection: seek to byte 32768 (LBA 16) and check for CD001
+        if let Ok(()) = reader.seek(SeekFrom::Start(32768)).map(|_| ()) {
+            let mut iso_sig = [0u8; 6];
+            if reader.read_exact(&mut iso_sig).is_ok() {
+                // Byte 0 is VD type (1=Primary, 2=Supplementary, 3=Boot, 255=Terminator)
+                // Bytes 1-5 must be "CD001"
+                if &iso_sig[1..6] == b"CD001" && matches!(iso_sig[0], 1 | 2 | 3 | 255) {
+                    return Ok((Self::Iso9660, magic));
+                }
+            }
+        }
+
+        Ok((Self::Unknown, magic))
     }
 
     /// Get the typical file extension.
@@ -144,6 +167,7 @@ impl ArchiveFormat {
             Self::Cab => "cab",
             Self::Brotli => "br",
             Self::Snappy => "sz",
+            Self::Iso9660 => "iso",
             Self::Unknown => "",
         }
     }
@@ -163,6 +187,7 @@ impl ArchiveFormat {
             Self::Cab => "application/vnd.ms-cab-compressed",
             Self::Brotli => "application/x-brotli",
             Self::Snappy => "application/x-snappy",
+            Self::Iso9660 => "application/x-iso9660-image",
             Self::Unknown => "application/octet-stream",
         }
     }
@@ -185,7 +210,7 @@ impl ArchiveFormat {
     pub fn is_archive(&self) -> bool {
         matches!(
             self,
-            Self::Zip | Self::Tar | Self::Lzh | Self::SevenZip | Self::Cab
+            Self::Zip | Self::Tar | Self::Lzh | Self::SevenZip | Self::Cab | Self::Iso9660
         )
     }
 }
@@ -205,6 +230,7 @@ impl std::fmt::Display for ArchiveFormat {
             Self::Cab => write!(f, "Cabinet"),
             Self::Brotli => write!(f, "Brotli"),
             Self::Snappy => write!(f, "Snappy"),
+            Self::Iso9660 => write!(f, "ISO 9660"),
             Self::Unknown => write!(f, "Unknown"),
         }
     }
@@ -298,5 +324,28 @@ mod tests {
         assert!(!ArchiveFormat::Lz4.is_archive());
         assert!(ArchiveFormat::Cab.is_archive());
         assert!(!ArchiveFormat::Cab.is_compression_only());
+    }
+
+    #[test]
+    fn test_detect_iso9660() {
+        use std::io::Cursor;
+        // Build a minimal buffer with CD001 at byte 32768 (LBA 16)
+        let mut data = vec![0u8; 32768 + 6];
+        data[32768] = 1; // PVD type
+        data[32769..32774].copy_from_slice(b"CD001");
+        let mut cursor = Cursor::new(data);
+        let (format, _) = ArchiveFormat::detect(&mut cursor).expect("detect failed");
+        assert_eq!(format, ArchiveFormat::Iso9660);
+    }
+
+    #[test]
+    fn test_iso9660_properties() {
+        assert!(ArchiveFormat::Iso9660.is_archive());
+        assert!(!ArchiveFormat::Iso9660.is_compression_only());
+        assert_eq!(ArchiveFormat::Iso9660.extension(), "iso");
+        assert_eq!(
+            ArchiveFormat::Iso9660.mime_type(),
+            "application/x-iso9660-image"
+        );
     }
 }

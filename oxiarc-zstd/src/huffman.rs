@@ -320,7 +320,7 @@ mod tests {
     fn test_huffman_table_from_weights() {
         // Simple test: two symbols with equal weight
         let weights = [1u8, 1];
-        let table = HuffmanTable::from_weights(&weights).unwrap();
+        let table = HuffmanTable::from_weights(&weights).expect("valid huffman table");
 
         assert!(table.max_bits() >= 1);
     }
@@ -329,7 +329,7 @@ mod tests {
     fn test_huffman_table_varying_weights() {
         // More complex: varying weights
         let weights = [4u8, 3, 2, 1, 1, 0, 0, 0];
-        let table = HuffmanTable::from_weights(&weights).unwrap();
+        let table = HuffmanTable::from_weights(&weights).expect("valid huffman table");
 
         // Should have valid entries
         assert!(table.max_bits() > 0);
@@ -345,7 +345,7 @@ mod tests {
         data.push(0x21); // weights 2, 1
         data.push(0x11); // weights 1, 1
 
-        let (table, consumed) = read_huffman_table(&data).unwrap();
+        let (table, consumed) = read_huffman_table(&data).expect("valid huffman table");
 
         assert_eq!(consumed, 3);
         assert!(table.max_bits() > 0);

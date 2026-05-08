@@ -3,11 +3,13 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![Version](https://img.shields.io/badge/version-0.2.8-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.2.7** (2026-04-21) — 68 tests passing.
+**Version 0.2.8** (2026-05-08) — 74 tests passing.
+
+**What's new in 0.2.8**: `with_progress(Arc<dyn ProgressSink>)` and `with_cancel(CancellationToken)` builder methods on `Lzma2Encoder`, `Lzma2Decoder`, and `Lzma2ChunkedEncoder` for progress reporting and cooperative cancellation.
 
 **What's new in 0.2.6**: Encoder improvements including probability model refinements and optimal parsing enhancements for better compression ratios on structured data.
 
@@ -32,6 +34,8 @@ It's used in:
 - **Configurable levels** - 0-9 compression levels
 - **Streaming API** - Memory-efficient processing
 - **Range Coder** - Precise 11-bit probability model
+- **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on LZMA2 codecs
+- **Cooperative cancellation** - `with_cancel(CancellationToken)` builder on LZMA2 codecs
 
 All features are implemented and tested. API is stable.
 
@@ -203,7 +207,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.2.6"
+oxiarc-lzma = "0.2.8"
 ```
 
 ## Modules

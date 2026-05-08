@@ -427,8 +427,6 @@ mod tests {
         let plaintext = "Repeated text for compression. ".repeat(50);
         let plaintext_bytes = plaintext.as_bytes();
 
-        // Write with explicit Store compression (deflate + AES has issues)
-        // TODO: Fix deflate + AES combination in the future
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);
@@ -450,6 +448,33 @@ mod tests {
         let data = reader.extract_with_password_aes(&entry, password)?;
         assert_eq!(data, plaintext_bytes);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_aes_encrypted_with_deflate() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let password = b"password";
+        let plaintext = "Repeated text for compression. ".repeat(50);
+        let plaintext_bytes = plaintext.as_bytes();
+
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            writer.add_encrypted_file_with_options(
+                "compressed.txt",
+                plaintext_bytes,
+                password,
+                ZipCompressionLevel::Normal,
+                AesStrength::Aes256,
+            )?;
+            writer.finish()?;
+        }
+
+        let cursor = Cursor::new(output);
+        let mut reader = ZipReader::new(cursor)?;
+        let entry = reader.entries()[0].clone();
+        let data = reader.extract_with_password_aes(&entry, password)?;
+        assert_eq!(data, plaintext_bytes);
         Ok(())
     }
 
@@ -731,8 +756,6 @@ mod tests {
         // Create 10KB of data (reduced from 100KB for faster test)
         let plaintext: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
 
-        // AES encryption with Store compression
-        // TODO: Fix deflate + encryption combination
         let mut output = Vec::new();
         {
             let mut writer = ZipWriter::new(&mut output);

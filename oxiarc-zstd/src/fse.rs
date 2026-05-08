@@ -403,7 +403,7 @@ mod tests {
     fn test_fse_table_creation() {
         // Simple uniform distribution: 4 symbols with equal probability
         let probs = [4i16, 4, 4, 4]; // Each symbol gets 4 states in a 16-state table
-        let table = FseTable::new(4, &probs).unwrap();
+        let table = FseTable::new(4, &probs).expect("valid FSE operation");
 
         assert_eq!(table.accuracy_log(), 4);
         assert_eq!(table.size(), 16);
@@ -413,7 +413,7 @@ mod tests {
     fn test_fse_table_with_less_than_one() {
         // Mix of normal and less-than-one probabilities
         let probs = [8i16, 4, 2, 1, -1]; // Total = 15 + 1 = 16
-        let table = FseTable::new(4, &probs).unwrap();
+        let table = FseTable::new(4, &probs).expect("valid FSE operation");
 
         assert_eq!(table.size(), 16);
     }
@@ -423,9 +423,18 @@ mod tests {
         let data = [0b10110100, 0b11001010];
         let mut bit_pos = 0;
 
-        assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b0100);
-        assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b1011);
-        assert_eq!(read_bits_forward(&data, &mut bit_pos, 4).unwrap(), 0b1010);
+        assert_eq!(
+            read_bits_forward(&data, &mut bit_pos, 4).expect("valid FSE operation"),
+            0b0100
+        );
+        assert_eq!(
+            read_bits_forward(&data, &mut bit_pos, 4).expect("valid FSE operation"),
+            0b1011
+        );
+        assert_eq!(
+            read_bits_forward(&data, &mut bit_pos, 4).expect("valid FSE operation"),
+            0b1010
+        );
     }
 
     #[test]

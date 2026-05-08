@@ -52,6 +52,12 @@ pub mod zlib;
 #[cfg(feature = "async-io")]
 pub mod async_deflate;
 
+#[cfg(feature = "async-io")]
+pub mod raw_stream;
+
+#[cfg(feature = "async-io")]
+pub use raw_stream::{RawDeflateWriter, RawInflateReader};
+
 // Re-exports
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
 pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};

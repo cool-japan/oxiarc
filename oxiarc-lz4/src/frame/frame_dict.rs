@@ -6,7 +6,9 @@ use crate::dict::{
     decompress_with_dict as block_decompress_with_dict,
 };
 use crate::xxhash::{XxHash32, xxhash32};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::traits::{CompressStatus, Compressor, DecompressStatus, Decompressor, FlushMode};
 
 /// Compress data using the official LZ4 frame format with dictionary.
@@ -364,6 +366,310 @@ pub fn decompress_frame_with_dict(
     Ok(output)
 }
 
+/// Compress data using the official LZ4 frame format with dictionary, reporting progress.
+///
+/// This is the internal variant of [`compress_frame_with_dict_options`] that
+/// accepts optional progress and cancellation hooks.  Each block reports
+/// cumulative uncompressed bytes via `progress.on_progress`.
+fn compress_frame_with_dict_options_tracked(
+    input: &[u8],
+    dict: &Lz4Dict,
+    desc: FrameDescriptor,
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(19 + input.len());
+    let mut content_hasher = if desc.content_checksum {
+        Some(XxHash32::new())
+    } else {
+        None
+    };
+
+    // Write magic number
+    output.extend_from_slice(&LZ4_FRAME_MAGIC.to_le_bytes());
+
+    // Write frame descriptor with dictionary ID flag
+    let desc_with_dict = FrameDescriptor {
+        dict_id: Some(dict.id()),
+        ..desc
+    };
+    let flg = desc_with_dict.flg_byte();
+    let bd = desc_with_dict.block_max_size.to_bd();
+    output.push(flg);
+    output.push(bd);
+
+    if let Some(size) = desc_with_dict.content_size {
+        output.extend_from_slice(&size.to_le_bytes());
+    }
+
+    output.extend_from_slice(&dict.id().to_le_bytes());
+
+    let header_checksum = {
+        let header_start = 4;
+        let header_end = output.len();
+        (xxhash32(&output[header_start..header_end]) >> 8) as u8
+    };
+    output.push(header_checksum);
+
+    let block_size = desc_with_dict.block_max_size.size_bytes();
+    let mut pos = 0;
+    let mut bytes_processed: u64 = 0;
+
+    while pos < input.len() {
+        // Cooperative cancellation check before each block.
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+
+        let chunk_end = (pos + block_size).min(input.len());
+        let chunk = &input[pos..chunk_end];
+
+        if let Some(ref mut hasher) = content_hasher {
+            hasher.update(chunk);
+        }
+
+        let compressed = block_compress_with_dict(chunk, dict)?;
+
+        if compressed.len() < chunk.len() {
+            let block_len = compressed.len() as u32;
+            output.extend_from_slice(&block_len.to_le_bytes());
+            output.extend_from_slice(&compressed);
+            if desc_with_dict.block_checksum {
+                let checksum = xxhash32(&compressed);
+                output.extend_from_slice(&checksum.to_le_bytes());
+            }
+        } else {
+            let block_len = (chunk.len() as u32) | 0x80000000;
+            output.extend_from_slice(&block_len.to_le_bytes());
+            output.extend_from_slice(chunk);
+            if desc_with_dict.block_checksum {
+                let checksum = xxhash32(chunk);
+                output.extend_from_slice(&checksum.to_le_bytes());
+            }
+        }
+
+        bytes_processed += chunk.len() as u64;
+        if let Some(handle) = progress {
+            handle.on_progress(bytes_processed, None);
+        }
+
+        pos = chunk_end;
+    }
+
+    output.extend_from_slice(&0u32.to_le_bytes());
+
+    if let Some(hasher) = content_hasher {
+        let checksum = hasher.finish();
+        output.extend_from_slice(&checksum.to_le_bytes());
+    }
+
+    if let Some(handle) = progress {
+        handle.on_finish();
+    }
+
+    Ok(output)
+}
+
+/// Decompress LZ4 framed data with dictionary, reporting progress.
+///
+/// This is the internal variant of [`decompress_frame_with_dict`] that accepts
+/// optional progress and cancellation hooks.  Each block reports cumulative
+/// decompressed bytes via `progress.on_progress`.
+fn decompress_frame_with_dict_tracked(
+    input: &[u8],
+    max_output: usize,
+    dict: &Lz4Dict,
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<u8>> {
+    if input.len() < 7 {
+        return Err(OxiArcError::invalid_header("LZ4 frame too short"));
+    }
+
+    let magic = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+    if magic != LZ4_FRAME_MAGIC {
+        return Err(OxiArcError::invalid_magic(
+            LZ4_FRAME_MAGIC.to_le_bytes(),
+            &input[..4],
+        ));
+    }
+
+    let mut pos = 4;
+
+    let flg = input[pos];
+    pos += 1;
+    let bd = input[pos];
+    pos += 1;
+
+    let mut desc = FrameDescriptor::parse(flg, bd)?;
+
+    if desc.content_size.is_some() {
+        if pos + 8 > input.len() {
+            return Err(OxiArcError::invalid_header("missing content size"));
+        }
+        let size = u64::from_le_bytes([
+            input[pos],
+            input[pos + 1],
+            input[pos + 2],
+            input[pos + 3],
+            input[pos + 4],
+            input[pos + 5],
+            input[pos + 6],
+            input[pos + 7],
+        ]);
+        desc.content_size = Some(size);
+        pos += 8;
+    }
+
+    if desc.dict_id.is_some() {
+        if pos + 4 > input.len() {
+            return Err(OxiArcError::invalid_header("missing dictionary ID"));
+        }
+        let frame_dict_id =
+            u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
+        pos += 4;
+
+        if frame_dict_id != dict.id() {
+            return Err(OxiArcError::corrupted(pos as u64, "dictionary ID mismatch"));
+        }
+        desc.dict_id = Some(frame_dict_id);
+    }
+
+    if pos >= input.len() {
+        return Err(OxiArcError::invalid_header("missing header checksum"));
+    }
+    let stored_hc = input[pos];
+    pos += 1;
+
+    let header_data = &input[4..pos - 1];
+    let computed_hc = (xxhash32(header_data) >> 8) as u8;
+    if stored_hc != computed_hc {
+        return Err(OxiArcError::crc_mismatch(
+            computed_hc as u32,
+            stored_hc as u32,
+        ));
+    }
+
+    let mut output = Vec::with_capacity(
+        desc.content_size
+            .map(|s| s as usize)
+            .unwrap_or(max_output)
+            .min(max_output),
+    );
+    let mut content_hasher = if desc.content_checksum {
+        Some(XxHash32::new())
+    } else {
+        None
+    };
+
+    let block_max = desc.block_max_size.size_bytes();
+    let mut bytes_processed: u64 = 0;
+
+    loop {
+        // Cooperative cancellation check before each block.
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+
+        if pos + 4 > input.len() {
+            return Err(OxiArcError::corrupted(pos as u64, "truncated block header"));
+        }
+
+        let block_len =
+            u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
+        pos += 4;
+
+        if block_len == 0 {
+            break;
+        }
+
+        let uncompressed = (block_len & 0x80000000) != 0;
+        let block_size = (block_len & 0x7FFFFFFF) as usize;
+
+        if block_size > block_max {
+            return Err(OxiArcError::corrupted(
+                pos as u64,
+                "block size exceeds maximum",
+            ));
+        }
+
+        if pos + block_size > input.len() {
+            return Err(OxiArcError::corrupted(pos as u64, "truncated block data"));
+        }
+
+        let block_data = &input[pos..pos + block_size];
+        pos += block_size;
+
+        if desc.block_checksum {
+            if pos + 4 > input.len() {
+                return Err(OxiArcError::corrupted(pos as u64, "missing block checksum"));
+            }
+            let stored_checksum =
+                u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
+            pos += 4;
+
+            let computed_checksum = xxhash32(block_data);
+            if stored_checksum != computed_checksum {
+                return Err(OxiArcError::crc_mismatch(
+                    computed_checksum,
+                    stored_checksum,
+                ));
+            }
+        }
+
+        let decompressed = if uncompressed {
+            block_data.to_vec()
+        } else {
+            block_decompress_with_dict(block_data, block_max, dict)?
+        };
+
+        if let Some(ref mut hasher) = content_hasher {
+            hasher.update(&decompressed);
+        }
+
+        bytes_processed += decompressed.len() as u64;
+        output.extend_from_slice(&decompressed);
+
+        if output.len() > max_output {
+            return Err(OxiArcError::corrupted(
+                pos as u64,
+                "output exceeds maximum size",
+            ));
+        }
+
+        if let Some(handle) = progress {
+            handle.on_progress(bytes_processed, None);
+        }
+    }
+
+    if desc.content_checksum {
+        if pos + 4 > input.len() {
+            return Err(OxiArcError::corrupted(
+                pos as u64,
+                "missing content checksum",
+            ));
+        }
+        let stored_checksum =
+            u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
+
+        if let Some(hasher) = content_hasher {
+            let computed_checksum = hasher.finish();
+            if stored_checksum != computed_checksum {
+                return Err(OxiArcError::crc_mismatch(
+                    computed_checksum,
+                    stored_checksum,
+                ));
+            }
+        }
+    }
+
+    if let Some(handle) = progress {
+        handle.on_finish();
+    }
+
+    Ok(output)
+}
+
 /// Extract dictionary ID from an LZ4 frame header.
 ///
 /// Returns `None` if no dictionary ID is present in the frame.
@@ -408,6 +714,10 @@ pub fn get_frame_dict_id(input: &[u8]) -> Result<Option<u32>> {
 /// This encoder uses a dictionary to improve compression ratios for small data
 /// with common patterns.
 ///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`Lz4DictFrameEncoder::with_progress`] / [`Lz4DictFrameEncoder::with_cancel`] builders.
+///
 /// # Example
 ///
 /// ```
@@ -423,6 +733,10 @@ pub fn get_frame_dict_id(input: &[u8]) -> Result<Option<u32>> {
 pub struct Lz4DictFrameEncoder {
     dict: Lz4Dict,
     desc: FrameDescriptor,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
 }
 
 impl Lz4DictFrameEncoder {
@@ -431,12 +745,37 @@ impl Lz4DictFrameEncoder {
         Self {
             dict,
             desc: FrameDescriptor::new(),
+            progress: None,
+            cancel: None,
         }
     }
 
     /// Create a new dictionary frame encoder with custom options.
     pub fn with_options(dict: Lz4Dict, desc: FrameDescriptor) -> Self {
-        Self { dict, desc }
+        Self {
+            dict,
+            desc,
+            progress: None,
+            cancel: None,
+        }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(bytes_processed, None)` is called after each
+    /// block is compressed. `on_finish()` is called when all blocks are done.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before each block is compressed.
+    /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Get the dictionary.
@@ -451,13 +790,25 @@ impl Lz4DictFrameEncoder {
 
     /// Encode data using the dictionary.
     pub fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        compress_frame_with_dict_options(input, &self.dict, self.desc)
+        compress_frame_with_dict_options_tracked(
+            input,
+            &self.dict,
+            self.desc,
+            self.progress.as_ref(),
+            self.cancel.as_ref(),
+        )
     }
 
     /// Encode data with content size in header.
     pub fn encode_with_size(&self, input: &[u8]) -> Result<Vec<u8>> {
         let desc = self.desc.with_content_size(input.len() as u64);
-        compress_frame_with_dict_options(input, &self.dict, desc)
+        compress_frame_with_dict_options_tracked(
+            input,
+            &self.dict,
+            desc,
+            self.progress.as_ref(),
+            self.cancel.as_ref(),
+        )
     }
 }
 
@@ -474,6 +825,10 @@ impl std::fmt::Debug for Lz4DictFrameEncoder {
 ///
 /// This decoder uses a dictionary to decompress data that was compressed
 /// with dictionary support.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`Lz4DictFrameDecoder::with_progress`] / [`Lz4DictFrameDecoder::with_cancel`] builders.
 ///
 /// # Example
 ///
@@ -492,12 +847,38 @@ impl std::fmt::Debug for Lz4DictFrameEncoder {
 /// ```
 pub struct Lz4DictFrameDecoder {
     dict: Lz4Dict,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
 }
 
 impl Lz4DictFrameDecoder {
     /// Create a new dictionary frame decoder.
     pub fn new(dict: Lz4Dict) -> Self {
-        Self { dict }
+        Self {
+            dict,
+            progress: None,
+            cancel: None,
+        }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(bytes_decompressed, None)` is called after each
+    /// block is decompressed. `on_finish()` is called when all blocks are done.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before each block is decompressed.
+    /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Get the dictionary.
@@ -512,7 +893,13 @@ impl Lz4DictFrameDecoder {
 
     /// Decode data using the dictionary.
     pub fn decode(&self, input: &[u8], max_output: usize) -> Result<Vec<u8>> {
-        decompress_frame_with_dict(input, max_output, &self.dict)
+        decompress_frame_with_dict_tracked(
+            input,
+            max_output,
+            &self.dict,
+            self.progress.as_ref(),
+            self.cancel.as_ref(),
+        )
     }
 
     /// Check if the input frame requires this dictionary.
@@ -682,5 +1069,114 @@ impl Decompressor for Lz4DictDecompressor {
 
     fn is_finished(&self) -> bool {
         self.finished
+    }
+}
+
+#[cfg(test)]
+mod dict_frame_tests {
+    use super::*;
+    use oxiarc_core::cancel::CancellationToken;
+    use oxiarc_core::progress::ProgressSink;
+    use std::sync::{Arc, Mutex};
+
+    type ProgressLog = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
+    struct MockSink(ProgressLog);
+
+    impl ProgressSink for MockSink {
+        fn on_progress(&self, processed: u64, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("lock poisoned")
+                .push((processed, total));
+        }
+    }
+
+    fn make_compressible_data(size: usize) -> Vec<u8> {
+        let pattern = b"LZ4 dict frame test data with repeating pattern ABCDEFGH ";
+        let mut data = Vec::with_capacity(size);
+        while data.len() < size {
+            let remaining = size - data.len();
+            let chunk = &pattern[..remaining.min(pattern.len())];
+            data.extend_from_slice(chunk);
+        }
+        data
+    }
+
+    #[test]
+    fn test_lz4_dict_frame_encoder_progress_reports() {
+        let dict = Lz4Dict::new(b"repeating pattern ABCDEFGH ");
+        let data = make_compressible_data(1024 * 1024); // 1 MB
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let encoder = Lz4DictFrameEncoder::new(dict).with_progress(sink as ProgressHandle);
+        encoder.encode(&data).expect("encode failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal input size"
+        );
+    }
+
+    #[test]
+    fn test_lz4_dict_frame_encoder_cancel_aborts() {
+        let dict = Lz4Dict::new(b"repeating pattern ABCDEFGH ");
+        let data = make_compressible_data(1024 * 1024);
+        let token = CancellationToken::new();
+
+        let encoder = Lz4DictFrameEncoder::new(dict).with_cancel(token.clone());
+        token.cancel();
+
+        let result = encoder.encode(&data);
+        assert!(result.is_err(), "expected cancellation error");
+    }
+
+    #[test]
+    fn test_lz4_dict_frame_decoder_progress_reports() {
+        let dict = Lz4Dict::new(b"repeating pattern ABCDEFGH ");
+        let data = make_compressible_data(1024 * 1024); // 1 MB
+
+        let compressed = Lz4DictFrameEncoder::new(dict.clone())
+            .encode(&data)
+            .expect("encode failed");
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let decoder = Lz4DictFrameDecoder::new(dict).with_progress(sink as ProgressHandle);
+        decoder
+            .decode(&compressed, data.len() * 2)
+            .expect("decode failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal decompressed size"
+        );
+    }
+
+    #[test]
+    fn test_lz4_dict_frame_decoder_cancel_aborts() {
+        let dict = Lz4Dict::new(b"repeating pattern ABCDEFGH ");
+        let data = make_compressible_data(1024 * 1024);
+        let compressed = Lz4DictFrameEncoder::new(dict.clone())
+            .encode(&data)
+            .expect("encode failed");
+
+        let token = CancellationToken::new();
+        let decoder = Lz4DictFrameDecoder::new(dict).with_cancel(token.clone());
+        token.cancel();
+
+        let result = decoder.decode(&compressed, data.len() * 2);
+        assert!(result.is_err(), "expected cancellation error");
     }
 }

@@ -93,30 +93,33 @@ mod tests {
     fn test_roundtrip_hello() {
         // Start with a simpler test case - single character
         let original = b"a";
-        let compressed = compress(original, CompressionLevel::new(1)).unwrap();
+        let compressed =
+            compress(original, CompressionLevel::new(1)).expect("compress hello roundtrip");
         eprintln!(
             "Compressed {} bytes to {} bytes",
             original.len(),
             compressed.len()
         );
         eprintln!("Compressed data: {:02x?}", &compressed);
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let decompressed = decompress(&compressed[..]).expect("decompress hello roundtrip");
         assert_eq!(decompressed, original.as_slice());
     }
 
     #[test]
     fn test_roundtrip_repeated() {
         let original = b"aaaaaaaaaabbbbbbbbbbcccccccccc";
-        let compressed = compress(original, CompressionLevel::new(1)).unwrap();
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let compressed =
+            compress(original, CompressionLevel::new(1)).expect("compress repeated roundtrip");
+        let decompressed = decompress(&compressed[..]).expect("decompress repeated roundtrip");
         assert_eq!(decompressed, original.as_slice());
     }
 
     #[test]
     fn test_roundtrip_empty() {
         let original = b"";
-        let compressed = compress(original, CompressionLevel::new(1)).unwrap();
-        let decompressed = decompress(&compressed[..]).unwrap();
+        let compressed =
+            compress(original, CompressionLevel::new(1)).expect("compress empty roundtrip");
+        let decompressed = decompress(&compressed[..]).expect("decompress empty roundtrip");
         assert_eq!(decompressed, original.as_slice());
     }
 }

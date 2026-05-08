@@ -97,7 +97,7 @@ mod tests {
             obs_clone.store(true, StdOrdering::Release);
         });
         token.cancel();
-        handle.join().unwrap();
+        handle.join().expect("thread should complete without panic");
         assert!(observed.load(StdOrdering::Acquire));
     }
 }

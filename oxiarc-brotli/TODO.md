@@ -1,4 +1,4 @@
-# oxiarc-brotli - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-brotli - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 

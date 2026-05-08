@@ -144,24 +144,29 @@ static CRC32_DISPATCH: std::sync::OnceLock<Crc32Fn> = std::sync::OnceLock::new()
 /// Select the best available CRC-32 implementation at runtime.
 ///
 /// Called once and cached in `CRC32_DISPATCH`. Checks for CPU features and
-/// returns the fastest verified implementation:
-/// - On x86_64: uses `software_crc32` (slicing-by-8) via the SIMD dispatcher
-///   until PCLMULQDQ fold constants are fully verified in `crc_simd::x86`.
-/// - On aarch64: uses `software_crc32` (slicing-by-8) via the SIMD dispatcher
-///   until PMULL paths are fully verified in `crc_simd::arm`.
-///
-/// The dispatch infrastructure (OnceLock + fn pointer) is in place so that
-/// when SIMD paths are re-enabled in `SimdCrc32Dispatcher`, only this function
-/// needs updating and the hot path automatically benefits.
+/// returns a plain function pointer to the fastest verified implementation:
+/// - On aarch64 with AES/PMULL support: `arm::crc32_pmull` wrapper.
+/// - On x86_64: PCLMULQDQ path pending verification; slicing-by-8.
+/// - Other architectures: slicing-by-8.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn init_crc32_dispatch() -> Crc32Fn {
-    // Delegate to the dispatcher's update, which itself does runtime feature
-    // detection and currently routes to software_crc32 for correctness.
-    // Wrap in a free fn pointer so CRC32_DISPATCH stores a plain fn, not a closure.
-    fn dispatch_via_simd_module(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::crc_simd::arm::is_supported() {
+            // SAFETY: is_supported() verified AES/PMULL is available.
+            fn pmull_dispatch(crc: u32, data: &[u8]) -> u32 {
+                // SAFETY: this function is only selected when is_supported() is true,
+                // meaning the AES (and therefore PMULL) CPU feature is present.
+                unsafe { crate::crc_simd::arm::crc32_pmull(crc, data) }
+            }
+            return pmull_dispatch;
+        }
+    }
+    // Fallback: slicing-by-8 software implementation.
+    fn software_dispatch(crc: u32, data: &[u8]) -> u32 {
         crate::crc_simd::software_crc32(crc, data)
     }
-    dispatch_via_simd_module
+    software_dispatch
 }
 
 /// Get the cached runtime-dispatched CRC-32 function.

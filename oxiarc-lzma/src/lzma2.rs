@@ -19,10 +19,16 @@ use crate::model::{
     LzmaModel, LzmaProperties, MATCH_LEN_MIN, State,
 };
 use crate::{LzmaLevel, RangeDecoder};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::progress::ProgressHandle;
 use std::io::{Read, Write};
 
 /// LZMA2 decoder.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`Lzma2Decoder::with_progress`] / [`Lzma2Decoder::with_cancel`] builders.
 pub struct Lzma2Decoder {
     /// Dictionary size.
     dict_size: u32,
@@ -42,6 +48,12 @@ pub struct Lzma2Decoder {
     rep: [u32; 4],
     /// Whether decoding is finished.
     finished: bool,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
+    /// Cumulative decompressed bytes.
+    bytes_processed: u64,
 }
 
 impl Lzma2Decoder {
@@ -58,7 +70,28 @@ impl Lzma2Decoder {
             state: State::new(),
             rep: [0; 4],
             finished: false,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(cumulative_decompressed_bytes, None)` is called
+    /// after each chunk is decoded. `on_finish()` is called after the end-of-stream marker.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before each chunk is decoded.
+    /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Decode an LZMA2 stream.
@@ -66,6 +99,11 @@ impl Lzma2Decoder {
         let mut output = Vec::new();
 
         loop {
+            // Cooperative cancellation check before each chunk.
+            if let Some(ref token) = self.cancel {
+                token.check()?;
+            }
+
             // Read control byte
             let mut control = [0u8; 1];
             if reader.read_exact(&mut control).is_err() {
@@ -76,8 +114,13 @@ impl Lzma2Decoder {
             if control == 0x00 {
                 // End of stream
                 self.finished = true;
+                if let Some(ref handle) = self.progress {
+                    handle.on_finish();
+                }
                 break;
             }
+
+            let before = output.len();
 
             if control == 0x01 || control == 0x02 {
                 // Uncompressed chunk
@@ -91,6 +134,11 @@ impl Lzma2Decoder {
                     "Invalid LZMA2 control byte: 0x{:02X}",
                     control
                 )));
+            }
+
+            self.bytes_processed += (output.len() - before) as u64;
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(self.bytes_processed, None);
             }
         }
 
@@ -578,12 +626,20 @@ fn decode_length<R: Read>(
 }
 
 /// LZMA2 encoder.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`Lzma2Encoder::with_progress`] / [`Lzma2Encoder::with_cancel`] builders.
 pub struct Lzma2Encoder {
     /// Compression level.
     #[allow(dead_code)]
     level: LzmaLevel,
     /// Dictionary size.
     dict_size: u32,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
 }
 
 impl Lzma2Encoder {
@@ -592,16 +648,45 @@ impl Lzma2Encoder {
         Self {
             level,
             dict_size: level.dict_size(),
+            progress: None,
+            cancel: None,
         }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(bytes, None)` is called once after the full
+    /// encode completes. `on_finish()` is called at the same point.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked at the start of `encode`.
+    /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Encode data to LZMA2 format.
     pub fn encode(&self, data: &[u8]) -> Result<Vec<u8>> {
+        // Cooperative cancellation check at the start.
+        if let Some(ref token) = self.cancel {
+            token.check()?;
+        }
+
         let mut output = Vec::new();
 
         if data.is_empty() {
             // Empty stream - just end marker
             output.push(0x00);
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(0, None);
+                handle.on_finish();
+            }
             return Ok(output);
         }
 
@@ -626,6 +711,11 @@ impl Lzma2Encoder {
 
         // End marker
         output.push(0x00);
+
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(data.len() as u64, None);
+            handle.on_finish();
+        }
 
         Ok(output)
     }
@@ -778,7 +868,8 @@ mod tests {
     #[test]
     fn test_lzma2_empty() {
         let original: &[u8] = b"";
-        let encoded = encode_lzma2(original, LzmaLevel::DEFAULT).unwrap();
+        let encoded =
+            encode_lzma2(original, LzmaLevel::DEFAULT).expect("compression/encoding failed");
         assert_eq!(encoded, vec![0x00]); // Just end marker
     }
 
@@ -786,8 +877,8 @@ mod tests {
     fn test_lzma2_uncompressed_roundtrip() {
         // Test with small data that won't compress well
         let original = b"ABCD";
-        let encoded = encode_lzma2(original, LzmaLevel::FAST).unwrap();
-        let decoded = decode_lzma2(&encoded, 4096).unwrap();
+        let encoded = encode_lzma2(original, LzmaLevel::FAST).expect("compression/encoding failed");
+        let decoded = decode_lzma2(&encoded, 4096).expect("decompression failed");
         assert_eq!(decoded, original);
     }
 
@@ -795,8 +886,101 @@ mod tests {
     fn test_lzma2_compressed_roundtrip() {
         // Test with repeating data that compresses well
         let original: Vec<u8> = vec![b'A'; 1000];
-        let encoded = encode_lzma2(&original, LzmaLevel::DEFAULT).unwrap();
-        let decoded = decode_lzma2(&encoded, 1 << 20).unwrap();
+        let encoded =
+            encode_lzma2(&original, LzmaLevel::DEFAULT).expect("compression/encoding failed");
+        let decoded = decode_lzma2(&encoded, 1 << 20).expect("decompression failed");
         assert_eq!(decoded, original);
+    }
+
+    use oxiarc_core::cancel::CancellationToken;
+    use oxiarc_core::progress::ProgressSink;
+    use std::sync::{Arc, Mutex};
+
+    type ProgressLog = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
+    struct MockSink(ProgressLog);
+
+    impl ProgressSink for MockSink {
+        fn on_progress(&self, processed: u64, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("lock poisoned")
+                .push((processed, total));
+        }
+    }
+
+    fn make_compressible_data(size: usize) -> Vec<u8> {
+        // Use highly compressible repeating data for fast LZMA tests.
+        vec![b'A'; size]
+    }
+
+    #[test]
+    fn test_lzma2_encoder_progress_reports() {
+        // Use small data and FAST level to keep the test quick.
+        let data = make_compressible_data(8 * 1024); // 8 KB
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let encoder = Lzma2Encoder::new(LzmaLevel::FAST)
+            .with_progress(sink as oxiarc_core::progress::ProgressHandle);
+        encoder.encode(&data).expect("encode failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal input size"
+        );
+    }
+
+    #[test]
+    fn test_lzma2_encoder_cancel_aborts() {
+        let data = make_compressible_data(8 * 1024);
+        let token = CancellationToken::new();
+        let encoder = Lzma2Encoder::new(LzmaLevel::FAST).with_cancel(token.clone());
+
+        token.cancel();
+        let result = encoder.encode(&data);
+        assert!(result.is_err(), "expected cancellation error");
+    }
+
+    #[test]
+    fn test_lzma2_decoder_progress_reports() {
+        let data = make_compressible_data(8 * 1024); // 8 KB
+        let encoded = encode_lzma2(&data, LzmaLevel::FAST).expect("encode failed");
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let mut decoder =
+            Lzma2Decoder::new(1 << 20).with_progress(sink as oxiarc_core::progress::ProgressHandle);
+        let mut cursor = std::io::Cursor::new(&encoded);
+        decoder.decode(&mut cursor).expect("decode failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal decompressed size"
+        );
+    }
+
+    #[test]
+    fn test_lzma2_decoder_cancel_aborts() {
+        let data = make_compressible_data(8 * 1024);
+        let encoded = encode_lzma2(&data, LzmaLevel::FAST).expect("encode failed");
+
+        let token = CancellationToken::new();
+        let mut decoder = Lzma2Decoder::new(1 << 20).with_cancel(token.clone());
+        let mut cursor = std::io::Cursor::new(&encoded);
+
+        token.cancel();
+        let result = decoder.decode(&mut cursor);
+        assert!(result.is_err(), "expected cancellation error");
     }
 }

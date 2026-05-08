@@ -11,7 +11,9 @@ use crate::LzmaLevel;
 use crate::encoder::LzmaEncoder;
 use crate::lzma2::decode_lzma2;
 use crate::model::{LzmaModel, LzmaProperties, State};
+use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::Result;
+use oxiarc_core::progress::ProgressHandle;
 use std::io::Write;
 
 /// Maximum uncompressed size for a single LZMA chunk (2MB).
@@ -234,11 +236,21 @@ impl ChunkedEncoderState {
 }
 
 /// LZMA2 chunked encoder with full streaming support.
+///
+/// Supports optional progress reporting via [`ProgressHandle`] and
+/// cooperative cancellation via [`CancellationToken`] using the
+/// [`Lzma2ChunkedEncoder::with_progress`] / [`Lzma2ChunkedEncoder::with_cancel`] builders.
 pub struct Lzma2ChunkedEncoder {
     /// Configuration.
     config: Lzma2Config,
     /// Internal state.
     encoder_state: ChunkedEncoderState,
+    /// Optional progress sink.
+    progress: Option<ProgressHandle>,
+    /// Optional cancellation token.
+    cancel: Option<CancellationToken>,
+    /// Cumulative uncompressed bytes encoded so far.
+    bytes_processed: u64,
 }
 
 impl Lzma2ChunkedEncoder {
@@ -254,7 +266,28 @@ impl Lzma2ChunkedEncoder {
         Self {
             config,
             encoder_state,
+            progress: None,
+            cancel: None,
+            bytes_processed: 0,
         }
+    }
+
+    /// Attach a progress sink.
+    ///
+    /// The sink's `on_progress(cumulative_bytes, None)` is called after each
+    /// chunk is encoded. `on_finish()` is called after the end-of-stream marker.
+    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
+        self.progress = Some(handle);
+        self
+    }
+
+    /// Attach a cancellation token.
+    ///
+    /// The token is checked before each chunk is encoded.
+    /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Encode data to LZMA2 format with proper chunking.
@@ -263,22 +296,39 @@ impl Lzma2ChunkedEncoder {
 
         if data.is_empty() {
             output.push(control::EOS);
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(0, None);
+                handle.on_finish();
+            }
             return Ok(output);
         }
 
         // Split data into chunks and encode
         let mut offset = 0;
         while offset < data.len() {
+            // Cooperative cancellation check before each chunk.
+            if let Some(ref token) = self.cancel {
+                token.check()?;
+            }
+
             let remaining = data.len() - offset;
             let chunk_size = remaining.min(self.config.chunk_size);
             let chunk = &data[offset..offset + chunk_size];
 
             self.encode_chunk(&mut output, chunk)?;
             offset += chunk_size;
+            self.bytes_processed += chunk_size as u64;
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(self.bytes_processed, None);
+            }
         }
 
         // End marker
         output.push(control::EOS);
+
+        if let Some(ref handle) = self.progress {
+            handle.on_finish();
+        }
 
         Ok(output)
     }
@@ -681,5 +731,63 @@ mod tests {
         let encoded = encoder.encode(&original).expect("encode failed");
         let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
         assert_eq!(decoded, original);
+    }
+
+    use oxiarc_core::cancel::CancellationToken;
+    use oxiarc_core::progress::ProgressSink;
+    use std::sync::{Arc, Mutex};
+
+    type ProgressLog = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
+    struct MockSink(ProgressLog);
+
+    impl ProgressSink for MockSink {
+        fn on_progress(&self, processed: u64, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("lock poisoned")
+                .push((processed, total));
+        }
+    }
+
+    fn make_compressible_data(size: usize) -> Vec<u8> {
+        // Use highly compressible repeating data for fast LZMA tests.
+        vec![b'B'; size]
+    }
+
+    #[test]
+    fn test_lzma2_chunked_encoder_progress_reports() {
+        // Use small data with FAST level and small chunk size for quick test.
+        let data = make_compressible_data(8 * 1024); // 8 KB
+
+        let calls: ProgressLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(MockSink(calls.clone()));
+
+        let config = Lzma2Config::with_level(LzmaLevel::FAST).chunk_size(4 * 1024);
+        let mut encoder = Lzma2ChunkedEncoder::with_config(config)
+            .with_progress(sink as oxiarc_core::progress::ProgressHandle);
+        encoder.encode(&data).expect("encode failed");
+
+        let recorded = calls.lock().expect("lock poisoned");
+        assert!(!recorded.is_empty(), "expected at least one progress call");
+        let (last_processed, _) = *recorded.last().expect("non-empty");
+        assert_eq!(
+            last_processed,
+            data.len() as u64,
+            "final processed count must equal input size"
+        );
+    }
+
+    #[test]
+    fn test_lzma2_chunked_encoder_cancel_aborts() {
+        let data = make_compressible_data(8 * 1024);
+        let token = CancellationToken::new();
+
+        let config = Lzma2Config::with_level(LzmaLevel::FAST).chunk_size(1024);
+        let mut encoder = Lzma2ChunkedEncoder::with_config(config).with_cancel(token.clone());
+
+        token.cancel();
+        let result = encoder.encode(&data);
+        assert!(result.is_err(), "expected cancellation error");
     }
 }

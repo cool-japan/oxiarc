@@ -410,11 +410,11 @@ mod tests {
         let original = b"Hello, GZIP World! This is a test of compression.";
 
         // Compress
-        let compressed = compress(original, 6).unwrap();
+        let compressed = compress(original, 6).expect("compress");
 
         // Decompress
-        let mut reader = GzipReader::new(Cursor::new(compressed)).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = GzipReader::new(Cursor::new(compressed)).expect("GzipReader::new");
+        let decompressed = reader.decompress().expect("decompress");
 
         assert_eq!(decompressed, original);
     }
@@ -424,23 +424,24 @@ mod tests {
         let original = b"Test data with filename";
 
         // Compress with filename
-        let compressed = compress_with_filename(original, "data.txt", 6).unwrap();
+        let compressed =
+            compress_with_filename(original, "data.txt", 6).expect("compress_with_filename");
 
         // Decompress and check filename
-        let mut reader = GzipReader::new(Cursor::new(compressed)).unwrap();
+        let mut reader = GzipReader::new(Cursor::new(compressed)).expect("GzipReader::new");
         assert_eq!(reader.header().filename, Some("data.txt".to_string()));
 
-        let decompressed = reader.decompress().unwrap();
+        let decompressed = reader.decompress().expect("decompress");
         assert_eq!(decompressed, original);
     }
 
     #[test]
     fn test_gzip_empty() {
         let original: &[u8] = b"";
-        let compressed = compress(original, 6).unwrap();
+        let compressed = compress(original, 6).expect("compress empty");
 
-        let mut reader = GzipReader::new(Cursor::new(compressed)).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = GzipReader::new(Cursor::new(compressed)).expect("GzipReader::new");
+        let decompressed = reader.decompress().expect("decompress empty");
 
         assert_eq!(decompressed, original);
     }
@@ -448,13 +449,13 @@ mod tests {
     #[test]
     fn test_gzip_repeated() {
         let original = vec![b'A'; 10000];
-        let compressed = compress(&original, 9).unwrap();
+        let compressed = compress(&original, 9).expect("compress repeated");
 
         // Should compress well
         assert!(compressed.len() < original.len() / 10);
 
-        let mut reader = GzipReader::new(Cursor::new(compressed)).unwrap();
-        let decompressed = reader.decompress().unwrap();
+        let mut reader = GzipReader::new(Cursor::new(compressed)).expect("GzipReader::new");
+        let decompressed = reader.decompress().expect("decompress repeated");
 
         assert_eq!(decompressed, original);
     }
@@ -472,13 +473,16 @@ mod tests {
 
         impl oxiarc_core::progress::ProgressSink for Sink {
             fn on_progress(&self, _processed: u64, _total: Option<u64>) {
-                *self.progress_calls.lock().unwrap() += 1;
+                *self.progress_calls.lock().expect("progress_calls lock") += 1;
             }
             fn on_entry(&self, name: &str, _index: u64) {
-                self.entries.lock().unwrap().push(name.to_string());
+                self.entries
+                    .lock()
+                    .expect("entries lock")
+                    .push(name.to_string());
             }
             fn on_finish(&self) {
-                *self.finish_called.lock().unwrap() = true;
+                *self.finish_called.lock().expect("finish_called lock") = true;
             }
         }
 
@@ -486,22 +490,26 @@ mod tests {
         let handle: oxiarc_core::progress::ProgressHandle = sink.clone();
 
         let original = b"Hello, progress world!";
-        let compressed = compress_with_filename(original, "hello.txt", 6).unwrap();
+        let compressed =
+            compress_with_filename(original, "hello.txt", 6).expect("compress_with_filename");
 
         let mut reader = GzipReader::new(Cursor::new(compressed))
-            .unwrap()
+            .expect("GzipReader::new")
             .with_progress(handle);
-        let decompressed = reader.decompress().unwrap();
+        let decompressed = reader.decompress().expect("decompress");
 
         assert_eq!(&decompressed, original);
 
         // on_entry should have been called once with the filename
         {
-            let entries = sink.entries.lock().unwrap();
+            let entries = sink.entries.lock().expect("entries lock");
             assert_eq!(entries.len(), 1, "expected on_entry called once");
             assert_eq!(entries[0], "hello.txt");
         }
-        assert!(*sink.finish_called.lock().unwrap(), "on_finish not called");
-        assert_eq!(*sink.progress_calls.lock().unwrap(), 1);
+        assert!(
+            *sink.finish_called.lock().expect("finish_called lock"),
+            "on_finish not called"
+        );
+        assert_eq!(*sink.progress_calls.lock().expect("progress_calls lock"), 1);
     }
 }

@@ -1,5 +1,5 @@
 use crate::style::Styler;
-use oxiarc_archive::{ArchiveFormat, CabReader, SevenZReader, ZipReader};
+use oxiarc_archive::{ArchiveFormat, CabReader, IsoReader, SevenZReader, ZipReader};
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -114,6 +114,35 @@ pub fn cmd_info(archive: &PathBuf, styler: &Styler) -> Result<(), Box<dyn std::e
             );
             println!(
                 "  Total size: {}",
+                styler.size(&format!("{total_size} bytes"))
+            );
+        }
+        ArchiveFormat::Iso9660 => {
+            let iso = IsoReader::new(reader)?;
+            let file_count = iso.entries().iter().filter(|e| !e.is_dir).count();
+            let dir_count = iso.entries().iter().filter(|e| e.is_dir).count();
+            let total_size: u64 = iso
+                .entries()
+                .iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| e.size)
+                .sum();
+
+            println!();
+            println!("{}", styler.header("ISO 9660 Image Info:"));
+            println!("  Volume ID: {}", styler.path(iso.volume_id.trim()));
+            println!("  Total LBAs: {}", iso.total_lbas);
+            println!("  Logical block size: {} bytes", iso.logical_block_size);
+            println!(
+                "  Joliet extensions: {}",
+                if iso.is_joliet() { "yes" } else { "no" }
+            );
+            println!();
+            println!("{}", styler.header("Contents:"));
+            println!("  Files: {}", file_count);
+            println!("  Directories: {}", dir_count);
+            println!(
+                "  Total file data: {}",
                 styler.size(&format!("{total_size} bytes"))
             );
         }

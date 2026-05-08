@@ -1,4 +1,4 @@
-# oxiarc-snappy - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-snappy - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -32,7 +32,12 @@
 
 ### Performance
 - [ ] SIMD-accelerated matching
-- [ ] CRC32C hardware acceleration (SSE 4.2)
+- [x] Snappy CRC32C with SSE 4.2 hardware acceleration on x86_64 (done 2026-05-06)
+  - **Goal:** `crc32c()` in `crc32c.rs` dispatches to `_mm_crc32_u8`/`_mm_crc32_u64` intrinsics on x86_64 when `is_x86_feature_detected!("sse4.2")` is true, else falls back to scalar. Output bitwise-identical to scalar.
+  - **Design:** Private fn `crc32c_sse42` under `#[target_feature(enable = "sse4.2")]` + `unsafe`: 8 bytes at a time via `_mm_crc32_u64` (`read_unaligned`), 1–7 trailing via `_mm_crc32_u8`. Runtime dispatcher via `OnceLock<fn(&[u8]) -> u32>`. Snappy masked form applied after raw CRC. Scalar fallback unchanged.
+  - **Files:** MODIFY `oxiarc-snappy/src/crc32c.rs`
+  - **Tests:** `test_crc32c_sse_matches_scalar_lengths` (0..=4096 step 17), `test_crc32c_sse_random` (100 inputs fixed seed), `test_crc32c_known_vectors`; all `#[cfg(target_arch = "x86_64")]`
+  - **Risk:** Mac is aarch64 — SSE4.2 path not exercised locally; scalar fallback is default so non-blocking.
 - [ ] Multi-threaded frame compression
 - [ ] Memory pool for allocations
 
@@ -76,5 +81,5 @@
 ## Known Limitations
 
 1. Single-threaded only
-2. No hardware CRC32C acceleration
+2. Hardware CRC32C acceleration (SSE 4.2) implemented on x86_64
 3. No dictionary support

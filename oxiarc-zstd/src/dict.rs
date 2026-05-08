@@ -23,7 +23,7 @@
 //!     b"common prefix data B",
 //!     b"common prefix data C",
 //! ];
-//! let dict = train_dictionary(&samples, 4096).unwrap();
+//! let dict = train_dictionary(&samples, 4096).expect("dictionary training failed");
 //! assert!(dict.len() > 0);
 //! ```
 
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_dict_new_basic() {
         let data = b"hello world".to_vec();
-        let dict = ZstdDict::new(data.clone()).unwrap();
+        let dict = ZstdDict::new(data.clone()).expect("compression/encoding failed");
         assert_eq!(dict.data(), data.as_slice());
         assert_eq!(dict.len(), data.len());
         assert!(!dict.is_empty());
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_dict_new_empty() {
-        let dict = ZstdDict::new(Vec::new()).unwrap();
+        let dict = ZstdDict::new(Vec::new()).expect("compression/encoding failed");
         assert!(dict.is_empty());
         assert_eq!(dict.len(), 0);
     }
@@ -236,15 +236,15 @@ mod tests {
     #[test]
     fn test_dict_id_deterministic() {
         let data = b"test dictionary".to_vec();
-        let dict1 = ZstdDict::new(data.clone()).unwrap();
-        let dict2 = ZstdDict::new(data).unwrap();
+        let dict1 = ZstdDict::new(data.clone()).expect("compression/encoding failed");
+        let dict2 = ZstdDict::new(data).expect("compression/encoding failed");
         assert_eq!(dict1.id(), dict2.id());
     }
 
     #[test]
     fn test_dict_id_differs_for_different_data() {
-        let dict_a = ZstdDict::new(b"data A".to_vec()).unwrap();
-        let dict_b = ZstdDict::new(b"data B".to_vec()).unwrap();
+        let dict_a = ZstdDict::new(b"data A".to_vec()).expect("compression/encoding failed");
+        let dict_b = ZstdDict::new(b"data B".to_vec()).expect("compression/encoding failed");
         // Not strictly guaranteed but extremely likely for different inputs.
         assert_ne!(dict_a.id(), dict_b.id());
     }
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn test_dict_into_data() {
         let data = b"round-trip".to_vec();
-        let dict = ZstdDict::new(data.clone()).unwrap();
+        let dict = ZstdDict::new(data.clone()).expect("compression/encoding failed");
         assert_eq!(dict.into_data(), data);
     }
 
@@ -269,7 +269,7 @@ mod tests {
             b"the quick brown dog runs",
             b"the quick brown cat sleeps",
         ];
-        let dict = train_dictionary(&samples, 256).unwrap();
+        let dict = train_dictionary(&samples, 256).expect("compression/encoding failed");
         assert!(!dict.is_empty());
         assert!(dict.len() <= 256);
     }
@@ -281,7 +281,7 @@ mod tests {
             b"AAAA BBBB CCCC DDDD FFFF",
             b"AAAA BBBB CCCC DDDD GGGG",
         ];
-        let dict = train_dictionary(&samples, 32).unwrap();
+        let dict = train_dictionary(&samples, 32).expect("compression/encoding failed");
         assert!(dict.len() <= 32);
     }
 
@@ -289,7 +289,7 @@ mod tests {
     fn test_train_dictionary_short_samples() {
         // Samples shorter than MIN_NGRAM should fall back to raw data.
         let samples: Vec<&[u8]> = vec![b"AB", b"CD", b"EF"];
-        let dict = train_dictionary(&samples, 64).unwrap();
+        let dict = train_dictionary(&samples, 64).expect("compression/encoding failed");
         // Should contain raw sample data.
         assert!(!dict.is_empty());
     }
@@ -298,14 +298,15 @@ mod tests {
     fn test_train_dictionary_identical_samples() {
         let sample = b"identical content repeated";
         let samples: Vec<&[u8]> = vec![sample, sample, sample];
-        let dict = train_dictionary(&samples, 256).unwrap();
+        let dict = train_dictionary(&samples, 256).expect("compression/encoding failed");
         assert!(!dict.is_empty());
     }
 
     #[test]
     fn test_train_dictionary_caps_at_max_dict_size() {
         let samples: Vec<&[u8]> = vec![b"data"];
-        let dict = train_dictionary(&samples, MAX_DICT_SIZE + 100).unwrap();
+        let dict =
+            train_dictionary(&samples, MAX_DICT_SIZE + 100).expect("compression/encoding failed");
         assert!(dict.len() <= MAX_DICT_SIZE);
     }
 
@@ -316,7 +317,7 @@ mod tests {
             b"prefix_beta_suffix",
             b"prefix_gamma_suffix",
         ];
-        let dict = train_dictionary(&samples, 1024).unwrap();
+        let dict = train_dictionary(&samples, 1024).expect("compression/encoding failed");
 
         // The common substrings "prefix_" and "_suffix" should be present.
         let dict_str = String::from_utf8_lossy(dict.data());

@@ -259,8 +259,8 @@ mod tests {
     #[test]
     fn test_fixed_trees() {
         // These should not fail
-        let _ = fixed_litlen_tree().unwrap();
-        let _ = fixed_distance_tree().unwrap();
+        let _ = fixed_litlen_tree().expect("fixed litlen tree should be valid");
+        let _ = fixed_distance_tree().expect("fixed distance tree should be valid");
     }
 
     #[test]

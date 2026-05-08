@@ -155,17 +155,17 @@ mod tests {
         let mut writer = MsbBitWriter::new();
 
         // Write some bits
-        writer.write_bits(0b101, 3).unwrap();
-        writer.write_bits(0b1100, 4).unwrap();
-        writer.write_bits(0b11111111, 8).unwrap();
+        writer.write_bits(0b101, 3).expect("write 3 msb bits");
+        writer.write_bits(0b1100, 4).expect("write 4 msb bits");
+        writer.write_bits(0b11111111, 8).expect("write 8 msb bits");
 
-        let data = writer.into_vec().unwrap();
+        let data = writer.into_vec().expect("flush msb writer to vec");
 
         // Read them back
         let mut reader = MsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(3).unwrap(), 0b101);
-        assert_eq!(reader.read_bits(4).unwrap(), 0b1100);
-        assert_eq!(reader.read_bits(8).unwrap(), 0b11111111);
+        assert_eq!(reader.read_bits(3).expect("read 3 msb bits"), 0b101);
+        assert_eq!(reader.read_bits(4).expect("read 4 msb bits"), 0b1100);
+        assert_eq!(reader.read_bits(8).expect("read 8 msb bits"), 0b11111111);
     }
 
     #[test]
@@ -173,13 +173,13 @@ mod tests {
         let mut writer = MsbBitWriter::new();
 
         // Write exactly one byte
-        writer.write_bits(0xAB, 8).unwrap();
+        writer.write_bits(0xAB, 8).expect("write byte 0xAB msb");
 
-        let data = writer.into_vec().unwrap();
+        let data = writer.into_vec().expect("flush msb writer byte boundary");
         assert_eq!(data, vec![0xAB]);
 
         // Read it back
         let mut reader = MsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(8).unwrap(), 0xAB);
+        assert_eq!(reader.read_bits(8).expect("read byte 0xAB msb"), 0xAB);
     }
 }

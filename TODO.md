@@ -1,8 +1,9 @@
 
-# OxiArc - Development Roadmap (v0.2.7, 2026-04-21)
+# OxiArc - Development Roadmap (v0.2.8, 2026-05-08)
 
 ## Version History
 
+- **v0.2.8** (2026-05-08): SIMD CRC32 via aarch64 PMULL (Apple Silicon) and x86_64 SSE 4.2 (Snappy CRC32C). Progress/cancel builders (`with_progress`, `with_cancel`) on lz4, zstd, and lzma2. Raw-preserve append in `oxiarc add` (ZIP/LZH byte-for-byte). ISO 9660 read support (list/extract/info/detect). CLI `--memory-limit` option for extract and list. 1281 tests passing (2 skipped), 1442 public API items, 58,356 lines, 12 crates, 182 Rust files.
 - **v0.2.7** (2026-04-21): All workspace crates feature-complete, tested, and API-stable. All policies enforced. 1206 tests passing, 1394 public API items.
 - **v0.2.6** (2026-03-21): Brotli fixes: is_single_symbol() bug fix, write_prefix_code_and_build_tree() function, Kraft inequality i32 fix, comprehensive roundtrip tests.
 - **v0.2.5** (2026-03-18): New codecs: Brotli (RFC 7932) with quality levels 0-11, static dictionary, streaming; Snappy with block and framed formats, CRC32C. DEFLATE streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder) with flush modes (sync_flush, full_flush, partial_flush). LZ4 acceleration parameter for compress_block_with_accel(). LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder, TIFF and GIF modes). Brotli/Snappy archive integration (BrotliReader/BrotliWriter, SnappyReader/SnappyWriter with format detection). EntryBuilder pattern with fluent API. Serde serialization for Entry types (optional feature). CLI: dry-run mode (--dry-run/-n), sort by ratio, Brotli/Snappy format support. Total: 1038 tests, ~47,241 lines, 150 files.
@@ -242,32 +243,32 @@
 
 ## Test Coverage
 
-- oxiarc-core: 111 tests
-  - CRC-32/64 slicing-by-8, DualCrc optimization, size boundary tests, bitstream, ringbuffer, EntryBuilder, Serde serialization
-- oxiarc-deflate: 120 tests
+- oxiarc-core: 127 tests
+  - CRC-32/64 slicing-by-8, DualCrc optimization, SIMD CRC32 (aarch64 PMULL), size boundary tests, bitstream, ringbuffer, EntryBuilder, Serde serialization
+- oxiarc-deflate: 128 tests
   - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module, streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder, flush modes)
-- oxiarc-lzhuf: 54 tests (34 lib + 20 streaming_integration)
+- oxiarc-lzhuf: 56 tests
   - LH5 roundtrip encoding/decoding, LZSS, Huffman trees
-- oxiarc-bzip2: 37 tests (2 skipped)
+- oxiarc-bzip2: 41 tests (2 skipped)
   - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
-- oxiarc-lz4: 110 tests
-  - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression, acceleration parameter tests
-- oxiarc-zstd: 170 tests
-  - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression
-- oxiarc-archive: 165 tests
-  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP, Brotli/Snappy integration
-- oxiarc-lzma: 66 tests
-  - LZMA/LZMA2, optimal parsing, range coder, price calculation
+- oxiarc-lz4: 118 tests
+  - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression, acceleration parameter tests, progress/cancel builders
+- oxiarc-zstd: 176 tests
+  - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression, progress/cancel builders
+- oxiarc-archive: 290 tests
+  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP, Brotli/Snappy integration, ISO 9660 read support, raw-preserve append
+- oxiarc-lzma: 74 tests
+  - LZMA/LZMA2, optimal parsing, range coder, price calculation, progress/cancel builders
 - oxiarc-lzw: 76 tests
   - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests, streaming encoder/decoder tests
-- oxiarc-brotli: 78 tests
+- oxiarc-brotli: 92 tests
   - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API
-- oxiarc-snappy: 54 tests
-  - Snappy block format, framed format with CRC32C checksums, streaming Write/Read API
-- oxiarc-cli: 0 tests
-- Total: 1041 tests (1041 passed, 2 skipped, zero warnings)
+- oxiarc-snappy: 57 tests
+  - Snappy block format, framed format with CRC32C checksums (SSE 4.2 hardware acceleration on x86_64), streaming Write/Read API
+- oxiarc-cli: 36 tests
+- Total: 1281 tests (1281 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.2.6, 2026-03-18)
+## Code Statistics (v0.2.8, 2026-05-08)
 
 | Crate | Lines of Code |
 |-------|---------------|
@@ -283,4 +284,4 @@
 | oxiarc-cli | ~2,443 |
 | oxiarc-lzma | ~3,868 |
 | oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
-| **Total** | **~47,303** (150 files) |
+| **Total** | **~58,356** (182 files) |

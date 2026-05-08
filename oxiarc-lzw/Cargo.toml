@@ -16,7 +16,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-weezl = "0.1.12"
+weezl.workspace = true
 
 [[bench]]
 name = "lzw_bench"

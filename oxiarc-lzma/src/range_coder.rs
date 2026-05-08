@@ -350,12 +350,24 @@ mod tests {
         // The encoder output already includes the leading 0x00 byte
         // through its cache mechanism, so we use it directly
         let cursor = Cursor::new(encoded);
-        let mut decoder = RangeDecoder::new(cursor).unwrap();
+        let mut decoder = RangeDecoder::new(cursor).expect("valid LZMA operation");
         let mut prob = PROB_INIT;
 
-        assert_eq!(decoder.decode_bit(&mut prob).unwrap(), 0);
-        assert_eq!(decoder.decode_bit(&mut prob).unwrap(), 1);
-        assert_eq!(decoder.decode_bit(&mut prob).unwrap(), 0);
-        assert_eq!(decoder.decode_bit(&mut prob).unwrap(), 1);
+        assert_eq!(
+            decoder.decode_bit(&mut prob).expect("valid LZMA operation"),
+            0
+        );
+        assert_eq!(
+            decoder.decode_bit(&mut prob).expect("valid LZMA operation"),
+            1
+        );
+        assert_eq!(
+            decoder.decode_bit(&mut prob).expect("valid LZMA operation"),
+            0
+        );
+        assert_eq!(
+            decoder.decode_bit(&mut prob).expect("valid LZMA operation"),
+            1
+        );
     }
 }

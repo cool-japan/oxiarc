@@ -3,11 +3,13 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![Version](https://img.shields.io/badge/version-0.2.8-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.2.7** (2026-04-21) — 122 tests passing.
+**Version 0.2.8** (2026-05-08) — 127 tests passing.
+
+**What's new in 0.2.8**: Hardware-accelerated CRC-32 via aarch64 PMULL instructions is now automatically enabled on compatible hardware with no feature flag required. Added `ProgressSink` and `CancellationToken` types for progress reporting and cooperative cancellation in long-running operations. The `simd` feature flag is now a deprecated no-op.
 
 
 ## Features
@@ -161,10 +163,11 @@ OxiArcError::InvalidHeader(message)
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `default` | yes | Core primitives with no extra dependencies |
+| `default` | no | Core primitives with no extra dependencies |
 | `async-io` | no | Async I/O support via Tokio (`AsyncRead`/`AsyncWrite`) |
-| `simd` | no | SIMD-accelerated CRC-32 (PCLMULQDQ on x86_64, PMULL on aarch64) |
+| `simd` | no | Deprecated no-op — SIMD CRC-32 (aarch64 PMULL) is now auto-enabled at compile time with no feature flag required |
 | `mmap` | no | Memory-mapped file access for efficient large file processing (memmap2) |
+| `serde` | no | Serde serialization/deserialization support for core types |
 
 ## Usage
 
@@ -172,14 +175,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.2.6"
+oxiarc-core = "0.2.8"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.2.6", features = ["async-io", "simd"] }
+oxiarc-core = { version = "0.2.8", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

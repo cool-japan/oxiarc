@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.7 (2026-04-21) | 263 tests passing**
+**Version: 0.2.8 (2026-05-08) | 299 tests passing**
 
 
 ## Features
@@ -18,6 +18,8 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 - Format auto-detection
 - Async ZIP entry reading (async-io feature)
 - Brotli and Snappy compression support
+- ISO 9660 read support with PVD and Joliet UCS-2 filename handling (new in 0.2.8)
+- Raw-preserve append: `ZipWriter::add_file_raw`, `LzhReader::read_raw_method_data`, `LzhWriter::add_file_raw` (new in 0.2.8)
 
 All features are implemented and tested. API is stable.
 
@@ -29,6 +31,8 @@ This crate handles the container/wrapper aspects of archive formats:
 - Async ZIP entry reading (new in 0.2.4, via `async-io` feature)
 - Brotli compression support (via `oxiarc-brotli`)
 - Snappy compression support (via `oxiarc-snappy`)
+- ISO 9660 read support with PVD and Joliet UCS-2 filename handling (new in 0.2.8, via `IsoReader`)
+- Raw-preserve append for ZIP and LZH entries (new in 0.2.8)
 
 The actual compression/decompression is delegated to codec crates (`oxiarc-deflate`, `oxiarc-lzhuf`, `oxiarc-lzma`, `oxiarc-brotli`, `oxiarc-snappy`).
 
@@ -36,10 +40,11 @@ The actual compression/decompression is delegated to codec crates (`oxiarc-defla
 
 | Format | Extension | Read | Write | Notes |
 |--------|-----------|------|-------|-------|
-| ZIP | .zip | Yes | No | DEFLATE, Stored; async read via `async-io` |
+| ZIP | .zip | Yes | No | DEFLATE, Stored; async read via `async-io`; raw-preserve append via `add_file_raw` |
 | GZIP | .gz | Yes | No | RFC 1952 |
 | TAR | .tar | Yes | No | UStar format |
-| LZH | .lzh, .lha | Yes | No | Level 0/1/2 headers |
+| LZH | .lzh, .lha | Yes | No | Level 0/1/2 headers; raw-preserve append via `add_file_raw` / `read_raw_method_data` |
+| ISO 9660 | .iso | Yes | No | PVD + Joliet UCS-2 filenames; magic detection at LBA 16 (new in 0.2.8) |
 | Brotli | .br | Yes | No | RFC 7932, via `oxiarc-brotli` |
 | Snappy | .sz | Yes | No | Block and framed formats, via `oxiarc-snappy` |
 
@@ -100,16 +105,16 @@ Supported async compression methods: `Stored`, `Deflate`.
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.2.6"
+oxiarc-archive = "0.2.8"
 
 # With memory-mapped I/O
-oxiarc-archive = { version = "0.2.4", features = ["mmap"] }
+oxiarc-archive = { version = "0.2.8", features = ["mmap"] }
 
 # With async ZIP support
-oxiarc-archive = { version = "0.2.4", features = ["async-io"] }
+oxiarc-archive = { version = "0.2.8", features = ["async-io"] }
 
 # With all features
-oxiarc-archive = { version = "0.2.4", features = ["mmap", "async-io"] }
+oxiarc-archive = { version = "0.2.8", features = ["mmap", "async-io"] }
 ```
 
 ## Format Detection
@@ -128,6 +133,7 @@ match format {
     ArchiveFormat::Gzip => println!("GZIP compressed"),
     ArchiveFormat::Tar => println!("TAR archive"),
     ArchiveFormat::Lzh => println!("LZH archive"),
+    ArchiveFormat::Iso => println!("ISO 9660 image"),
     ArchiveFormat::SevenZip => println!("7-Zip (not supported yet)"),
     ArchiveFormat::Xz => println!("XZ compressed (not supported yet)"),
     ArchiveFormat::Unknown => println!("Unknown format"),
@@ -240,10 +246,11 @@ for entry in lzh.entries() {
 | Module | Description |
 |--------|-------------|
 | `detect` | Format auto-detection |
-| `zip` | ZIP archive handling |
+| `zip` | ZIP archive handling (including `ZipWriter::add_file_raw`) |
 | `gzip` | GZIP file handling |
 | `tar` | TAR archive handling |
-| `lzh` | LZH archive handling |
+| `lzh` | LZH archive handling (including `LzhWriter::add_file_raw`, `LzhReader::read_raw_method_data`) |
+| `iso` | ISO 9660 image reading via `IsoReader` (new in 0.2.8) |
 | `async_zip` | Async ZIP entry reading (requires `async-io` feature) |
 
 ## Security
@@ -273,6 +280,7 @@ let safe_path = entry.sanitized_name();
 | Zstd | `28 B5 2F FD` | 0 |
 | LZH | `-lh?-` or `-lz?-` | 2 |
 | TAR | `ustar` | 257 |
+| ISO 9660 | `CD001` (Primary Volume Descriptor) | LBA 16 (byte 32768) |
 
 ## License
 

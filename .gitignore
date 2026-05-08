@@ -1,6 +1,10 @@
 # Rust
 /target/
 Cargo.lock
+target
+
+# Backup
+**/*.bak
 
 # Claude
 **/CLAUDE.md

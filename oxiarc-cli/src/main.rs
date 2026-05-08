@@ -98,6 +98,10 @@ enum Commands {
         /// Continue on corruption when reading the archive (emit warnings to stderr)
         #[arg(long)]
         lenient: bool,
+
+        /// Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
+        #[arg(long, value_parser = crate::utils::parse_byte_size)]
+        memory_limit: Option<u64>,
     },
 
     /// Extract files from an archive
@@ -174,6 +178,10 @@ enum Commands {
         /// Continue on corruption (CRC mismatch, bad TAR checksum, etc.) with warnings instead of errors
         #[arg(long)]
         lenient: bool,
+
+        /// Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
+        #[arg(long, value_parser = crate::utils::parse_byte_size)]
+        memory_limit: Option<u64>,
     },
 
     /// Test archive integrity
@@ -369,6 +377,7 @@ fn main() {
             include,
             exclude,
             lenient,
+            memory_limit,
         } => {
             let options = commands::list::ListOptions {
                 verbose,
@@ -379,6 +388,7 @@ fn main() {
                 include: &include,
                 exclude: &exclude,
                 lenient,
+                memory_limit,
             };
             cmd_list(&archive, &options, &styler)
         }
@@ -401,6 +411,7 @@ fn main() {
             password,
             strict_names,
             lenient,
+            memory_limit,
         } => cmd_extract(
             commands::extract::ExtractArgs {
                 archive: &archive,
@@ -421,6 +432,7 @@ fn main() {
                 password,
                 strict_names,
                 lenient,
+                memory_limit,
             },
             &styler,
         ),

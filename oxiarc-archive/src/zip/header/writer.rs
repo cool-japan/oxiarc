@@ -6,9 +6,9 @@ use super::super::encryption::{
     generate_salt,
 };
 use super::types::{
-    CentralDirEntry, END_OF_CENTRAL_DIR_SIG, LOCAL_FILE_HEADER_SIG, METHOD_AES_ENCRYPTED,
-    ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_END_OF_CENTRAL_DIR_SIG, ZIP64_EXTRA_FIELD_ID,
-    ZIP64_MARKER_16, ZIP64_MARKER_32, ZipCompressionLevel,
+    CentralDirEntry, CompressionMethod, END_OF_CENTRAL_DIR_SIG, LOCAL_FILE_HEADER_SIG,
+    METHOD_AES_ENCRYPTED, ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_END_OF_CENTRAL_DIR_SIG,
+    ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_16, ZIP64_MARKER_32, ZipCompressionLevel,
 };
 use oxiarc_core::Crc32;
 use oxiarc_core::error::{OxiArcError, Result};
@@ -772,6 +772,142 @@ impl<W: Write> ZipWriter<W> {
         Ok(())
     }
 
+    /// Add a file to the archive with pre-compressed data verbatim.
+    ///
+    /// This method writes the raw compressed bytes directly without any
+    /// re-compression, preserving byte-for-byte fidelity for existing archive
+    /// entries. The caller must supply the correct `crc32` of the *uncompressed*
+    /// data and the `uncompressed_size`.
+    ///
+    /// For LZMA (method 14) entries the EOS-marker general-purpose flag is set
+    /// automatically. All other methods use flags = 0.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` – Entry name in the archive
+    /// * `method` – Compression method stored in the source entry
+    /// * `crc32` – CRC-32 of the *uncompressed* data
+    /// * `uncompressed_size` – Original (uncompressed) size in bytes
+    /// * `mtime_opt` – Optional modification time; current time is used when `None`
+    /// * `compressed_data` – Raw compressed payload to write verbatim
+    pub fn add_file_raw(
+        &mut self,
+        name: &str,
+        method: CompressionMethod,
+        crc32: u32,
+        uncompressed_size: u64,
+        mtime_opt: Option<std::time::SystemTime>,
+        compressed_data: &[u8],
+    ) -> Result<()> {
+        // Progress: notify about entry start
+        let file_index = self.entries.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(name, file_index);
+        }
+
+        let (mtime, mdate) = match mtime_opt {
+            Some(t) => Self::dos_time_from_systime(t),
+            None => Self::current_dos_time(),
+        };
+
+        let method_u16 = method.to_u16();
+        // LZMA (method 14) requires bit 1 set in flags to indicate EOS marker.
+        let flags: u16 = if method_u16 == 14 { FLAG_LZMA_EOS } else { 0 };
+
+        let compressed_size = compressed_data.len() as u64;
+        let local_header_offset = self.offset;
+
+        // Check if Zip64 is needed
+        let needs_zip64 = compressed_size >= ZIP64_MARKER_32 as u64
+            || uncompressed_size >= ZIP64_MARKER_32 as u64
+            || local_header_offset >= ZIP64_MARKER_32 as u64;
+
+        // Version needed depends on method and Zip64 usage
+        let version_needed: u16 = if needs_zip64 {
+            45
+        } else if method_u16 == 14 {
+            63
+        } else if method_u16 == 8 {
+            20
+        } else {
+            10
+        };
+
+        let filename_bytes = name.as_bytes();
+
+        // Build Zip64 extra field for local header if needed
+        let mut local_extra = Vec::new();
+        if needs_zip64 {
+            local_extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
+            local_extra.extend_from_slice(&16u16.to_le_bytes());
+            local_extra.extend_from_slice(&uncompressed_size.to_le_bytes());
+            local_extra.extend_from_slice(&compressed_size.to_le_bytes());
+        }
+
+        let compressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            compressed_size as u32
+        };
+        let uncompressed_size_32 = if needs_zip64 {
+            ZIP64_MARKER_32
+        } else {
+            uncompressed_size as u32
+        };
+
+        // Write local file header
+        self.writer
+            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+        self.writer.write_all(&version_needed.to_le_bytes())?;
+        self.writer.write_all(&flags.to_le_bytes())?;
+        self.writer.write_all(&method_u16.to_le_bytes())?;
+        self.writer.write_all(&mtime.to_le_bytes())?;
+        self.writer.write_all(&mdate.to_le_bytes())?;
+        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer
+            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+        self.writer
+            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
+        self.writer.write_all(filename_bytes)?;
+        self.writer.write_all(&local_extra)?;
+
+        // Write pre-compressed data verbatim
+        self.writer.write_all(compressed_data)?;
+
+        // Update offset (30 = fixed local header size)
+        self.offset +=
+            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + compressed_size;
+
+        // Store central directory entry
+        self.entries.push(CentralDirEntry {
+            version_made_by: 0x031E, // Unix, version 3.0
+            version_needed,
+            flags,
+            method: method_u16,
+            mtime,
+            mdate,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            filename: name.to_string(),
+            extra: Vec::new(),
+            comment: String::new(),
+            disk_start: 0,
+            internal_attr: 0,
+            external_attr: 0o100644 << 16,
+            local_header_offset,
+        });
+
+        // Progress: notify about bytes written
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(uncompressed_size, None);
+        }
+
+        Ok(())
+    }
+
     /// Add a directory to the archive.
     pub fn add_directory(&mut self, name: &str) -> Result<()> {
         // Ensure directory name ends with /
@@ -936,6 +1072,37 @@ impl<W: Write> ZipWriter<W> {
         Ok(unsafe { std::ptr::read(&this.writer) })
     }
 
+    /// Convert a `SystemTime` to DOS (mtime, mdate) pair.
+    fn dos_time_from_systime(t: SystemTime) -> (u16, u16) {
+        let secs = t
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        let days = secs / 86400;
+        let time_of_day = secs % 86400;
+
+        let hours = (time_of_day / 3600) as u16;
+        let minutes = ((time_of_day % 3600) / 60) as u16;
+        let seconds = ((time_of_day % 60) / 2) as u16;
+
+        let mtime = (hours << 11) | (minutes << 5) | seconds;
+
+        let years = days / 365;
+        let year = (1970 + years) as u16;
+        let day_of_year = days % 365;
+        let month = ((day_of_year / 30) + 1) as u16;
+        let day = ((day_of_year % 30) + 1) as u16;
+
+        let mdate = if year >= 1980 {
+            ((year - 1980) << 9) | (month << 5) | day
+        } else {
+            0
+        };
+
+        (mtime, mdate)
+    }
+
     /// Get current time in DOS format.
     fn current_dos_time() -> (u16, u16) {
         let now = SystemTime::now()
@@ -973,5 +1140,151 @@ impl<W: Write> ZipWriter<W> {
 impl<W: Write> Drop for ZipWriter<W> {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zip::header::reader::ZipReader;
+    use std::io::Cursor;
+
+    /// Create a ZIP with one Deflate-compressed file, extract_raw,
+    /// add_file_raw into a new ZIP, then verify the compressed bytes are
+    /// byte-identical through the round-trip.
+    #[test]
+    fn test_zip_add_file_raw_preserves_bytes() {
+        // Build source archive with a compressible file
+        let test_data: Vec<u8> = b"Hello raw world! "
+            .iter()
+            .cycle()
+            .take(512)
+            .copied()
+            .collect();
+
+        let mut src_bytes = Vec::new();
+        {
+            let mut zw = ZipWriter::new(&mut src_bytes);
+            zw.add_file_with_options("hello.txt", &test_data, ZipCompressionLevel::Normal)
+                .expect("add_file_with_options failed");
+            zw.finish().expect("finish failed");
+        }
+
+        // Extract raw compressed payload from source
+        let mut src_reader = ZipReader::new(Cursor::new(&src_bytes)).expect("ZipReader::new");
+        let entries = src_reader.entries().to_vec();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        let raw1 = src_reader.extract_raw(entry).expect("extract_raw");
+
+        // Build destination archive using add_file_raw
+        let method = CompressionMethod::from_core(&entry.method);
+        let crc32 = entry.crc32.unwrap_or(0);
+        let uncompressed_size = entry.size;
+
+        let mut dst_bytes = Vec::new();
+        {
+            let mut zw2 = ZipWriter::new(&mut dst_bytes);
+            zw2.add_file_raw(
+                &entry.name,
+                method,
+                crc32,
+                uncompressed_size,
+                entry.modified,
+                &raw1,
+            )
+            .expect("add_file_raw failed");
+            zw2.finish().expect("finish failed");
+        }
+
+        // Read back and extract_raw from destination
+        let mut dst_reader = ZipReader::new(Cursor::new(&dst_bytes)).expect("ZipReader::new dst");
+        let dst_entries = dst_reader.entries().to_vec();
+        assert_eq!(dst_entries.len(), 1);
+        let raw2 = dst_reader
+            .extract_raw(&dst_entries[0])
+            .expect("extract_raw dst");
+
+        assert_eq!(
+            raw1, raw2,
+            "compressed bytes must be byte-identical through add_file_raw round-trip"
+        );
+
+        // Also verify decompression still works
+        let decoded = dst_reader
+            .extract(&dst_entries[0])
+            .expect("extract after add_file_raw");
+        assert_eq!(decoded, test_data, "decompressed content mismatch");
+    }
+
+    /// Verify that both Stored and Deflate entries survive an
+    /// add_file_raw round-trip with byte-equal compressed payloads.
+    #[test]
+    fn test_zip_add_file_raw_mixed_methods() {
+        let small_data = b"tiny";
+        let big_data: Vec<u8> = b"AAAA".iter().cycle().take(256).copied().collect();
+
+        // Build source archive: small_data stored, big_data deflated
+        let mut src_bytes = Vec::new();
+        {
+            let mut zw = ZipWriter::new(&mut src_bytes);
+            zw.add_file_with_options("small.bin", small_data, ZipCompressionLevel::Store)
+                .expect("add small");
+            zw.add_file_with_options("big.bin", &big_data, ZipCompressionLevel::Best)
+                .expect("add big");
+            zw.finish().expect("finish");
+        }
+
+        let mut src_reader = ZipReader::new(Cursor::new(&src_bytes)).expect("src reader");
+        let src_entries = src_reader.entries().to_vec();
+        assert_eq!(src_entries.len(), 2);
+
+        // Gather raw payloads
+        let raws: Vec<Vec<u8>> = src_entries
+            .iter()
+            .map(|e| src_reader.extract_raw(e).expect("extract_raw"))
+            .collect();
+
+        // Rebuild via add_file_raw
+        let mut dst_bytes = Vec::new();
+        {
+            let mut zw2 = ZipWriter::new(&mut dst_bytes);
+            for (entry, raw) in src_entries.iter().zip(raws.iter()) {
+                let method = CompressionMethod::from_core(&entry.method);
+                zw2.add_file_raw(
+                    &entry.name,
+                    method,
+                    entry.crc32.unwrap_or(0),
+                    entry.size,
+                    entry.modified,
+                    raw,
+                )
+                .expect("add_file_raw");
+            }
+            zw2.finish().expect("finish dst");
+        }
+
+        // Verify byte-equality of raw payloads
+        let mut dst_reader = ZipReader::new(Cursor::new(&dst_bytes)).expect("dst reader");
+        let dst_entries = dst_reader.entries().to_vec();
+        assert_eq!(dst_entries.len(), 2);
+
+        for (i, (src_e, dst_e)) in src_entries.iter().zip(dst_entries.iter()).enumerate() {
+            let raw_src = &raws[i];
+            let raw_dst = dst_reader.extract_raw(dst_e).expect("extract_raw dst");
+            assert_eq!(
+                *raw_src, raw_dst,
+                "compressed bytes differ for entry {}",
+                src_e.name
+            );
+            // Verify decompression correctness
+            let decoded = dst_reader.extract(dst_e).expect("extract");
+            let expected = src_reader.extract(src_e).expect("extract src");
+            assert_eq!(
+                decoded, expected,
+                "decompressed content differs for {}",
+                src_e.name
+            );
+        }
     }
 }

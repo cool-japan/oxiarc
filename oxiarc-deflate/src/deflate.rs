@@ -836,17 +836,17 @@ mod tests {
     #[test]
     fn test_deflate_stored() {
         let input = b"Hello, World!";
-        let compressed = deflate(input, 0).unwrap();
+        let compressed = deflate(input, 0).expect("deflate stored block");
 
         // Decompress and verify
-        let decompressed = inflate(&compressed).unwrap();
+        let decompressed = inflate(&compressed).expect("inflate stored block");
         assert_eq!(decompressed, input);
     }
 
     #[test]
     fn test_deflate_compressed() {
         let input = b"AAAAAAAAAABBBBBBBBBBCCCCCCCCCC";
-        let compressed = deflate(input, 6).unwrap();
+        let compressed = deflate(input, 6).expect("deflate level 6");
 
         // Should be smaller than input
         assert!(
@@ -857,15 +857,15 @@ mod tests {
         );
 
         // Decompress and verify
-        let decompressed = inflate(&compressed).unwrap();
+        let decompressed = inflate(&compressed).expect("inflate compressed data");
         assert_eq!(decompressed, input);
     }
 
     #[test]
     fn test_deflate_empty() {
         let input = b"";
-        let compressed = deflate(input, 0).unwrap();
-        let decompressed = inflate(&compressed).unwrap();
+        let compressed = deflate(input, 0).expect("deflate empty input");
+        let decompressed = inflate(&compressed).expect("inflate empty deflated");
         assert!(decompressed.is_empty());
     }
 
@@ -880,8 +880,8 @@ mod tests {
 
         for input in &inputs {
             for level in [0, 1, 6, 9] {
-                let compressed = deflate(input, level).unwrap();
-                let decompressed = inflate(&compressed).unwrap();
+                let compressed = deflate(input, level).expect("deflate for roundtrip");
+                let decompressed = inflate(&compressed).expect("inflate for roundtrip");
                 assert_eq!(
                     &decompressed,
                     input,
@@ -908,8 +908,8 @@ mod tests {
                       CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\
                       DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
 
-        let compressed_dynamic = deflate(input, 9).unwrap();
-        let compressed_fixed = deflate(input, 1).unwrap();
+        let compressed_dynamic = deflate(input, 9).expect("deflate dynamic huffman level 9");
+        let compressed_fixed = deflate(input, 1).expect("deflate fixed huffman level 1");
 
         // Dynamic Huffman should compress better for this pattern
         assert!(
@@ -920,8 +920,8 @@ mod tests {
         );
 
         // Both should decompress correctly
-        let decompressed_dynamic = inflate(&compressed_dynamic).unwrap();
-        let decompressed_fixed = inflate(&compressed_fixed).unwrap();
+        let decompressed_dynamic = inflate(&compressed_dynamic).expect("inflate dynamic huffman");
+        let decompressed_fixed = inflate(&compressed_fixed).expect("inflate fixed huffman");
         assert_eq!(decompressed_dynamic, input);
         assert_eq!(decompressed_fixed, input);
     }
@@ -932,8 +932,8 @@ mod tests {
 
         let mut prev_size = usize::MAX;
         for level in [0, 1, 5, 9] {
-            let compressed = deflate(&input, level).unwrap();
-            let decompressed = inflate(&compressed).unwrap();
+            let compressed = deflate(&input, level).expect("deflate for level comparison");
+            let decompressed = inflate(&compressed).expect("inflate for level comparison");
             assert_eq!(decompressed, input);
 
             // Higher levels should generally compress better (or equal)

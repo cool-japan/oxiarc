@@ -157,7 +157,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn test_long_path_prefix_noop_on_non_windows() {
-        let p = Path::new("/tmp/foo");
-        assert_eq!(long_path_prefix(p), PathBuf::from("/tmp/foo"));
+        let tmp = std::env::temp_dir();
+        let p = tmp.join("foo");
+        let expected = tmp.join("foo");
+        assert_eq!(long_path_prefix(&p), expected);
     }
 }

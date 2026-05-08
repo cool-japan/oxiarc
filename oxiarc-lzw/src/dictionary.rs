@@ -211,11 +211,11 @@ mod tests {
 
     #[test]
     fn test_dictionary_init() {
-        let dict = LzwDictionary::new(LzwConfig::TIFF).unwrap();
+        let dict = LzwDictionary::new(LzwConfig::TIFF).expect("create lzw dictionary");
 
         // Check initial single-byte codes
         for i in 0..256u16 {
-            let string = dict.get_string(i).unwrap();
+            let string = dict.get_string(i).expect("get string for initial code");
             assert_eq!(string, &[i as u8]);
         }
 
@@ -228,18 +228,22 @@ mod tests {
 
     #[test]
     fn test_add_string() {
-        let mut dict = LzwDictionary::new(LzwConfig::TIFF).unwrap();
+        let mut dict =
+            LzwDictionary::new(LzwConfig::TIFF).expect("create lzw dictionary for add string");
 
-        let code = dict.add_string(vec![b'A', b'B']).unwrap();
+        let code = dict
+            .add_string(vec![b'A', b'B'])
+            .expect("add string AB to dictionary");
         assert_eq!(code, 258);
 
-        let retrieved = dict.get_string(code).unwrap();
+        let retrieved = dict.get_string(code).expect("get string for code 258");
         assert_eq!(retrieved, b"AB");
     }
 
     #[test]
     fn test_bit_width_increase() {
-        let mut dict = LzwDictionary::new(LzwConfig::TIFF).unwrap();
+        let mut dict =
+            LzwDictionary::new(LzwConfig::TIFF).expect("create lzw dictionary for bit width test");
 
         // Initially 9 bits
         assert_eq!(dict.current_bits(), 9);
@@ -248,7 +252,8 @@ mod tests {
         // With early change, bit width increases when next_code == 512 (2^9)
         // We start at 258, so need to add 254 entries (258 + 254 = 512)
         for i in 0..254 {
-            dict.add_string(vec![i as u8, (i + 1) as u8]).unwrap();
+            dict.add_string(vec![i as u8, (i + 1) as u8])
+                .expect("add string for bit width increase test");
         }
 
         // After adding 254 entries, next_code should be 512
@@ -260,13 +265,16 @@ mod tests {
 
     #[test]
     fn test_find_code() {
-        let mut dict = LzwDictionary::new(LzwConfig::TIFF).unwrap();
+        let mut dict =
+            LzwDictionary::new(LzwConfig::TIFF).expect("create lzw dictionary for find code test");
 
         // Single-byte codes should be findable
         assert_eq!(dict.find_code(&[65]), Some(65));
 
         // Add a new code
-        let code = dict.add_string(vec![b'A', b'B']).unwrap();
+        let code = dict
+            .add_string(vec![b'A', b'B'])
+            .expect("add string AB for find code test");
         assert_eq!(dict.find_code(b"AB"), Some(code));
 
         // Non-existent code

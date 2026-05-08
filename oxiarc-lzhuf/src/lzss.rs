@@ -469,7 +469,7 @@ mod tests {
         decoder.decode_literal(b'B');
 
         // Match: copy 2 bytes from distance 2 -> "AB" again
-        decoder.decode_match(2, 2).unwrap();
+        decoder.decode_match(2, 2).expect("operation failed");
 
         assert_eq!(decoder.output(), b"ABAB");
     }
@@ -482,7 +482,7 @@ mod tests {
         decoder.decode_literal(b'A');
 
         // Match: copy 5 bytes from distance 1 -> "AAAAA"
-        decoder.decode_match(5, 1).unwrap();
+        decoder.decode_match(5, 1).expect("operation failed");
 
         assert_eq!(decoder.output(), b"AAAAAA");
     }
@@ -523,9 +523,9 @@ mod tests {
         for token in tokens {
             match token {
                 LzssToken::Literal(b) => decoder.decode_literal(b),
-                LzssToken::Match { length, distance } => {
-                    decoder.decode_match(length, distance).unwrap()
-                }
+                LzssToken::Match { length, distance } => decoder
+                    .decode_match(length, distance)
+                    .expect("operation failed"),
             }
         }
 
@@ -632,7 +632,9 @@ mod tests {
             match token {
                 LzssToken::Literal(b) => decoder.decode_literal(*b),
                 LzssToken::Match { length, distance } => {
-                    decoder.decode_match(*length, *distance).unwrap();
+                    decoder
+                        .decode_match(*length, *distance)
+                        .expect("operation failed");
                 }
             }
         }

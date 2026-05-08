@@ -248,6 +248,39 @@ impl RingBuffer {
     }
 }
 
+/// Snapshot of ring buffer state for partial-delivery rollback.
+///
+/// Created by [`RingBuffer::snapshot`] and restored via [`RingBuffer::restore_from`].
+#[derive(Clone, Debug)]
+pub struct RingSnapshot {
+    buffer: Vec<u8>,
+    position: usize,
+    size: usize,
+}
+
+impl RingBuffer {
+    /// Take a snapshot of current state for rollback on partial-input failure.
+    pub fn snapshot(&self) -> RingSnapshot {
+        RingSnapshot {
+            buffer: self.buffer.clone(),
+            position: self.position,
+            size: self.size,
+        }
+    }
+
+    /// Restore from a previously taken snapshot.
+    pub fn restore_from(&mut self, snap: &RingSnapshot) {
+        debug_assert_eq!(
+            snap.buffer.len(),
+            self.capacity,
+            "snapshot capacity mismatch"
+        );
+        self.buffer.copy_from_slice(&snap.buffer);
+        self.position = snap.position;
+        self.size = snap.size;
+    }
+}
+
 /// A ring buffer that also accumulates output data.
 ///
 /// This is useful when you need both the sliding window for back-references
@@ -352,6 +385,30 @@ impl OutputRingBuffer {
         self.ring.preload_dictionary(dictionary);
         // Note: Dictionary is NOT added to output, only to history
     }
+
+    /// Drain all accumulated output while PRESERVING the LZ77 sliding window.
+    ///
+    /// This is the streaming primitive: call it after each sync-flush unit to
+    /// collect decompressed bytes, then continue feeding the next unit.  The
+    /// ring-buffer history is untouched so distance back-references across flush
+    /// boundaries remain valid (RFC 4978 §3 requires this).
+    pub fn drain_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output)
+    }
+
+    /// Take a ring-state snapshot for rollback on partial-input failure.
+    pub fn ring_snapshot(&self) -> RingSnapshot {
+        self.ring.snapshot()
+    }
+
+    /// Restore ring state and truncate output to `output_len`.
+    ///
+    /// Used after a failed partial-block attempt to undo all side-effects of
+    /// the failed `inflate_block` call before retrying with more input.
+    pub fn restore_ring(&mut self, snap: &RingSnapshot, output_len: usize) {
+        self.ring.restore_from(snap);
+        self.output.truncate(output_len);
+    }
 }
 
 #[cfg(test)]
@@ -369,9 +426,21 @@ mod tests {
         ring.write_byte(b'o');
 
         assert_eq!(ring.len(), 5);
-        assert_eq!(ring.read_at_distance(1).unwrap(), b'o');
-        assert_eq!(ring.read_at_distance(2).unwrap(), b'l');
-        assert_eq!(ring.read_at_distance(5).unwrap(), b'H');
+        assert_eq!(
+            ring.read_at_distance(1)
+                .expect("read at distance 1 should return last byte"),
+            b'o'
+        );
+        assert_eq!(
+            ring.read_at_distance(2)
+                .expect("read at distance 2 should return second-to-last byte"),
+            b'l'
+        );
+        assert_eq!(
+            ring.read_at_distance(5)
+                .expect("read at distance 5 should return first byte"),
+            b'H'
+        );
     }
 
     #[test]
@@ -381,10 +450,26 @@ mod tests {
         ring.write_bytes(b"ABCDEF"); // Wraps around
 
         assert_eq!(ring.len(), 4); // Max is capacity
-        assert_eq!(ring.read_at_distance(1).unwrap(), b'F');
-        assert_eq!(ring.read_at_distance(2).unwrap(), b'E');
-        assert_eq!(ring.read_at_distance(3).unwrap(), b'D');
-        assert_eq!(ring.read_at_distance(4).unwrap(), b'C');
+        assert_eq!(
+            ring.read_at_distance(1)
+                .expect("read at distance 1 after wrap should return last byte"),
+            b'F'
+        );
+        assert_eq!(
+            ring.read_at_distance(2)
+                .expect("read at distance 2 after wrap should return second-to-last byte"),
+            b'E'
+        );
+        assert_eq!(
+            ring.read_at_distance(3)
+                .expect("read at distance 3 after wrap should return third-to-last byte"),
+            b'D'
+        );
+        assert_eq!(
+            ring.read_at_distance(4)
+                .expect("read at distance 4 after wrap should return fourth-to-last byte"),
+            b'C'
+        );
     }
 
     #[test]
@@ -396,7 +481,9 @@ mod tests {
         ring.write_bytes(b"ABCD");
 
         // Copy distance=4, length=4 -> "ABCD"
-        let written = ring.copy_from_history(4, 4, Some(&mut output)).unwrap();
+        let written = ring
+            .copy_from_history(4, 4, Some(&mut output))
+            .expect("copy from history should succeed for valid distance and length");
         assert_eq!(written, 4);
         assert_eq!(&output[..4], b"ABCD");
     }
@@ -410,7 +497,9 @@ mod tests {
 
         ring.write_bytes(b"AB");
 
-        let written = ring.copy_from_history(2, 6, Some(&mut output)).unwrap();
+        let written = ring
+            .copy_from_history(2, 6, Some(&mut output))
+            .expect("copy from history should succeed for overlapping back-reference");
         assert_eq!(written, 6);
         assert_eq!(&output[..6], b"ABABAB");
     }
@@ -423,7 +512,9 @@ mod tests {
 
         ring.write_byte(b'X');
 
-        let written = ring.copy_from_history(1, 5, Some(&mut output)).unwrap();
+        let written = ring
+            .copy_from_history(1, 5, Some(&mut output))
+            .expect("copy from history should succeed for single-byte repeat");
         assert_eq!(written, 5);
         assert_eq!(&output[..5], b"XXXXX");
     }
@@ -441,7 +532,8 @@ mod tests {
         let mut orb = OutputRingBuffer::new(32);
 
         orb.write_literals(b"Hello");
-        orb.copy_match(5, 5).unwrap(); // Copy "Hello" again
+        orb.copy_match(5, 5)
+            .expect("copy match should succeed when history contains enough data"); // Copy "Hello" again
 
         assert_eq!(orb.output(), b"HelloHello");
     }
@@ -459,5 +551,36 @@ mod tests {
     #[should_panic(expected = "power of 2")]
     fn test_non_power_of_two_panics() {
         let _ = RingBuffer::new(100);
+    }
+
+    #[test]
+    fn test_drain_output_preserves_ring() {
+        let mut orb = OutputRingBuffer::new(32);
+        orb.write_literals(b"Hello");
+        let drained = orb.drain_output();
+        assert_eq!(drained, b"Hello");
+        assert_eq!(orb.output_len(), 0);
+        // Ring must still contain the history
+        orb.copy_match(5, 5)
+            .expect("copy match should succeed after drain since ring still holds history"); // back-ref to "Hello"
+        assert_eq!(orb.output(), b"Hello");
+    }
+
+    #[test]
+    fn test_restore_ring_rollback() {
+        let mut orb = OutputRingBuffer::new(32);
+        orb.write_literals(b"ABC");
+        let snap = orb.ring_snapshot();
+        let out_len = orb.output_len();
+        // Simulate partial work
+        orb.write_literals(b"XYZ");
+        assert_eq!(orb.output(), b"ABCXYZ");
+        // Rollback
+        orb.restore_ring(&snap, out_len);
+        assert_eq!(orb.output(), b"ABC");
+        // Ring should be back to ABC state — write a literal that would have
+        // conflicted with XYZ to confirm ring is rolled back
+        orb.write_literals(b"DEF");
+        assert_eq!(orb.output(), b"ABCDEF");
     }
 }

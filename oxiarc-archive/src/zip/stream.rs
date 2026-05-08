@@ -554,21 +554,27 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor);
 
-        let mut e0 = stream.next_entry().unwrap().unwrap();
+        let mut e0 = stream
+            .next_entry()
+            .expect("next_entry e0")
+            .expect("e0 present");
         assert_eq!(e0.meta.name, "hello.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e0, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e0, &mut out).expect("read_to_end e0");
         assert_eq!(&out, b"Hello");
         drop(e0);
 
-        let mut e1 = stream.next_entry().unwrap().unwrap();
+        let mut e1 = stream
+            .next_entry()
+            .expect("next_entry e1")
+            .expect("e1 present");
         assert_eq!(e1.meta.name, "world.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e1, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e1, &mut out).expect("read_to_end e1");
         assert_eq!(&out, b"World");
         drop(e1);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -584,14 +590,17 @@ mod tests {
 
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor);
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry data.bin")
+            .expect("data.bin present");
 
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end data.bin");
         assert_eq!(&out, data.as_slice());
         drop(entry);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -601,12 +610,18 @@ mod tests {
         let mut stream = ZipStreamReader::new(cursor);
 
         // Drop first entry without reading
-        let _ = stream.next_entry().unwrap().unwrap();
+        let _ = stream
+            .next_entry()
+            .expect("next_entry skip.txt")
+            .expect("skip.txt present");
 
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry keep.txt")
+            .expect("keep.txt present");
         assert_eq!(entry.meta.name, "keep.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end keep.txt");
         assert_eq!(&out, b"keep content");
     }
 
@@ -623,15 +638,21 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor);
 
-        let e0 = stream.next_entry().unwrap().unwrap();
+        let e0 = stream
+            .next_entry()
+            .expect("next_entry e0 dir")
+            .expect("e0 present");
         assert!(e0.meta.is_directory);
         drop(e0);
 
-        let mut e1 = stream.next_entry().unwrap().unwrap();
+        let mut e1 = stream
+            .next_entry()
+            .expect("next_entry e1 file")
+            .expect("e1 present");
         assert!(!e1.meta.is_directory);
         assert_eq!(e1.meta.name, "mydir/file.txt");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e1, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e1, &mut out).expect("read_to_end e1");
         assert_eq!(&out, b"content");
     }
 
@@ -645,7 +666,10 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor).with_cancel(token_clone);
 
-        let e0 = stream.next_entry().unwrap().unwrap();
+        let e0 = stream
+            .next_entry()
+            .expect("next_entry e0")
+            .expect("e0 present");
         drop(e0);
 
         token.cancel();
@@ -676,7 +700,7 @@ mod tests {
         let buf = build_zip(&[("f1.txt", b"1"), ("f2.txt", b"2"), ("f3.txt", b"3")]);
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor).with_progress(handle);
-        while let Some(e) = stream.next_entry().unwrap() {
+        while let Some(e) = stream.next_entry().expect("next_entry in progress loop") {
             drop(e);
         }
         assert_eq!(sink.count.load(Ordering::SeqCst), 3);
@@ -687,9 +711,12 @@ mod tests {
         let buf = build_zip(&[("x.txt", b"content")]);
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor).with_progress(noop_progress());
-        let mut e = stream.next_entry().unwrap().unwrap();
+        let mut e = stream
+            .next_entry()
+            .expect("next_entry x.txt")
+            .expect("x.txt present");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut e, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut e, &mut out).expect("read_to_end x.txt");
         assert_eq!(&out, b"content");
     }
 
@@ -702,7 +729,7 @@ mod tests {
         }
         let cursor = Cursor::new(buf);
         let mut stream = ZipStreamReader::new(cursor);
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry empty").is_none());
     }
 
     // ========================================================================

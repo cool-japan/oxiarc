@@ -1,5 +1,5 @@
 
-# oxiarc-archive - Development Status (v0.2.7, 2026-04-21)
+# oxiarc-archive - Development Status (v0.2.8, 2026-05-08)
 
 ## Completed Features (COMPLETE)
 
@@ -110,10 +110,16 @@
 ## Future Enhancements
 
 ### ZIP Improvements
-- [ ] ZIP encryption (traditional)
-- [ ] ZIP encryption (AES)
+- [x] ZIP encryption (traditional ZipCrypto) — implemented in 0.2.8
+- [x] ZIP encryption (AES-256) — implemented in 0.2.8
 - [ ] Split/multi-part archives
 - [x] ZIP streaming reader — data-descriptor (flag bit 3) support (planned 2026-04-20) — DEFLATE+bit3 works, Stored+bit3 still requires Seek
+- [x] Byte-fidelity raw-preserve in `oxiarc add` for ZIP and LZH (completed 2026-05-06)
+  - **Goal:** `oxiarc add` rewrites ZIP and LZH archives preserving existing entries byte-for-byte (compressed payload + method + CRC + sizes), eliminating decompress→recompress round-trip. TAR path extended to preserve symlink/special metadata.
+  - **Design:** NEW `ZipWriter::add_file_raw(name, method, crc32, uncompressed_size, compressed_data)` in zip/header/writer.rs — writes LFH with supplied method/CRC/sizes, payload verbatim, updates central dir. NEW `LzhReader::read_raw_method_data(entry) -> Result<(LzhMethod, Vec<u8>, u16)>` in lzh/mod.rs (skip CRC verify). NEW `LzhWriter::add_file_raw(name, method, crc16, original_size, compressed_data, mtime, attrs)` in lzh/mod.rs. Refactor `AddEntry` in oxiarc-cli/src/commands/add.rs (line 23) from tuple to struct/enum with method+crc+sizes variants. ZIP path uses `extract_raw`+`add_file_raw`; LZH path uses new raw read+write; TAR path preserves all metadata. Run `rslines 50` on lzh/mod.rs; invoke `splitrs` if >2000 lines.
+  - **Files:** MODIFY `oxiarc-archive/src/zip/header/writer.rs`, MODIFY `oxiarc-archive/src/lzh/mod.rs`, MODIFY `oxiarc-cli/src/commands/add.rs`
+  - **Tests:** `test_zip_add_preserves_compressed_bytes`, `test_zip_add_preserves_method_and_crc`, `test_lzh_add_preserves_compressed_bytes`, `test_tar_add_preserves_symlink`, `test_tar_add_preserves_mode_and_uname`
+  - **Risk:** LZH header CRC must be recomputed in `add_file_raw`; reuse `add_file_with_metadata` header-CRC path.
 
 ### TAR Improvements
 - [x] TAR sparse file support (GNU old-format + PAX GNU.sparse.*) (planned 2026-04-20) — materializes logical content with zero-fill; hole-preservation on disk is out of scope
@@ -135,7 +141,12 @@
 
 ### New Formats
 - [ ] RAR read support (licensing?)
-- [ ] ISO 9660 read support
+- [x] ISO 9660 read support — PVD + Joliet UCS-2 filenames (completed 2026-05-06)
+  - **Goal:** `oxiarc list/extract/info/detect` work on ISO 9660 images. PVD + Joliet SVD support, fallback to 8.3 names. No Rock Ridge / El Torito / UDF / write / multi-session.
+  - **Design:** NEW `oxiarc-archive/src/iso9660/` with: `mod.rs` (`IsoReader<R: Read+Seek>`, new/entries/extract), `volume_descriptor.rs` (PVD type-1 + Joliet SVD type-2, 2048-byte sector walk from LBA 16), `directory_record.rs` (ECMA-119 §9.1, recursive walker), `joliet.rs` (UCS-2 BE→UTF-8). Register in lib.rs. `ArchiveFormat::Iso9660` detected at offset 32768 by magic `CD001`. CLI match arms in list/extract/info/detect. Test fixture: `build_minimal_iso() -> Vec<u8>` hand-crafted 32-KiB ISO byte literal (system area 0-15, PVD at 16, Joliet SVD at 17, terminator at 18, path table at 19, root dir at 20, file data at 21-22) with field-by-field ECMA-119 section comments.
+  - **Files:** NEW `oxiarc-archive/src/iso9660/{mod,volume_descriptor,directory_record,joliet}.rs`, MODIFY `oxiarc-archive/src/{lib,format}.rs`, MODIFY `oxiarc-cli/src/commands/{list,extract,info,detect}.rs`
+  - **Tests:** `test_iso_detect_magic_at_lba_16`, `test_iso_pvd_parses`, `test_iso_joliet_filename_decode`, `test_iso_directory_record_walk`, `test_iso_extract_file_content`, `test_iso_level1_fallback`, CLI `test_cli_list_iso`
+  - **Risk:** Fixture self-consistency risk — field-by-field ECMA-119 comments in builder function mitigate.
 
 ### General
 - [x] Streaming extraction (without buffering entire file) (completed 2026-04-20)
@@ -227,12 +238,11 @@
 
 ## Known Limitations
 
-1. No support for encrypted ZIP archives (traditional or AES)
-2. No split/multi-part ZIP archive support
-3. TAR sparse: read support lands hole-preserving extraction via in-memory
+1. No split/multi-part ZIP archive support
+2. TAR sparse: read support lands hole-preserving extraction via in-memory
    materialization (GNU old-format + PAX `GNU.sparse.*`); writer-side sparse
    emission and on-disk hole-punching during extraction remain out of scope.
-4. LZH level 3 headers not supported
-5. No RAR format support
-6. 7z and CAB are read-only (no create/write)
-7. Async I/O only available for ZIP format
+3. LZH level 3 headers not supported
+4. No RAR format support
+5. 7z and CAB are read-only (no create/write)
+6. Async I/O only available for ZIP format

@@ -75,42 +75,42 @@ mod tests {
     #[test]
     fn test_roundtrip_empty() {
         let data: &[u8] = b"";
-        let compressed = compress(data).unwrap();
-        let decompressed = decompress(&compressed, 0).unwrap();
+        let compressed = compress(data).expect("lz4 compress empty");
+        let decompressed = decompress(&compressed, 0).expect("lz4 decompress empty");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_hello() {
         let data = b"Hello, World!";
-        let compressed = compress(data).unwrap();
-        let decompressed = decompress(&compressed, data.len()).unwrap();
+        let compressed = compress(data).expect("lz4 compress hello");
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress hello");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_repeated() {
         let data = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let compressed = compress(data).unwrap();
+        let compressed = compress(data).expect("lz4 compress repeated");
         // Repeated data should compress well
         assert!(compressed.len() < data.len());
-        let decompressed = decompress(&compressed, data.len()).unwrap();
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress repeated");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_roundtrip_pattern() {
         let data = b"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
-        let compressed = compress(data).unwrap();
-        let decompressed = decompress(&compressed, data.len()).unwrap();
+        let compressed = compress(data).expect("lz4 compress pattern");
+        let decompressed = decompress(&compressed, data.len()).expect("lz4 decompress pattern");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_block_roundtrip() {
         let data = b"The quick brown fox jumps over the lazy dog";
-        let compressed = compress_block(data).unwrap();
-        let decompressed = decompress_block(&compressed, data.len()).unwrap();
+        let compressed = compress_block(data).expect("lz4 block compress");
+        let decompressed = decompress_block(&compressed, data.len()).expect("lz4 block decompress");
         assert_eq!(decompressed, data);
     }
 

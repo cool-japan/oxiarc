@@ -9,18 +9,51 @@
 //! cases a clear error is printed and the process exits with status 2.
 
 use crate::commands::CompressionLevel;
+use oxiarc_archive::zip::{CompressionMethod as ZipMethod, is_entry_encrypted};
 use oxiarc_archive::{
-    ArchiveFormat, LzhCompressionLevel, LzhReader, LzhWriter, TarReader, TarWriter,
-    ZipCompressionLevel, ZipReader, ZipWriter,
+    ArchiveFormat, LzhCompressionLevel, LzhMethod, LzhReader, LzhWriter, TarHeader, TarReader,
+    TarWriter, ZipCompressionLevel, ZipReader, ZipWriter,
 };
 use oxiarc_core::EntryType;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// `(entry_name, is_dir, data)` record passed between the read and write
-/// phases of the add operation. Simple tuple to avoid a throwaway struct.
-type AddEntry = (String, bool, Vec<u8>);
+/// A raw-preserved entry from an existing archive, or new file input data.
+///
+/// Existing ZIP and LZH entries are stored with their original compressed
+/// payload to avoid recompression and preserve byte-for-byte fidelity.
+/// TAR entries keep the full `TarHeader` so all metadata (uid/gid/uname/gname/
+/// mtime/mode/linkname) round-trips without loss.
+enum ArchiveEntry {
+    /// Existing ZIP directory entry.
+    ZipDir { name: String },
+    /// Existing ZIP file entry — pre-compressed bytes preserved verbatim.
+    ZipFile {
+        name: String,
+        method: ZipMethod,
+        crc32: u32,
+        uncompressed_size: u64,
+        mtime: Option<std::time::SystemTime>,
+        compressed_data: Vec<u8>,
+    },
+    /// Existing LZH directory entry.
+    LzhDir { name: String },
+    /// Existing LZH file entry — pre-compressed bytes preserved verbatim.
+    LzhFile {
+        name: String,
+        method: LzhMethod,
+        crc16: u16,
+        original_size: u64,
+        compressed_data: Vec<u8>,
+        mtime: u32,
+    },
+    /// Existing TAR entry — full header and raw body preserved.
+    Tar { header: TarHeader, data: Vec<u8> },
+}
+
+/// `(entry_name, is_dir, data)` record used only for newly-added files.
+type NewEntry = (String, bool, Vec<u8>);
 
 /// Entrypoint invoked by `main.rs` when the user runs `oxiarc add ...`.
 pub fn cmd_add(
@@ -59,8 +92,8 @@ pub fn cmd_add(
 /// `(entry_name, is_dir, data)` tuples with `name` always using `/` separators
 /// and rooted at the file's own basename (matching the convention in
 /// `create.rs`).
-fn collect_input_entries(files: &[PathBuf]) -> Result<Vec<AddEntry>, Box<dyn std::error::Error>> {
-    let mut out: Vec<AddEntry> = Vec::new();
+fn collect_input_entries(files: &[PathBuf]) -> Result<Vec<NewEntry>, Box<dyn std::error::Error>> {
+    let mut out: Vec<NewEntry> = Vec::new();
     for path in files {
         if !path.exists() {
             return Err(format!("input not found: {}", path.display()).into());
@@ -73,7 +106,7 @@ fn collect_input_entries(files: &[PathBuf]) -> Result<Vec<AddEntry>, Box<dyn std
 fn collect_one(
     path: &Path,
     base: &Path,
-    out: &mut Vec<AddEntry>,
+    out: &mut Vec<NewEntry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rel = path
         .strip_prefix(base.parent().unwrap_or(base))
@@ -106,7 +139,8 @@ fn temp_path_for(archive: &Path) -> PathBuf {
 }
 
 /// ZIP append — read all existing entries via `ZipReader`, rewrite with a
-/// fresh `ZipWriter`, then append the newly-supplied files.
+/// fresh `ZipWriter` using raw-preserve for existing entries, then append
+/// the newly-supplied files.
 fn add_to_zip(
     archive: &Path,
     files: &[PathBuf],
@@ -114,19 +148,36 @@ fn add_to_zip(
     verbose: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Read all existing entries into memory.
+    // Read all existing entries into memory, preserving raw compressed bytes.
     let file = File::open(archive)?;
     let reader = BufReader::new(file);
     let mut zip = ZipReader::new(reader)?;
     let existing: Vec<_> = zip.entries().to_vec();
 
-    let mut existing_data: Vec<AddEntry> = Vec::with_capacity(existing.len());
+    let mut existing_entries: Vec<ArchiveEntry> = Vec::with_capacity(existing.len());
     for entry in &existing {
         if entry.is_dir() {
-            existing_data.push((entry.name.clone(), true, Vec::new()));
+            existing_entries.push(ArchiveEntry::ZipDir {
+                name: entry.name.clone(),
+            });
         } else {
-            let data = zip.extract(entry)?;
-            existing_data.push((entry.name.clone(), false, data));
+            // Reject encrypted entries — raw-preserve cannot work without the key.
+            if is_entry_encrypted(entry) {
+                return Err(format!(
+                    "cannot add to archive: entry '{}' is encrypted; raw-preserve requires an unencrypted archive",
+                    entry.name
+                )
+                .into());
+            }
+            let compressed_data = zip.extract_raw(entry)?;
+            existing_entries.push(ArchiveEntry::ZipFile {
+                name: entry.name.clone(),
+                method: ZipMethod::from_core(&entry.method),
+                crc32: entry.crc32.unwrap_or(0),
+                uncompressed_size: entry.size,
+                mtime: entry.modified,
+                compressed_data,
+            });
         }
     }
     drop(zip);
@@ -135,7 +186,7 @@ fn add_to_zip(
 
     if dry_run {
         println!("[DRY RUN] Would update ZIP archive: {}", archive.display());
-        println!("[DRY RUN] Existing entries: {}", existing_data.len());
+        println!("[DRY RUN] Existing entries: {}", existing_entries.len());
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 println!("[DRY RUN]   + (dir) {}", name);
@@ -165,13 +216,34 @@ fn add_to_zip(
         };
         zw.set_compression(level);
 
-        for (name, is_dir, data) in existing_data {
-            if is_dir {
-                zw.add_directory(&name)?;
-            } else {
-                zw.add_file(&name, &data)?;
+        // Rewrite existing entries verbatim (raw-preserve).
+        for entry in existing_entries {
+            match entry {
+                ArchiveEntry::ZipDir { name } => {
+                    zw.add_directory(&name)?;
+                }
+                ArchiveEntry::ZipFile {
+                    name,
+                    method,
+                    crc32,
+                    uncompressed_size,
+                    mtime,
+                    compressed_data,
+                } => {
+                    zw.add_file_raw(
+                        &name,
+                        method,
+                        crc32,
+                        uncompressed_size,
+                        mtime,
+                        &compressed_data,
+                    )?;
+                }
+                _ => unreachable!("ZIP path only holds Zip variants"),
             }
         }
+
+        // Append newly-supplied files (re-compressed normally).
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 zw.add_directory(name)?;
@@ -195,7 +267,8 @@ fn add_to_zip(
     Ok(())
 }
 
-/// TAR append — read all existing entries, rewrite + append, rename.
+/// TAR append — read all existing entries preserving full metadata via
+/// `TarHeader`, rewrite + append, rename.
 fn add_to_tar(
     archive: &Path,
     files: &[PathBuf],
@@ -207,22 +280,26 @@ fn add_to_tar(
     let mut tar = TarReader::new(reader)?;
     let existing: Vec<_> = tar.entries().to_vec();
 
-    let mut existing_data: Vec<AddEntry> = Vec::with_capacity(existing.len());
+    // Collect all existing entries with their full headers for metadata preservation.
+    let mut existing_entries: Vec<ArchiveEntry> = Vec::with_capacity(existing.len());
     for entry in &existing {
-        if entry.is_dir() {
-            existing_data.push((entry.name.clone(), true, Vec::new()));
-        } else if entry.entry_type == EntryType::File {
-            let data = tar.extract_to_vec(entry)?;
-            existing_data.push((entry.name.clone(), false, data));
-        } else {
-            // Skip symlinks/specials — add_file API can't represent them.
-            if verbose {
-                eprintln!(
-                    "note: skipping non-file entry {} (type {:?})",
-                    entry.name, entry.entry_type
-                );
-            }
-        }
+        let header = tar
+            .header_for(entry)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: header not found for TAR entry '{}'",
+                    entry.name
+                )
+            })?
+            .clone();
+
+        let data = match entry.entry_type {
+            EntryType::File => tar.extract_to_vec(entry)?,
+            // Directories, symlinks, hard links — no payload.
+            _ => Vec::new(),
+        };
+
+        existing_entries.push(ArchiveEntry::Tar { header, data });
     }
     drop(tar);
 
@@ -230,7 +307,7 @@ fn add_to_tar(
 
     if dry_run {
         println!("[DRY RUN] Would update TAR archive: {}", archive.display());
-        println!("[DRY RUN] Existing entries: {}", existing_data.len());
+        println!("[DRY RUN] Existing entries: {}", existing_entries.len());
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 println!("[DRY RUN]   + (dir) {}", name);
@@ -252,13 +329,17 @@ fn add_to_tar(
         let writer = BufWriter::new(out);
         let mut tw = TarWriter::new(writer);
 
-        for (name, is_dir, data) in existing_data {
-            if is_dir {
-                tw.add_directory(&name)?;
-            } else {
-                tw.add_file(&name, &data)?;
+        // Rewrite existing entries via add_entry_from_header to preserve all metadata.
+        for entry in existing_entries {
+            match entry {
+                ArchiveEntry::Tar { header, data } => {
+                    tw.add_entry_from_header(&header, &data)?;
+                }
+                _ => unreachable!("TAR path only holds Tar variants"),
             }
         }
+
+        // Append newly-supplied files.
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 tw.add_directory(name)?;
@@ -282,10 +363,12 @@ fn add_to_tar(
     Ok(())
 }
 
-/// LZH append — read all existing entries, rewrite + append, rename.
+/// LZH append — read all existing entries preserving raw compressed bytes,
+/// rewrite + append, rename.
 ///
-/// Compression level for the rewrite is forced to `Store` to match the
-/// behaviour in `create.rs`, which currently treats `Lh5` as experimental.
+/// Existing entries are rewritten verbatim via `add_file_raw` so that the
+/// compression method (lh0, lh5, …) and the exact compressed payload are
+/// preserved. Newly-added files are compressed with `Store` (`lh0`).
 fn add_to_lzh(
     archive: &Path,
     files: &[PathBuf],
@@ -297,13 +380,27 @@ fn add_to_lzh(
     let mut lzh = LzhReader::new(reader)?;
     let existing: Vec<_> = lzh.entries();
 
-    let mut existing_data: Vec<AddEntry> = Vec::with_capacity(existing.len());
+    let mut existing_entries: Vec<ArchiveEntry> = Vec::with_capacity(existing.len());
     for entry in &existing {
         if entry.is_dir() {
-            existing_data.push((entry.name.clone(), true, Vec::new()));
+            existing_entries.push(ArchiveEntry::LzhDir {
+                name: entry.name.clone(),
+            });
         } else if entry.entry_type == EntryType::File {
-            let data = lzh.extract_to_vec(entry)?;
-            existing_data.push((entry.name.clone(), false, data));
+            let (method, compressed_data, crc16) = lzh.read_raw_method_data(entry)?;
+            let mtime = entry
+                .modified
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            existing_entries.push(ArchiveEntry::LzhFile {
+                name: entry.name.clone(),
+                method,
+                crc16,
+                original_size: entry.size,
+                compressed_data,
+                mtime,
+            });
         }
     }
     drop(lzh);
@@ -312,7 +409,7 @@ fn add_to_lzh(
 
     if dry_run {
         println!("[DRY RUN] Would update LZH archive: {}", archive.display());
-        println!("[DRY RUN] Existing entries: {}", existing_data.len());
+        println!("[DRY RUN] Existing entries: {}", existing_entries.len());
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 println!("[DRY RUN]   + (dir) {}", name);
@@ -333,15 +430,38 @@ fn add_to_lzh(
             .open(&tmp)?;
         let writer = BufWriter::new(out);
         let mut lw = LzhWriter::new(writer);
+        // Newly-added files use Store (lh0). Existing files keep their original method.
         lw.set_compression(LzhCompressionLevel::Store);
 
-        for (name, is_dir, data) in existing_data {
-            if is_dir {
-                lw.add_directory(&name)?;
-            } else {
-                lw.add_file(&name, &data)?;
+        // Rewrite existing entries verbatim.
+        for entry in existing_entries {
+            match entry {
+                ArchiveEntry::LzhDir { name } => {
+                    lw.add_directory(&name)?;
+                }
+                ArchiveEntry::LzhFile {
+                    name,
+                    method,
+                    crc16,
+                    original_size,
+                    compressed_data,
+                    mtime,
+                } => {
+                    lw.add_file_raw(
+                        &name,
+                        method,
+                        crc16,
+                        original_size,
+                        &compressed_data,
+                        mtime,
+                        None,
+                    )?;
+                }
+                _ => unreachable!("LZH path only holds Lzh variants"),
             }
         }
+
+        // Append newly-supplied files.
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 lw.add_directory(name)?;

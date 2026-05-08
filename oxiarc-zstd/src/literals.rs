@@ -368,7 +368,7 @@ mod tests {
     fn test_parse_raw_literals_small() {
         // Raw literals, size format 0/2, 5 bits size
         let data = [0b00001000]; // type=0 (raw), size_format=0, size=1
-        let header = parse_literals_header(&data).unwrap();
+        let header = parse_literals_header(&data).expect("valid decode operation");
 
         assert_eq!(header.block_type, LiteralsBlockType::Raw);
         assert_eq!(header.regenerated_size, 1);
@@ -379,7 +379,7 @@ mod tests {
     fn test_parse_rle_literals() {
         // RLE literals
         let data = [0b00001001]; // type=1 (RLE), size_format=0, size=1
-        let header = parse_literals_header(&data).unwrap();
+        let header = parse_literals_header(&data).expect("valid decode operation");
 
         assert_eq!(header.block_type, LiteralsBlockType::Rle);
         assert_eq!(header.regenerated_size, 1);
@@ -393,7 +393,7 @@ mod tests {
         data.extend_from_slice(b"Hello");
 
         let mut decoder = LiteralsDecoder::new();
-        let (literals, consumed) = decoder.decode(&data).unwrap();
+        let (literals, consumed) = decoder.decode(&data).expect("valid decode operation");
 
         assert_eq!(literals, b"Hello");
         assert_eq!(consumed, 6);
@@ -405,7 +405,7 @@ mod tests {
         let data = [0b00101001, b'A']; // type=1, size=5, byte='A'
 
         let mut decoder = LiteralsDecoder::new();
-        let (literals, consumed) = decoder.decode(&data).unwrap();
+        let (literals, consumed) = decoder.decode(&data).expect("valid decode operation");
 
         assert_eq!(literals, vec![b'A'; 5]);
         assert_eq!(consumed, 2);

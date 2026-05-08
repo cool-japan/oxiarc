@@ -775,7 +775,8 @@ mod tests {
     #[test]
     fn test_encode_literal_length_small() {
         for val in 0..16u32 {
-            let (code, extra, extra_val) = encode_literal_length(val).unwrap();
+            let (code, extra, extra_val) =
+                encode_literal_length(val).expect("valid encode operation");
             assert_eq!(code, val as u8);
             assert_eq!(extra, 0);
             assert_eq!(extra_val, 0);
@@ -785,13 +786,15 @@ mod tests {
     #[test]
     fn test_encode_literal_length_large() {
         // value=18 -> code=17, baseline=18, extra_bits=1, extra=0
-        let (code, extra_bits, extra_val) = encode_literal_length(18).unwrap();
+        let (code, extra_bits, extra_val) =
+            encode_literal_length(18).expect("valid encode operation");
         assert_eq!(code, 17);
         assert_eq!(extra_bits, 1);
         assert_eq!(extra_val, 0);
 
         // value=19 -> code=17, baseline=18, extra_bits=1, extra=1
-        let (code, extra_bits, extra_val) = encode_literal_length(19).unwrap();
+        let (code, extra_bits, extra_val) =
+            encode_literal_length(19).expect("valid encode operation");
         assert_eq!(code, 17);
         assert_eq!(extra_bits, 1);
         assert_eq!(extra_val, 1);
@@ -799,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_encode_match_length_minimum() {
-        let (code, extra, extra_val) = encode_match_length(3).unwrap();
+        let (code, extra, extra_val) = encode_match_length(3).expect("valid encode operation");
         assert_eq!(code, 0);
         assert_eq!(extra, 0);
         assert_eq!(extra_val, 0);
@@ -814,19 +817,19 @@ mod tests {
     #[test]
     fn test_encode_offset() {
         // offset=1 -> offset_value=4 -> code=2, extra_bits=2, extra=0
-        let (code, extra_bits, extra_val) = encode_offset(1).unwrap();
+        let (code, extra_bits, extra_val) = encode_offset(1).expect("valid encode operation");
         assert_eq!(code, 2);
         assert_eq!(extra_bits, 2);
         assert_eq!(extra_val, 0);
 
         // offset=2 -> offset_value=5 -> code=2, extra_bits=2, extra=1
-        let (code, extra_bits, extra_val) = encode_offset(2).unwrap();
+        let (code, extra_bits, extra_val) = encode_offset(2).expect("valid encode operation");
         assert_eq!(code, 2);
         assert_eq!(extra_bits, 2);
         assert_eq!(extra_val, 1);
 
         // offset=5 -> offset_value=8 -> code=3, extra_bits=3, extra=0
-        let (code, extra_bits, extra_val) = encode_offset(5).unwrap();
+        let (code, extra_bits, extra_val) = encode_offset(5).expect("valid encode operation");
         assert_eq!(code, 3);
         assert_eq!(extra_bits, 3);
         assert_eq!(extra_val, 0);
@@ -840,7 +843,7 @@ mod tests {
     #[test]
     fn test_encode_raw_literals_small() {
         let literals = b"Hello";
-        let encoded = encode_raw_literals(literals).unwrap();
+        let encoded = encode_raw_literals(literals).expect("valid encode operation");
         // 1-byte header for size < 32
         assert_eq!(encoded[0], (5u8) << 3);
         assert_eq!(&encoded[1..], b"Hello");
@@ -849,7 +852,7 @@ mod tests {
     #[test]
     fn test_encode_raw_literals_medium() {
         let literals = vec![0xAB; 100];
-        let encoded = encode_raw_literals(&literals).unwrap();
+        let encoded = encode_raw_literals(&literals).expect("valid encode operation");
         // 2-byte header
         let header: u16 = (0b01 << 2) | ((100u16) << 4);
         assert_eq!(encoded[0], (header & 0xFF) as u8);
@@ -860,7 +863,7 @@ mod tests {
     #[test]
     fn test_encode_rle_literals() {
         let literals = vec![0xCC; 10];
-        let encoded = encode_rle_literals(&literals).unwrap();
+        let encoded = encode_rle_literals(&literals).expect("valid encode operation");
         // 1-byte header + 1 data byte
         assert_eq!(encoded[0], (10u8 << 3) | 0b01);
         assert_eq!(encoded[1], 0xCC);
@@ -869,21 +872,21 @@ mod tests {
 
     #[test]
     fn test_encode_literals_section_empty() {
-        let encoded = encode_literals_section(&[]).unwrap();
+        let encoded = encode_literals_section(&[]).expect("valid encode operation");
         assert_eq!(encoded, vec![0]);
     }
 
     #[test]
     fn test_encode_literals_section_rle() {
         let literals = vec![0xFF; 20];
-        let encoded = encode_literals_section(&literals).unwrap();
+        let encoded = encode_literals_section(&literals).expect("valid encode operation");
         // Should pick RLE encoding
         assert_eq!(encoded[0] & 0x03, 0x01); // type = RLE
     }
 
     #[test]
     fn test_encode_sequences_section_empty() {
-        let encoded = encode_sequences_section(&[]).unwrap();
+        let encoded = encode_sequences_section(&[]).expect("valid encode operation");
         assert_eq!(encoded, vec![0]);
     }
 
@@ -939,7 +942,7 @@ mod tests {
             match_length: 3,
             offset: 1,
         }];
-        let block = encode_compressed_block(&sequences).unwrap();
+        let block = encode_compressed_block(&sequences).expect("valid encode operation");
         // Should produce a non-empty block.
         assert!(!block.is_empty());
     }
@@ -951,7 +954,7 @@ mod tests {
             match_length: 0,
             offset: 0,
         }];
-        let block = encode_compressed_block(&sequences).unwrap();
+        let block = encode_compressed_block(&sequences).expect("valid encode operation");
         // Literals section present, sequences section should be [0].
         assert!(!block.is_empty());
     }

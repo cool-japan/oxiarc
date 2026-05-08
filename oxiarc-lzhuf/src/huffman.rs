@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_empty_tree() {
-        let tree = LzhHuffmanTree::from_lengths(&[], 8).unwrap();
+        let tree = LzhHuffmanTree::from_lengths(&[], 8).expect("valid huffman table");
         assert_eq!(tree.max_length, 0);
     }
 
@@ -361,7 +361,7 @@ mod tests {
         let mut lengths = vec![0u8; 256];
         lengths[65] = 1; // Only 'A'
 
-        let tree = LzhHuffmanTree::from_lengths(&lengths, 8).unwrap();
+        let tree = LzhHuffmanTree::from_lengths(&lengths, 8).expect("valid huffman table");
         assert_eq!(tree.max_length, 1);
     }
 }

@@ -1,30 +1,18 @@
-# oxiarc-lzhuf
-
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-
-Pure Rust implementation of LZH (LZSS + Huffman) compression.
-
-**Version 0.2.7** (2026-04-21) — 54 tests passing.
-
 # oxiarc-lzhuf [Stable]
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![Version](https://img.shields.io/badge/version-0.2.8-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.2.7** (2026-04-21) — 56 tests passing.
+**Version 0.2.8** (2026-05-08) — 56 tests passing.
 
 ## Overview
 
 LZH is the compression algorithm used in LHA/LZH archives. It was particularly popular in Japan during the BBS era and is still used in some embedded systems and legacy applications.
 
 This crate implements the core compression algorithm, separate from the archive container format (handled by `oxiarc-archive`).
-
-## Features
-
 
 ## Features
 

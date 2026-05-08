@@ -275,32 +275,43 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("hello.txt", b"Hello, streaming!").unwrap();
-            w.add_directory("subdir").unwrap();
-            w.add_file("subdir/world.txt", b"World").unwrap();
-            w.finish().unwrap();
+            w.add_file("hello.txt", b"Hello, streaming!")
+                .expect("add_file hello.txt");
+            w.add_directory("subdir").expect("add_directory subdir");
+            w.add_file("subdir/world.txt", b"World")
+                .expect("add_file subdir/world.txt");
+            w.finish().expect("writer finish");
         }
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor);
 
-        let entry0 = stream.next_entry().unwrap().unwrap();
+        let entry0 = stream
+            .next_entry()
+            .expect("next_entry 0")
+            .expect("entry 0 present");
         assert_eq!(entry0.header.name, "hello.txt");
         assert_eq!(entry0.header.size, 17);
         drop(entry0);
 
-        let entry1 = stream.next_entry().unwrap().unwrap();
+        let entry1 = stream
+            .next_entry()
+            .expect("next_entry 1")
+            .expect("entry 1 present");
         assert!(entry1.header.entry_type() == EntryType::Directory);
         drop(entry1);
 
-        let mut entry2 = stream.next_entry().unwrap().unwrap();
+        let mut entry2 = stream
+            .next_entry()
+            .expect("next_entry 2")
+            .expect("entry 2 present");
         assert_eq!(entry2.header.name, "subdir/world.txt");
         let mut content = Vec::new();
-        std::io::Read::read_to_end(&mut entry2, &mut content).unwrap();
+        std::io::Read::read_to_end(&mut entry2, &mut content).expect("read_to_end entry2");
         assert_eq!(&content, b"World");
         drop(entry2);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -308,21 +319,25 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("data.bin", &[42u8; 1024]).unwrap();
-            w.finish().unwrap();
+            w.add_file("data.bin", &[42u8; 1024])
+                .expect("add_file data.bin");
+            w.finish().expect("writer finish");
         }
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor);
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry")
+            .expect("entry present");
 
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end entry");
         assert_eq!(out.len(), 1024);
         assert!(out.iter().all(|&b| b == 42));
         drop(entry);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -330,21 +345,29 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("skip_me.txt", b"skip this content").unwrap();
-            w.add_file("read_me.txt", b"read this content").unwrap();
-            w.finish().unwrap();
+            w.add_file("skip_me.txt", b"skip this content")
+                .expect("add_file skip_me.txt");
+            w.add_file("read_me.txt", b"read this content")
+                .expect("add_file read_me.txt");
+            w.finish().expect("writer finish");
         }
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor);
 
         // Drop the first entry without reading
-        let _ = stream.next_entry().unwrap().unwrap();
+        let _ = stream
+            .next_entry()
+            .expect("next_entry 0")
+            .expect("entry 0 present");
 
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry 1")
+            .expect("entry 1 present");
         assert_eq!(entry.header.name, "read_me.txt");
         let mut content = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read_to_end entry");
         assert_eq!(&content, b"read this content");
     }
 
@@ -354,9 +377,10 @@ mod tests {
         {
             let mut w = TarWriter::new(&mut buf);
             for i in 0..5u8 {
-                w.add_file(&format!("file{}.txt", i), &[i; 64]).unwrap();
+                w.add_file(&format!("file{}.txt", i), &[i; 64])
+                    .expect("add_file in loop");
             }
-            w.finish().unwrap();
+            w.finish().expect("writer finish");
         }
 
         let token = CancellationToken::new();
@@ -366,7 +390,10 @@ mod tests {
         let mut stream = TarStreamReader::new(cursor).with_cancel(token_clone);
 
         // Read the first entry normally.
-        let entry = stream.next_entry().unwrap().unwrap();
+        let entry = stream
+            .next_entry()
+            .expect("next_entry 0")
+            .expect("entry 0 present");
         assert_eq!(entry.header.name, "file0.txt");
         drop(entry);
 
@@ -400,15 +427,15 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("a.txt", b"aaa").unwrap();
-            w.add_file("b.txt", b"bbb").unwrap();
-            w.finish().unwrap();
+            w.add_file("a.txt", b"aaa").expect("add_file a.txt");
+            w.add_file("b.txt", b"bbb").expect("add_file b.txt");
+            w.finish().expect("writer finish");
         }
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor).with_progress(handle);
 
-        while let Some(e) = stream.next_entry().unwrap() {
+        while let Some(e) = stream.next_entry().expect("next_entry in progress loop") {
             drop(e);
         }
 
@@ -421,8 +448,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("big.bin", &data).unwrap();
-            w.finish().unwrap();
+            w.add_file("big.bin", &data).expect("add_file big.bin");
+            w.finish().expect("writer finish");
         }
 
         struct ByteSink {
@@ -441,10 +468,13 @@ mod tests {
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor).with_progress(handle);
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry big.bin")
+            .expect("big.bin present");
 
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end big.bin");
         drop(entry);
 
         assert_eq!(sink.total.load(Ordering::SeqCst), 4096);
@@ -458,26 +488,34 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("short.txt", b"Short").unwrap();
-            w.add_file(&long_name, b"LongPath").unwrap();
-            w.finish().unwrap();
+            w.add_file("short.txt", b"Short")
+                .expect("add_file short.txt");
+            w.add_file(&long_name, b"LongPath")
+                .expect("add_file long_name");
+            w.finish().expect("writer finish");
         }
 
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor);
 
-        let e0 = stream.next_entry().unwrap().unwrap();
+        let e0 = stream
+            .next_entry()
+            .expect("next_entry e0")
+            .expect("e0 present");
         assert_eq!(e0.header.name, "short.txt");
         drop(e0);
 
-        let mut e1 = stream.next_entry().unwrap().unwrap();
+        let mut e1 = stream
+            .next_entry()
+            .expect("next_entry e1")
+            .expect("e1 present");
         assert_eq!(e1.header.name, long_name);
         let mut content = Vec::new();
-        std::io::Read::read_to_end(&mut e1, &mut content).unwrap();
+        std::io::Read::read_to_end(&mut e1, &mut content).expect("read_to_end e1");
         assert_eq!(&content, b"LongPath");
         drop(e1);
 
-        assert!(stream.next_entry().unwrap().is_none());
+        assert!(stream.next_entry().expect("next_entry final").is_none());
     }
 
     #[test]
@@ -485,17 +523,20 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = TarWriter::new(&mut buf);
-            w.add_file("x.txt", b"x").unwrap();
-            w.finish().unwrap();
+            w.add_file("x.txt", b"x").expect("add_file x.txt");
+            w.finish().expect("writer finish");
         }
 
         let handle = noop_progress();
         let cursor = Cursor::new(buf);
         let mut stream = TarStreamReader::new(cursor).with_progress(handle);
 
-        let mut entry = stream.next_entry().unwrap().unwrap();
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry")
+            .expect("entry present");
         let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end entry");
         drop(entry);
         assert_eq!(&out, b"x");
     }
@@ -513,9 +554,9 @@ mod tests {
         {
             let mut w = TarWriter::new(&mut buf);
             for (name, data) in &files {
-                w.add_file(name, data).unwrap();
+                w.add_file(name, data).expect("add_file in loop");
             }
-            w.finish().unwrap();
+            w.finish().expect("writer finish");
         }
 
         // Read with streaming reader.
@@ -523,20 +564,24 @@ mod tests {
         {
             let cursor = Cursor::new(buf.clone());
             let mut stream = TarStreamReader::new(cursor);
-            while let Some(mut entry) = stream.next_entry().unwrap() {
+            while let Some(mut entry) = stream.next_entry().expect("next_entry in stream loop") {
                 let name = entry.header.name.clone();
                 let mut data = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+                std::io::Read::read_to_end(&mut entry, &mut data)
+                    .expect("read_to_end in stream loop");
                 stream_results.push((name, data));
             }
         }
 
         // Read with TarReader.
         let cursor = Cursor::new(buf);
-        let mut reader = TarReader::new(cursor).unwrap();
+        let mut reader = TarReader::new(cursor).expect("TarReader::new");
         for (i, (name, expected)) in files.iter().enumerate() {
             assert_eq!(stream_results[i].0, *name);
-            let actual = reader.extract_by_name(name).unwrap().unwrap();
+            let actual = reader
+                .extract_by_name(name)
+                .expect("extract_by_name")
+                .expect("entry present");
             assert_eq!(stream_results[i].1, actual);
             assert_eq!(actual, *expected);
         }

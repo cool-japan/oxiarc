@@ -7,11 +7,11 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.7 (2026-04-21) | 110 tests passing**
+**Version: 0.2.8 (2026-05-08) | 118 tests passing**
 
 ## Overview
 
-LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.2.6 adds an acceleration parameter for tuning compression speed vs ratio, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
+LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.2.8 adds progress reporting and cancellation support to the compressor/decompressor builders, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
 
 
 ## Features
@@ -25,6 +25,8 @@ LZ4 is a lossless compression algorithm focused on compression and decompression
 - **Parallel compression** - Optional multi-threaded compression via Rayon (`parallel` feature)
 - **Acceleration parameter** - Tunable speed/ratio tradeoff for compression
 - **Dictionary support** - Improved dictionary compression
+- **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on compressor/decompressor types
+- **Cancellation support** - `with_cancel(CancellationToken)` builder on compressor/decompressor types
 
 All features are implemented and tested. API is stable.
 
@@ -78,6 +80,30 @@ use oxiarc_lz4::compress_parallel;
 let compressed = compress_parallel(&data)?;
 ```
 
+## Progress and Cancellation (0.2.8)
+
+`Lz4Compressor`, `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4DictFrameDecoder` all expose two new builder methods:
+
+```rust
+use oxiarc_lz4::{Lz4Compressor, ProgressSink, CancellationToken};
+use std::sync::Arc;
+
+// Attach a progress sink (receives bytes-processed callbacks)
+let compressor = Lz4Compressor::new()
+    .with_progress(Arc::new(my_progress_sink));
+
+// Attach a cancellation token (cooperative cancellation)
+let compressor = Lz4Compressor::new()
+    .with_cancel(cancellation_token);
+
+// Both can be combined
+let compressor = Lz4Compressor::new()
+    .with_progress(Arc::new(my_progress_sink))
+    .with_cancel(cancellation_token);
+```
+
+The same pattern applies to `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4DictFrameDecoder`.
+
 ## Features (Cargo)
 
 | Feature | Default | Description |
@@ -87,7 +113,7 @@ let compressed = compress_parallel(&data)?;
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-lz4 = "0.2.6"
+oxiarc-lz4 = "0.2.8"
 
 # With parallel compression
 oxiarc-lz4 = { version = "0.2.6", features = ["parallel"] }

@@ -1,5 +1,30 @@
 use crate::commands::SortBy;
 use crate::style::Styler;
+
+/// Parse a human-readable byte size string into a raw `u64` byte count.
+///
+/// Accepted formats: `"100"`, `"100k"` / `"100K"` (×1 000), `"100m"` / `"100M"` (×1 000 000),
+/// `"100g"` / `"100G"` (×1 000 000 000).  The suffixes use decimal (SI) multipliers, not
+/// binary (KiB/MiB/GiB).
+///
+/// # Errors
+/// Returns `Err(String)` with a human-readable message when the input cannot be parsed.
+pub fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num_str, mult) = if let Some(rest) = s.strip_suffix(['k', 'K']) {
+        (rest, 1_000u64)
+    } else if let Some(rest) = s.strip_suffix(['m', 'M']) {
+        (rest, 1_000_000u64)
+    } else if let Some(rest) = s.strip_suffix(['g', 'G']) {
+        (rest, 1_000_000_000u64)
+    } else {
+        (s, 1u64)
+    };
+    num_str
+        .parse::<u64>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("invalid byte size: '{s}'"))
+}
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use oxiarc_core::{Entry, EntryType};
@@ -273,5 +298,50 @@ fn format_size(size: u64) -> String {
         format!("{:.1} KB", size as f64 / KB as f64)
     } else {
         format!("{size} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_byte_size_plain() {
+        assert_eq!(parse_byte_size("100").unwrap(), 100);
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("1048576").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn test_parse_byte_size_kilo() {
+        assert_eq!(parse_byte_size("100K").unwrap(), 100_000);
+        assert_eq!(parse_byte_size("100k").unwrap(), 100_000);
+        assert_eq!(parse_byte_size("1K").unwrap(), 1_000);
+    }
+
+    #[test]
+    fn test_parse_byte_size_mega() {
+        assert_eq!(parse_byte_size("100M").unwrap(), 100_000_000);
+        assert_eq!(parse_byte_size("100m").unwrap(), 100_000_000);
+        assert_eq!(parse_byte_size("1M").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_byte_size_giga() {
+        assert_eq!(parse_byte_size("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_byte_size("1g").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_byte_size_error() {
+        assert!(parse_byte_size("garbage").is_err());
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("-1").is_err());
+        assert!(parse_byte_size("1.5M").is_err());
+    }
+
+    #[test]
+    fn test_parse_byte_size_whitespace() {
+        assert_eq!(parse_byte_size("  100M  ").unwrap(), 100_000_000);
     }
 }
