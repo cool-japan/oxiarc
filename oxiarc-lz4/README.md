@@ -7,11 +7,11 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.8 (2026-05-08) | 118 tests passing**
+**Version: 0.3.0 (2026-05-17) | 138 tests passing**
 
 ## Overview
 
-LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.2.8 adds progress reporting and cancellation support to the compressor/decompressor builders, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
+LZ4 is a lossless compression algorithm focused on compression and decompression speed, making it ideal for real-time applications. It provides an excellent balance between speed and compression ratio. Version 0.3.0 introduces true bounded-memory streaming (no full-input buffering in `Lz4Compressor`), a state-machine block parser in `Lz4Decompressor`, and a `with_memory_budget(usize)` builder on both encoder and decoder, along with continued improvements to the dictionary (`dict`) and high-compression (`hc`) modules.
 
 
 ## Features
@@ -27,6 +27,10 @@ LZ4 is a lossless compression algorithm focused on compression and decompression
 - **Dictionary support** - Improved dictionary compression
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on compressor/decompressor types
 - **Cancellation support** - `with_cancel(CancellationToken)` builder on compressor/decompressor types
+- **True bounded-memory streaming** - `Lz4Compressor` emits complete blocks on the fly with no full-input buffering
+- **State-machine block parser** - `Lz4Decompressor` processes one block at a time via an internal state machine
+- **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap working-set size
+- **Block-layer prefix dictionary** - `compress_block_with_dict` / `decompress_block_dict` free functions and `Lz4DictBlockEncoder` / `Lz4DictBlockDecoder` builders for prefix-dictionary block compression (dictionary truncated to last 64 KiB per LZ4 spec)
 
 All features are implemented and tested. API is stable.
 
@@ -71,6 +75,34 @@ let compressed = compress_block(&data);
 let decompressed = decompress_block(&compressed, original_size)?;
 ```
 
+### Block-Layer Prefix Dictionary
+
+Both encoder and decoder must use the same dictionary. The dictionary is automatically truncated to the last 64 KiB (LZ4 spec limit).
+
+```rust
+use oxiarc_lz4::block::{
+    compress_block_with_dict, decompress_block_dict,
+    Lz4DictBlockEncoder, Lz4DictBlockDecoder,
+};
+
+let dict = b"common prefix data used to seed the dictionary";
+let input = b"common prefix data plus some new payload bytes";
+
+// Free-function API
+let compressed = compress_block_with_dict(input, dict, 1 /* accel */);
+let decompressed = decompress_block_dict(&compressed, dict, input.len())?;
+assert_eq!(&decompressed, input);
+
+// Builder API
+let compressed = Lz4DictBlockEncoder::new(dict)
+    .acceleration(1)
+    .compress(input);
+
+let decompressed = Lz4DictBlockDecoder::new(dict)
+    .decompress(&compressed, input.len())?;
+assert_eq!(&decompressed, input);
+```
+
 ### Parallel Compression
 
 ```rust
@@ -80,7 +112,7 @@ use oxiarc_lz4::compress_parallel;
 let compressed = compress_parallel(&data)?;
 ```
 
-## Progress and Cancellation (0.2.8)
+## Progress and Cancellation (0.3.0)
 
 `Lz4Compressor`, `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4DictFrameDecoder` all expose two new builder methods:
 
@@ -113,10 +145,10 @@ The same pattern applies to `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4Di
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-lz4 = "0.2.8"
+oxiarc-lz4 = "0.3.0"
 
 # With parallel compression
-oxiarc-lz4 = { version = "0.2.6", features = ["parallel"] }
+oxiarc-lz4 = { version = "0.3.0", features = ["parallel"] }
 ```
 
 ## Use Cases

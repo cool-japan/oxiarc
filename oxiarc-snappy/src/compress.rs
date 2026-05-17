@@ -297,6 +297,165 @@ fn emit_copy(offset: usize, mut length: usize, output: &mut Vec<u8>) {
     }
 }
 
+/// Compress `input` using a prefix dictionary.
+///
+/// The dictionary seeds the hash table so matches inside it can be referenced.
+/// The decoder must be supplied the same dictionary. Output is **NOT** compatible
+/// with vanilla Snappy decoders; use [`crate::decompress::decompress_block_with_dict`]
+/// to decode.
+///
+/// If `dict` is empty, the output is byte-identical to [`compress`].
+///
+/// The maximum dictionary size is 64 KiB; if `dict` is longer only the last
+/// 64 KiB is used.
+///
+/// # OxiArc extension
+/// This is an OxiArc-specific extension. The Snappy specification does not
+/// define dictionary semantics.
+pub fn compress_block_with_dict(input: &[u8], dict: &[u8]) -> Vec<u8> {
+    // Clamp dict to the last 64 KiB.
+    let dict = if dict.len() > 65536 {
+        &dict[dict.len() - 65536..]
+    } else {
+        dict
+    };
+
+    // Empty-dict is byte-identical to standard compress.
+    if dict.is_empty() {
+        return compress(input);
+    }
+
+    if input.is_empty() {
+        // Empty input with non-empty dict: just write varint(0)
+        return vec![0];
+    }
+
+    let mut output = Vec::with_capacity(crate::compress::max_compress_len(input.len()));
+
+    // Write the uncompressed length (input only, not dict).
+    encode_varint(input.len(), &mut output);
+
+    // For very small inputs, just emit literals — dict can't help.
+    if input.len() < MIN_MATCH_LEN {
+        emit_literal(input, output.as_mut());
+        return output;
+    }
+
+    // Build a combined buffer: dict || input.
+    let dict_len = dict.len();
+    let combined_len = dict_len + input.len();
+
+    // Allocate once; copy dict then input.
+    let mut combined = Vec::with_capacity(combined_len);
+    combined.extend_from_slice(dict);
+    combined.extend_from_slice(input);
+
+    // Determine hash table size based on combined length (covers the whole window).
+    let hash_table_size = hash_table_size(combined_len);
+    let hash_shift = 32u32.saturating_sub(log2_floor(hash_table_size as u32));
+    let mut hash_table = vec![0u32; hash_table_size];
+
+    // Pre-seed the hash table from the dictionary.
+    // We store position + 1 so that 0 stays as the "empty" sentinel, and
+    // subtract 1 when reading back.  This way dict positions are distinguishable
+    // from the empty sentinel and the existing `candidate < pos` guard still works.
+    //
+    // Actually, the existing code uses 0 as "never matched" because all real
+    // positions are >= 1 (pos starts at 1).  Dict positions are 0..dict_len-1,
+    // so position 0 is a valid dict slot.  We seed positions as their raw
+    // index in `combined`; the `candidate < pos` guard is satisfied because
+    // dict positions (< dict_len) are always less than pos (>= dict_len + 1).
+    if dict_len >= MIN_MATCH_LEN {
+        let seed_limit = dict_len.saturating_sub(MIN_MATCH_LEN - 1);
+        for i in 0..seed_limit {
+            let h = hash4(&combined[i..], hash_shift);
+            hash_table[h as usize] = i as u32;
+        }
+    }
+
+    // Encode: iterate over input positions only (dict_len .. combined_len).
+    let encode_start = dict_len;
+    let encode_end = combined_len;
+
+    // We need at least 4 bytes of input.
+    let input_limit = if encode_end > encode_start + MIN_MATCH_LEN + 1 {
+        encode_end - MIN_MATCH_LEN - 1
+    } else {
+        // Input too small for any match — emit as literal.
+        emit_literal(input, output.as_mut());
+        return output;
+    };
+
+    let mut literal_start = encode_start;
+    let mut next_hash = hash4(&combined[encode_start + 1..], hash_shift);
+    let mut pos = encode_start + 1;
+
+    'outer: loop {
+        let mut candidate;
+        let mut skip = 32u32;
+        let mut next_pos;
+
+        loop {
+            let hash = next_hash;
+            let bytes_between = skip >> 5;
+            skip += 1;
+            next_pos = pos + bytes_between as usize;
+
+            if next_pos > input_limit {
+                break 'outer;
+            }
+
+            candidate = hash_table[hash as usize] as usize;
+            hash_table[hash as usize] = pos as u32;
+            next_hash = hash4(&combined[next_pos..], hash_shift);
+
+            // Accept matches anywhere in [0, pos).
+            // No 65535 cap: dict-region matches can span up to 64 KiB offset.
+            // emit_copy handles large offsets with the copy-4 opcode.
+            if candidate < pos && combined[candidate..candidate + 4] == combined[pos..pos + 4] {
+                break;
+            }
+
+            pos = next_pos;
+        }
+
+        // Emit pending literal bytes (slice into input portion).
+        if literal_start < pos {
+            emit_literal(&combined[literal_start..pos], &mut output);
+        }
+
+        let match_offset = pos - candidate;
+        let match_len = find_match_length(&combined[candidate + 4..], &combined[pos + 4..]) + 4;
+
+        emit_copy(match_offset, match_len, &mut output);
+        pos += match_len;
+        literal_start = pos;
+
+        if pos >= input_limit {
+            break;
+        }
+
+        // Insert hashes for bytes just past the match.
+        if pos >= 2 {
+            let h = hash4(&combined[pos - 2..], hash_shift);
+            hash_table[h as usize] = (pos - 2) as u32;
+            let h = hash4(&combined[pos - 1..], hash_shift);
+            hash_table[h as usize] = (pos - 1) as u32;
+        }
+
+        literal_start = pos;
+        next_hash = hash4(&combined[pos + 1..], hash_shift);
+        pos += 1;
+    }
+
+    // Emit remaining literal bytes.
+    if literal_start < encode_end {
+        emit_literal(&combined[literal_start..encode_end], &mut output);
+    }
+
+    output
+}
+
 /// Compute a hash of 4 bytes at the given position.
 /// Uses a multiplicative hash to distribute values well.
 fn hash4(data: &[u8], shift: u32) -> u32 {

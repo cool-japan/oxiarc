@@ -1,4 +1,4 @@
-# oxiarc-lz4 - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-lz4 - Development Status (v0.3.0, 2026-05-16)
 
 ## Completed Features (COMPLETE)
 
@@ -59,8 +59,25 @@
 ### Performance
 - [ ] SIMD-accelerated matching
 - [x] Parallel compression (rayon-based block-level parallelism)
-- [ ] Streaming with bounded memory
-- [ ] Dictionary support
+- [x] Streaming with bounded memory — true block-level streaming with with_memory_budget() builder (done 2026-05-16)
+- [x] Dictionary support (planned 2026-05-17)
+  - **Goal:** LZ4 block compression/decompression with a user-supplied prefix dictionary (up to 64 KiB, per the LZ4 spec). Encoder seeds the hash table from the dictionary tail so matches inside the dictionary are emitted as back-references; decoder seeds the reference window from the dictionary. Output is bit-compatible with `lz4_compress_HC` and `lz4_compress_default` invoked with `dict` + `dictSize`.
+  - **Design:**
+    - New types `Lz4DictBlockEncoder { hc: bool, dict: Vec<u8>, accel: i32 }` and `Lz4DictBlockDecoder { dict: Vec<u8> }`. Builder API: `Lz4BlockEncoder::with_dictionary(dict: &[u8]) -> Lz4DictBlockEncoder` and similar for the HC encoder; `Lz4BlockDecoder::with_dictionary(dict: &[u8])`.
+    - Encoder: prefix the input window with the dict bytes (last 64 KiB only); pre-populate the hash chain by running the standard `lz4_hash` over `dict[len-3..]` … `dict[len-1]`; emit matches with offsets up to 65535 that may point inside the dict region. Track a `current_pos` offset so emitted match positions are `input_pos - dict_len` relative.
+    - HC encoder: same approach, but populate the doubly-linked match-chain via `hc::init_dict()` analog to LZ4's `LZ4HC_setExternalDict`.
+    - Decoder: when an offset points before position 0, satisfy the copy from `dict[dict_len - (offset - cur_pos)..]`. Wire this into `decompress_block_dict(input, dict, output_capacity)`.
+    - Frame format: `compress_block_with_dict(input, dict, accel)` free function for parity with no-dict `compress_block`.
+    - Documentation: doc-comment the dict invariants (offset arithmetic, max 64 KiB) and note the dict must be re-supplied to the decoder.
+  - **Files:** `oxiarc-lz4/src/block.rs` (new dict-aware compress/decompress paths), `oxiarc-lz4/src/hc.rs` (HC dict init), `oxiarc-lz4/src/lib.rs` (re-exports + crate-level docs), `oxiarc-lz4/TODO.md` (mark `[x]`)
+  - **Prerequisites:** none — `Lz4DictFrameEncoder/Decoder` already exists in the frame layer; this fills the block-layer gap.
+  - **Tests:**
+    - `tests/dict_block_roundtrip.rs`: standard mode roundtrip with a 4 KiB random dict and 64 KiB input.
+    - HC mode roundtrip at levels 1, 9, 12 with the same dict.
+    - Cross-decoder test: encode with dict, decode without dict → must fail or return garbage (assert mismatch).
+    - Boundary tests: dict exactly 64 KiB; dict shorter than input; dict longer than 64 KiB (must truncate to last 64 KiB); empty dict (equivalent to no-dict path).
+    - Property test: random byte input vs. shared random dict roundtrips perfectly.
+  - **Risk:** offset arithmetic at the dict/input boundary is the historical bug-magnet for this feature. Mitigation: encode `(dict_tail || input)` as a single conceptual buffer and lift offsets to that buffer in tests; assert no offset exceeds the LZ4 max distance of 65535.
 
 ## Test Coverage
 
@@ -76,6 +93,7 @@
 | File | Lines |
 |------|-------|
 | frame/ (multiple files) | ~1,800 |
+| frame/streaming.rs | ~1,177 (grew in v0.3.0) |
 | block.rs | ~500 |
 | hc.rs | ~450 |
 | xxhash.rs | ~230 |

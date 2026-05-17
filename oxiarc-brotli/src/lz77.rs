@@ -4,6 +4,8 @@
 //! of Brotli compression. Produces a sequence of literal bytes and
 //! backward references (length, distance).
 
+use crate::pool::BrotliPool;
+
 /// LZ77 compression parameters.
 #[derive(Debug, Clone)]
 pub struct Lz77Params {
@@ -44,26 +46,62 @@ pub enum Lz77Command {
 
 /// Perform LZ77 compression on the input data.
 pub fn lz77_compress(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
+    lz77_compress_pooled(data, params, None)
+}
+
+/// Perform LZ77 compression, optionally drawing buffers from a pool.
+///
+/// When `pool` is `Some`, the LZ77 command buffer and the fixed-size hash-head
+/// table are acquired from the pool instead of being freshly allocated, reducing
+/// per-encode allocation pressure.
+pub(crate) fn lz77_compress_pooled(
+    data: &[u8],
+    params: &Lz77Params,
+    pool: Option<&BrotliPool>,
+) -> Vec<Lz77Command> {
     if data.is_empty() {
         return Vec::new();
     }
 
     match params.quality {
-        0 => lz77_no_compression(data),
-        1..=3 => lz77_fast(data, params),
-        _ => lz77_standard(data, params),
+        0 => lz77_no_compression_pooled(data, pool),
+        1..=3 => lz77_fast_pooled(data, params, pool),
+        _ => lz77_standard_pooled(data, params, pool),
     }
 }
 
-/// Quality 0: no LZ77 matching, all literals.
-fn lz77_no_compression(data: &[u8]) -> Vec<Lz77Command> {
-    data.iter().map(|&b| Lz77Command::Literal(b)).collect()
+/// Quality 0: no LZ77 matching, all literals, optionally pooled command buf.
+fn lz77_no_compression_pooled(data: &[u8], pool: Option<&BrotliPool>) -> Vec<Lz77Command> {
+    if let Some(p) = pool {
+        let mut guard = p.get_lz77_cmd();
+        guard
+            .buf
+            .extend(data.iter().map(|&b| Lz77Command::Literal(b)));
+        // Take the filled buffer out of the guard; the guard's drop will return
+        // the now-empty Vec back to the pool (capacity preserved).
+        std::mem::take(&mut guard.buf)
+    } else {
+        data.iter().map(|&b| Lz77Command::Literal(b)).collect()
+    }
 }
 
-/// Fast LZ77 matching (quality 1-3).
+/// Fast LZ77 matching (quality 1-3), optionally reusing the command buffer from pool.
 /// Uses a simple hash table for O(1) match finding.
-fn lz77_fast(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
-    let mut commands = Vec::new();
+fn lz77_fast_pooled(
+    data: &[u8],
+    params: &Lz77Params,
+    pool: Option<&BrotliPool>,
+) -> Vec<Lz77Command> {
+    // Acquire a pooled command buffer or a fresh Vec.
+    let mut commands: Vec<Lz77Command> = pool
+        .map(|p| {
+            let mut g = p.get_lz77_cmd();
+            std::mem::take(&mut g.buf)
+            // g drops here — returns the now-empty (but capacity-preserving) Vec to pool.
+            // On next call, pool has the allocation back.
+        })
+        .unwrap_or_default();
+
     let mut pos = 0;
 
     // Hash table: maps 4-byte hash to position.
@@ -115,20 +153,42 @@ fn lz77_fast(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
     commands
 }
 
-/// Standard LZ77 matching (quality 4+).
-/// Uses a hash chain for better match finding.
-fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
+/// Standard LZ77 matching (quality 4+), optionally reusing the hash-head buffer.
+///
+/// The hash-head table is `1 << 17 = 131 072` u32 entries (512 KiB).  Pooling it
+/// avoids a large fresh allocation on every quality-4+ encode call.
+fn lz77_standard_pooled(
+    data: &[u8],
+    params: &Lz77Params,
+    pool: Option<&BrotliPool>,
+) -> Vec<Lz77Command> {
     let mut commands = Vec::new();
     let mut pos = 0;
 
-    // Hash chain: maps hash to list of positions.
     let hash_bits = 17;
     let hash_size = 1usize << hash_bits;
     let hash_mask = hash_size - 1;
-    let mut hash_head = vec![u32::MAX; hash_size]; // Head of chain for each hash.
-    let mut hash_chain = vec![u32::MAX; data.len()]; // Chain links.
 
-    // Maximum chain length depends on quality.
+    // Acquire hash_head from the pool (512 KiB) or allocate fresh.
+    // We use an enum to avoid keeping a mutable borrow on the guard while also
+    // having a local Vec; the guard is dropped at function end, returning the
+    // buffer to the pool.
+    enum HashHeadStorage {
+        Pooled(crate::pool::PooledU32Buf),
+        Local(Vec<u32>),
+    }
+    let mut storage = if let Some(p) = pool {
+        HashHeadStorage::Pooled(p.get_hash_u32())
+    } else {
+        HashHeadStorage::Local(vec![u32::MAX; hash_size])
+    };
+    let hash_head: &mut [u32] = match storage {
+        HashHeadStorage::Pooled(ref mut g) => &mut g.buf,
+        HashHeadStorage::Local(ref mut v) => v.as_mut_slice(),
+    };
+
+    let mut hash_chain = vec![u32::MAX; data.len()]; // data-length-sized: not poolable
+
     let max_chain = match params.quality {
         4..=5 => 16,
         6..=7 => 32,
@@ -145,7 +205,6 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
 
         let hash = hash4(&data[pos..]) & hash_mask;
 
-        // Search the hash chain for the best match.
         let mut best_length = params.min_match_len - 1;
         let mut best_distance = 0;
         let mut chain_pos = hash_head[hash];
@@ -159,7 +218,6 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
                 break;
             }
 
-            // Check match length.
             if candidate + best_length < data.len()
                 && pos + best_length < data.len()
                 && data[candidate + best_length] == data[pos + best_length]
@@ -178,7 +236,7 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
                     best_distance = distance;
 
                     if length >= params.max_match_len {
-                        break; // Good enough.
+                        break;
                     }
                 }
             }
@@ -187,12 +245,10 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
             chain_count += 1;
         }
 
-        // Update hash chain.
         hash_chain[pos] = hash_head[hash];
         hash_head[hash] = pos as u32;
 
         if best_distance > 0 && best_length >= params.min_match_len {
-            // Lazy match evaluation for higher quality levels.
             if params.quality >= 6 && pos + 1 + params.min_match_len <= data.len() {
                 let next_hash = hash4(&data[pos + 1..]) & hash_mask;
                 let mut next_best_length = 0;
@@ -221,7 +277,6 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
                 }
 
                 if next_best_length > best_length + 1 {
-                    // Better match at next position, emit literal now.
                     commands.push(Lz77Command::Literal(data[pos]));
                     pos += 1;
                     continue;
@@ -233,7 +288,6 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
                 distance: best_distance,
             });
 
-            // Update hash chain for all positions in the match.
             for i in 1..best_length {
                 if pos + i + params.min_match_len <= data.len() {
                     let h = hash4(&data[pos + i..]) & hash_mask;
@@ -249,6 +303,8 @@ fn lz77_standard(data: &[u8], params: &Lz77Params) -> Vec<Lz77Command> {
         }
     }
 
+    // RAII: storage drops here, returning hash_head to the pool (if pooled).
+    drop(storage);
     commands
 }
 
@@ -309,7 +365,11 @@ mod tests {
     #[test]
     fn test_no_compression() {
         let data = b"Hello";
-        let commands = lz77_no_compression(data);
+        let params = Lz77Params {
+            quality: 0,
+            ..Default::default()
+        };
+        let commands = lz77_compress(data, &params);
         assert_eq!(commands.len(), 5);
         for (i, cmd) in commands.iter().enumerate() {
             match cmd {
@@ -326,7 +386,7 @@ mod tests {
             quality: 1,
             ..Default::default()
         };
-        let commands = lz77_fast(data, &params);
+        let commands = lz77_compress(data, &params);
         // Should find repeated patterns.
         let output = decompose_commands(&commands, params.window_size);
         assert_eq!(output, data);
@@ -339,7 +399,7 @@ mod tests {
             quality: 6,
             ..Default::default()
         };
-        let commands = lz77_standard(data, &params);
+        let commands = lz77_compress(data, &params);
         let output = decompose_commands(&commands, params.window_size);
         assert_eq!(output, data);
     }

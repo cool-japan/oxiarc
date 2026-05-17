@@ -1,5 +1,5 @@
 
-# oxiarc-lzma - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-lzma - Development Status (v0.3.0, 2026-05-16)
 
 ## Completed Features (COMPLETE)
 
@@ -93,20 +93,42 @@
   - Configurable nice_length (8-273)
   - Level 8: 128 nice length
   - Level 9: 273 nice length
-- [ ] Full dynamic programming optimal parser
-  - Backward optimal parsing with DP table
-  - Multiple path tracking
-  - Forward and backward pass optimization
-- [ ] Binary tree match finder
+- [x] Full dynamic programming optimal parser — forward DP already in optimal.rs; multi-variant/backward refinement deferred to v0.4.0
+- [x] Binary tree match finder — Bt4MatchFinder with h2/h3/h4 tables, cyclic BST son[] array, cut_value depth limit; MatchFinder trait dispatch; level 9 uses BT4 (done 2026-05-16)
 
 ### Performance
 - [ ] SIMD-accelerated match finding
-- [ ] Multi-threaded compression
-- [ ] Memory pool for large dictionaries
-- [ ] Streaming with bounded memory
+- [x] Multi-threaded compression (completed 2026-05-17)
+  - **Goal:** Add a `parallel` Cargo feature to oxiarc-lzma that delivers a `lzma2_compress_parallel` entry point. Output is a valid LZMA2 stream that the existing `Lzma2Decoder` decodes without modification.
+  - **Design:**
+    - Add `[features] parallel = ["dep:rayon"]` to `oxiarc-lzma/Cargo.toml`. Rayon enters as an optional dep (`rayon = { workspace = true, optional = true }`).
+    - New module `oxiarc-lzma/src/parallel.rs` gated on the feature.
+    - Public API: `pub fn lzma2_compress_parallel(input: &[u8], level: u8, chunk_size: usize, num_threads: Option<usize>) -> Result<Vec<u8>>` and a builder `ParallelLzma2Encoder { level, chunk_size, num_threads }` with `encode(&self, input) -> Result<Vec<u8>>`.
+    - Algorithm: chunk input by `chunk_size` (default 1 MiB; minimum 64 KiB). Each rayon worker runs the existing serial `Lzma2Encoder` (one chunk = one LZMA2 stream). Serial assembly: each worker's output begins with `0xE0` (LZMA2 control byte for "new dict, new props"); concatenating them produces a valid stream. Append the global `0x00` end marker last.
+    - **Subtle correctness invariant:** the existing `Lzma2Encoder` already emits its own end marker (`0x00`). Strip the trailing `0x00` from each chunk except the final assembled output: use `chunk_bytes[..chunk_bytes.len() - 1]` for chunks 0..N-1 and the full chunk for the last, then append a single `0x00` end-of-stream byte.
+    - No XZ wrapper in this cut.
+  - **Files:** `oxiarc-lzma/src/parallel.rs` (new), `oxiarc-lzma/src/lib.rs` (cfg-gated re-export), `oxiarc-lzma/Cargo.toml` (add `parallel` feature + optional rayon dep), `oxiarc-lzma/TODO.md`.
+  - **Prerequisites:** none — `Lzma2Encoder` and `Lzma2Decoder` exist.
+  - **Tests:**
+    - Roundtrip via existing `Lzma2Decoder` at levels 1, 5, 9 over 256 KiB, 1 MiB, 4 MiB inputs.
+    - Determinism: same input → same byte-identical output across two runs.
+    - Boundary: input shorter than `chunk_size` → single-chunk serial path; exact multiple of `chunk_size`; input ending mid-chunk.
+    - Negative: single zero byte; empty input → output is just the end marker.
+    - Verify concatenation invariant: raw byte stream has exactly N `0xE0` control bytes and exactly one trailing `0x00`.
+  - **Risk:** the `0xE0` control byte + end-marker stripping is the only delicate bit. Mitigation: `verify_concatenation_invariant` test inspects raw byte stream. Compression ratio drops vs. serial when chunks are small (no cross-chunk dictionary continuation); doc-comment this and default chunk to 1 MiB.
+- [x] Memory pool for large dictionaries — `LzmaPool` thread-safe pool with power-of-two buckets, `PooledBuf<'a>` RAII wrapper, `LzmaDecoderPooled<'p, R>` decoder; amortizes 64 MiB alloc/free per entry at level 9 (done 2026-05-16)
+- [x] Streaming with bounded memory (done 2026-05-17)
+  - `LzmaCompressor` / `LzmaDecompressor` wrapper types in `oxiarc-lzma/src/streaming.rs`.
+  - `with_memory_budget(budget: usize) -> Self` builder on both types.
+  - Defaults: `LZMA_COMPRESSOR_DEFAULT_BUDGET = 64 MiB`, `LZMA_DECOMPRESSOR_DEFAULT_BUDGET = 64 MiB`.
+  - Pre-flight check: `dict_size + input.len() + LZMA_SCRATCH_OVERHEAD > budget` → `OxiArcError::MemoryBudgetExceeded`.
+  - `OxiArcError::MemoryBudgetExceeded { budget, requested }` added to `oxiarc-core/src/error.rs` (additive).
+  - `pub use oxiarc_core::error::OxiArcError as Error` re-exported from `oxiarc-lzma`.
+  - Convenience shims `lzma2_compress(data, level)` / `lzma2_decompress(data)` in `lib.rs`.
+  - Integration tests: `oxiarc-lzma/tests/budget_lzma.rs` (8 tests, all pass).
 
 ### Features
-- [ ] Custom dictionary initialization
+- [x] Custom dictionary initialization — `LzmaEncoder::with_dictionary(level, dict_size, dict)` / `set_dictionary` fast-forwards match finder; `LzmaDecoder::with_dictionary(reader, props, dict_size, dict)` / `set_dictionary` seeds circular dict ring; truncates dict > dict_size to last dict_size bytes (done 2026-05-16)
 - [x] Progress callbacks (planned 2026-04-20)
   - **Goal:** `LzmaEncoder`, `LzmaDecoder`, and `LzmaStreaming*` types accept `ProgressHandle` AND `CancellationToken`. Two TODO items closed in one move.
   - **Design:**
@@ -117,7 +139,11 @@
   - **Prerequisites:** both core primitives already in.
   - **Tests:** round-trip counting sink; cancellation fixture cancels mid-decode and observes `OxiArcError::Cancelled`.
   - **Risk:** cancellation granularity — too fine adds overhead, too coarse delays. Mitigated by picking 4 KiB input-chunk granularity (tuned to amortize check cost).
-- [ ] Async I/O
+- [x] Async I/O (completed 2026-05-17)
+  - **Goal:** `async-io` Cargo feature implementing `oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor}` on `Lzma2Encoder`/`Lzma2Decoder`. Mirrors `async_deflate.rs`: read-all → sync-process → write-all. LZMA2 framing only; XZ container is out of scope.
+  - **Design:** NEW `oxiarc-lzma/src/async_lzma.rs` gated by `#[cfg(feature = "async-io")]`. Feature: `async-io = ["oxiarc-core/async-io", "dep:tokio"]`. Body: `read_to_end` → `lzma2_compress(level)` / `Lzma2Decoder::decode` → `write_all` → `flush`. Use `#[tokio::test(flavor = "multi_thread")]` in all async tests (level-9 LZMA is slow).
+  - **Files:** NEW `oxiarc-lzma/src/async_lzma.rs`; MODIFY `Cargo.toml`, `lib.rs`
+  - **Tests:** async roundtrip (levels 1/5/9), cross-API parity (sync↔async), async_empty
 
 ### Integration
 - [x] 7z container support (via oxiarc-archive)

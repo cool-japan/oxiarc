@@ -247,6 +247,93 @@ fn decode_copy4(
     Ok(pos + 4)
 }
 
+/// Decompress Snappy block-format data that was compressed with
+/// [`crate::compress::compress_block_with_dict`].
+///
+/// The `dict` must be identical to the one used during compression.
+/// The maximum dictionary size is 64 KiB; if `dict` is longer only the last
+/// 64 KiB is used (mirroring the encoder).
+///
+/// # OxiArc extension
+/// This is an OxiArc-specific extension. The Snappy specification does not
+/// define dictionary semantics.
+///
+/// # Errors
+/// Returns an error if the compressed data is corrupted, truncated, or invalid.
+pub fn decompress_block_with_dict(input: &[u8], dict: &[u8]) -> Result<Vec<u8>, SnappyError> {
+    // Clamp dict to the last 64 KiB (mirrors encoder).
+    let dict = if dict.len() > 65536 {
+        &dict[dict.len() - 65536..]
+    } else {
+        dict
+    };
+
+    // Empty dict falls back to standard decompression.
+    if dict.is_empty() {
+        return decompress(input);
+    }
+
+    if input.is_empty() {
+        return Err(SnappyError::UnexpectedEof {
+            context: "empty input",
+        });
+    }
+
+    // Read the decompressed length (refers to input bytes, not including dict).
+    let (decompressed_len, mut pos) = decompress_len(input)?;
+
+    if decompressed_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Pre-populate the working buffer with dict bytes.  The decoder always
+    // resolves copy offsets against this buffer; input bytes are appended after
+    // the dict prefix, then stripped at the end.
+    let dict_len = dict.len();
+    let mut output: Vec<u8> = Vec::with_capacity(dict_len + decompressed_len);
+    output.extend_from_slice(dict);
+
+    // The output must end at exactly dict_len + decompressed_len bytes.
+    let target_len = dict_len + decompressed_len;
+
+    while pos < input.len() && output.len() < target_len {
+        let tag = input[pos];
+        let tag_type = tag & 0x03;
+        pos += 1;
+
+        match tag_type {
+            0x00 => {
+                pos = decode_literal(input, pos, tag, &mut output, target_len)?;
+            }
+            0x01 => {
+                pos = decode_copy1(input, pos, tag, &mut output, target_len)?;
+            }
+            0x02 => {
+                pos = decode_copy2(input, pos, tag, &mut output, target_len)?;
+            }
+            0x03 => {
+                pos = decode_copy4(input, pos, tag, &mut output, target_len)?;
+            }
+            _ => {
+                return Err(SnappyError::InvalidTag {
+                    tag,
+                    offset: pos - 1,
+                });
+            }
+        }
+    }
+
+    if output.len() != target_len {
+        return Err(SnappyError::OutputLengthMismatch {
+            expected: decompressed_len,
+            actual: output.len().saturating_sub(dict_len),
+        });
+    }
+
+    // Strip the dict prefix and return only the decompressed input bytes.
+    Ok(output[dict_len..].to_vec())
+}
+
 /// Copy `length` bytes from position `output.len() - offset` within the output.
 ///
 /// This handles overlapping copies correctly (e.g., for run-length encoding

@@ -10,11 +10,12 @@
 //! - Level 10: Ultra optimal parsing with maximum look-ahead
 
 use crate::LzmaLevel;
+use crate::match_finder::{Bt4MatchFinder, HashChainMatchFinder, MatchFinder};
 use crate::model::{
     DIST_ALIGN_BITS, END_POS_MODEL_INDEX, LEN_HIGH_BITS, LEN_LOW_BITS, LEN_MID_BITS, LengthModel,
     LzmaModel, LzmaProperties, MATCH_LEN_MIN, State,
 };
-use crate::optimal::{MatchCandidate, MatchType, OptimalParser, ProbabilityModels};
+use crate::optimal::{MatchType, OptimalParser, ProbabilityModels};
 use crate::range_coder::RangeEncoder;
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::Result;
@@ -26,9 +27,6 @@ const PROGRESS_GRANULARITY: u64 = 4096;
 
 /// Maximum match length for fast mode.
 const MATCH_LEN_MAX: usize = 273;
-
-/// Hash table size (64K entries).
-const HASH_SIZE: usize = 1 << 16;
 
 /// Maximum chain depth per compression level.
 const CHAIN_DEPTH: [usize; 11] = [
@@ -106,11 +104,9 @@ pub struct LzmaEncoder {
     state: State,
     /// Rep distances.
     rep: [u32; 4],
-    /// Hash table for match finding (stores head of chain).
-    hash_head: Vec<u32>,
-    /// Chain table (links positions with same hash).
-    hash_chain: Vec<u32>,
-    /// Maximum chain depth (based on compression level).
+    /// Match finder (hash-chain for levels 0–8, BT4 for level 9).
+    match_finder: Box<dyn MatchFinder>,
+    /// Maximum chain depth (retained for brute-force DP path).
     chain_depth: usize,
     /// Compression level.
     level: LzmaLevel,
@@ -130,12 +126,18 @@ pub struct LzmaEncoder {
     cancel: Option<CancellationToken>,
     /// Bytes processed at the last progress/cancel checkpoint.
     last_checkpoint: u64,
+    /// Preset dictionary bytes (virtual prefix; not written to output).
+    ///
+    /// When set, `compress()` prepends this slice to the input buffer so that
+    /// the match finder can discover back-references into the dictionary prefix.
+    /// Only the bytes starting after the dict are actually encoded.
+    preset_dict: Vec<u8>,
 }
 
 impl LzmaEncoder {
     /// Create a new LZMA encoder.
     pub fn new(level: LzmaLevel, dict_size: u32) -> Self {
-        let dict_size = dict_size.max(4096) as usize;
+        let dict_size_usize = dict_size.max(4096) as usize;
         let props = LzmaProperties::default();
         let level_idx = (level.level() as usize).min(10);
         let chain_depth = CHAIN_DEPTH[level_idx];
@@ -148,14 +150,32 @@ impl LzmaEncoder {
             None
         };
 
+        // Choose match finder based on level:
+        // level 9 → BT4 (binary tree, superior quality)
+        // levels 0-8 → hash chain
+        let nice_length = match level.level() {
+            0..=3 => 32u32,
+            4..=6 => 64u32,
+            7..=8 => 128u32,
+            _ => 273u32, // level 9
+        };
+        let match_finder: Box<dyn MatchFinder> = if level.level() >= 9 {
+            Box::new(Bt4MatchFinder::new(512, nice_length, dict_size.max(4096)))
+        } else {
+            Box::new(HashChainMatchFinder::new(
+                chain_depth,
+                nice_length,
+                dict_size.max(4096),
+            ))
+        };
+
         Self {
             rc: RangeEncoder::new(),
             model: LzmaModel::new(props),
-            dict_size,
+            dict_size: dict_size_usize,
             state: State::new(),
             rep: [0; 4],
-            hash_head: vec![u32::MAX; HASH_SIZE],
-            hash_chain: Vec::new(),
+            match_finder,
             chain_depth,
             level,
             bytes_encoded: 0,
@@ -166,7 +186,46 @@ impl LzmaEncoder {
             progress: None,
             cancel: None,
             last_checkpoint: 0,
+            preset_dict: Vec::new(),
         }
+    }
+
+    /// Construct encoder pre-loaded with a dictionary for improved compression
+    /// on data that shares a prefix with the dictionary.
+    ///
+    /// During `compress()` the dictionary is transparently prepended to the input
+    /// buffer. The match finder sees it as a virtual history prefix and may emit
+    /// back-references into it; those references will be resolvable by any decoder
+    /// initialised with the same dictionary. The dictionary bytes themselves are
+    /// **not** written into the output stream.
+    ///
+    /// If `dict.len()` > `dict_size`, only the last `dict_size` bytes are kept
+    /// to stay within the sliding window.
+    ///
+    /// Mirrors the DEFLATE `Deflater::with_dictionary` pattern.
+    pub fn with_dictionary(level: LzmaLevel, dict_size: u32, dict: &[u8]) -> Self {
+        let mut enc = Self::new(level, dict_size);
+        enc.set_dictionary(dict);
+        enc
+    }
+
+    /// Preload a preset dictionary.
+    ///
+    /// The encoder stores the dictionary as a virtual prefix. On the next call to
+    /// `compress()` the dictionary is prepended to the input data so that the match
+    /// finder can discover back-references into it. The dictionary bytes are **not**
+    /// emitted into the compressed output.
+    ///
+    /// If `dict.len()` > `dict_size`, only the last `dict_size` bytes are kept.
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        if dict.is_empty() {
+            self.preset_dict.clear();
+            return;
+        }
+        // Keep at most dict_size bytes at the tail (oldest bytes are beyond the
+        // sliding window and can never be referenced anyway).
+        let tail_start = dict.len().saturating_sub(self.dict_size);
+        self.preset_dict = dict[tail_start..].to_vec();
     }
 
     /// Attach a progress sink; called for every ~4096 bytes compressed.
@@ -185,14 +244,17 @@ impl LzmaEncoder {
         self
     }
 
-    /// Check cancellation and emit progress if a checkpoint boundary has been crossed.
+    /// Check cancellation and emit progress using explicit `processed` and `total` values.
     ///
-    /// `total` is the total number of input bytes (known at compress time).
-    fn check_progress_and_cancel(&mut self, total: u64) -> Result<()> {
+    /// `processed` is the number of real input bytes consumed so far (excluding any
+    /// preset dictionary prefix), `total` is the total real input size. Used instead
+    /// of tracking `bytes_encoded` directly so that a preset dictionary does not
+    /// inflate the reported progress.
+    fn check_progress_and_cancel_with(&mut self, processed: u64, total: u64) -> Result<()> {
         if self.bytes_encoded.saturating_sub(self.last_checkpoint) >= PROGRESS_GRANULARITY {
             self.last_checkpoint = self.bytes_encoded;
             if let Some(ref h) = self.progress {
-                h.on_progress(self.bytes_encoded, Some(total));
+                h.on_progress(processed, Some(total));
             }
             if let Some(ref t) = self.cancel {
                 t.check()?;
@@ -227,130 +289,6 @@ impl LzmaEncoder {
         }
     }
 
-    /// Calculate hash for 3 bytes with improved avalanche properties.
-    fn hash3(data: &[u8]) -> usize {
-        if data.len() < 3 {
-            return 0;
-        }
-        // FNV-1a inspired hash with good distribution
-        let mut h = 2166136261u32;
-        h ^= data[0] as u32;
-        h = h.wrapping_mul(16777619);
-        h ^= data[1] as u32;
-        h = h.wrapping_mul(16777619);
-        h ^= data[2] as u32;
-        h = h.wrapping_mul(16777619);
-        (h as usize) & (HASH_SIZE - 1)
-    }
-
-    /// Calculate hash for 4 bytes (better for longer matches).
-    #[allow(dead_code)]
-    fn hash4(data: &[u8]) -> usize {
-        if data.len() < 4 {
-            return Self::hash3(data);
-        }
-        // FNV-1a inspired hash
-        let mut h = 2166136261u32;
-        h ^= data[0] as u32;
-        h = h.wrapping_mul(16777619);
-        h ^= data[1] as u32;
-        h = h.wrapping_mul(16777619);
-        h ^= data[2] as u32;
-        h = h.wrapping_mul(16777619);
-        h ^= data[3] as u32;
-        h = h.wrapping_mul(16777619);
-        (h as usize) & (HASH_SIZE - 1)
-    }
-
-    /// Find best match at current position using hash chains.
-    fn find_match(&self, data: &[u8], pos: usize) -> Option<(u32, u32)> {
-        if pos + MATCH_LEN_MIN > data.len() {
-            return None;
-        }
-
-        let hash = Self::hash3(&data[pos..]);
-        let mut match_pos = self.hash_head[hash] as usize;
-
-        if match_pos == u32::MAX as usize {
-            return None;
-        }
-
-        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
-        let mut best_len = 0usize;
-        let mut best_dist = 0usize;
-        let mut chain_count = 0;
-
-        // Walk the hash chain to find the best match
-        while match_pos < pos && chain_count < self.chain_depth {
-            let dist = pos - match_pos;
-            if dist > self.dict_size {
-                break;
-            }
-
-            // Quick rejection: check first 3 bytes
-            if data[pos] == data[match_pos]
-                && data[pos + 1] == data[match_pos + 1]
-                && data[pos + 2] == data[match_pos + 2]
-            {
-                // Count matching bytes
-                let mut len = 3usize;
-                while len < max_len && data[pos + len] == data[match_pos + len] {
-                    len += 1;
-                }
-
-                // Prefer longer matches, or equal length with shorter distance
-                if len > best_len || (len == best_len && dist < best_dist) {
-                    best_len = len;
-                    best_dist = dist;
-
-                    // Found maximum length, stop searching
-                    if best_len >= max_len {
-                        break;
-                    }
-                }
-            }
-
-            // Follow the chain
-            if match_pos < self.hash_chain.len() {
-                let next = self.hash_chain[match_pos] as usize;
-                if next >= match_pos || next == u32::MAX as usize {
-                    break;
-                }
-                match_pos = next;
-            } else {
-                break;
-            }
-
-            chain_count += 1;
-        }
-
-        if best_len < MATCH_LEN_MIN {
-            return None;
-        }
-
-        Some(((best_dist - 1) as u32, best_len as u32))
-    }
-
-    /// Update hash chains for a position.
-    fn update_hash(&mut self, data: &[u8], pos: usize) {
-        if pos + 3 > data.len() {
-            return;
-        }
-
-        // Ensure hash_chain is large enough
-        if pos >= self.hash_chain.len() {
-            self.hash_chain.resize(pos + 1, u32::MAX);
-        }
-
-        let hash = Self::hash3(&data[pos..]);
-
-        // Link current position to previous head
-        self.hash_chain[pos] = self.hash_head[hash];
-
-        // Update head to current position
-        self.hash_head[hash] = pos as u32;
-    }
-
     /// Check for rep match.
     fn check_rep_match(&self, data: &[u8], pos: usize, rep_idx: usize) -> u32 {
         let dist = self.rep[rep_idx] as usize;
@@ -368,111 +306,6 @@ impl LzmaEncoder {
         }
 
         len as u32
-    }
-
-    /// Find all matches at current position for optimal parsing.
-    /// Returns vector of (distance, length) pairs sorted by length.
-    fn find_all_matches(&self, data: &[u8], pos: usize, max_matches: usize) -> Vec<(u32, u32)> {
-        if pos + MATCH_LEN_MIN > data.len() {
-            return Vec::new();
-        }
-
-        let hash = Self::hash3(&data[pos..]);
-        let mut match_pos = self.hash_head[hash] as usize;
-
-        if match_pos == u32::MAX as usize {
-            return Vec::new();
-        }
-
-        let max_len = (data.len() - pos).min(MATCH_LEN_MAX);
-        let mut matches = Vec::with_capacity(max_matches);
-        let mut prev_len = 0usize;
-        let mut chain_count = 0;
-
-        // Walk the hash chain to find all good matches
-        while match_pos < pos && chain_count < self.chain_depth && matches.len() < max_matches {
-            let dist = pos - match_pos;
-            if dist > self.dict_size {
-                break;
-            }
-
-            // Quick rejection: check first 3 bytes
-            if data[pos] == data[match_pos]
-                && data[pos + 1] == data[match_pos + 1]
-                && data[pos + 2] == data[match_pos + 2]
-            {
-                // Count matching bytes
-                let mut len = 3usize;
-                while len < max_len && data[pos + len] == data[match_pos + len] {
-                    len += 1;
-                }
-
-                // Only add if this is a longer match than previous
-                if len > prev_len {
-                    matches.push(((dist - 1) as u32, len as u32));
-                    prev_len = len;
-
-                    // Found maximum length, stop searching
-                    if len >= max_len {
-                        break;
-                    }
-                }
-            }
-
-            // Follow the chain
-            if match_pos < self.hash_chain.len() {
-                let next = self.hash_chain[match_pos] as usize;
-                if next >= match_pos || next == u32::MAX as usize {
-                    break;
-                }
-                match_pos = next;
-            } else {
-                break;
-            }
-
-            chain_count += 1;
-        }
-
-        matches
-    }
-
-    /// Get all match candidates for optimal parsing.
-    #[allow(dead_code)]
-    fn get_match_candidates(&self, data: &[u8], pos: usize) -> Vec<MatchCandidate> {
-        let mut candidates = Vec::new();
-
-        // Check rep matches
-        for rep_idx in 0..4u8 {
-            let len = self.check_rep_match(data, pos, rep_idx as usize);
-            if len >= MATCH_LEN_MIN as u32 {
-                candidates.push(MatchCandidate {
-                    dist: self.rep[rep_idx as usize],
-                    len,
-                    is_rep: true,
-                    rep_idx,
-                });
-            }
-        }
-
-        // Get normal matches
-        let max_matches = self
-            .optimal_parser
-            .as_ref()
-            .map(|p| p.look_ahead())
-            .unwrap_or(32);
-        let normal_matches = self.find_all_matches(data, pos, max_matches);
-        for (dist, len) in normal_matches {
-            if len >= MATCH_LEN_MIN as u32 {
-                candidates.push(MatchCandidate {
-                    dist,
-                    len,
-                    is_rep: false,
-                    rep_idx: 0,
-                });
-            }
-        }
-
-        candidates
     }
 
     /// Fill `dp_pending` with the optimal decisions for a block starting at `start_pos`
@@ -664,8 +497,9 @@ impl LzmaEncoder {
             }
         }
 
-        // Get normal matches
-        let matches = self.find_all_matches(data, start_pos, 32);
+        // Use brute-force scan for normal matches (heuristic path doesn't mutate match_finder)
+        let matches =
+            Self::find_matches_brute(data, start_pos, 32, self.dict_size, self.chain_depth);
         let normal_match = matches.last().copied();
 
         // Decision logic with price estimation
@@ -818,8 +652,32 @@ impl LzmaEncoder {
     }
 
     /// Compress data.
+    ///
+    /// When a preset dictionary has been set via [`set_dictionary`] or
+    /// [`with_dictionary`], the dictionary bytes are transparently prepended to
+    /// `data` so that the match finder can discover back-references into them.
+    /// The dictionary bytes are **not** written into the returned byte stream.
+    ///
+    /// [`set_dictionary`]: Self::set_dictionary
+    /// [`with_dictionary`]: Self::with_dictionary
     pub fn compress(mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut i = 0;
+        // When a preset dictionary is active, build a combined buffer and remember
+        // the offset at which real data starts. The encoder loop runs over `buf`
+        // starting at `data_start` so that the match finder already has the dict
+        // content in its hash tables when it processes the first input byte.
+        let (buf, data_start): (std::borrow::Cow<'_, [u8]>, usize) = if self.preset_dict.is_empty()
+        {
+            (std::borrow::Cow::Borrowed(data), 0)
+        } else {
+            let mut combined = Vec::with_capacity(self.preset_dict.len() + data.len());
+            combined.extend_from_slice(&self.preset_dict);
+            combined.extend_from_slice(data);
+            let start = self.preset_dict.len();
+            (std::borrow::Cow::Owned(combined), start)
+        };
+        let buf: &[u8] = &buf;
+
+        // `total` reflects only the real input bytes (for progress reporting).
         let total = data.len() as u64;
 
         // Initialize prices for optimal parser
@@ -837,31 +695,49 @@ impl LzmaEncoder {
             t.check()?;
         }
 
-        while i < data.len() {
+        // When a dict is present, fast-forward the match finder through the dict
+        // bytes so that hash chains are populated before encoding starts. We do
+        // this here (rather than in set_dictionary) because the match finder
+        // needs to see the *combined* buffer to correctly set up positions.
+        if data_start > 0 {
+            for pos in 0..data_start {
+                self.match_finder.skip(buf, pos);
+            }
+            // Set bytes_encoded so that `check_rep_match` uses correct base
+            // (rep distances are relative to current position in `buf`).
+            self.bytes_encoded = data_start as u64;
+        }
+
+        let mut i = data_start;
+
+        while i < buf.len() {
             let pos_state = (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
             let state_idx = self.state.value();
 
             // Determine match using optimal or greedy parsing
             let (use_match, match_info) = if self.use_optimal {
                 // Use optimal parsing
-                if let Some(result) = self.find_optimal_sequence(data, i) {
+                if let Some(result) = self.find_optimal_sequence(buf, i) {
                     (true, Some(result))
                 } else {
                     (false, None)
                 }
             } else {
-                // Use greedy parsing (original implementation)
+                // Use greedy parsing
                 // Check for rep matches first
                 let mut best_rep: Option<(usize, u32)> = None;
                 for rep_idx in 0..4 {
-                    let len = self.check_rep_match(data, i, rep_idx);
+                    let len = self.check_rep_match(buf, i, rep_idx);
                     if len >= MATCH_LEN_MIN as u32 && best_rep.is_none_or(|(_, l)| len > l) {
                         best_rep = Some((rep_idx, len));
                     }
                 }
 
-                // Check for normal match
-                let normal_match = self.find_match(data, i);
+                // Check for normal match via the match finder trait.
+                // find_matches also inserts the position, so we must NOT
+                // call skip/insert separately for the literal/match head.
+                let normal_matches = self.match_finder.find_matches(buf, i);
+                let normal_match = normal_matches.last().copied();
 
                 // Decide what to encode
                 match (best_rep, normal_match) {
@@ -888,23 +764,28 @@ impl LzmaEncoder {
                 self.rc
                     .encode_bit(&mut self.model.is_match[state_idx][pos_state], 0);
 
-                let prev_byte = if i > 0 { data[i - 1] } else { 0 };
+                let prev_byte = if i > 0 { buf[i - 1] } else { 0 };
                 let match_byte = if !self.state.is_literal() && (self.rep[0] as usize) < i {
-                    data[i - self.rep[0] as usize - 1]
+                    buf[i - self.rep[0] as usize - 1]
                 } else {
                     0
                 };
 
-                self.encode_literal(data[i], prev_byte, match_byte);
+                self.encode_literal(buf[i], prev_byte, match_byte);
                 self.state.update_literal();
                 self.bytes_encoded += 1;
 
-                // Update hash chains
-                self.update_hash(data, i);
+                // Greedy path: position was already inserted by find_matches above.
+                // Optimal path: DP uses brute-force internally, so we skip here.
+                if self.use_optimal {
+                    self.match_finder.skip(buf, i);
+                }
 
                 i += 1;
 
-                self.check_progress_and_cancel(total)?;
+                // Progress is measured in bytes of *real* input consumed.
+                let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+                self.check_progress_and_cancel_with(real_consumed, total)?;
             } else if let Some((is_rep, idx_or_dist, len)) = match_info {
                 self.rc
                     .encode_bit(&mut self.model.is_match[state_idx][pos_state], 1);
@@ -970,20 +851,26 @@ impl LzmaEncoder {
 
                 self.bytes_encoded += len as u64;
 
-                // Update hash chains for all bytes in match
-                for j in 0..len as usize {
-                    self.update_hash(data, i + j);
+                // Keep the match finder in sync with stream position:
+                // - Greedy path: position i was already inserted by find_matches;
+                //   skip positions i+1 .. i+len-1.
+                // - Optimal path: no find_matches was called; skip all i .. i+len-1.
+                let skip_start = if self.use_optimal { 0 } else { 1 };
+                for j in skip_start..len as usize {
+                    self.match_finder.skip(buf, i + j);
                 }
 
                 i += len as usize;
 
-                self.check_progress_and_cancel(total)?;
+                let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+                self.check_progress_and_cancel_with(real_consumed, total)?;
             }
         }
 
         // Final progress notification
         if let Some(ref h) = self.progress {
-            h.on_progress(self.bytes_encoded, Some(total));
+            let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+            h.on_progress(real_consumed, Some(total));
         }
 
         // Write end marker
@@ -1060,6 +947,7 @@ pub fn compress_raw(data: &[u8], level: LzmaLevel, dict_size: u32) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::match_finder::HashChainMatchFinder;
 
     #[test]
     fn test_encoder_creation() {
@@ -1077,16 +965,17 @@ mod tests {
     }
 
     #[test]
-    fn test_hash3() {
+    fn test_hash3_in_match_finder() {
+        // hash3 now lives in HashChainMatchFinder
         let data1 = [0u8, 0, 0];
         let data2 = [1u8, 2, 3];
 
-        let h1 = LzmaEncoder::hash3(&data1);
-        let h2 = LzmaEncoder::hash3(&data2);
+        let h1 = HashChainMatchFinder::hash3_fnv(&data1);
+        let h2 = HashChainMatchFinder::hash3_fnv(&data2);
 
         assert_ne!(h1, h2);
-        assert!(h1 < HASH_SIZE);
-        assert!(h2 < HASH_SIZE);
+        assert!(h1 < (1 << 16));
+        assert!(h2 < (1 << 16));
     }
 
     #[test]
@@ -1099,40 +988,13 @@ mod tests {
         let enc6 = LzmaEncoder::new(LzmaLevel::new(6), 1 << 16);
         assert_eq!(enc6.chain_depth, 128);
 
-        // Level 9 should have depth 1024
+        // Level 9 should have depth 1024 (stored for brute-force DP path)
         let enc9 = LzmaEncoder::new(LzmaLevel::new(9), 1 << 16);
         assert_eq!(enc9.chain_depth, 1024);
 
         // Level 10 is clamped to 9 by LzmaLevel::new(), so chain_depth is 1024
-        // (LzmaLevel::new caps at level 9)
         let enc10 = LzmaEncoder::new(LzmaLevel::new(10), 1 << 16);
         assert_eq!(enc10.chain_depth, 1024);
-    }
-
-    #[test]
-    fn test_hash_chain_initialization() {
-        let encoder = LzmaEncoder::new(LzmaLevel::DEFAULT, 1 << 16);
-        // hash_head should be initialized to u32::MAX
-        assert!(encoder.hash_head.iter().all(|&v| v == u32::MAX));
-        // hash_chain starts empty
-        assert!(encoder.hash_chain.is_empty());
-    }
-
-    #[test]
-    fn test_hash4() {
-        let data1 = [0u8, 0, 0, 0];
-        let data2 = [1u8, 2, 3, 4];
-
-        let h1 = LzmaEncoder::hash4(&data1);
-        let h2 = LzmaEncoder::hash4(&data2);
-
-        assert_ne!(h1, h2);
-        assert!(h1 < HASH_SIZE);
-        assert!(h2 < HASH_SIZE);
-
-        // hash4 should give different results than hash3 for same prefix
-        let h3_1 = LzmaEncoder::hash3(&data1);
-        assert!(h3_1 < HASH_SIZE); // Verify hash3 result is valid
     }
 
     #[test]
@@ -1169,11 +1031,10 @@ mod tests {
     }
 
     #[test]
-    fn test_match_candidates() {
-        let encoder = LzmaEncoder::new(LzmaLevel::new(9), 1 << 20);
+    fn test_match_candidates_via_brute_force() {
+        // At position 0 with no history, brute-force should return no matches
         let data = b"ABCDEFGHIJ";
-        let candidates = encoder.get_match_candidates(data, 0);
-        // At position 0 with empty hash tables, no matches expected
-        assert!(candidates.is_empty());
+        let matches = LzmaEncoder::find_matches_brute(data, 0, 32, 1 << 20, 512);
+        assert!(matches.is_empty());
     }
 }

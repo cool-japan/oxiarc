@@ -69,11 +69,29 @@ pub mod lz77;
 /// Streaming compression and decompression.
 pub mod streaming;
 
+/// Parallel compression and decompression (requires `parallel` feature).
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
+/// Thread-safe buffer pool for amortising per-encode allocations.
+pub mod pool;
+
+/// Async I/O support via Tokio (requires `async-io` feature).
+#[cfg(feature = "async-io")]
+pub mod async_brotli;
+
 // Re-export primary API.
 pub use compress::{BrotliParams, compress, compress_with_params};
 pub use decompress::decompress;
 pub use error::{BrotliError, BrotliResult};
+pub use pool::{BrotliPool, PoolStats};
 pub use streaming::{BrotliCompressor, BrotliDecompressor};
+
+#[cfg(feature = "parallel")]
+pub use parallel::{compress_parallel, compress_parallel_with_params, decompress_frame_parallel};
+
+#[cfg(feature = "async-io")]
+pub use async_brotli::{BrotliAsyncCompressor, BrotliAsyncDecompressor};
 
 #[cfg(test)]
 mod tests {

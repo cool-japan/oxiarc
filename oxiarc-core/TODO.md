@@ -1,5 +1,5 @@
 
-# oxiarc-core - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-core - Development Status (v0.3.0, 2026-05-16)
 
 ## Completed Features (COMPLETE)
 
@@ -98,7 +98,7 @@
   - **Prerequisites:** none.
   - **Tests:** four-way matrix above; `tokio = { version = "*", features = ["rt", "macros", "io-util"] }` dev-dep (latest).
   - **Risk:** if implementation has gaps, the verify becomes genuine implementation work; that is acceptable per IMPLEMENT POLICY. Report `deviated` if scope explodes beyond this run.
-- [ ] Memory-mapped file support
+- [x] Memory-mapped file support — MappedFile struct with Deref/AsRef<[u8]>, mmap feature flag (done 2026-05-16)
 - [x] Progress callbacks (planned 2026-04-20)
   - **Goal:** A single `ProgressSink` trait lives in `oxiarc-core::progress` and is consumable by every codec + archive reader. This run wires it into the three streaming readers (TAR/ZIP/LZH). Per-codec adoption for brotli/deflate/lzma/snappy/cli is deferred to future runs.
   - **Design:** `pub trait ProgressSink: Send + Sync { fn on_progress(&self, processed: u64, total: Option<u64>); fn on_entry(&self, _name: &str, _index: u64) {} fn on_finish(&self) {} }`. Plus `NoopProgress` impl, `ProgressHandle = Arc<dyn ProgressSink>`, and `noop_progress()` helper. Stream readers accept `Option<ProgressHandle>` via `.with_progress(handle)`.

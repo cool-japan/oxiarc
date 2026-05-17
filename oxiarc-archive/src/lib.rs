@@ -46,6 +46,9 @@ pub mod iso9660;
 pub mod lenient;
 pub mod lz4;
 pub mod lzh;
+pub mod repair;
+pub mod repair_tar;
+pub mod repair_zip;
 pub mod sevenz;
 pub mod snappy;
 pub mod tar;
@@ -76,6 +79,10 @@ pub use lzh::{
     LzhStreamReader, LzhWriter,
 };
 pub use oxiarc_lzhuf::LzhMethod;
+pub use repair::{
+    RecoveredEntry, RecoveryStatus, RepairOptions, RepairReport, TarRepair, ZipRepair, repair_tar,
+    repair_zip,
+};
 pub use sevenz::{SevenZEntry, SevenZReader};
 pub use snappy::{SnappyReader, SnappyWriter};
 pub use tar::{TarHeader, TarReader, TarStreamEntry, TarStreamReader, TarWriter};

@@ -5,6 +5,34 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 0.3.1
+
+### Added
+- **oxiarc-lzhuf**: Custom dictionary support — `LzhEncoder::with_dictionary(method, dict)` / `set_dictionary(&mut self, dict)` and `LzhDecoder::with_dictionary(method, size, dict)` / `set_dictionary` mirror the DEFLATE template; `LzssEncoder::preload_dictionary` / `LzssDecoder::preload_dictionary` seed hash chains and ring buffer from the dict tail; improves compression ratio when encoder and decoder share a known corpus prefix.
+- **oxiarc-lzma**: Custom dictionary support — `LzmaEncoder::with_dictionary(level, dict_size, dict)` / `set_dictionary` fast-forwards the match finder through the dict prefix; `LzmaDecoder::with_dictionary(reader, props, dict_size, dict)` / `set_dictionary` seeds the circular dict ring from the dict tail; dict larger than `dict_size` is silently truncated to the last `dict_size` bytes.
+- **oxiarc-lzma**: Thread-safe memory pool (`LzmaPool`) for amortizing large dict buffer allocations — power-of-two capacity buckets, configurable max buffers per bucket, `PooledBuf<'a>` RAII wrapper, `LzmaDecoderPooled<'p, R>` decoder backed by pooled buffer, `LzmaPool::decode` / `decode_from_header` convenience constructors.
+- **oxiarc-archive**: Archive repair/recovery — `repair_zip<R: Read+Seek>(reader)` and `repair_tar<R: Read>(reader)` scan archives front-to-back independent of central directory / trailer integrity; ZIP scanner rolls over LFH signatures (`PK\x03\x04`), decompresses stored/deflated payloads, verifies CRC; TAR scanner walks 512-byte UStar blocks, recovers regular files and skips corrupt headers; results in `RepairReport { recovered_entries, skipped_ranges, warnings }` with per-entry `RecoveryStatus` (Verified/Recovered/RawOnly). Also available as `ZipRepair` / `TarRepair` builder structs with `RepairOptions`.
+- **oxiarc-snappy**: 16 interop integration tests against Google Snappy wire-format golden vectors — empty, single-byte, 64 KiB boundary, 64 KiB+1, `max_compress_len` invariant, arbitrary-data roundtrip, crafted-stream decode, truncated/oversized-varint rejection.
+- **oxiarc-brotli**: 19 interop integration tests covering all quality levels 0–11, empty/single-byte/binary/text/large-input roundtrips, `compress_with_params` variations, minimum-window (lgwin=16), compression-is-beneficial assertion, invalid parameter rejection.
+
+### Quality
+- 1446 tests (77 new), 3 skipped, zero warnings
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file)
+
+## [0.3.0] - 2026-05-17
+
+### Added
+- **oxiarc-deflate**: Zopfli-style graph-based optimal DEFLATE parser (`OptimalParser`) — iterative shortest-path DP with per-pass Huffman cost retraining; opt-in via `Deflater::with_optimal_parsing(level)`; produces smaller output than greedy/lazy at the cost of extra CPU time. Adds `cost_table_from_lengths`, `cost_of_match`, `find_all_matches` helpers.
+- **oxiarc-snappy**: Parallel frame compression (`compress_parallel`) via new `parallel` feature flag — rayon-based chunk-level parallelism mirroring the LZ4 parallel encoder; output is fully compatible with serial `FrameDecoder`.
+- **oxiarc-lz4**: True bounded-memory streaming compressor/decompressor — `Lz4Compressor` now emits complete blocks on the fly (no full-input buffering); `Lz4Decompressor` uses a state-machine parser that processes one block at a time; both gain `with_memory_budget(usize)` builder.
+- **oxiarc-lzhuf**: 4-byte multiplicative hash function replacing the old 3-byte hash (better avalanche, fewer collisions); new `LzssOptimalParser` two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder.
+- **oxiarc-lzma**: BT4 binary tree match finder (`Bt4MatchFinder`) with 3-table hash (h2/h3/h4), cyclic-buffer BST, and configurable `cut_value` depth limit; `MatchFinder` trait abstracts both `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9); level 9 now delivers superior compression quality matching LZMA SDK.
+- **oxiarc-core**: `MappedFile` — read-only memory-mapped file primitive (`memmap2`-backed, `mmap` feature flag); `Deref<Target=[u8]>` + `AsRef<[u8]>` for zero-copy archive access.
+
+### Quality
+- 1325 tests (44 new), 3 skipped, zero warnings
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file)
+
 ## [0.2.8] - 2026-05-08
 
 ### Added

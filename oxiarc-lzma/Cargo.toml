@@ -7,15 +7,24 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "README.md"
-description = "LZMA/LZMA2 compression for OxiArc (placeholder)"
+description = "Pure Rust LZMA/LZMA2 compression with custom dictionaries, memory pool, parallel and streaming support for OxiArc"
 keywords = ["lzma", "lzma2", "compression", "7z", "xz"]
 categories = ["compression", "encoding"]
 
+[features]
+default = []
+# Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for Lzma2Encoder/Lzma2Decoder
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+parallel = ["dep:rayon"]
+
 [dependencies]
 oxiarc-core.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt"], optional = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "lzma_bench"

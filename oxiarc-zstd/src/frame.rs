@@ -439,8 +439,108 @@ pub fn decompress_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
 /// This allows callers to locate the end of one frame in a concatenated
 /// stream and proceed to the next.
 pub fn decompress_frame(data: &[u8]) -> Result<(Vec<u8>, usize)> {
-    let header = parse_frame_header(data)?;
     let mut decoder = ZstdDecoder::new();
+    decompress_frame_with_decoder(data, &mut decoder)
+}
+
+/// Decompress one or more concatenated Zstandard frames.
+///
+/// Skippable frames (magic `0x184D2A50`–`0x184D2A5F`) are silently skipped.
+/// Unknown magic values cause iteration to stop and the accumulated output is
+/// returned (trailing garbage is tolerated).
+pub fn decompress_multi_frame(data: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Need at least 4 bytes to read a magic number.
+        if data.len() - pos < 4 {
+            break;
+        }
+        let magic = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+
+        if magic == 0xFD2FB528 {
+            // Normal Zstd frame.
+            let (decompressed, consumed) = decompress_frame(&data[pos..])?;
+            output.extend_from_slice(&decompressed);
+            pos += consumed;
+        } else if (crate::SKIPPABLE_MAGIC_LOW..=crate::SKIPPABLE_MAGIC_HIGH).contains(&magic) {
+            // Skippable frame: 4 bytes magic + 4 bytes size + <size> bytes data.
+            if data.len() - pos < 8 {
+                break;
+            }
+            let skip_size =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            pos += 8 + skip_size;
+        } else {
+            // Unknown magic — stop gracefully.
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
+/// Decompress one or more concatenated Zstandard frames using a dictionary.
+///
+/// Identical to [`decompress_multi_frame`] but applies `dict` to every frame.
+/// Each frame is decoded with a fresh [`ZstdDecoder`] initialised with the
+/// supplied dictionary, so back-references can resolve into the dictionary
+/// just as they do on the encoder side.
+///
+/// Skippable frames (magic `0x184D2A50`–`0x184D2A5F`) are silently skipped.
+/// Unknown magic values cause iteration to stop and the accumulated output is
+/// returned (trailing garbage is tolerated).
+pub fn decompress_multi_frame_with_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Need at least 4 bytes to read a magic number.
+        if data.len() - pos < 4 {
+            break;
+        }
+        let magic = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+
+        if magic == 0xFD2FB528 {
+            // Normal Zstd frame — each frame is independent so we create a
+            // fresh decoder for every frame to avoid FSE table state bleeding
+            // across frame boundaries, while still applying the dictionary.
+            let mut decoder = ZstdDecoder::new();
+            decoder.set_dictionary(dict);
+            let (decompressed, consumed) =
+                decompress_frame_with_decoder(&data[pos..], &mut decoder)?;
+            output.extend_from_slice(&decompressed);
+            pos += consumed;
+        } else if (crate::SKIPPABLE_MAGIC_LOW..=crate::SKIPPABLE_MAGIC_HIGH).contains(&magic) {
+            // Skippable frame: 4 bytes magic + 4 bytes size + <size> bytes data.
+            if data.len() - pos < 8 {
+                break;
+            }
+            let skip_size =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
+            pos += 8 + skip_size;
+        } else {
+            // Unknown magic — stop gracefully.
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
+/// Decompress a single Zstandard frame using a caller-supplied decoder.
+///
+/// Returns the decompressed bytes and the number of bytes consumed from
+/// `data` (the frame boundary).  The decoder's dictionary, if any, is used
+/// for match resolution.
+fn decompress_frame_with_decoder(
+    data: &[u8],
+    decoder: &mut ZstdDecoder,
+) -> Result<(Vec<u8>, usize)> {
+    let header = parse_frame_header(data)?;
     decoder.window_size = header.window_size;
 
     if let Some(size) = header.content_size {
@@ -449,7 +549,6 @@ pub fn decompress_frame(data: &[u8]) -> Result<(Vec<u8>, usize)> {
 
     let mut pos = header.header_size;
 
-    // Decode blocks, tracking how many bytes we consume.
     loop {
         if data.len() < pos + 3 {
             return Err(OxiArcError::CorruptedData {
@@ -546,45 +645,6 @@ pub fn decompress_frame(data: &[u8]) -> Result<(Vec<u8>, usize)> {
 
     let decompressed = std::mem::take(&mut decoder.output);
     Ok((decompressed, pos))
-}
-
-/// Decompress one or more concatenated Zstandard frames.
-///
-/// Skippable frames (magic `0x184D2A50`–`0x184D2A5F`) are silently skipped.
-/// Unknown magic values cause iteration to stop and the accumulated output is
-/// returned (trailing garbage is tolerated).
-pub fn decompress_multi_frame(data: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut pos = 0;
-
-    while pos < data.len() {
-        // Need at least 4 bytes to read a magic number.
-        if data.len() - pos < 4 {
-            break;
-        }
-        let magic = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-
-        if magic == 0xFD2FB528 {
-            // Normal Zstd frame.
-            let (decompressed, consumed) = decompress_frame(&data[pos..])?;
-            output.extend_from_slice(&decompressed);
-            pos += consumed;
-        } else if (crate::SKIPPABLE_MAGIC_LOW..=crate::SKIPPABLE_MAGIC_HIGH).contains(&magic) {
-            // Skippable frame: 4 bytes magic + 4 bytes size + <size> bytes data.
-            if data.len() - pos < 8 {
-                break;
-            }
-            let skip_size =
-                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                    as usize;
-            pos += 8 + skip_size;
-        } else {
-            // Unknown magic — stop gracefully.
-            break;
-        }
-    }
-
-    Ok(output)
 }
 
 /// Write a skippable Zstandard frame containing arbitrary user data.

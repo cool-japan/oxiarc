@@ -11,8 +11,12 @@ description = "Pure Rust LZH (LZSS + Huffman) compression for OxiArc"
 keywords = ["lzh", "lha", "lzss", "compression", "huffman"]
 categories = ["compression", "encoding"]
 
+[features]
+parallel = ["dep:rayon"]
+
 [dependencies]
 oxiarc-core.workspace = true
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

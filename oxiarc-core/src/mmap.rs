@@ -539,6 +539,115 @@ impl MmapOptions {
     }
 }
 
+/// A read-only memory-mapped view of a file.
+///
+/// Unlike [`MmapReader`], which maintains a read cursor and implements [`std::io::Read`],
+/// `MappedFile` is a lower-level primitive that exposes the entire file as a byte slice
+/// via [`std::ops::Deref`], [`AsRef<[u8]>`], and [`as_slice`][Self::as_slice]. It is intended for
+/// random-access and zero-copy use cases where the caller manages indexing directly.
+///
+/// The underlying [`File`] handle is kept alive for the lifetime of the struct, which
+/// prevents the OS from unmap-after-close issues on platforms where that would be
+/// problematic.
+///
+/// # Thread Safety
+///
+/// `MappedFile` is `Send + Sync` because `memmap2::Mmap` is already `Send + Sync`
+/// (see memmap2 docs). No additional `unsafe impl` is needed.
+///
+/// # Example
+///
+/// ```no_run
+/// use oxiarc_core::mmap::MappedFile;
+///
+/// let mapped = MappedFile::open("archive.zip")?;
+/// println!("File size: {} bytes", mapped.len());
+/// let first_four = &mapped[..4];
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct MappedFile {
+    /// Keep the file handle alive to prevent unmap-after-close issues.
+    _file: File,
+    /// The read-only memory mapping.
+    map: Mmap,
+}
+
+impl MappedFile {
+    /// Open a file for memory-mapped reading.
+    ///
+    /// Opens the file at `path` and creates a read-only memory mapping of its entire
+    /// contents. The file handle is retained internally to keep the mapping valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] if:
+    /// - The file does not exist or cannot be opened.
+    /// - Memory mapping fails (e.g., insufficient virtual address space).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use oxiarc_core::mmap::MappedFile;
+    ///
+    /// let mapped = MappedFile::open("archive.zip")?;
+    /// assert!(!mapped.is_empty());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        // SAFETY: We create a read-only mapping. The `_file` field keeps the file
+        // descriptor alive for the duration of the mapping. The caller is responsible
+        // for ensuring no other process truncates or replaces the file while mapped
+        // (standard mmap contract; violations cause SIGBUS on POSIX, not UB in Rust).
+        let map = unsafe { Mmap::map(&file)? };
+        Ok(Self { _file: file, map })
+    }
+
+    /// Returns the memory-mapped bytes as a slice.
+    ///
+    /// This is a zero-copy view of the file contents.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.map
+    }
+
+    /// Returns the length of the mapped file in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Returns `true` if the mapped file is empty (zero bytes).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl std::ops::Deref for MappedFile {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for MappedFile {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for MappedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedFile")
+            .field("len", &self.map.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,5 +1029,122 @@ mod tests {
         assert_eq!(bytes_read, 0);
 
         remove_temp_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // MappedFile tests
+    // -----------------------------------------------------------------------
+
+    /// Temporary file guard — deletes the file when dropped.
+    struct TempFileGuard(std::path::PathBuf);
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Build a unique temp-file path using subsec_nanos as a lightweight
+    /// unique suffix (tests are not run concurrently within a single process,
+    /// and the suffix is combined with a descriptive tag for extra safety).
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        std::env::temp_dir().join(format!("oxiarc_test_{}_{}.dat", tag, suffix))
+    }
+
+    #[test]
+    fn test_mmap_open_and_read() {
+        // Write 100 known bytes to a temp file, mmap it, verify as_slice() matches.
+        let path = temp_path("mapped_open");
+        let _guard = TempFileGuard(path.clone());
+
+        let data: Vec<u8> = (0_u8..100).collect();
+        {
+            let mut f = File::create(&path).expect("create temp file");
+            f.write_all(&data).expect("write temp file");
+            f.sync_all().expect("sync temp file");
+        }
+
+        let mapped = MappedFile::open(&path).expect("MappedFile::open failed");
+        assert_eq!(mapped.len(), 100);
+        assert!(!mapped.is_empty());
+        assert_eq!(mapped.as_slice(), data.as_slice());
+        // Deref coercion (auto-deref via index)
+        let via_deref: &[u8] = &mapped[..];
+        assert_eq!(via_deref, data.as_slice());
+        // AsRef
+        let via_as_ref: &[u8] = mapped.as_ref();
+        assert_eq!(via_as_ref, data.as_slice());
+    }
+
+    #[test]
+    fn test_mmap_open_nonexistent_errors() {
+        let result = MappedFile::open("/nonexistent/path/xyz_oxiarc_test.dat");
+        assert!(result.is_err(), "Expected Err for nonexistent path");
+        let err = result.expect_err("should be Err");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_mmap_empty_file() {
+        let path = temp_path("mapped_empty");
+        let _guard = TempFileGuard(path.clone());
+
+        // Create a 0-byte file.
+        File::create(&path).expect("create empty temp file");
+
+        let mapped = MappedFile::open(&path).expect("MappedFile::open on empty file failed");
+        assert_eq!(mapped.len(), 0);
+        assert!(mapped.is_empty());
+        assert_eq!(mapped.as_slice(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_mmap_large_file() {
+        let path = temp_path("mapped_large");
+        let _guard = TempFileGuard(path.clone());
+
+        const SIZE: usize = 1024 * 1024; // 1 MiB
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 256) as u8).collect();
+        {
+            let mut f = File::create(&path).expect("create large temp file");
+            f.write_all(&data).expect("write large temp file");
+            f.sync_all().expect("sync large temp file");
+        }
+
+        let mapped = MappedFile::open(&path).expect("MappedFile::open on large file failed");
+        assert_eq!(mapped.len(), SIZE);
+
+        // Verify first 256 bytes.
+        let expected_first: Vec<u8> = (0_u8..=255).collect();
+        assert_eq!(&mapped[..256], expected_first.as_slice());
+
+        // Verify last 256 bytes (SIZE is a multiple of 256, so last chunk is 0..255 again).
+        let last_start = SIZE - 256;
+        let expected_last: Vec<u8> = (0_u8..=255).collect();
+        assert_eq!(&mapped[last_start..], expected_last.as_slice());
+    }
+
+    #[test]
+    fn test_mmap_debug_impl() {
+        let path = temp_path("mapped_debug");
+        let _guard = TempFileGuard(path.clone());
+
+        let data = b"debug test";
+        {
+            let mut f = File::create(&path).expect("create temp file");
+            f.write_all(data).expect("write temp file");
+        }
+
+        let mapped = MappedFile::open(&path).expect("MappedFile::open failed");
+        let dbg = format!("{:?}", mapped);
+        assert!(
+            dbg.contains("MappedFile"),
+            "Debug output should contain struct name"
+        );
+        assert!(dbg.contains("10"), "Debug output should show len = 10");
     }
 }

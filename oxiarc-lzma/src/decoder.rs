@@ -104,6 +104,49 @@ impl<R: Read> LzmaDecoder<R> {
         })
     }
 
+    /// Construct decoder pre-loaded with a dictionary.
+    ///
+    /// Preloading seeds the circular dict buffer so back-references into the
+    /// dictionary are valid from position 0 — same semantics as DEFLATE's
+    /// `Inflater::with_dictionary`.
+    ///
+    /// If `dict.len()` > `dict_size`, only the last `dict_size` bytes are used.
+    pub fn with_dictionary(
+        reader: R,
+        props: LzmaProperties,
+        dict_size: u32,
+        dict: &[u8],
+    ) -> Result<Self> {
+        let mut dec = Self::new(reader, props, dict_size)?;
+        dec.set_dictionary(dict);
+        Ok(dec)
+    }
+
+    /// Preload dictionary bytes into the circular dict buffer.
+    ///
+    /// If `dict.len()` > `dict_size`, only the last `dict_size` bytes are used
+    /// (they must be at the tail of the dict for LZMA back-reference semantics).
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        if dict.is_empty() {
+            return;
+        }
+        let tail_start = dict.len().saturating_sub(self.dict_size);
+        let tail = &dict[tail_start..];
+        for &byte in tail {
+            self.dict[self.dict_pos] = byte;
+            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+        }
+        // bytes_decoded advances so that literal contexts and distance checks work
+        self.bytes_decoded = tail.len() as u64;
+    }
+
+    /// Set the expected uncompressed size (used to determine when decoding is complete).
+    ///
+    /// When `None`, decoding continues until an LZMA end marker is encountered.
+    pub(crate) fn set_uncompressed_size(&mut self, size: Option<u64>) {
+        self.uncompressed_size = size;
+    }
+
     /// Attach a progress sink; called for every ~4096 bytes decompressed.
     ///
     /// The `on_progress` callback receives `(bytes_produced, uncompressed_size_if_known)`.

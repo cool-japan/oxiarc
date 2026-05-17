@@ -466,6 +466,15 @@ impl<'a> DictBlockEncoder<'a> {
 
     /// Encode the input data with dictionary support.
     fn encode(&mut self, output: &mut Vec<u8>) -> Result<()> {
+        self.encode_with_accel(output, 1)
+    }
+
+    /// Encode the input data with dictionary support and acceleration parameter.
+    ///
+    /// `accel` controls the step size after a hash miss. A value of 1 is
+    /// the default (no extra skipping). Higher values trade compression ratio
+    /// for speed. Values less than 1 are clamped to 1.
+    fn encode_with_accel(&mut self, output: &mut Vec<u8>, accel: usize) -> Result<()> {
         let input = self.input;
         let len = input.len();
 
@@ -475,9 +484,21 @@ impl<'a> DictBlockEncoder<'a> {
             return Ok(());
         }
 
+        // Mirror the accel_shift computation from BlockEncoder::encode_with_accel
+        let accel_shift = match accel {
+            0..=1 => 6,
+            2 => 5,
+            3..=4 => 4,
+            5..=8 => 3,
+            9..=16 => 2,
+            17..=64 => 1,
+            _ => 0,
+        };
+
         let mut pos = 0;
         let mut anchor = 0; // Start of current literal run
         let end = len.saturating_sub(5); // Leave room for last literals
+        let mut misses: usize = 0;
 
         while pos < end {
             let virtual_pos = pos + self.dict_len;
@@ -514,6 +535,7 @@ impl<'a> DictBlockEncoder<'a> {
 
                     pos += match_len;
                     anchor = pos;
+                    misses = 0;
 
                     // Update hash for positions we skipped
                     if pos < len {
@@ -526,7 +548,10 @@ impl<'a> DictBlockEncoder<'a> {
                 }
             }
 
-            pos += 1;
+            // Miss — advance by acceleration-scaled step
+            let step = 1 + (misses >> accel_shift);
+            misses += 1;
+            pos += step;
         }
 
         // Emit remaining literals
@@ -804,6 +829,43 @@ pub fn compress_with_dict(input: &[u8], dict: &Lz4Dict) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Compress data using LZ4 block format with dictionary and acceleration parameter.
+///
+/// `acceleration` controls how aggressively the compressor skips positions
+/// after a hash miss. A value of 1 is the default (no extra skipping). Higher
+/// values make compression faster at the cost of a worse compression ratio.
+/// Values less than 1 are clamped to 1.
+///
+/// # Arguments
+///
+/// * `input` - Data to compress
+/// * `dict` - Dictionary for reference
+/// * `acceleration` - Acceleration factor (≥1; higher = faster but worse ratio)
+///
+/// # Returns
+///
+/// Compressed data in LZ4 block format.
+pub fn compress_with_dict_accel(
+    input: &[u8],
+    dict: &Lz4Dict,
+    acceleration: i32,
+) -> Result<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let accel = (acceleration.max(1)) as usize;
+
+    if dict.is_empty() {
+        return crate::compress_block_with_accel(input, acceleration);
+    }
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut encoder = DictBlockEncoder::new(input, dict);
+    encoder.encode_with_accel(&mut output, accel)?;
+    Ok(output)
+}
+
 /// Compress data using LZ4 block format with dictionary and level.
 ///
 /// # Arguments
@@ -903,6 +965,130 @@ pub fn decompress_with_dict(input: &[u8], max_output: usize, dict: &Lz4Dict) -> 
     let mut decoder = DictBlockDecoder::new(input);
     decoder.decode(&mut output, max_output, dict)?;
     Ok(output)
+}
+
+/// Dictionary block encoder with reusable dictionary.
+///
+/// Encodes LZ4 blocks using a prefix dictionary. The dictionary allows the
+/// encoder to reference bytes from the dictionary, improving compression
+/// ratios for data that shares common patterns with the dictionary.
+///
+/// The dictionary is automatically truncated to the last 64 KiB (the LZ4
+/// maximum match distance), so only the tail is used even if you supply a
+/// larger buffer.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_lz4::dict::{Lz4DictBlockEncoder, Lz4DictBlockDecoder};
+///
+/// let dict_bytes = b"The quick brown fox jumps over the lazy dog.";
+/// let encoder = Lz4DictBlockEncoder::new(dict_bytes);
+/// let decoder = Lz4DictBlockDecoder::new(dict_bytes);
+///
+/// let data = b"The quick brown fox jumps over the lazy dog. Again!";
+/// let compressed = encoder.compress(data).unwrap();
+/// let decompressed = decoder.decompress(&compressed, data.len() * 2).unwrap();
+/// assert_eq!(decompressed, data);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Lz4DictBlockEncoder {
+    /// Pre-built dictionary (truncated to last 64 KiB).
+    dict: Lz4Dict,
+    /// Acceleration factor (≥1; higher = faster, worse ratio).
+    accel: i32,
+}
+
+impl Lz4DictBlockEncoder {
+    /// Create a new encoder with the given dictionary and default acceleration (1).
+    ///
+    /// The dictionary is truncated to the last 64 KiB.
+    pub fn new(dict: &[u8]) -> Self {
+        Self {
+            dict: Lz4Dict::new(dict),
+            accel: 1,
+        }
+    }
+
+    /// Create a new encoder with the given dictionary and a specific acceleration factor.
+    ///
+    /// `acceleration` is clamped to ≥1. Higher values trade compression ratio for speed.
+    pub fn with_accel(dict: &[u8], acceleration: i32) -> Self {
+        Self {
+            dict: Lz4Dict::new(dict),
+            accel: acceleration.max(1),
+        }
+    }
+
+    /// Set the acceleration factor, consuming and returning `self`.
+    pub fn acceleration(mut self, acceleration: i32) -> Self {
+        self.accel = acceleration.max(1);
+        self
+    }
+
+    /// Compress `input` using the dictionary.
+    ///
+    /// Returns the compressed data in LZ4 block format. Use
+    /// [`Lz4DictBlockDecoder`] with the **same** dictionary to decompress.
+    pub fn compress(&self, input: &[u8]) -> Result<Vec<u8>> {
+        compress_with_dict_accel(input, &self.dict, self.accel)
+    }
+
+    /// Get a reference to the underlying dictionary.
+    pub fn dict(&self) -> &Lz4Dict {
+        &self.dict
+    }
+}
+
+/// Dictionary block decoder with reusable dictionary.
+///
+/// Decodes LZ4 blocks that were compressed with a matching dictionary.
+/// Back-references that point before the start of the output are resolved
+/// from the tail of the dictionary.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_lz4::dict::{Lz4DictBlockEncoder, Lz4DictBlockDecoder};
+///
+/// let dict_bytes = b"some common prefix";
+/// let encoder = Lz4DictBlockEncoder::new(dict_bytes);
+/// let decoder = Lz4DictBlockDecoder::new(dict_bytes);
+///
+/// let data = b"some common prefix and more data";
+/// let compressed = encoder.compress(data).unwrap();
+/// let decompressed = decoder.decompress(&compressed, data.len() * 2).unwrap();
+/// assert_eq!(decompressed, data);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Lz4DictBlockDecoder {
+    /// Pre-built dictionary (truncated to last 64 KiB).
+    dict: Lz4Dict,
+}
+
+impl Lz4DictBlockDecoder {
+    /// Create a new decoder with the given dictionary.
+    ///
+    /// The dictionary is truncated to the last 64 KiB, matching the encoder's
+    /// behaviour.
+    pub fn new(dict: &[u8]) -> Self {
+        Self {
+            dict: Lz4Dict::new(dict),
+        }
+    }
+
+    /// Decompress `input` using the dictionary.
+    ///
+    /// `output_capacity` is the expected maximum decompressed size. The
+    /// function returns an error if any back-reference is invalid.
+    pub fn decompress(&self, input: &[u8], output_capacity: usize) -> Result<Vec<u8>> {
+        decompress_with_dict(input, output_capacity, &self.dict)
+    }
+
+    /// Get a reference to the underlying dictionary.
+    pub fn dict(&self) -> &Lz4Dict {
+        &self.dict
+    }
 }
 
 /// Dictionary frame descriptor for frame format with dictionary support.

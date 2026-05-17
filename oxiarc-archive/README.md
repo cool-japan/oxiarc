@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.8 (2026-05-08) | 299 tests passing**
+**Version: 0.3.0 (2026-05-17) | 332 tests passing**
 
 
 ## Features
@@ -20,6 +20,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 - Brotli and Snappy compression support
 - ISO 9660 read support with PVD and Joliet UCS-2 filename handling (new in 0.2.8)
 - Raw-preserve append: `ZipWriter::add_file_raw`, `LzhReader::read_raw_method_data`, `LzhWriter::add_file_raw` (new in 0.2.8)
+- Archive repair/recovery: `repair_zip`, `repair_tar` functions; `ZipRepair`, `TarRepair`, `RepairReport` structs for recovering truncated or corrupt archives (new in 0.3.0)
 
 All features are implemented and tested. API is stable.
 
@@ -33,6 +34,7 @@ This crate handles the container/wrapper aspects of archive formats:
 - Snappy compression support (via `oxiarc-snappy`)
 - ISO 9660 read support with PVD and Joliet UCS-2 filename handling (new in 0.2.8, via `IsoReader`)
 - Raw-preserve append for ZIP and LZH entries (new in 0.2.8)
+- Archive repair/recovery: `repair_zip`, `repair_tar`, `ZipRepair`, `TarRepair`, `RepairReport` for recovering truncated or corrupt archives (new in 0.3.0)
 
 The actual compression/decompression is delegated to codec crates (`oxiarc-deflate`, `oxiarc-lzhuf`, `oxiarc-lzma`, `oxiarc-brotli`, `oxiarc-snappy`).
 
@@ -105,16 +107,16 @@ Supported async compression methods: `Stored`, `Deflate`.
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.2.8"
+oxiarc-archive = "0.3.0"
 
 # With memory-mapped I/O
-oxiarc-archive = { version = "0.2.8", features = ["mmap"] }
+oxiarc-archive = { version = "0.3.0", features = ["mmap"] }
 
 # With async ZIP support
-oxiarc-archive = { version = "0.2.8", features = ["async-io"] }
+oxiarc-archive = { version = "0.3.0", features = ["async-io"] }
 
 # With all features
-oxiarc-archive = { version = "0.2.8", features = ["mmap", "async-io"] }
+oxiarc-archive = { version = "0.3.0", features = ["mmap", "async-io"] }
 ```
 
 ## Format Detection
@@ -251,6 +253,7 @@ for entry in lzh.entries() {
 | `tar` | TAR archive handling |
 | `lzh` | LZH archive handling (including `LzhWriter::add_file_raw`, `LzhReader::read_raw_method_data`) |
 | `iso` | ISO 9660 image reading via `IsoReader` (new in 0.2.8) |
+| `repair` | Archive repair/recovery: `repair_zip`, `repair_tar`, `ZipRepair`, `TarRepair`, `RepairReport` (new in 0.3.0) |
 | `async_zip` | Async ZIP entry reading (requires `async-io` feature) |
 
 ## Security

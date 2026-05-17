@@ -13,9 +13,12 @@ categories = ["compression", "encoding"]
 
 [dependencies]
 oxiarc-core = { workspace = true }
+tokio = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "brotli_bench"
@@ -23,6 +26,9 @@ harness = false
 
 [features]
 default = []
+# Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for BrotliCompressor/BrotliDecompressor
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+parallel = ["dep:rayon"]
 
 [lints]
 workspace = true

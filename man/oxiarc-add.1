@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH oxiarc-add 1  "oxiarc-add " 
+.SH NAME
+oxiarc\-add \- Add files to an existing archive (ZIP, TAR, LZH)
+.SH SYNOPSIS
+\fBoxiarc\-add\fR [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
+.SH DESCRIPTION
+Add files to an existing archive (ZIP, TAR, LZH)
+.SH OPTIONS
+.TP
+\fB\-l\fR, \fB\-\-compression\fR \fI<COMPRESSION>\fR [default: normal]
+Compression level (used when the archive format supports it)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+store: Store without compression
+.IP \(bu 2
+fast: Fast compression
+.IP \(bu 2
+normal: Normal compression (default)
+.IP \(bu 2
+best: Best compression
+.RE
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Verbose output
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Dry run: show planned changes without modifying the archive
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIARCHIVE\fR>
+Existing archive file to append to
+.TP
+[\fIFILES\fR]
+Files to add to the archive

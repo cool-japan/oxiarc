@@ -270,16 +270,39 @@ impl Lzma2Decoder {
 
             if is_match == 0 {
                 // Literal
-                let prev_byte = if bytes_decoded == 0 && self.dict_len == 0 {
-                    0
+                // prev_byte: the byte immediately before the current decode position.
+                // We first look in the `output` buffer that we are building for this
+                // chunk; only if that is empty do we fall back to the external
+                // dictionary ring-buffer.
+                let prev_byte = if let Some(&b) = output.last() {
+                    b
                 } else {
-                    self.get_byte_from_dict(0, bytes_decoded)
+                    // output is empty — try the external dictionary.
+                    if self.dict_len > 0 {
+                        self.get_byte_from_dict(0, 0)
+                    } else {
+                        0
+                    }
                 };
 
-                let match_byte = if !self.state.is_literal()
-                    && self.rep[0] < (self.dict_len as u64 + bytes_decoded) as u32
-                {
-                    self.get_byte_from_dict(self.rep[0] as usize, bytes_decoded)
+                // match_byte: the byte at distance rep[0] from the current position,
+                // used as match context for the literal coder when we are not in a
+                // literal state.  The combined window is  output ++ dictionary.
+                let match_byte = if !self.state.is_literal() {
+                    let dist = self.rep[0] as usize;
+                    let out_len = output.len();
+                    let total_avail = out_len + self.dict_len;
+                    if dist < total_avail {
+                        if dist < out_len {
+                            // Within the current chunk's output buffer.
+                            output[out_len - dist - 1]
+                        } else {
+                            // In the external dictionary ring-buffer.
+                            self.get_byte_from_dict(dist - out_len, 0)
+                        }
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -338,16 +361,23 @@ impl Lzma2Decoder {
 
                         if is_rep0_long == 0 {
                             // Short rep (length 1)
-                            let dist = self.rep[0];
+                            let dist = self.rep[0] as usize;
+                            let out_len = output.len();
+                            let total_avail = out_len + self.dict_len;
 
-                            if dist as u64 >= self.dict_len as u64 + bytes_decoded {
+                            if dist >= total_avail {
                                 return Err(OxiArcError::corrupted(
                                     bytes_decoded,
                                     "Invalid LZMA data",
                                 ));
                             }
 
-                            let byte = self.get_byte_from_dict(dist as usize, bytes_decoded);
+                            // Read from output first, then fall back to the external dict.
+                            let byte = if dist < out_len {
+                                output[out_len - dist - 1]
+                            } else {
+                                self.get_byte_from_dict(dist - out_len, 0)
+                            };
                             output.push(byte);
                             bytes_decoded += 1;
                             self.state.update_short_rep();

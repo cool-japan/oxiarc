@@ -42,6 +42,29 @@ impl LzhDecoder {
         }
     }
 
+    /// Construct a decoder pre-loaded with a custom dictionary.
+    ///
+    /// The dictionary is written into the sliding window history so that
+    /// back-references produced by an encoder that used the same dictionary are
+    /// valid from the very first byte of compressed output.
+    ///
+    /// If `dict` is larger than the window, only the last `window_size` bytes
+    /// are used.
+    pub fn with_dictionary(method: LzhMethod, uncompressed_size: u64, dict: &[u8]) -> Self {
+        let mut dec = Self::new(method, uncompressed_size);
+        dec.set_dictionary(dict);
+        dec
+    }
+
+    /// Preload a custom dictionary into the sliding window history.
+    ///
+    /// Equivalent to constructing with
+    /// [`with_dictionary`](Self::with_dictionary) but usable after construction.
+    /// Must be called before any data is decoded.
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        self.lzss.preload_dictionary(dict);
+    }
+
     /// Reset the decoder.
     pub fn reset(&mut self) {
         self.lzss.reset();

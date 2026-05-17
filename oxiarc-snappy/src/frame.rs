@@ -9,17 +9,26 @@
 //! (decompression) that implement `Write` and `Read` respectively.
 
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 
 use crate::compress;
-use crate::crc32c::masked_crc32c;
+use crate::crc32c::{crc32c, masked_crc32c};
 use crate::decompress;
 use crate::error::SnappyError;
+use crate::pool::{PoolInner, SnappyPool};
 
 /// Stream identifier magic bytes: "sNaPpY" (0xff 0x06 0x00 0x00 0x73 0x4e 0x61 0x50 0x70 0x59)
 const STREAM_IDENTIFIER: [u8; 10] = [0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
+
+/// OxiArc dictionary-frame skippable chunk type.
+/// Skippable chunks are 0x80..=0xFE.  We use 0xFE to identify the dict info.
+const CHUNK_TYPE_OXIARC_DICT: u8 = 0xFE;
+
+/// Magic prefix for the OxiArc dict info chunk body.
+const OXIARC_DICT_MAGIC: &[u8] = b"OXIAD";
 
 /// The "sNaPpY" body of the stream identifier (without the chunk header).
 const STREAM_BODY: [u8; 6] = [0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
@@ -64,6 +73,8 @@ pub struct FrameEncoder<W: Write> {
     cancel: Option<CancellationToken>,
     /// Cumulative uncompressed bytes that have been encoded into chunks.
     bytes_processed: u64,
+    /// Optional shared memory pool for buffer reuse.
+    pool: Option<SnappyPool>,
 }
 
 impl<W: Write> FrameEncoder<W> {
@@ -78,7 +89,17 @@ impl<W: Write> FrameEncoder<W> {
             progress: None,
             cancel: None,
             bytes_processed: 0,
+            pool: None,
         }
+    }
+
+    /// Create a new framed encoder that reuses scratch buffers from `pool`.
+    ///
+    /// All other behaviour is identical to [`FrameEncoder::new`].
+    pub fn with_pool(inner: W, pool: &SnappyPool) -> Self {
+        let mut enc = Self::new(inner);
+        enc.pool = Some(pool.clone());
+        enc
     }
 
     /// Attach a progress sink that will receive `on_progress` callbacks once
@@ -136,8 +157,46 @@ impl<W: Write> FrameEncoder<W> {
         }
 
         let chunk_len = self.buffer.len() as u64;
-        let data = std::mem::take(&mut self.buffer);
+
+        // Swap the full staging buffer out so we can pass a slice to write_chunk
+        // without holding a conflicting borrow on `self`.  When a pool is active,
+        // the replacement buffer is acquired from the pool (preserving capacity);
+        // otherwise we use the standard `mem::take` path.
+        let data = if let Some(ref snappy_pool) = self.pool {
+            let pi = &snappy_pool.inner;
+            let mut replacement = {
+                let mut guard = pi.encoder_scratch.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut b) = guard.pop() {
+                    pi.encoder_scratch_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    b.clear();
+                    b
+                } else {
+                    pi.encoder_scratch_allocs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Vec::with_capacity(crate::pool::ENCODER_SCRATCH_CAP)
+                }
+            };
+            // Swap: `replacement` (empty, capacity preserved) becomes new staging;
+            // `self.buffer` (full data) is returned as `data`.
+            std::mem::swap(&mut self.buffer, &mut replacement);
+            replacement
+        } else {
+            std::mem::take(&mut self.buffer)
+        };
+
         self.write_chunk(&data)?;
+
+        // Return `data` to the pool after writing.
+        if let Some(ref snappy_pool) = self.pool {
+            let pi = &snappy_pool.inner;
+            let mut buf = data;
+            buf.clear();
+            let mut guard = pi.encoder_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < pi.cap {
+                guard.push(buf);
+            }
+        }
 
         // Update the running total and notify the progress sink.
         self.bytes_processed += chunk_len;
@@ -253,6 +312,8 @@ pub struct FrameDecoder<R: Read> {
     cancel: Option<CancellationToken>,
     /// Cumulative decompressed bytes that have been produced.
     bytes_processed: u64,
+    /// Optional shared memory pool for scratch buffer reuse.
+    pool: Option<Arc<PoolInner>>,
 }
 
 impl<R: Read> FrameDecoder<R> {
@@ -267,7 +328,17 @@ impl<R: Read> FrameDecoder<R> {
             progress: None,
             cancel: None,
             bytes_processed: 0,
+            pool: None,
         }
+    }
+
+    /// Create a new framed decoder that reuses scratch buffers from `pool`.
+    ///
+    /// All other behaviour is identical to [`FrameDecoder::new`].
+    pub fn with_pool(inner: R, pool: &SnappyPool) -> Self {
+        let mut dec = Self::new(inner);
+        dec.pool = Some(Arc::clone(&pool.inner));
+        dec
     }
 
     /// Attach a progress sink that will receive `on_progress` callbacks once
@@ -380,6 +451,45 @@ impl<R: Read> FrameDecoder<R> {
         }
     }
 
+    /// Acquire a scratch buffer for reading chunk data.
+    ///
+    /// Returns a `Vec<u8>` sized to `chunk_len` bytes (zeroed), either from
+    /// the pool or freshly allocated.
+    fn acquire_decoder_scratch(&mut self, chunk_len: usize) -> Vec<u8> {
+        if let Some(ref pool_inner) = self.pool {
+            let mut guard = pool_inner
+                .decoder_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(mut b) = guard.pop() {
+                pool_inner
+                    .decoder_scratch_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                b.clear();
+                b.resize(chunk_len, 0);
+                return b;
+            }
+            pool_inner
+                .decoder_scratch_allocs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        vec![0u8; chunk_len]
+    }
+
+    /// Return a scratch buffer to the pool (no-op if no pool is active).
+    fn release_decoder_scratch(&self, mut buf: Vec<u8>) {
+        if let Some(ref pool_inner) = self.pool {
+            buf.clear();
+            let mut guard = pool_inner
+                .decoder_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.len() < pool_inner.cap {
+                guard.push(buf);
+            }
+        }
+    }
+
     /// Read and decompress a compressed data chunk.
     fn read_compressed_chunk(&mut self, chunk_len: usize) -> io::Result<()> {
         if chunk_len < 4 {
@@ -389,7 +499,7 @@ impl<R: Read> FrameDecoder<R> {
             ));
         }
 
-        let mut chunk_data = vec![0u8; chunk_len];
+        let mut chunk_data = self.acquire_decoder_scratch(chunk_len);
         self.inner.read_exact(&mut chunk_data)?;
 
         // First 4 bytes are the masked CRC32C
@@ -399,6 +509,9 @@ impl<R: Read> FrameDecoder<R> {
         let compressed_data = &chunk_data[4..];
         let decompressed = decompress::decompress(compressed_data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        // Return scratch buffer to pool before we replace output_buffer.
+        self.release_decoder_scratch(chunk_data);
 
         // Verify checksum
         let computed_checksum = masked_crc32c(&decompressed);
@@ -427,15 +540,17 @@ impl<R: Read> FrameDecoder<R> {
             ));
         }
 
-        let mut chunk_data = vec![0u8; chunk_len];
+        let mut chunk_data = self.acquire_decoder_scratch(chunk_len);
         self.inner.read_exact(&mut chunk_data)?;
 
         let expected_checksum =
             u32::from_le_bytes([chunk_data[0], chunk_data[1], chunk_data[2], chunk_data[3]]);
 
-        let data = &chunk_data[4..];
+        let data_slice = chunk_data[4..].to_vec();
 
-        let computed_checksum = masked_crc32c(data);
+        self.release_decoder_scratch(chunk_data);
+
+        let computed_checksum = masked_crc32c(&data_slice);
         if expected_checksum != computed_checksum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -447,7 +562,7 @@ impl<R: Read> FrameDecoder<R> {
             ));
         }
 
-        self.output_buffer = data.to_vec();
+        self.output_buffer = data_slice;
         self.output_pos = 0;
         Ok(())
     }
@@ -519,6 +634,300 @@ fn write_chunk_header(writer: &mut impl Write, chunk_type: u8, data_len: usize) 
         ((data_len >> 16) & 0xFF) as u8,
     ];
     writer.write_all(&header)
+}
+
+/// Compress `input` using the Snappy framing format, reusing scratch buffers
+/// from `pool` to amortise per-chunk allocation costs.
+///
+/// Output is byte-for-byte compatible with the serial [`FrameEncoder`] and
+/// can be decoded by [`FrameDecoder`].
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if the internal write operations fail (in practice
+/// this only happens on allocation failures when writing to a `Vec`).
+pub fn compress_frame_pooled(input: &[u8], pool: &SnappyPool) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut encoder = FrameEncoder::with_pool(&mut output, pool);
+    encoder.write_all(input)?;
+    encoder.finish()?;
+    Ok(output)
+}
+
+/// Compress `input` using the Snappy framing format with a prefix dictionary.
+///
+/// Each data chunk is compressed via
+/// [`crate::compress::compress_block_with_dict`] so matches into `dict` can
+/// reduce the compressed size when the input shares substrings with the dict.
+///
+/// The output begins with a custom **OxiArc dictionary frame** chunk (chunk
+/// type `0xFE`) that embeds a CRC32C of `dict` and the dict length.
+/// [`decompress_frame_with_dict`] uses this header to detect mismatched
+/// dictionaries before attempting decompression.
+///
+/// # Format
+/// ```text
+/// [Snappy stream identifier, 10 bytes]
+/// [OxiArc dict-info chunk, chunk-type=0xFE]
+///   body: b"OXIAD" (5) | crc32c(dict) as LE u32 (4) | dict_len as LE u32 (4)
+/// [compressed data chunks, each chunk-compressed with dict]
+/// ```
+///
+/// **This format is NOT compatible with standard Snappy frame readers.**
+/// Use [`decompress_frame_with_dict`] to decode.
+///
+/// The maximum dictionary size is 64 KiB; if `dict` is longer only the last
+/// 64 KiB is used (mirroring the block-level encoder).
+pub fn compress_frame_with_dict(input: &[u8], dict: &[u8]) -> Vec<u8> {
+    // Clamp dict to the last 64 KiB.
+    let dict = if dict.len() > 65536 {
+        &dict[dict.len() - 65536..]
+    } else {
+        dict
+    };
+
+    let mut output = Vec::new();
+
+    // 1. Snappy stream identifier.
+    output.extend_from_slice(&STREAM_IDENTIFIER);
+
+    // 2. OxiArc dict-info skippable chunk.
+    //    body: b"OXIAD" (5) | crc32c(dict) LE u32 (4) | dict_len LE u32 (4) = 13 bytes.
+    let dict_crc = crc32c(dict);
+    let dict_len_u32 = dict.len() as u32;
+    let mut dict_body = Vec::with_capacity(13);
+    dict_body.extend_from_slice(OXIARC_DICT_MAGIC);
+    dict_body.extend_from_slice(&dict_crc.to_le_bytes());
+    dict_body.extend_from_slice(&dict_len_u32.to_le_bytes());
+
+    // Chunk header: [chunk_type (1)] [body_len (3 bytes LE)]
+    let body_len = dict_body.len();
+    output.push(CHUNK_TYPE_OXIARC_DICT);
+    output.push((body_len & 0xFF) as u8);
+    output.push(((body_len >> 8) & 0xFF) as u8);
+    output.push(((body_len >> 16) & 0xFF) as u8);
+    output.extend_from_slice(&dict_body);
+
+    // 3. Data chunks (standard framing but block-compressed with dict).
+    let mut src_pos = 0usize;
+    while src_pos < input.len() {
+        let chunk_end = (src_pos + MAX_UNCOMPRESSED_CHUNK_SIZE).min(input.len());
+        let chunk_data = &input[src_pos..chunk_end];
+
+        let checksum = masked_crc32c(chunk_data);
+        let compressed = compress::compress_block_with_dict(chunk_data, dict);
+
+        if compressed.len() < chunk_data.len() {
+            // Compressed chunk.
+            let chunk_len = 4 + compressed.len();
+            write_chunk_header_vec(&mut output, CHUNK_TYPE_COMPRESSED, chunk_len);
+            output.extend_from_slice(&checksum.to_le_bytes());
+            output.extend_from_slice(&compressed);
+        } else {
+            // Uncompressed chunk (compression didn't help).
+            let chunk_len = 4 + chunk_data.len();
+            write_chunk_header_vec(&mut output, CHUNK_TYPE_UNCOMPRESSED, chunk_len);
+            output.extend_from_slice(&checksum.to_le_bytes());
+            output.extend_from_slice(chunk_data);
+        }
+
+        src_pos = chunk_end;
+    }
+
+    output
+}
+
+/// Decompress data produced by [`compress_frame_with_dict`].
+///
+/// The `dict` must be identical to the one used during compression.  The
+/// OxiArc dict-info chunk embedded in the frame is validated: if the CRC32C
+/// of the supplied dict does not match the stored CRC, an `InvalidData` error
+/// is returned before any decompression is attempted.
+///
+/// **This function only processes frames produced by [`compress_frame_with_dict`].**
+/// Standard Snappy frames (without the `0xFE` dict chunk) will be rejected.
+///
+/// # Errors
+/// Returns an error if the data is malformed, truncated, or the wrong dict is supplied.
+pub fn decompress_frame_with_dict(input: &[u8], dict: &[u8]) -> Result<Vec<u8>, SnappyError> {
+    // Clamp dict to the last 64 KiB.
+    let dict = if dict.len() > 65536 {
+        &dict[dict.len() - 65536..]
+    } else {
+        dict
+    };
+
+    let mut pos = 0usize;
+
+    // 1. Read and validate the stream identifier.
+    if pos + 10 > input.len() {
+        return Err(SnappyError::UnexpectedEof {
+            context: "stream identifier",
+        });
+    }
+    if input[pos..pos + 10] != STREAM_IDENTIFIER[..] {
+        return Err(SnappyError::InvalidStreamIdentifier);
+    }
+    pos += 10;
+
+    // 2. Read and validate the OxiArc dict-info chunk.
+    if pos + 4 > input.len() {
+        return Err(SnappyError::UnexpectedEof {
+            context: "dict-info chunk header",
+        });
+    }
+    let dict_chunk_type = input[pos];
+    let dict_chunk_body_len = (input[pos + 1] as usize)
+        | ((input[pos + 2] as usize) << 8)
+        | ((input[pos + 3] as usize) << 16);
+    pos += 4;
+
+    if dict_chunk_type != CHUNK_TYPE_OXIARC_DICT {
+        return Err(SnappyError::CorruptedData {
+            message: format!(
+                "expected OxiArc dict-info chunk (0xFE), found {dict_chunk_type:#04x}"
+            ),
+        });
+    }
+
+    if dict_chunk_body_len < 13 {
+        return Err(SnappyError::CorruptedData {
+            message: format!("OxiArc dict-info chunk body too short: {dict_chunk_body_len} bytes"),
+        });
+    }
+
+    if pos + dict_chunk_body_len > input.len() {
+        return Err(SnappyError::UnexpectedEof {
+            context: "dict-info chunk body",
+        });
+    }
+
+    let dict_body = &input[pos..pos + dict_chunk_body_len];
+    pos += dict_chunk_body_len;
+
+    // Validate magic.
+    if &dict_body[..5] != OXIARC_DICT_MAGIC {
+        return Err(SnappyError::CorruptedData {
+            message: "OxiArc dict-info magic mismatch".to_string(),
+        });
+    }
+
+    let stored_crc = u32::from_le_bytes([dict_body[5], dict_body[6], dict_body[7], dict_body[8]]);
+    let stored_len =
+        u32::from_le_bytes([dict_body[9], dict_body[10], dict_body[11], dict_body[12]]) as usize;
+
+    // Validate dict CRC and length.
+    let computed_crc = crc32c(dict);
+    if computed_crc != stored_crc {
+        return Err(SnappyError::ChecksumMismatch {
+            expected: stored_crc,
+            computed: computed_crc,
+        });
+    }
+    if dict.len() != stored_len {
+        return Err(SnappyError::CorruptedData {
+            message: format!(
+                "dict length mismatch: frame has {stored_len} bytes, supplied dict is {} bytes",
+                dict.len()
+            ),
+        });
+    }
+
+    // 3. Decode data chunks.
+    let mut output = Vec::new();
+
+    while pos < input.len() {
+        if pos + 4 > input.len() {
+            return Err(SnappyError::UnexpectedEof {
+                context: "chunk header",
+            });
+        }
+        let chunk_type = input[pos];
+        let chunk_body_len = (input[pos + 1] as usize)
+            | ((input[pos + 2] as usize) << 8)
+            | ((input[pos + 3] as usize) << 16);
+        pos += 4;
+
+        if pos + chunk_body_len > input.len() {
+            return Err(SnappyError::UnexpectedEof {
+                context: "chunk body",
+            });
+        }
+
+        let chunk_body = &input[pos..pos + chunk_body_len];
+        pos += chunk_body_len;
+
+        match chunk_type {
+            CHUNK_TYPE_COMPRESSED => {
+                if chunk_body.len() < 4 {
+                    return Err(SnappyError::CorruptedData {
+                        message: "compressed chunk too short for checksum".to_string(),
+                    });
+                }
+                let expected_checksum = u32::from_le_bytes([
+                    chunk_body[0],
+                    chunk_body[1],
+                    chunk_body[2],
+                    chunk_body[3],
+                ]);
+                let compressed_payload = &chunk_body[4..];
+                let decompressed =
+                    decompress::decompress_block_with_dict(compressed_payload, dict)?;
+
+                let computed_checksum = masked_crc32c(&decompressed);
+                if expected_checksum != computed_checksum {
+                    return Err(SnappyError::ChecksumMismatch {
+                        expected: expected_checksum,
+                        computed: computed_checksum,
+                    });
+                }
+                output.extend_from_slice(&decompressed);
+            }
+            CHUNK_TYPE_UNCOMPRESSED => {
+                if chunk_body.len() < 4 {
+                    return Err(SnappyError::CorruptedData {
+                        message: "uncompressed chunk too short for checksum".to_string(),
+                    });
+                }
+                let expected_checksum = u32::from_le_bytes([
+                    chunk_body[0],
+                    chunk_body[1],
+                    chunk_body[2],
+                    chunk_body[3],
+                ]);
+                let raw_data = &chunk_body[4..];
+
+                let computed_checksum = masked_crc32c(raw_data);
+                if expected_checksum != computed_checksum {
+                    return Err(SnappyError::ChecksumMismatch {
+                        expected: expected_checksum,
+                        computed: computed_checksum,
+                    });
+                }
+                output.extend_from_slice(raw_data);
+            }
+            CHUNK_TYPE_STREAM_ID => {
+                // Ignore any additional stream identifiers.
+            }
+            0x02..=0x7F => {
+                return Err(SnappyError::InvalidChunkType { chunk_type });
+            }
+            _ => {
+                // Other skippable chunks (including 0xFE if seen again) — skip.
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Write a chunk header to a plain `Vec<u8>` (infallible version used by
+/// the non-streaming dict-frame helpers).
+fn write_chunk_header_vec(output: &mut Vec<u8>, chunk_type: u8, data_len: usize) {
+    output.push(chunk_type);
+    output.push((data_len & 0xFF) as u8);
+    output.push(((data_len >> 8) & 0xFF) as u8);
+    output.push(((data_len >> 16) & 0xFF) as u8);
 }
 
 #[cfg(test)]
@@ -871,5 +1280,243 @@ mod tests {
         let mut output = Vec::new();
         let result = decoder.read_to_end(&mut output);
         assert!(result.is_err(), "expected cancellation error from decoder");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case tests: max-size blocks and boundary conditions
+    // -----------------------------------------------------------------------
+
+    /// Compress exactly MAX_UNCOMPRESSED_CHUNK_SIZE (65536) bytes using
+    /// FrameEncoder, verify it decompresses correctly via FrameDecoder.
+    #[test]
+    fn test_frame_max_size_chunk() {
+        let data: Vec<u8> = (0..MAX_UNCOMPRESSED_CHUNK_SIZE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        assert_eq!(data.len(), MAX_UNCOMPRESSED_CHUNK_SIZE);
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        let mut decoder = FrameDecoder::new(&compressed[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read should succeed");
+
+        assert_eq!(output, data, "max-size chunk roundtrip failed");
+    }
+
+    /// Compress MAX_UNCOMPRESSED_CHUNK_SIZE + 1 (65537) bytes; verify that
+    /// exactly two compressed data chunks are present in the output, and that
+    /// the full roundtrip is correct.
+    ///
+    /// The framing spec splits input at exactly 65536-byte boundaries, so
+    /// 65537 bytes → chunk of 65536 + chunk of 1.
+    #[test]
+    fn test_frame_just_over_max_chunk() {
+        let size = MAX_UNCOMPRESSED_CHUNK_SIZE + 1;
+        let data: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // Count data chunks (CHUNK_TYPE_COMPRESSED = 0x00 or CHUNK_TYPE_UNCOMPRESSED = 0x01).
+        // Skip the 10-byte stream identifier first.
+        let payload = &compressed[10..];
+        let mut data_chunk_count = 0usize;
+        let mut pos = 0usize;
+        while pos + 4 <= payload.len() {
+            let chunk_type = payload[pos];
+            let chunk_len = (payload[pos + 1] as usize)
+                | ((payload[pos + 2] as usize) << 8)
+                | ((payload[pos + 3] as usize) << 16);
+            if chunk_type == CHUNK_TYPE_COMPRESSED || chunk_type == CHUNK_TYPE_UNCOMPRESSED {
+                data_chunk_count += 1;
+            }
+            pos += 4 + chunk_len;
+        }
+
+        assert_eq!(
+            data_chunk_count, 2,
+            "expected exactly 2 data chunks for 65537-byte input, got {data_chunk_count}"
+        );
+
+        // Full roundtrip
+        let mut decoder = FrameDecoder::new(&compressed[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read should succeed");
+        assert_eq!(output, data, "just-over-max chunk roundtrip failed");
+    }
+
+    /// `max_compress_len(65536)` must be at least 65536 bytes (worst-case
+    /// incompressible data must still fit in the output).
+    /// `max_compress_len(0)` must be at least 1 (varint overhead for length).
+    #[test]
+    fn test_block_max_compress_len() {
+        use crate::compress::max_compress_len;
+
+        let max_len_65536 = max_compress_len(MAX_UNCOMPRESSED_CHUNK_SIZE);
+        assert!(
+            max_len_65536 >= MAX_UNCOMPRESSED_CHUNK_SIZE,
+            "max_compress_len(65536) = {max_len_65536}, expected >= 65536"
+        );
+
+        let max_len_0 = max_compress_len(0);
+        assert!(
+            max_len_0 >= 1,
+            "max_compress_len(0) = {max_len_0}, expected >= 1"
+        );
+    }
+
+    /// Feed truncated compressed data to FrameDecoder::read_to_end; verify
+    /// it returns an error and does not panic.
+    #[test]
+    fn test_decompress_truncated_frame() {
+        // Encode valid data first.
+        let data = vec![b'X'; 1000];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // Truncate to half the compressed length (but past the identifier).
+        let truncated_len = compressed.len() / 2;
+        let truncated = &compressed[..truncated_len];
+
+        let mut decoder = FrameDecoder::new(truncated);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+        // Must return an error (UnexpectedEof or InvalidData), never panic.
+        assert!(
+            result.is_err(),
+            "expected error on truncated input, but read_to_end succeeded"
+        );
+    }
+
+    /// Flip one byte in the CRC field of the first compressed data chunk;
+    /// verify that FrameDecoder returns a checksum error.
+    #[test]
+    fn test_decompress_corrupt_crc() {
+        let data = vec![b'A'; 500];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // The stream layout: [10 bytes identifier][4 bytes chunk header][4 bytes CRC][…]
+        // Flip the first byte of the CRC (byte index 14).
+        let crc_offset = 14;
+        assert!(
+            crc_offset < compressed.len(),
+            "compressed output is too short to contain a CRC field"
+        );
+        let mut corrupt = compressed.clone();
+        corrupt[crc_offset] ^= 0xFF;
+
+        let mut decoder = FrameDecoder::new(&corrupt[..]);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+        assert!(
+            result.is_err(),
+            "expected checksum error on corrupt CRC, but read_to_end succeeded"
+        );
+    }
+
+    /// 65536 bytes of all zeros should compress to a much smaller output;
+    /// roundtrip must be correct.
+    #[test]
+    fn test_compress_all_zeros() {
+        let data = vec![0u8; MAX_UNCOMPRESSED_CHUNK_SIZE];
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // All-zero data should compress very well.
+        assert!(
+            compressed.len() < data.len() / 4,
+            "expected compressed output much smaller than {}, got {}",
+            data.len(),
+            compressed.len()
+        );
+
+        let mut decoder = FrameDecoder::new(&compressed[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read should succeed");
+        assert_eq!(output, data, "all-zeros roundtrip failed");
+    }
+
+    /// 65536 bytes of 0xFF; compression must be correct (roundtrip works),
+    /// even if output is not smaller.
+    #[test]
+    fn test_compress_all_ones() {
+        let data = vec![0xFFu8; MAX_UNCOMPRESSED_CHUNK_SIZE];
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        let mut decoder = FrameDecoder::new(&compressed[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read should succeed");
+        assert_eq!(output, data, "all-0xFF roundtrip failed");
+    }
+
+    /// Feed a max-size compressed chunk byte-by-byte through a
+    /// `std::io::BufReader`-backed FrameDecoder; the output must appear
+    /// correctly (tests the incremental chunk-reading code path).
+    #[test]
+    fn test_frame_decoder_incremental_max_size() {
+        use std::io::BufReader;
+
+        let data: Vec<u8> = (0..MAX_UNCOMPRESSED_CHUNK_SIZE)
+            .map(|i| (i % 199) as u8)
+            .collect();
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // Wrap the compressed slice in a BufReader with a tiny buffer (1 byte)
+        // so that the decoder must make many small reads to reassemble each chunk.
+        let buf_reader = BufReader::with_capacity(1, &compressed[..]);
+        let mut decoder = FrameDecoder::new(buf_reader);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("incremental read should succeed");
+
+        assert_eq!(
+            output, data,
+            "incremental max-size chunk decoder roundtrip failed"
+        );
     }
 }

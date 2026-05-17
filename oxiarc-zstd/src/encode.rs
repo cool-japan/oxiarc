@@ -518,6 +518,21 @@ pub fn decode_all(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::decompress;
+    use crate::frame::decompress_with_dict;
+
+    #[test]
+    fn test_encoder_decoder_dict_roundtrip() {
+        let dict = b"prefix-shared-corpus-prefix-shared-corpus";
+        let data = b"prefix-shared-corpus is here, and prefix-shared-corpus is here again";
+
+        let mut enc = ZstdEncoder::new();
+        enc.set_level(3);
+        enc.set_dictionary(dict);
+        let compressed = enc.compress(data).expect("compress");
+
+        let out = decompress_with_dict(&compressed, dict).expect("decompress with dict");
+        assert_eq!(out.as_slice(), data as &[u8]);
+    }
 
     #[test]
     fn test_compress_empty() {

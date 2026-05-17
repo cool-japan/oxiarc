@@ -15,10 +15,13 @@ categories = ["compression", "encoding"]
 default = []
 # Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for Deflater/Inflater
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
+# Parallel compression using rayon thread pool (pigz-style multi-member GZIP)
+parallel = ["dep:rayon"]
 
 [dependencies]
 oxiarc-core.workspace = true
 tokio = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

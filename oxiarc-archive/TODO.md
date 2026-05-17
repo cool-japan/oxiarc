@@ -1,5 +1,5 @@
 
-# oxiarc-archive - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-archive - Development Status (v0.3.0, 2026-05-17)
 
 ## Completed Features (COMPLETE)
 
@@ -137,7 +137,7 @@
   - **Tests:** round-trip — write 3 files at level 3, read back via `LzhReader`, verify names/sizes/crcs match. Extend `test_level3_header_parsing` with a writer-side symmetric test.
   - **Risk:** level-3 extension-header encoding is fiddly (common header, extension header size in 4 bytes). Mitigated by reading the level-3 reader code (already implemented at lines 120-230) as the authoritative reference format — the writer is its inverse.
 - [x] LZH extension headers — 0x40/0x41/0x42/0x43/0x44/0x46/0x50 read + write (planned 2026-04-20)
-- [ ] More extension headers
+- [x] More extension headers (0x40 OS attr u16, 0x41 Windows timestamps, 0x42/0x43 64-bit sizes, 0x44 comment, 0x46 Unix perms, 0x50 owner names, 0x51 owner IDs, 0x54 Unix mtime)
 
 ### New Formats
 - [ ] RAR read support (licensing?)
@@ -193,7 +193,7 @@
   - **Risk:** API addition only; existing tests keep passing because `Option<ProgressHandle>` defaults to `None`. Mitigation: run full archive crate test suite.
 - [x] Memory-mapped files (planned 2026-04-20) — `open_zip_mmap`, `open_tar_mmap`, `open_lzh_mmap` live
 - [x] Archive-crate codec wrappers forward progress/cancellation (planned 2026-04-20) — `BrotliReader`/`BrotliWriter`, `Bzip2Reader`/`Bzip2Writer`, `SnappyReader`/`SnappyWriter`, `Lz4Reader`/`Lz4Writer`, `XzReader`/`XzWriter`, `ZstdReader`/`ZstdWriter` all grew `.with_progress(ProgressHandle)` / `.with_cancel(CancellationToken)` builders. Brotli/Snappy forward to streaming builders on `oxiarc-brotli::BrotliCompressor/Decompressor` and `oxiarc-snappy::FrameEncoder/Decoder`. Bzip2 forwards to new `BzEncoder`/`BzDecoder` builders added to `oxiarc-bzip2` in the same pass (reference implementation; per-block progress). LZ4/XZ/Zstd use wrapper self-emission (one-shot `on_progress`+`on_finish`, cancel-check before the compress/decompress call) because `oxiarc-lz4`, `oxiarc-lzma::Lzma2Encoder/Decoder`, and `oxiarc-zstd::ZstdEncoder` still lack builder hooks — upgrading those crates to per-chunk builders is deferred follow-up. Tests: `{brotli,bzip2,lz4,snappy,xz,zstd}::tests::test_*_progress_forwarding` and matching `*_cancel_forwarding`.
-- [ ] Archive repair/recovery
+- [x] Archive repair/recovery — `ZipRepair` / `TarRepair` structs + `repair_zip` / `repair_tar` convenience functions; rolling LFH scanner for ZIP, 512-byte UStar block scanner for TAR; `RepairReport` with recovered entries, skipped byte ranges, and per-entry `RecoveryStatus` (Verified/Recovered/RawOnly) (done 2026-05-16)
 - [x] Lenient-mode corruption recovery — ZIP/TAR/LZH readers .lenient(bool) + CLI --lenient flag on extract/list (planned 2026-04-20)
 
 ## Test Coverage

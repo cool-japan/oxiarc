@@ -13,9 +13,17 @@ categories = ["compression", "encoding"]
 
 [dependencies]
 oxiarc-core = { workspace = true }
+tokio = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 criterion.workspace = true
+rayon.workspace = true
 
 [[bench]]
 name = "snappy_bench"

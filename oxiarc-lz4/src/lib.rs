@@ -22,13 +22,16 @@
 //! assert_eq!(decompressed, data);
 //! ```
 
-mod block;
+pub mod block;
 pub mod dict;
 mod frame;
 pub mod hc;
 pub mod xxhash;
 
-pub use block::{compress_block, compress_block_hc, compress_block_with_accel, decompress_block};
+pub use block::{
+    compress_block, compress_block_hc, compress_block_with_accel, compress_block_with_dict,
+    decompress_block, decompress_block_dict,
+};
 pub use frame::{
     BlockMaxSize, FrameDescriptor, LZ4_FRAME_MAGIC, Lz4Compressor, Lz4Decompressor,
     Lz4DictCompressor, Lz4DictDecompressor, Lz4DictFrameDecoder, Lz4DictFrameEncoder, compress,
@@ -39,8 +42,9 @@ pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level, compress_hc_wit
 
 // Re-export dictionary types for convenience
 pub use dict::{
-    DictBuilder, DictFrameDescriptor, DictLevel, Lz4Dict, compress_with_dict,
-    compress_with_dict_hc, compress_with_dict_level, decompress_with_dict,
+    DictBuilder, DictFrameDescriptor, DictLevel, Lz4Dict, Lz4DictBlockDecoder, Lz4DictBlockEncoder,
+    compress_with_dict, compress_with_dict_accel, compress_with_dict_hc, compress_with_dict_level,
+    decompress_with_dict,
 };
 
 #[cfg(feature = "parallel")]

@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.8 (2026-05-08) | 92 tests passing**
+**Version: 0.3.0 (2026-05-17) | 150 tests passing**
 
 ## Features
 
@@ -20,6 +20,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 - **Configurable window size** — 16–24 bits (default: 22 = 4 MB)
 
 All features are implemented and tested. API is stable.
+- **Interop integration tests** — 19 integration tests covering all quality levels 0–11 against Brotli/Snappy interoperability scenarios (new in 0.3.0)
 
 ## Quick Start
 
@@ -27,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.2.8"
+oxiarc-brotli = "0.3.0"
 ```
 
 ### One-shot compression / decompression
@@ -104,11 +105,19 @@ decompressor.read_to_end(&mut output)?;
 
 ## Feature Flags
 
-oxiarc-brotli has no optional feature flags. All functionality — one-shot API, streaming API, Huffman coding, LZ77 engine, static dictionary — is enabled by default.
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `parallel` | no | Rayon-based parallel compression for throughput-sensitive workloads |
+
+All other functionality — one-shot API, streaming API, Huffman coding, LZ77 engine, static dictionary — is enabled by default with no feature flags required.
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.2.8"
+# Default (no optional features)
+oxiarc-brotli = "0.3.0"
+
+# With parallel compression support
+oxiarc-brotli = { version = "0.3.0", features = ["parallel"] }
 ```
 
 ## Algorithm

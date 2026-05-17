@@ -16,7 +16,8 @@ use crate::error::{BrotliError, BrotliResult};
 use crate::huffman::{
     build_huffman_tree, encode_symbol, write_prefix_code_and_build_tree, write_simple_prefix_code,
 };
-use crate::lz77::{Lz77Command, Lz77Params, lz77_compress};
+use crate::lz77::{Lz77Command, Lz77Params, lz77_compress_pooled};
+use crate::pool::BrotliPool;
 
 /// Brotli compression parameters.
 #[derive(Debug, Clone)]
@@ -113,6 +114,22 @@ pub(crate) fn compress_with_hooks(
     progress: Option<&ProgressHandle>,
     cancel: Option<&CancellationToken>,
 ) -> BrotliResult<Vec<u8>> {
+    compress_with_hooks_pooled(data, params, progress, cancel, None)
+}
+
+/// Compress data with optional per-meta-block progress, cancellation hooks, and
+/// a buffer pool.
+///
+/// This is the internal implementation behind both [`compress_with_hooks`] (no pool)
+/// and [`pool::compress_with_params_pooled`] (with pool).  All four optional
+/// parameters may be `None`.
+pub(crate) fn compress_with_hooks_pooled(
+    data: &[u8],
+    params: &BrotliParams,
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+    pool: Option<&BrotliPool>,
+) -> BrotliResult<Vec<u8>> {
     params.validate()?;
 
     if data.is_empty() {
@@ -138,7 +155,7 @@ pub(crate) fn compress_with_hooks(
         let block = &data[offset..end];
         let is_last = end == data.len();
 
-        encode_meta_block(&mut writer, block, data, offset, params, is_last)?;
+        encode_meta_block_pooled(&mut writer, block, data, offset, params, is_last, pool)?;
         offset = end;
 
         // Report progress: approximate compressed bytes produced so far.
@@ -195,14 +212,15 @@ fn write_window_bits(writer: &mut BitWriter, lgwin: u32) -> BrotliResult<()> {
     Ok(())
 }
 
-/// Encode a single meta-block.
-fn encode_meta_block(
+/// Encode a single meta-block, optionally drawing buffers from a pool.
+fn encode_meta_block_pooled(
     writer: &mut BitWriter,
     block: &[u8],
     _full_data: &[u8],
     _offset: usize,
     params: &BrotliParams,
     is_last: bool,
+    pool: Option<&BrotliPool>,
 ) -> BrotliResult<()> {
     // ISLAST
     writer.write_bit(is_last)?;
@@ -223,7 +241,7 @@ fn encode_meta_block(
     if params.quality == 0 {
         encode_uncompressed_meta_block(writer, block, is_last)?;
     } else {
-        encode_compressed_meta_block(writer, block, params)?;
+        encode_compressed_meta_block_pooled(writer, block, params, pool)?;
     }
 
     Ok(())
@@ -252,11 +270,13 @@ fn encode_uncompressed_meta_block(
     Ok(())
 }
 
-/// Encode a compressed meta-block using LZ77 + Huffman.
-fn encode_compressed_meta_block(
+/// Encode a compressed meta-block using LZ77 + Huffman, optionally reusing
+/// buffers from a pool.
+fn encode_compressed_meta_block_pooled(
     writer: &mut BitWriter,
     block: &[u8],
     params: &BrotliParams,
+    pool: Option<&BrotliPool>,
 ) -> BrotliResult<()> {
     let mlen = block.len();
 
@@ -273,13 +293,33 @@ fn encode_compressed_meta_block(
         min_match_len: 4,
         max_match_len: 256,
     };
-    let commands = lz77_compress(block, &lz77_params);
+    let commands = lz77_compress_pooled(block, &lz77_params, pool);
 
     // Collect literal and distance statistics.
-    let mut literal_freqs = vec![0u32; 256];
+    let commands_ref: &[Lz77Command] = &commands;
+
+    // Acquire a Huffman scratch buffer from the pool (already zeroed, len=1024)
+    // or allocate fresh frequency vectors.  The scratch buffer layout is:
+    //   [0..256)  = literal_freqs  (256 u32s)
+    //   [256..960) = ic_freqs      (704 u32s)
+    //   [960..1024) = dist_freqs   (64 u32s — padded to 1024 total)
+    let mut scratch_guard = pool.map(|p| p.get_huffman_scratch());
+
+    // Build owned freq Vecs.  When pool is active, copy out of the scratch buf
+    // (avoiding the alloc() system call); the scratch guard is retained until
+    // function return so its buffer is returned to the pool afterwards.
+    let (mut literal_freqs, mut ic_freqs, mut dist_freqs) = if let Some(ref mut g) = scratch_guard {
+        let (lit_slice, rest) = g.buf.split_at(256);
+        let (ic_slice, _) = rest.split_at(704);
+        // All sub-slices are already zeroed by get_huffman_scratch().
+        (lit_slice.to_vec(), ic_slice.to_vec(), vec![0u32; 64])
+    } else {
+        (vec![0u32; 256], vec![0u32; 704], vec![0u32; 64])
+    };
+
     let mut has_distances = false;
 
-    for cmd in &commands {
+    for cmd in commands_ref {
         match cmd {
             Lz77Command::Literal(b) => {
                 literal_freqs[*b as usize] += 1;
@@ -334,12 +374,9 @@ fn encode_compressed_meta_block(
     // - Distance (if copy length > 0)
 
     // Convert commands to insert-and-copy format.
-    let ic_commands = build_insert_copy_commands(&commands);
+    let ic_commands = build_insert_copy_commands(commands_ref);
 
     // Build frequency tables for insert-and-copy length codes.
-    let mut ic_freqs = vec![0u32; 704]; // insert-and-copy alphabet size
-    let mut dist_freqs = vec![0u32; 64]; // simplified distance alphabet
-
     for ic in &ic_commands {
         let ic_code = insert_copy_length_code(ic.insert_length, ic.copy_length);
         if (ic_code as usize) < ic_freqs.len() {
@@ -431,6 +468,9 @@ fn encode_compressed_meta_block(
         }
     }
 
+    // RAII: scratch_guard is dropped here, returning its buffer to the pool.
+    drop(scratch_guard);
+
     Ok(())
 }
 
@@ -455,6 +495,20 @@ const MAX_IC_COPY_LENGTH: usize = 17;
 ///
 /// Long backward references (copy_length > MAX_IC_COPY_LENGTH) are split into
 /// multiple IC commands so that each copy fits within the encodable range.
+///
+/// # Copy-length minimum
+///
+/// The Brotli insert-and-copy alphabet encodes copy lengths starting at 2
+/// (category 0 maps to base 2, no extra bits).  A split chunk of `copy_length
+/// == 1` would be written with category 0 but the decoder unconditionally reads
+/// back 2, producing a one-byte content error that silently corrupts single
+/// blocks (truncated by `output.truncate(mlen)`) and causes bit-alignment
+/// drift that breaks subsequent meta-block headers in multi-block streams.
+///
+/// The fix: when the current chunk would leave exactly 1 byte for the next
+/// iteration (i.e. `remaining_copy - chunk == 1`), shrink the current chunk by
+/// one so the remainder is 2 instead of 1.  This keeps every chunk ≥ 2 without
+/// changing the total copy length.
 fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand> {
     let mut result = Vec::new();
     let mut literals = Vec::new();
@@ -468,7 +522,14 @@ fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand
                 let mut remaining_copy = *length;
                 let mut first = true;
                 while remaining_copy > 0 {
-                    let chunk = remaining_copy.min(MAX_IC_COPY_LENGTH);
+                    let mut chunk = remaining_copy.min(MAX_IC_COPY_LENGTH);
+                    // Ensure the tail chunk is never 1 (copy_length==1 is unencodable;
+                    // the minimum encodable copy length is 2). If taking `chunk` bytes
+                    // would leave exactly 1 byte remaining, reduce chunk by 1 so the
+                    // remainder becomes 2, which is safely encodable.
+                    if remaining_copy - chunk == 1 {
+                        chunk -= 1;
+                    }
                     remaining_copy -= chunk;
 
                     if first {

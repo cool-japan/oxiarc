@@ -5,6 +5,7 @@
 use crate::lzss::{LzssEncoder, LzssToken};
 use crate::methods::LzhMethod;
 use crate::methods::constants::{NC, NT};
+use crate::optimal::LzssOptimalParser;
 use oxiarc_core::BitWriter;
 use oxiarc_core::error::Result;
 use oxiarc_core::progress::ProgressHandle;
@@ -27,6 +28,8 @@ pub struct LzhEncoder {
     finished: bool,
     /// Optional progress sink for reporting encode progress at block boundaries.
     progress: Option<ProgressHandle>,
+    /// Whether to use the optimal (2-pass DP) parser instead of greedy.
+    use_optimal: bool,
 }
 
 impl std::fmt::Debug for LzhEncoder {
@@ -34,6 +37,7 @@ impl std::fmt::Debug for LzhEncoder {
         f.debug_struct("LzhEncoder")
             .field("method", &self.method)
             .field("finished", &self.finished)
+            .field("use_optimal", &self.use_optimal)
             .field(
                 "progress",
                 &self.progress.as_ref().map(|_| "<ProgressHandle>"),
@@ -54,12 +58,51 @@ impl LzhEncoder {
             lzss: LzssEncoder::new(window_size, min_match, max_match),
             finished: false,
             progress: None,
+            use_optimal: false,
         }
     }
 
     /// Create a default encoder (lh5).
     pub fn lh5() -> Self {
         Self::new(LzhMethod::Lh5)
+    }
+
+    /// Construct an encoder pre-loaded with a custom dictionary.
+    ///
+    /// The dictionary is written into the sliding window and hash chains before
+    /// any user data is processed.  Compressed output produced by this encoder
+    /// must be decompressed with an [`LzhDecoder`](crate::decode::LzhDecoder)
+    /// initialised with the same dictionary via
+    /// [`LzhDecoder::with_dictionary`](crate::decode::LzhDecoder::with_dictionary).
+    ///
+    /// If `dict` is larger than the window, only the last `window_size` bytes
+    /// are used.
+    pub fn with_dictionary(method: LzhMethod, dict: &[u8]) -> Self {
+        let mut enc = Self::new(method);
+        enc.set_dictionary(dict);
+        enc
+    }
+
+    /// Preload a custom dictionary into the sliding window and hash chains.
+    ///
+    /// Equivalent to constructing with [`with_dictionary`](Self::with_dictionary)
+    /// but usable after construction. Must be called before any data is encoded.
+    pub fn set_dictionary(&mut self, dict: &[u8]) {
+        self.lzss.preload_dictionary(dict);
+    }
+
+    /// Enable the optimal (two-pass DP) LZSS parser.
+    ///
+    /// When set, compression uses a Zopfli-style forward dynamic-programming
+    /// parser that minimises the estimated total bit-cost of the token stream
+    /// over two passes rather than the default greedy/lazy strategy.  The
+    /// result is always bit-for-bit compatible with the standard LZH format.
+    ///
+    /// Optimal parsing is slower than greedy parsing but typically produces
+    /// equal or smaller compressed output.
+    pub fn with_optimal(mut self) -> Self {
+        self.use_optimal = true;
+        self
     }
 
     /// Attach a progress sink to this encoder.
@@ -91,8 +134,13 @@ impl LzhEncoder {
 
         let mut bit_writer = BitWriter::new(writer);
 
-        // Get LZSS tokens
-        let tokens = self.lzss.encode(data);
+        // Get LZSS tokens (greedy/lazy or optimal depending on configuration).
+        let tokens = if self.use_optimal {
+            let mut parser = LzssOptimalParser::new();
+            parser.parse(data, &mut self.lzss)
+        } else {
+            self.lzss.encode(data)
+        };
 
         // Encode tokens in blocks
         let np = self.get_np();
@@ -921,6 +969,189 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.last_processed
                 .store(processed, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Custom dictionary tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lzh_with_dictionary_roundtrip() {
+        // Encode with a dict, decode with the same dict; output must equal input.
+        let dict: Vec<u8> = (0u8..=255).collect();
+        let data: Vec<u8> = b"hello dictionary world hello dictionary world"
+            .iter()
+            .cycle()
+            .take(512)
+            .copied()
+            .collect();
+
+        let mut encoder = LzhEncoder::with_dictionary(LzhMethod::Lh5, &dict);
+        let compressed = encoder
+            .compress_to_vec(&data)
+            .expect("encode with dictionary failed");
+
+        let mut decoder =
+            crate::decode::LzhDecoder::with_dictionary(LzhMethod::Lh5, data.len() as u64, &dict);
+        let mut cursor = std::io::Cursor::new(&compressed);
+        let decoded = decoder
+            .decode(&mut cursor)
+            .expect("decode with dictionary failed");
+
+        assert_eq!(decoded, data, "dictionary roundtrip must be lossless");
+    }
+
+    #[test]
+    fn test_lzh_dictionary_improves_ratio() {
+        // Build a 512-byte corpus prefix used as dictionary.
+        // The payload repeats phrases from that prefix → more back-references
+        // → smaller compressed output when the dictionary is available.
+        let dict: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(512)
+            .copied()
+            .collect();
+
+        // 1 KiB input that is dense with dictionary phrases.
+        let data: Vec<u8> = b"the quick brown fox the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(1024)
+            .copied()
+            .collect();
+
+        let mut enc_with = LzhEncoder::with_dictionary(LzhMethod::Lh5, &dict);
+        let size_with = enc_with
+            .compress_to_vec(&data)
+            .expect("encode with dict failed")
+            .len();
+
+        let mut enc_without = LzhEncoder::new(LzhMethod::Lh5);
+        let size_without = enc_without
+            .compress_to_vec(&data)
+            .expect("encode without dict failed")
+            .len();
+
+        assert!(
+            size_with < size_without,
+            "expected dictionary to improve compression ({size_with} < {size_without})"
+        );
+    }
+
+    #[test]
+    fn test_lzh_empty_dictionary_is_noop() {
+        // Encoding with an empty dictionary must produce the same bytes as
+        // encoding without a dictionary.
+        let data: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz"
+            .iter()
+            .cycle()
+            .take(256)
+            .copied()
+            .collect();
+
+        let mut enc_empty_dict = LzhEncoder::with_dictionary(LzhMethod::Lh5, b"");
+        let with_empty = enc_empty_dict
+            .compress_to_vec(&data)
+            .expect("encode with empty dict failed");
+
+        let mut enc_no_dict = LzhEncoder::new(LzhMethod::Lh5);
+        let without = enc_no_dict
+            .compress_to_vec(&data)
+            .expect("encode without dict failed");
+
+        assert_eq!(
+            with_empty, without,
+            "empty dictionary must produce identical output to no dictionary"
+        );
+    }
+
+    #[test]
+    fn test_lzh_dictionary_mismatch_no_panic() {
+        // Encode with dictionary A, then attempt to decode with dictionary B.
+        // The output will be garbage, but there must be no panic or unwrap failure.
+        let dict_a: Vec<u8> = b"alpha_prefix".iter().cycle().take(128).copied().collect();
+        let dict_b: Vec<u8> = b"beta_prefix".iter().cycle().take(128).copied().collect();
+
+        let data: Vec<u8> = b"some data to compress with dict_a"
+            .iter()
+            .cycle()
+            .take(128)
+            .copied()
+            .collect();
+
+        let mut encoder = LzhEncoder::with_dictionary(LzhMethod::Lh5, &dict_a);
+        let compressed = encoder
+            .compress_to_vec(&data)
+            .expect("encode with dict_a failed");
+
+        // Decode with the wrong dictionary — may error or produce wrong output,
+        // but must not panic.
+        let mut decoder =
+            crate::decode::LzhDecoder::with_dictionary(LzhMethod::Lh5, data.len() as u64, &dict_b);
+        let mut cursor = std::io::Cursor::new(&compressed);
+        // A mismatched dictionary can cause an invalid-distance error during
+        // decode (the back-reference may point past the ring buffer).  We
+        // accept either Ok or Err — both are safe outcomes.
+        let _ = decoder.decode(&mut cursor);
+    }
+
+    #[test]
+    fn test_lzh_set_dictionary_after_construction() {
+        // LzhEncoder::with_dictionary and (new + set_dictionary) must yield
+        // the same compressed bytes for the same input.
+        let dict = b"shared_prefix_data";
+        let data: Vec<u8> = b"shared_prefix_data and more shared_prefix_data here"
+            .iter()
+            .cycle()
+            .take(256)
+            .copied()
+            .collect();
+
+        let mut enc_a = LzhEncoder::with_dictionary(LzhMethod::Lh5, dict);
+        let out_a = enc_a
+            .compress_to_vec(&data)
+            .expect("with_dictionary encode failed");
+
+        let mut enc_b = LzhEncoder::new(LzhMethod::Lh5);
+        enc_b.set_dictionary(dict);
+        let out_b = enc_b
+            .compress_to_vec(&data)
+            .expect("set_dictionary encode failed");
+
+        assert_eq!(
+            out_a, out_b,
+            "with_dictionary and new+set_dictionary must produce identical output"
+        );
+    }
+
+    #[test]
+    fn test_lzh_dictionary_with_lh5_lh6_lh7() {
+        // All three window sizes must accept a dictionary without panicking,
+        // and the encode→decode roundtrip must be lossless for each.
+        let dict = b"shared_prefix";
+        let data: Vec<u8> = b"shared_prefix hello shared_prefix world"
+            .iter()
+            .cycle()
+            .take(128)
+            .copied()
+            .collect();
+
+        for method in [LzhMethod::Lh5, LzhMethod::Lh6, LzhMethod::Lh7] {
+            let mut encoder = LzhEncoder::with_dictionary(method, dict);
+            let compressed = encoder
+                .compress_to_vec(&data)
+                .expect("encode failed for method");
+
+            let mut decoder =
+                crate::decode::LzhDecoder::with_dictionary(method, data.len() as u64, dict);
+            let mut cursor = std::io::Cursor::new(&compressed);
+            let decoded = decoder
+                .decode(&mut cursor)
+                .expect("decode failed for method");
+
+            assert_eq!(decoded, data, "roundtrip failed for method {:?}", method);
         }
     }
 

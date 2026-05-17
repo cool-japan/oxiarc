@@ -1026,7 +1026,12 @@ fn extract_archive_format<R: Read + Seek>(
             pb.finish_with_message("Done");
         }
         _ => {
-            return Err(format!("Extraction not yet implemented for {}", format).into());
+            return Err(format!(
+                "Unsupported archive format: {}; supported formats: \
+                 zip, gzip, tar, lzh, xz, lz4, zstd, bzip2, brotli, snappy, 7z, cab, iso9660",
+                format
+            )
+            .into());
         }
     }
 
@@ -1216,17 +1221,16 @@ mod tests {
     use crate::style::ColorChoice;
     use std::io::Cursor;
 
-    /// Test A: `ArchiveFormat::Unknown` is the only variant that reaches the
-    /// `_ =>` arm in `extract_archive_format`.  All fourteen named variants
-    /// (Zip, Gzip, Tar, Lzh, SevenZip, Xz, Bzip2, Zstd, Lz4, Cab, Brotli,
-    /// Snappy, Iso9660) are handled by explicit arms; `Unknown` is the only
-    /// reachable catch-all through the CLI.
+    /// `ArchiveFormat::Unknown` is the only variant that reaches the `_ =>` arm
+    /// in `extract_archive_format`. All thirteen named variants (Zip, Gzip, Tar,
+    /// Lzh, SevenZip, Xz, Bzip2, Zstd, Lz4, Cab, Brotli, Snappy, Iso9660) are
+    /// handled by explicit arms; `Unknown` is the only reachable catch-all
+    /// through the CLI.
     ///
     /// This test constructs `ExtractArchiveArgs` directly (bypassing detection)
-    /// to verify that the new `Err` return from the `_ =>` arm carries the
-    /// expected message.
+    /// to verify that the `_ =>` arm returns a clear unsupported-format error.
     #[test]
-    fn unknown_format_returns_err() {
+    fn test_extract_dispatch_unknown_format_errors_clearly() {
         let tmp = std::env::temp_dir().join(format!(
             "oxiarc_extract_test_unknown_{}",
             std::process::id()
@@ -1261,10 +1265,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(result.is_err(), "expected Err for Unknown format");
-        let msg = result.unwrap_err().to_string();
+        let msg = result
+            .expect_err("expected error for unknown format")
+            .to_string();
         assert!(
-            msg.contains("Extraction not yet implemented for Unknown"),
-            "unexpected error message: {msg}"
+            msg.contains("Unsupported archive format"),
+            "expected 'Unsupported archive format' in error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("zip"),
+            "error message should list supported formats, got: {msg}"
         );
     }
 }

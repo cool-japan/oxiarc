@@ -1,0 +1,96 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH oxiarc-extract 1  "oxiarc-extract " 
+.SH NAME
+oxiarc\-extract \- Extract files from an archive
+.SH SYNOPSIS
+\fBoxiarc\-extract\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-P\fR|\fB\-\-progress\fR] [\fB\-f\fR|\fB\-\-format\fR] [\fB\-\-overwrite\fR] [\fB\-\-skip\-existing\fR] [\fB\-\-prompt\fR] [\fB\-t\fR|\fB\-\-preserve\-timestamps\fR] [\fB\-\-preserve\-permissions\fR] [\fB\-p\fR|\fB\-\-preserve\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-password\fR] [\fB\-\-strict\-names\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
+.SH DESCRIPTION
+Extract files from an archive
+.SH OPTIONS
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: .]
+Output directory (use "\-" for stdout when extracting single\-file formats)
+.TP
+\fB\-I\fR, \fB\-\-include\fR \fI<INCLUDE>\fR
+Include only files matching pattern (glob syntax: *.txt, src/**/*)
+.TP
+\fB\-X\fR, \fB\-\-exclude\fR \fI<EXCLUDE>\fR
+Exclude files matching pattern (glob syntax)
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Show verbose output
+.TP
+\fB\-P\fR, \fB\-\-progress\fR
+Show progress bar
+.TP
+\fB\-f\fR, \fB\-\-format\fR \fI<FORMAT>\fR
+Format hint for stdin (gzip, xz, bz2, lz4, zst, br, snappy)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+zip: ZIP archive
+.IP \(bu 2
+tar: TAR archive
+.IP \(bu 2
+gzip: GZIP compressed file
+.IP \(bu 2
+lzh: LZH archive
+.IP \(bu 2
+xz: XZ compressed file
+.IP \(bu 2
+lz4: LZ4 compressed file
+.IP \(bu 2
+bz2: Bzip2 compressed file
+.IP \(bu 2
+zst: Zstandard compressed file
+.IP \(bu 2
+br: Brotli compressed file
+.IP \(bu 2
+snappy: Snappy compressed file
+.RE
+.TP
+\fB\-\-overwrite\fR
+Always overwrite existing files (default behavior)
+.TP
+\fB\-\-skip\-existing\fR
+Skip extraction if file already exists
+.TP
+\fB\-\-prompt\fR
+Prompt user before overwriting each file
+.TP
+\fB\-t\fR, \fB\-\-preserve\-timestamps\fR
+Preserve file timestamps (modification time)
+.TP
+\fB\-\-preserve\-permissions\fR
+Preserve file permissions (Unix mode)
+.TP
+\fB\-p\fR, \fB\-\-preserve\fR
+Preserve all metadata (timestamps and permissions)
+.TP
+\fB\-n\fR, \fB\-\-dry\-run\fR
+Dry run: show what would be extracted without writing files
+.TP
+\fB\-\-password\fR \fI<PASSWORD>\fR
+Password for encrypted entries (prompts interactively if omitted)
+.TP
+\fB\-\-strict\-names\fR
+Refuse to extract entries whose basename is a Windows reserved name (CON, NUL, COM1.., LPT1..). Default: append \*(Aq_\*(Aq to the stem
+.TP
+\fB\-\-lenient\fR
+Continue on corruption (CRC mismatch, bad TAR checksum, etc.) with warnings instead of errors
+.TP
+\fB\-\-memory\-limit\fR \fI<MEMORY_LIMIT>\fR
+Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIARCHIVE\fR>
+Archive file to extract (use "\-" for stdin)
+.TP
+[\fIFILES\fR]
+Files to extract (all if empty)

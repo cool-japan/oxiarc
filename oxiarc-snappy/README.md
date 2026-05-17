@@ -3,12 +3,12 @@
 
 Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.2.8-blue)
-![Tests](https://img.shields.io/badge/tests-57%20passing-brightgreen)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.2.8 (2026-05-08) | 57 tests passing**
+**Version: 0.3.0 (2026-05-17) | 112 tests passing**
 
 ## Features
 
@@ -17,6 +17,8 @@ Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 - **Snappy framing format** — Streaming API with CRC32C checksums per chunk
 - **Streaming API** — `FrameEncoder<W: Write>` and `FrameDecoder<R: Read>` for incremental processing
 - **SSE 4.2 CRC32C hardware acceleration** — x86_64 builds use `_mm_crc32_u64` intrinsics via runtime dispatch (`OnceLock`), falling back to pure-Rust software CRC32C automatically
+- **Parallel frame compression** — `compress_parallel` splits input into chunks and compresses them concurrently via Rayon (requires `parallel` feature flag)
+- **Google Snappy interop** — 16 integration tests validate wire-format compatibility against Google Snappy golden vectors
 
 All features are implemented and tested. API is stable.
 
@@ -26,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-snappy = "0.2.8"
+oxiarc-snappy = "0.3.0"
 ```
 
 ### Block Format
@@ -79,7 +81,20 @@ assert_eq!(output, b"Hello, streaming Snappy!");
 
 ## Feature Flags
 
-This crate has no optional feature flags. All functionality — block format, framing format, CRC32C (with SSE 4.2 hardware acceleration on x86_64) — is enabled by default.
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `parallel` | no | Multi-threaded frame compression via Rayon (`compress_parallel`) |
+
+All other functionality — block format, framing format, CRC32C (with SSE 4.2 hardware acceleration on x86_64) — is enabled by default.
+
+```toml
+[dependencies]
+# Default (no parallel)
+oxiarc-snappy = "0.3.0"
+
+# With parallel compression
+oxiarc-snappy = { version = "0.3.0", features = ["parallel"] }
+```
 
 ## CRC32C
 

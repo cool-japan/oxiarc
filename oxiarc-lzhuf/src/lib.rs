@@ -52,7 +52,11 @@ pub mod encode;
 pub mod huffman;
 pub mod lzss;
 pub mod methods;
+pub mod optimal;
 pub mod streaming;
+
+#[cfg(feature = "parallel")]
+pub mod parallel;
 
 // Re-exports
 pub use decode::{LzhDecoder, decode_lzh};
@@ -60,9 +64,13 @@ pub use encode::{LzhEncoder, encode_lzh};
 pub use huffman::LzhHuffmanTree;
 pub use lzss::{LzssDecoder, LzssEncoder, LzssToken};
 pub use methods::LzhMethod;
+pub use optimal::LzssOptimalParser;
+
+#[cfg(feature = "parallel")]
+pub use parallel::{LzhEntryInput, ParallelLzhBuilder, lzh_compress_parallel};
 
 // Streaming decompression re-exports
 pub use streaming::{
-    BitReaderState, DecoderPhase, StreamingBitReader, StreamingHuffmanTree, StreamingLzhDecoder,
-    create_streaming_decoder, decode_lzh_streaming,
+    BitReaderState, DecoderPhase, LzhStreamDecoder, StreamingBitReader, StreamingHuffmanTree,
+    StreamingLzhDecoder, create_streaming_decoder, decode_lzh_streaming,
 };

@@ -1,4 +1,4 @@
-# oxiarc-bzip2 - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-bzip2 - Development Status (v0.3.0, 2026-05-17)
 
 ## Completed Features (COMPLETE)
 

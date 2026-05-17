@@ -1,0 +1,68 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH oxiarc-convert 1  "oxiarc-convert " 
+.SH NAME
+oxiarc\-convert \- Convert archive to another format
+.SH SYNOPSIS
+\fBoxiarc\-convert\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIINPUT\fR> <\fIOUTPUT\fR> 
+.SH DESCRIPTION
+Convert archive to another format
+.SH OPTIONS
+.TP
+\fB\-f\fR, \fB\-\-format\fR \fI<FORMAT>\fR
+Output format (zip, tar, gzip, lzh, xz, lz4, br, snappy) \- auto\-detected from extension if not specified
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+zip: ZIP archive
+.IP \(bu 2
+tar: TAR archive
+.IP \(bu 2
+gzip: GZIP compressed file
+.IP \(bu 2
+lzh: LZH archive
+.IP \(bu 2
+xz: XZ compressed file
+.IP \(bu 2
+lz4: LZ4 compressed file
+.IP \(bu 2
+bz2: Bzip2 compressed file
+.IP \(bu 2
+zst: Zstandard compressed file
+.IP \(bu 2
+br: Brotli compressed file
+.IP \(bu 2
+snappy: Snappy compressed file
+.RE
+.TP
+\fB\-l\fR, \fB\-\-compression\fR \fI<COMPRESSION>\fR [default: normal]
+Compression level for output
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+store: Store without compression
+.IP \(bu 2
+fast: Fast compression
+.IP \(bu 2
+normal: Normal compression (default)
+.IP \(bu 2
+best: Best compression
+.RE
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Verbose output
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIINPUT\fR>
+Input archive file
+.TP
+<\fIOUTPUT\fR>
+Output archive file

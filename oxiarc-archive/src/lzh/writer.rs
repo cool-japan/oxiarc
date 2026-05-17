@@ -134,21 +134,56 @@ impl<W: Write> LzhWriter<W> {
         }
         self.entry_index += 1;
 
+        let original_size_u64 = data.len() as u64;
+        let compressed_size_u64 = compressed.len() as u64;
+
+        // Build effective metadata: auto-inject 64-bit size headers when
+        // either size exceeds u32::MAX so that large files are always
+        // round-trippable even when the caller does not set these fields.
+        let needs_size64 =
+            original_size_u64 > u32::MAX as u64 || compressed_size_u64 > u32::MAX as u64;
+
+        // `size64_override` holds an owned copy of metadata augmented with
+        // 64-bit size fields when required. It must outlive `effective_meta`.
+        let size64_override: Option<LzhExtensionMetadata> = if needs_size64 {
+            let mut m = metadata.cloned().unwrap_or_default();
+            if original_size_u64 > u32::MAX as u64 {
+                m.uncompressed_size64 = Some(original_size_u64);
+            }
+            if compressed_size_u64 > u32::MAX as u64 {
+                m.compressed_size64 = Some(compressed_size_u64);
+            }
+            Some(m)
+        } else {
+            None
+        };
+
+        // Prefer the augmented metadata when present, else pass through
+        // the caller-supplied reference unchanged.
+        let effective_meta: Option<&LzhExtensionMetadata> = size64_override
+            .as_ref()
+            .map(|m| m as &LzhExtensionMetadata)
+            .or(metadata);
+
+        // Clamp sizes to u32 for base-header fields; the 64-bit extension
+        // headers carry the true value when sizes exceed the 32-bit range.
+        let original_size_u32 = original_size_u64.min(u32::MAX as u64) as u32;
+
         // Write header based on header_level
         match self.header_level {
             3 => self.write_level3_header(
                 name,
                 &compressed,
-                data.len() as u32,
+                original_size_u32,
                 crc16,
                 mtime,
                 method,
-                metadata,
+                effective_meta,
             )?,
             _ => self.write_level1_header(
                 name,
                 &compressed,
-                data.len() as u32,
+                original_size_u32,
                 crc16,
                 mtime,
                 method,
@@ -203,6 +238,26 @@ impl<W: Write> LzhWriter<W> {
         }
         self.entry_index += 1;
 
+        // Auto-inject 0x42/0x43 extension headers when sizes exceed u32::MAX.
+        let compressed_size_u64 = compressed_data.len() as u64;
+        let needs_size64 = original_size > u32::MAX as u64 || compressed_size_u64 > u32::MAX as u64;
+        let size64_override: Option<LzhExtensionMetadata> = if needs_size64 {
+            let mut m = metadata.cloned().unwrap_or_default();
+            if original_size > u32::MAX as u64 {
+                m.uncompressed_size64 = Some(original_size);
+            }
+            if compressed_size_u64 > u32::MAX as u64 {
+                m.compressed_size64 = Some(compressed_size_u64);
+            }
+            Some(m)
+        } else {
+            None
+        };
+        let effective_meta = size64_override
+            .as_ref()
+            .map(|m| m as &LzhExtensionMetadata)
+            .or(metadata);
+
         let original_size_u32 = original_size.min(u32::MAX as u64) as u32;
 
         // Write header based on header_level, then the raw data
@@ -214,7 +269,7 @@ impl<W: Write> LzhWriter<W> {
                 crc16,
                 mtime,
                 method,
-                metadata,
+                effective_meta,
             )?,
             _ => self.write_level1_header(
                 name,
@@ -280,7 +335,7 @@ impl<W: Write> LzhWriter<W> {
     ///
     /// If `metadata` is `Some`, emits each populated field as an
     /// extension header in canonical order: filename (0x01) first,
-    /// then (0x40, 0x41, 0x42, 0x43, 0x44, 0x46, 0x50).
+    /// then (0x40, 0x41, 0x42, 0x43, 0x44, 0x46, 0x50, 0x51, 0x54).
     #[allow(clippy::too_many_arguments)]
     fn write_level3_header(
         &mut self,

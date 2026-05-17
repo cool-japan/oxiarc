@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-deflate - Development Status (v0.3.0, 2026-05-16)
 
 ## Completed Features (COMPLETE)
 
@@ -86,15 +86,57 @@
 ## Future Enhancements
 
 ### Advanced LZ77
-- [ ] Better hash function (4-byte hash)
-- [ ] Optimal parsing (graph-based)
-- [ ] Match filtering heuristics
-- [ ] Nice match length parameter
+- [x] Better hash function (4-byte hash) — already implemented in v0.2.8
+- [x] Optimal parsing (graph-based) — Zopfli-style OptimalParser with iterative cost retraining (done 2026-05-16)
+- [x] Match filtering heuristics + nice match length parameter (planned 2026-05-17)
+  - **Goal:** Expose two well-known zlib LZ77 tuning knobs on the DEFLATE encoder: `nice_match_length` (early-exit when any match ≥ this length is found) and `max_chain_length` / `good_length` (cap on hash-chain walks, with a tighter cap once a "good enough" match is found).
+  - **Design:**
+    - Add fields `nice_length: u16`, `max_chain: u32`, `good_length: u16` to `Deflater` (default tuning table mirrors zlib's `configuration_table` indexed by level — values for level 1..9 in `src/lz77.rs`).
+    - Builder API: `Deflater::with_lz77_params(self, nice_length: u16, max_chain: u32, good_length: u16) -> Self` plus `Deflater::with_lz77_preset(self, preset: Lz77Preset) -> Self` for `Lz77Preset::{Fast, Default, Best, Ultra}`.
+    - In the match-finder loop (`lz77::find_longest_match`): (1) if `current_best_length >= nice_length` → break; (2) if `current_best_length >= good_length`, halve `max_chain` for remainder of hash-chain walk.
+    - **No semantic change to output for default-level encoders** — the default per-level numbers reproduce existing encoder output bit-for-bit.
+  - **Files:** `oxiarc-deflate/src/lz77.rs` (match-finder loop, configuration table), `oxiarc-deflate/src/deflate.rs` (Deflater builder), `oxiarc-deflate/src/lib.rs` (re-export `Lz77Preset`), `oxiarc-deflate/TODO.md`.
+  - **Prerequisites:** none.
+  - **Tests:**
+    - Regression: existing roundtrip tests at every level must produce byte-identical output to pre-change for the default tuning table.
+    - Speed-vs-ratio: `Lz77Preset::Fast` produces output ≥ 95% the size of `Lz77Preset::Default`.
+    - Edge case: `nice_length = u16::MAX` → behaves like un-capped match finder.
+    - Edge case: `nice_length = 3` → encoder emits very short matches and output remains decodable.
+  - **Risk:** changing the match finder is highest-risk. Mitigation: keep existing code path as default; only new builder methods can change behavior.
 
 ### Performance
 - [ ] SIMD-accelerated hash computation
-- [ ] Multi-threaded compression
-- [ ] Memory pool for allocations
+- [x] Multi-threaded compression (planned 2026-05-17)
+  - **Goal:** Implement the already-declared `parallel` Cargo feature for oxiarc-deflate. Output is a valid GZIP stream consisting of N concatenated GZIP members, one per chunk, decodable by any conforming gzip reader. Mirrors pigz behavior at the format level.
+  - **Design:**
+    - New module `oxiarc-deflate/src/parallel.rs` (gated by `#[cfg(feature = "parallel")]`).
+    - Public API: `pub fn gzip_compress_parallel(input: &[u8], level: u32, chunk_size: usize) -> Vec<u8>` plus a builder `ParallelGzipEncoder { level, chunk_size, num_threads: Option<usize> }`.
+    - Algorithm: chunk input by `chunk_size` (default 1 MiB; minimum 64 KiB); each rayon worker compresses one chunk as an **independent GZIP member** (header + DEFLATE stream + CRC32 + ISIZE); serial assembly concatenates the members in order. ISIZE per member equals that member's uncompressed length (mod 2³²); a final 0-byte member is NOT appended.
+    - DEFLATE inside each member is the existing serial encoder at `level`; the encoder must emit BFINAL=1 on its last block. No cross-chunk LZ77 dictionary sharing in this first cut.
+    - Re-export: `pub use parallel::{gzip_compress_parallel, ParallelGzipEncoder}` in `lib.rs` under the same `#[cfg]`.
+  - **Files:** `oxiarc-deflate/src/parallel.rs` (new), `oxiarc-deflate/src/lib.rs` (re-export under `parallel` feature), `oxiarc-deflate/Cargo.toml` (verify `parallel = ["dep:rayon"]` exists), `oxiarc-deflate/TODO.md`.
+  - **Prerequisites:** none — `gzip` module and `Deflater` already exist; rayon already in workspace deps.
+  - **Tests:**
+    - Roundtrip via serial `GzipDecoder` on chunked outputs at levels 1, 5, 9.
+    - Equivalence test: parallel output decompresses to byte-identical original for 1 MiB, 5 MiB, 100 KiB (sub-chunk), and 1 byte inputs.
+    - Determinism test: same input → same output (rayon's stable order preserved by serial assembly).
+  - **Risk:** multi-member outputs are bigger than single-member at small chunk sizes. Mitigation: default to 1 MiB chunks to amortize overhead under 0.002%.
+- [x] Memory pool for allocations (planned 2026-05-17)
+  - **Goal:** Thread-safe buffer pool for the per-encode allocations of DEFLATE: the 32 KiB sliding window, the ~64 KiB hash chain head/prev arrays, and the per-block literal/length frequency tables. Mirrors `oxiarc-lzma::LzmaPool` (memory-pool primitive added in 0.3.1).
+  - **Design:**
+    - New module `oxiarc-deflate/src/pool.rs` with `DeflatePool` (capacity-bucketed pool), `PooledBuf<'a>` RAII wrapper (returns the buffer on drop), and `Deflater::with_pool(&DeflatePool) -> Deflater` builder.
+    - Bucket sizes: `WINDOW_BUF` (32 KiB), `HASH_HEAD` (32 KiB × `u16`), `HASH_PREV` (32 KiB × `u16`), `OUTPUT_SCRATCH` (defaults to 8 KiB, grows as needed).
+    - Internals: each bucket is a `Mutex<Vec<Vec<u8>>>` with a configurable per-bucket cap (default 4 buffers).
+    - When `Deflater::with_pool` is set, the encoder pulls buffers via `pool.get(BucketId)` instead of `Vec::with_capacity`; on drop the `PooledBuf` returns them.
+    - No-pool path is preserved (existing allocation behavior is the default; pool is strictly opt-in).
+  - **Files:** `oxiarc-deflate/src/pool.rs` (new), `oxiarc-deflate/src/deflate.rs` (Deflater integration), `oxiarc-deflate/src/lz77.rs` (window/hash-chain allocation sites), `oxiarc-deflate/src/lib.rs` (re-export `DeflatePool`, `PooledBuf`), `oxiarc-deflate/TODO.md`.
+  - **Prerequisites:** none — `LzmaPool`'s structure in oxiarc-lzma is the reference.
+  - **Tests:**
+    - Pool basic: three sequential `Deflater::with_pool` runs reuse the same window buffer (assert via `pool.stats()` counters).
+    - Roundtrip equality: pooled and non-pooled `Deflater` at the same level produce byte-identical output.
+    - Concurrent pool: 8 rayon threads each compress a 1 MiB input via the same pool; total allocations < 16 buffers.
+    - Pool boundary: per-bucket cap respected (cap of 2 → third buffer beyond cap is dropped, not returned).
+  - **Risk:** stale buffer contents being read as uninitialized data. Mitigation: `PooledBuf::get_mut` zeroes the slice before handing back to caller.
 - [ ] Pre-allocated output buffers
 
 ### Features
@@ -113,7 +155,7 @@
 - [x] Flush modes (sync_flush, full_flush, partial_flush for GzipStreamEncoder/ZlibStreamEncoder, v0.2.6)
 
 ### Compliance
-- [ ] Round-trip testing with zlib
+- [x] Round-trip testing (zlib/gzip format compliance, 2026-05-17)
 - [ ] Fuzzing tests
 - [ ] Edge case handling (empty input, max length matches)
 
@@ -135,6 +177,7 @@
 
 | File | Lines |
 |------|-------|
+| optimal.rs | ~534 (NEW in v0.3.0) |
 | streaming.rs | 1,047 (NEW) |
 | zlib.rs | 931 |
 | huffman.rs | 438 |

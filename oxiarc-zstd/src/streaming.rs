@@ -28,7 +28,7 @@
 //! ```
 
 use crate::encode::ZstdEncoder;
-use crate::frame::{ZstdDecoder, decompress_multi_frame};
+use crate::frame::{decompress_multi_frame, decompress_multi_frame_with_dict};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 use std::io::{self, Read, Write};
@@ -350,19 +350,14 @@ impl<R: Read> ZstdStreamDecoder<R> {
 
         // Use multi-frame decompression so that a stream of concatenated
         // frames (as produced by the incremental encoder) is handled correctly.
-        // Dictionary support: if a dict is set we fall back to single-frame
-        // decoding (dict + multi-frame is a more complex scenario and not
-        // required by the current API surface).
-        self.output_buffer = if self.dict.is_none() {
-            decompress_multi_frame(&compressed)
+        // When a dictionary is set, use the dict-aware variant so that all
+        // frames in the concatenated stream are decoded with the same dictionary
+        // (the encoder writes one frame per block, each referencing the dict).
+        self.output_buffer = if let Some(ref dict) = self.dict {
+            decompress_multi_frame_with_dict(&compressed, dict)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
         } else {
-            let mut decoder = ZstdDecoder::new();
-            if let Some(ref dict) = self.dict {
-                decoder.set_dictionary(dict);
-            }
-            decoder
-                .decode_frame(&compressed)
+            decompress_multi_frame(&compressed)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
         };
         self.output_pos = 0;
@@ -498,17 +493,72 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_encoder_with_dictionary() {
-        let dict = b"common pattern data".to_vec();
-        let mut encoder = ZstdStreamEncoder::with_dictionary(Vec::new(), 1, dict);
-        encoder.write_all(b"test data").expect("write failed");
-        let compressed = encoder.finish().expect("finish failed");
+    fn test_stream_encoder_decoder_dict_roundtrip_small() {
+        let dict = b"common pattern data appears frequently in the corpus".to_vec();
+        let payload = b"common pattern data";
 
-        // Should still decompress (dict is a placeholder for now).
-        let mut decoder = ZstdStreamDecoder::new(&compressed[..]);
-        let mut output = Vec::new();
-        decoder.read_to_end(&mut output).expect("read failed");
-        assert_eq!(output, b"test data");
+        let mut enc = ZstdStreamEncoder::with_dictionary(Vec::new(), 1, dict.clone());
+        enc.write_all(payload).expect("write");
+        let compressed = enc.finish().expect("finish");
+
+        let mut dec = ZstdStreamDecoder::with_dictionary(&compressed[..], dict);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).expect("read");
+        assert_eq!(out, payload as &[u8]);
+    }
+
+    #[test]
+    fn test_stream_encoder_decoder_dict_roundtrip_large() {
+        // Multi-frame dict roundtrip: use a small block_size so each write produces
+        // multiple concatenated Zstd frames, each well under 128 KiB so we stay in
+        // the single-internal-block regime and avoid the known multi-internal-block
+        // + dict bug that is pre-existing in the encoder.
+        let dict_text = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(50);
+        let dict = dict_text.as_bytes().to_vec();
+        // ~57 KB payload with 8 KB block_size → ~8 frames, each < 128 KiB.
+        let payload: Vec<u8> = dict_text.repeat(20).into_bytes();
+
+        let mut enc = ZstdStreamEncoder::with_dictionary(Vec::new(), 3, dict.clone())
+            .with_block_size(8 * 1024);
+        enc.write_all(&payload).expect("write");
+        let compressed = enc.finish().expect("finish");
+
+        // Verify multiple Zstd frames were produced by counting magic bytes.
+        let magic = &crate::ZSTD_MAGIC;
+        let frame_count = compressed.windows(4).filter(|w| *w == magic).count();
+        assert!(
+            frame_count > 1,
+            "expected multiple frames, got {}",
+            frame_count
+        );
+
+        let mut dec = ZstdStreamDecoder::with_dictionary(&compressed[..], dict);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).expect("read");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn test_stream_decoder_without_dict_on_dict_compressed_large_data() {
+        // Compress with a dict; decode without. On large inputs that trigger
+        // dict back-references, this must either error or produce wrong output.
+        let dict_text = "pattern frequently repeating text ".repeat(200);
+        let dict = dict_text.as_bytes().to_vec();
+        let payload: Vec<u8> = dict_text.repeat(50).into_bytes();
+
+        let mut enc = ZstdStreamEncoder::with_dictionary(Vec::new(), 3, dict);
+        enc.write_all(&payload).expect("write");
+        let compressed = enc.finish().expect("finish");
+
+        let mut dec = ZstdStreamDecoder::new(&compressed[..]);
+        let mut out = Vec::new();
+        let result = dec.read_to_end(&mut out);
+        if result.is_ok() {
+            assert_ne!(
+                out, payload,
+                "decoding without dict should not reproduce original on large input"
+            );
+        }
     }
 
     #[test]

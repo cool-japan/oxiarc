@@ -63,8 +63,8 @@ pub use encode::{
 
 // Decompression API
 pub use frame::{
-    ZstdDecoder, decompress, decompress_frame, decompress_multi_frame, decompress_with_dict,
-    write_skippable_frame,
+    ZstdDecoder, decompress, decompress_frame, decompress_multi_frame,
+    decompress_multi_frame_with_dict, decompress_with_dict, write_skippable_frame,
 };
 
 // Streaming API

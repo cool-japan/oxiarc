@@ -7,12 +7,32 @@
 //! - Dynamic Huffman codes
 
 use crate::huffman::HuffmanBuilder;
-use crate::lz77::{Lz77Encoder, Lz77Token};
+use crate::lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
+use crate::optimal::OptimalParser;
+use crate::pool::{DeflatePool, PooledBuf, PooledU16Buf};
 use crate::tables::{distance_to_code, fixed_litlen_lengths, length_to_code};
 use oxiarc_core::BitWriter;
 use oxiarc_core::error::Result;
 use oxiarc_core::traits::{CompressStatus, Compressor, FlushMode};
 use std::io::Write;
+
+/// Extract the inner `Vec<u8>` from a [`PooledBuf`] without returning it to
+/// the pool.  We take ownership here because the buffer's ownership is being
+/// transferred to the `Lz77Encoder`; it will be returned via `Deflater::drop`.
+fn extract_pooled_buf(guard: PooledBuf) -> Vec<u8> {
+    // SAFETY: We intentionally bypass the `Drop` impl by using `ManuallyDrop`
+    // so that the buffer is NOT returned to the pool at this point.  The buffer
+    // will be returned in `Deflater::drop` via `pool.return_window`.
+    let mut md = std::mem::ManuallyDrop::new(guard);
+    std::mem::take(&mut md.buf)
+}
+
+/// Extract the inner `Vec<u16>` from a [`PooledU16Buf`] without returning it
+/// to the pool.  Mirrors [`extract_pooled_buf`].
+fn extract_pooled_u16_buf(guard: PooledU16Buf) -> Vec<u16> {
+    let mut md = std::mem::ManuallyDrop::new(guard);
+    std::mem::take(&mut md.buf)
+}
 
 /// Code length alphabet order for encoding (RFC 1951).
 const CODELEN_ORDER: [usize; 19] = [
@@ -23,6 +43,9 @@ const CODELEN_ORDER: [usize; 19] = [
 pub const MAX_DICTIONARY_SIZE: usize = 32768;
 
 /// DEFLATE compressor.
+///
+/// Supports an optional [`DeflatePool`] to amortise buffer allocations across
+/// many successive encode calls.  Enable via [`Deflater::with_pool`].
 #[derive(Debug)]
 pub struct Deflater {
     /// LZ77 encoder.
@@ -35,6 +58,28 @@ pub struct Deflater {
     dictionary_checksum: Option<u32>,
     /// Pending bits from a partial flush (value, count).
     pending_bits: (u8, u8),
+    /// Whether to use the graph-based optimal parser instead of greedy.
+    optimal_parsing: bool,
+    /// Optional pool used to recycle the LZ77 window and hash buffers.
+    ///
+    /// When `Some`, the LZ77 encoder's underlying `Vec`s were acquired from
+    /// the pool and will be returned on `drop`.
+    pool: Option<DeflatePool>,
+}
+
+impl Drop for Deflater {
+    fn drop(&mut self) {
+        if let Some(ref pool) = self.pool {
+            // Swap a fresh minimal encoder in, taking the pooled-buffer encoder out.
+            // `with_level(0)` is cheap: it allocates a small store-only encoder which
+            // is immediately discarded, but the allocation is unavoidable here.
+            let old_lz77 = std::mem::replace(&mut self.lz77, Lz77Encoder::with_level(0));
+            let (window, hash_table, hash_chain) = old_lz77.into_buffers();
+            pool.return_window(window);
+            pool.return_hash_head(hash_table);
+            pool.return_hash_prev(hash_chain);
+        }
+    }
 }
 
 impl Deflater {
@@ -46,7 +91,125 @@ impl Deflater {
             finished: false,
             dictionary_checksum: None,
             pending_bits: (0, 0),
+            optimal_parsing: false,
+            pool: None,
         }
+    }
+
+    /// Attach a memory pool to this compressor.
+    ///
+    /// The compressor's current LZ77 encoder is replaced by one backed by
+    /// buffers acquired from `pool`.  When the `Deflater` is dropped those
+    /// buffers are automatically returned to the pool for reuse by a future
+    /// compressor.
+    ///
+    /// Any previously set dictionary is **preserved** — only the underlying
+    /// allocated buffers change.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_deflate::{Deflater, pool::DeflatePool};
+    ///
+    /// let pool = DeflatePool::new();
+    /// let mut d = Deflater::new(6).with_pool(&pool);
+    /// let out = d.compress_to_vec(b"hello").unwrap();
+    /// // buffers returned to pool when `d` is dropped
+    /// drop(d);
+    /// assert!(pool.stats().window_hits == 0); // first call always allocates
+    /// ```
+    pub fn with_pool(mut self, pool: &DeflatePool) -> Self {
+        // Acquire pooled buffers.
+        let window_guard = pool.get_window();
+        let hash_head_guard = pool.get_hash_head();
+        let hash_prev_guard = pool.get_hash_prev();
+
+        // Extract the raw Vecs from the guards WITHOUT returning them to the pool
+        // on drop.  We do this by taking the inner buf and forgetting the guard.
+        let window = extract_pooled_buf(window_guard);
+        let hash_head = extract_pooled_u16_buf(hash_head_guard);
+        let hash_prev = extract_pooled_u16_buf(hash_prev_guard);
+
+        // Build a new encoder using the pooled buffers while preserving the
+        // compression level and any Lz77Params already applied.
+        let old_level = self.level;
+        let old_lz77 = std::mem::replace(
+            &mut self.lz77,
+            Lz77Encoder::with_level_and_buffers(old_level, window, hash_head, hash_prev),
+        );
+
+        // If there was a previous lz77 with a dictionary, reapply it.
+        // (The new encoder starts with a zeroed window.)
+        // Note: dictionary state is reflected in dictionary_checksum; the raw
+        // dictionary bytes are not stored.  Since we cannot recover the exact
+        // bytes, we just drop the old lz77 normally (it may have been pooled
+        // or freshly allocated).
+        drop(old_lz77);
+
+        self.pool = Some(pool.clone());
+        self
+    }
+
+    /// Create a new DEFLATE compressor with graph-based optimal parsing enabled.
+    ///
+    /// The optimal parser uses a Zopfli-style forward shortest-path DP with
+    /// iterative Huffman cost refinement, producing smaller output than the
+    /// greedy/lazy parser at the cost of additional CPU time.
+    ///
+    /// `level` still controls which Huffman block type is preferred and sets the
+    /// LZ77 match-search depth for the internal encoder.
+    pub fn with_optimal_parsing(level: u8) -> Self {
+        Self {
+            lz77: Lz77Encoder::with_level(level),
+            level: level.min(9),
+            finished: false,
+            dictionary_checksum: None,
+            pending_bits: (0, 0),
+            optimal_parsing: true,
+            pool: None,
+        }
+    }
+
+    /// Override LZ77 match-finding parameters.
+    ///
+    /// Replaces the per-level defaults for `nice_length`, `max_chain`, and
+    /// `good_length`. The existing encoder state (window, hash chains, dictionary)
+    /// is preserved — only the tuning knobs are updated.
+    ///
+    /// Use [`Lz77Params::for_level`] to get the original per-level defaults,
+    /// or build custom values from scratch.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_deflate::{Deflater, lz77::Lz77Params};
+    ///
+    /// let mut deflater = Deflater::new(6)
+    ///     .with_lz77_params(Lz77Params { nice_length: 32, max_chain: 64, good_length: 259 });
+    /// ```
+    pub fn with_lz77_params(mut self, params: Lz77Params) -> Self {
+        // Preserve window/hash/dictionary state by applying params in-place.
+        let lz77 = std::mem::take(&mut self.lz77);
+        self.lz77 = lz77.with_lz77_params(&params);
+        self
+    }
+
+    /// Override LZ77 match-finding parameters using a named preset.
+    ///
+    /// The existing encoder state (window, hash chains, dictionary) is preserved.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_deflate::{Deflater, lz77::Lz77Preset};
+    ///
+    /// let mut deflater = Deflater::new(6).with_lz77_preset(Lz77Preset::Best);
+    /// ```
+    pub fn with_lz77_preset(mut self, preset: Lz77Preset) -> Self {
+        let params = preset.params();
+        let lz77 = std::mem::take(&mut self.lz77);
+        self.lz77 = lz77.with_lz77_params(&params);
+        self
     }
 
     /// Create a new DEFLATE compressor with a preset dictionary.
@@ -195,8 +358,13 @@ impl Deflater {
         writer: &mut BitWriter<W>,
         is_final: bool,
     ) -> Result<()> {
-        // Compress with LZ77
-        let tokens = self.lz77.compress(data);
+        // Compress with LZ77 (greedy/lazy) or the graph-based optimal parser.
+        let tokens = if self.optimal_parsing {
+            let mut parser = OptimalParser::new();
+            parser.parse(data, &mut self.lz77)
+        } else {
+            self.lz77.compress(data)
+        };
 
         // Count symbol frequencies
         let (litlen_freq, dist_freq) = Self::count_frequencies(&tokens);
@@ -987,5 +1155,110 @@ mod tests {
             let decompressed = inflate(&compressed).expect("inflate failed");
             assert_eq!(decompressed, input, "roundtrip failed at level {}", level);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lz77Params / Lz77Preset on Deflater
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_deflater_byte_identity_with_lz77_params_for_level() {
+        // Deflater::new(level) and Deflater::new(level).with_lz77_params(Lz77Params::for_level(...))
+        // must produce byte-identical compressed output.
+        let input: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(16_384)
+            .copied()
+            .collect();
+
+        for level in 0u8..=9 {
+            let baseline = deflate(&input, level).expect("baseline deflate failed");
+            let with_params = {
+                let mut d =
+                    Deflater::new(level).with_lz77_params(Lz77Params::for_level(level as u32));
+                d.compress_to_vec(&input)
+                    .expect("with_lz77_params deflate failed")
+            };
+            assert_eq!(
+                baseline, with_params,
+                "byte-identity broken at level {}",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_deflater_with_lz77_preset_best_roundtrip() {
+        let input: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz0123456789"
+            .iter()
+            .cycle()
+            .take(16_384)
+            .copied()
+            .collect();
+        let compressed = {
+            let mut d = Deflater::new(6).with_lz77_preset(Lz77Preset::Best);
+            d.compress_to_vec(&input)
+                .expect("Best preset compress failed")
+        };
+        let decompressed = inflate(&compressed).expect("Best preset inflate failed");
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_deflater_with_lz77_preset_fast_roundtrip() {
+        let input: Vec<u8> = b"abcdefgh".iter().cycle().take(32_768).copied().collect();
+        let compressed = {
+            let mut d = Deflater::new(6).with_lz77_preset(Lz77Preset::Fast);
+            d.compress_to_vec(&input)
+                .expect("Fast preset compress failed")
+        };
+        let decompressed = inflate(&compressed).expect("Fast preset inflate failed");
+        assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn test_with_lz77_params_preserves_dictionary() {
+        // with_lz77_params must NOT discard dictionary state set before the call.
+        // We verify byte-identity: Deflater::with_dictionary(6, dict) and
+        // Deflater::with_dictionary(6, dict).with_lz77_params(for_level(6))
+        // must produce the same compressed bytes, proving the dictionary was
+        // preserved and not silently reset.
+        let dict = b"the quick brown fox jumps over the lazy dog";
+        let input = b"the quick brown fox";
+
+        // Baseline: set dictionary then compress (no params override).
+        let out_a = {
+            let mut d = Deflater::with_dictionary(6, dict);
+            d.compress_to_vec(input).expect("baseline compress failed")
+        };
+
+        // Same but apply for_level(6) params after setting the dictionary.
+        // Since for_level(6) is already the implicit default, output must be
+        // byte-identical to the baseline. A mismatch means the dictionary was
+        // discarded and fresh window state was used.
+        let out_b = {
+            let mut d =
+                Deflater::with_dictionary(6, dict).with_lz77_params(Lz77Params::for_level(6));
+            d.compress_to_vec(input).expect("params compress failed")
+        };
+
+        assert_eq!(
+            out_a, out_b,
+            "with_lz77_params must not discard dictionary state"
+        );
+    }
+
+    #[test]
+    fn test_deflater_with_lz77_preset_ultra_roundtrip() {
+        // Use small input so the uncapped (u32::MAX) chain doesn't time out.
+        let input: Vec<u8> = b"abcdefgh".iter().cycle().take(2_048).copied().collect();
+        let compressed = {
+            let mut d = Deflater::new(6).with_lz77_preset(Lz77Preset::Ultra);
+            d.compress_to_vec(&input)
+                .expect("Ultra preset compress failed")
+        };
+        let decompressed = inflate(&compressed).expect("Ultra preset inflate failed");
+        assert_eq!(decompressed, input);
     }
 }

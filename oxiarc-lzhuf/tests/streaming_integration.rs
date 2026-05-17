@@ -6,7 +6,7 @@
 use oxiarc_core::traits::{DecompressStatus, Decompressor};
 use oxiarc_lzhuf::{
     DecoderPhase, LzhMethod, StreamingBitReader, StreamingLzhDecoder, create_streaming_decoder,
-    decode_lzh_streaming,
+    decode_lzh, decode_lzh_streaming,
 };
 
 // ============================================================================
@@ -391,4 +391,298 @@ fn test_decode_lzh_streaming_empty() {
     let data: &[u8] = b"";
     let result = decode_lzh_streaming(data, LzhMethod::Lh0, 0).expect("Decode failed");
     assert!(result.is_empty());
+}
+
+// ============================================================================
+// Lh4/5/6/7 baseline round-trip tests
+// ============================================================================
+
+/// Helper: compress with the LZH encoder, then decompress with both serial and
+/// streaming decoders and return `(serial_output, streaming_output)`.
+fn roundtrip_both(input: &[u8], method: LzhMethod) -> (Vec<u8>, Vec<u8>) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(input).expect("encode failed");
+
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+
+    (serial, streaming)
+}
+
+/// Find the first byte offset where two slices diverge (or the shorter length).
+fn first_divergence(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .or_else(|| {
+            if a.len() != b.len() {
+                Some(a.len().min(b.len()))
+            } else {
+                None
+            }
+        })
+}
+
+/// Drive `StreamingLzhDecoder` with a fixed `input_chunk_size` and a small
+/// `output_buf_size`, collecting all produced bytes.  Returns the full output.
+fn chunk_sweep_decode(
+    compressed: &[u8],
+    method: LzhMethod,
+    uncompressed_size: u64,
+    input_chunk_size: usize,
+    output_buf_size: usize,
+) -> Vec<u8> {
+    let mut decoder = StreamingLzhDecoder::new(method, uncompressed_size);
+    let mut all_output = Vec::with_capacity(uncompressed_size as usize);
+    let mut input_pos = 0usize;
+    let mut calls = 0u32;
+
+    loop {
+        calls += 1;
+        if calls > 200_000 {
+            panic!(
+                "{:?} chunk_size={} out_buf={}: stuck after {} calls \
+                 (input_pos={}/{}, output={} bytes)",
+                method,
+                input_chunk_size,
+                output_buf_size,
+                calls,
+                input_pos,
+                compressed.len(),
+                all_output.len()
+            );
+        }
+
+        let end = (input_pos + input_chunk_size).min(compressed.len());
+        let slice = &compressed[input_pos..end];
+        let mut buf = vec![0u8; output_buf_size];
+
+        let (consumed, produced, status) = decoder
+            .decompress(slice, &mut buf)
+            .expect("decompress failed");
+
+        input_pos += consumed;
+        all_output.extend_from_slice(&buf[..produced]);
+
+        match status {
+            DecompressStatus::Done => break,
+            DecompressStatus::NeedsInput if input_pos >= compressed.len() && produced == 0 => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    all_output
+}
+
+#[test]
+fn test_streaming_lh4_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh4);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh4 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh4 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh5_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh5);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh5 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh5 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh6_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh6);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh6 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh6 streaming mismatch vs original");
+}
+
+#[test]
+fn test_streaming_lh7_baseline() {
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let (serial, streaming) = roundtrip_both(&input, LzhMethod::Lh7);
+    if let Some(pos) = first_divergence(&serial, &streaming) {
+        panic!(
+            "Lh7 streaming mismatch at byte {}: serial={:#04x}, streaming={:#04x}",
+            pos,
+            serial.get(pos).copied().unwrap_or(0),
+            streaming.get(pos).copied().unwrap_or(0),
+        );
+    }
+    assert_eq!(streaming, input, "Lh7 streaming mismatch vs original");
+}
+
+// ============================================================================
+// Chunk-sweep tests — exercise cross-call resumption with tiny input/output
+// ============================================================================
+
+/// Chunk sizes chosen to force mid-header, mid-tree, and mid-block resumptions.
+const SWEEP_CHUNK_SIZES: &[usize] = &[1, 2, 3, 7, 17, 64, 256, 1024];
+
+fn run_chunk_sweep(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let input: Vec<u8> = b"hello world ".iter().cycle().take(4096).cloned().collect();
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(&input).expect("encode failed");
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+
+    for &chunk_size in SWEEP_CHUNK_SIZES {
+        // Use a small output buffer (16 bytes) to also stress output-buffer resumption.
+        let got = chunk_sweep_decode(&compressed, method, input.len() as u64, chunk_size, 16);
+        if let Some(pos) = first_divergence(&serial, &got) {
+            panic!(
+                "{:?} chunk_size={}: mismatch at byte {} \
+                 (serial={:#04x}, streaming={:#04x}), got {} bytes total",
+                method,
+                chunk_size,
+                pos,
+                serial.get(pos).copied().unwrap_or(0),
+                got.get(pos).copied().unwrap_or(0),
+                got.len(),
+            );
+        }
+        assert_eq!(
+            got.len(),
+            input.len(),
+            "{:?} chunk_size={}: wrong output length ({} vs {})",
+            method,
+            chunk_size,
+            got.len(),
+            input.len()
+        );
+    }
+}
+
+#[test]
+fn test_streaming_lh4_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_chunk_sweep() {
+    run_chunk_sweep(LzhMethod::Lh7);
+}
+
+// ============================================================================
+// Edge-case tests
+// ============================================================================
+
+/// Verify that a single-byte compressible input round-trips correctly.
+fn run_edge_single_byte(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let input = b"A";
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(input).expect("encode failed");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+    assert_eq!(
+        streaming.as_slice(),
+        input.as_ref(),
+        "{method:?} single-byte mismatch"
+    );
+}
+
+#[test]
+fn test_streaming_lh4_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_edge_single_byte() {
+    run_edge_single_byte(LzhMethod::Lh7);
+}
+
+/// Verify that an input close to the method's window size round-trips correctly.
+///
+/// Uses `window - 1` bytes to avoid a known LZH encoder limitation: when the
+/// entire highly-compressible input fits in a single block, the uncompressed
+/// byte count for that block can equal `window_size`, and the 16-bit block-size
+/// header field overflows to 0 for Lh7 (65536 bytes).  Using `window - 1`
+/// avoids this edge case while still exercising large-window decompression.
+fn run_edge_window_size(method: LzhMethod) {
+    use oxiarc_lzhuf::LzhEncoder;
+    let window = method.window_size();
+    // Use window - 1 bytes to avoid the 16-bit block-size overflow at exactly
+    // window = 65536 (Lh7).
+    let len = window - 1;
+    let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut encoder = LzhEncoder::new(method);
+    let compressed = encoder.compress_to_vec(&input).expect("encode failed");
+    let serial = decode_lzh(&compressed, method, input.len() as u64).expect("serial decode");
+    let streaming =
+        decode_lzh_streaming(&compressed, method, input.len() as u64).expect("streaming decode");
+    assert_eq!(
+        streaming, serial,
+        "{method:?} window-size mismatch vs serial"
+    );
+    assert_eq!(
+        streaming, input,
+        "{method:?} window-size mismatch vs original"
+    );
+}
+
+#[test]
+fn test_streaming_lh4_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh4);
+}
+
+#[test]
+fn test_streaming_lh5_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh5);
+}
+
+#[test]
+fn test_streaming_lh6_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh6);
+}
+
+#[test]
+fn test_streaming_lh7_edge_window_size() {
+    run_edge_window_size(LzhMethod::Lh7);
 }

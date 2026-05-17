@@ -2,11 +2,13 @@
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.2.8-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.2.8** (2026-05-08) — 56 tests passing.
+**Version 0.3.0** (2026-05-17) — 99 tests passing.
+
+**What's new in 0.3.0**: 4-byte multiplicative hash for better avalanche and fewer collisions; `LzssOptimalParser` — two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder; custom dictionary support via `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, and `LzssDecoder::preload_dictionary`.
 
 ## Overview
 
@@ -21,6 +23,10 @@ This crate implements the core compression algorithm, separate from the archive 
 - **Dual Huffman trees** - Codes + Offsets
 - **Configurable window sizes** - 4KB to 64KB
 - **Streaming and one-shot APIs**
+- **4-byte multiplicative hash** - Better avalanche effect, fewer collisions
+- **Optimal LZSS parser** - `LzssOptimalParser` with two-pass parsing and Huffman-cost retraining
+- **Optimal encoder builder** - `LzhEncoder::with_optimal()` for maximum compression
+- **Custom dictionary support** - `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, `LzssDecoder::preload_dictionary`
 
 All features are implemented and tested. API is stable.
 

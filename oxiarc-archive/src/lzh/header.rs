@@ -19,9 +19,9 @@ pub struct LzhHeader {
     pub header_size: u16,
     /// Compression method.
     pub method: LzhMethod,
-    /// Compressed size.
+    /// Compressed size (32-bit field from base header).
     pub compressed_size: u32,
-    /// Original (uncompressed) size.
+    /// Original (uncompressed) size (32-bit field from base header).
     pub original_size: u32,
     /// Modification time (Unix timestamp or DOS time).
     pub mtime: u32,
@@ -38,22 +38,32 @@ pub struct LzhHeader {
     /// Data offset in archive.
     pub data_offset: u64,
 
-    /// DOS attribute byte parsed from extension header `0x40`.
-    pub dos_attr: Option<u8>,
-    /// Unix UID parsed from extension header `0x41` (second u16 LE).
-    pub unix_uid: Option<u16>,
-    /// Unix GID parsed from extension header `0x41` (first u16 LE).
-    pub unix_gid: Option<u16>,
-    /// Unix group name parsed from extension header `0x42`.
-    pub unix_group_name: Option<String>,
-    /// Unix user name parsed from extension header `0x43`.
-    pub unix_user_name: Option<String>,
-    /// Unix mtime parsed from extension header `0x44` (u32 LE, seconds since epoch).
-    pub unix_mtime: Option<u32>,
-    /// Free-form comment parsed from extension header `0x46`.
+    /// OS/2 / MS-DOS attribute word parsed from extension header `0x40` (u16 LE).
+    pub dos_attr: Option<u16>,
+    /// Windows FILETIME creation timestamp from extension header `0x41` (first 8 bytes).
+    pub windows_creation: Option<u64>,
+    /// Windows FILETIME last-access timestamp from extension header `0x41` (second 8 bytes).
+    pub windows_access: Option<u64>,
+    /// Windows FILETIME last-modify timestamp from extension header `0x41` (third 8 bytes).
+    pub windows_modify: Option<u64>,
+    /// Uncompressed size as 64-bit value from extension header `0x42`.
+    pub uncompressed_size64: Option<u64>,
+    /// Compressed size as 64-bit value from extension header `0x43`.
+    pub compressed_size64: Option<u64>,
+    /// Free-form comment parsed from extension header `0x44`.
     pub comment: Option<String>,
-    /// Unix file permissions parsed from extension header `0x50` (u16 LE).
+    /// Unix file permissions parsed from extension header `0x46` (u16 LE).
     pub unix_permission: Option<u16>,
+    /// Unix owner user name parsed from extension header `0x50`.
+    pub unix_owner_user: Option<String>,
+    /// Unix owner group name parsed from extension header `0x50`.
+    pub unix_owner_group: Option<String>,
+    /// Unix UID parsed from extension header `0x51` (first u32 LE).
+    pub unix_uid: Option<u32>,
+    /// Unix GID parsed from extension header `0x51` (second u32 LE).
+    pub unix_gid: Option<u32>,
+    /// Unix mtime parsed from extension header `0x54` (u32 LE, seconds since epoch).
+    pub unix_mtime: Option<u32>,
 }
 
 /// Accumulator for extension-header metadata parsed from a Level-2 or
@@ -61,42 +71,96 @@ pub struct LzhHeader {
 /// extension block is decoded; copied into [`LzhHeader`] at the end.
 #[derive(Debug, Default)]
 pub(crate) struct LzhExtensionData {
-    pub(crate) dos_attr: Option<u8>,
-    pub(crate) unix_uid: Option<u16>,
-    pub(crate) unix_gid: Option<u16>,
-    pub(crate) unix_group_name: Option<String>,
-    pub(crate) unix_user_name: Option<String>,
-    pub(crate) unix_mtime: Option<u32>,
+    pub(crate) dos_attr: Option<u16>,
+    pub(crate) windows_creation: Option<u64>,
+    pub(crate) windows_access: Option<u64>,
+    pub(crate) windows_modify: Option<u64>,
+    pub(crate) uncompressed_size64: Option<u64>,
+    pub(crate) compressed_size64: Option<u64>,
     pub(crate) comment: Option<String>,
     pub(crate) unix_permission: Option<u16>,
+    pub(crate) unix_owner_user: Option<String>,
+    pub(crate) unix_owner_group: Option<String>,
+    pub(crate) unix_uid: Option<u32>,
+    pub(crate) unix_gid: Option<u32>,
+    pub(crate) unix_mtime: Option<u32>,
 }
 
 impl LzhExtensionData {
     /// Decode a single `[type + data]` extension header payload and
     /// fold the contained value into `self`.
+    ///
+    /// Type byte assignments follow the standard LHA specification:
+    ///
+    /// | Type | Meaning                  | Payload                              |
+    /// |------|--------------------------|--------------------------------------|
+    /// | 0x40 | OS/2 / MS-DOS attributes | 2 bytes LE u16                       |
+    /// | 0x41 | Windows timestamps       | 24 bytes (3 × u64 LE FILETIME)       |
+    /// | 0x42 | Uncompressed size 64-bit | 8 bytes LE u64                       |
+    /// | 0x43 | Compressed size 64-bit   | 8 bytes LE u64                       |
+    /// | 0x44 | Comment                  | variable UTF-8                       |
+    /// | 0x46 | Unix file permissions    | 2 bytes LE u16                       |
+    /// | 0x50 | Unix owner names         | user\0group (NUL-separated strings)  |
+    /// | 0x51 | Unix owner IDs           | 8 bytes: uid(4 LE) + gid(4 LE)       |
+    /// | 0x54 | Unix mtime               | 4 bytes LE u32 seconds-since-epoch   |
     pub(crate) fn apply(&mut self, ext_type: u8, data: &[u8]) {
         match ext_type {
-            0x40 => {
-                self.dos_attr = data.first().copied();
+            // 0x40 — OS/2 / MS-DOS attribute word (2 bytes LE)
+            0x40 if data.len() >= 2 => {
+                self.dos_attr = Some(u16::from_le_bytes([data[0], data[1]]));
             }
-            0x41 if data.len() >= 4 => {
-                self.unix_gid = Some(u16::from_le_bytes([data[0], data[1]]));
-                self.unix_uid = Some(u16::from_le_bytes([data[2], data[3]]));
+            // 0x41 — Windows FILETIME × 3 (24 bytes = 3 × u64 LE)
+            0x41 if data.len() >= 24 => {
+                self.windows_creation = Some(u64::from_le_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]));
+                self.windows_access = Some(u64::from_le_bytes([
+                    data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+                ]));
+                self.windows_modify = Some(u64::from_le_bytes([
+                    data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+                ]));
             }
-            0x42 => {
-                self.unix_group_name = Some(String::from_utf8_lossy(data).into_owned());
+            // 0x42 — uncompressed size as u64 (8 bytes LE)
+            0x42 if data.len() >= 8 => {
+                self.uncompressed_size64 = Some(u64::from_le_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]));
             }
-            0x43 => {
-                self.unix_user_name = Some(String::from_utf8_lossy(data).into_owned());
+            // 0x43 — compressed size as u64 (8 bytes LE)
+            0x43 if data.len() >= 8 => {
+                self.compressed_size64 = Some(u64::from_le_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]));
             }
-            0x44 if data.len() >= 4 => {
-                self.unix_mtime = Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
-            }
-            0x46 => {
+            // 0x44 — comment (variable-length UTF-8)
+            0x44 => {
                 self.comment = Some(String::from_utf8_lossy(data).into_owned());
             }
-            0x50 if data.len() >= 2 => {
+            // 0x46 — Unix file permissions (2 bytes LE u16)
+            0x46 if data.len() >= 2 => {
                 self.unix_permission = Some(u16::from_le_bytes([data[0], data[1]]));
+            }
+            // 0x50 — Unix owner names: NUL-separated "user\0group"
+            0x50 => {
+                if let Some(nul_pos) = data.iter().position(|&b| b == 0) {
+                    let user = String::from_utf8_lossy(&data[..nul_pos]).into_owned();
+                    let group = String::from_utf8_lossy(&data[nul_pos + 1..]).into_owned();
+                    self.unix_owner_user = Some(user);
+                    self.unix_owner_group = Some(group);
+                } else {
+                    // No NUL separator — treat the whole payload as username
+                    self.unix_owner_user = Some(String::from_utf8_lossy(data).into_owned());
+                }
+            }
+            // 0x51 — Unix owner IDs: uid(u32 LE) + gid(u32 LE)
+            0x51 if data.len() >= 8 => {
+                self.unix_uid = Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+                self.unix_gid = Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]));
+            }
+            // 0x54 — Unix mtime (4 bytes LE u32, seconds since epoch)
+            0x54 if data.len() >= 4 => {
+                self.unix_mtime = Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
             }
             _ => {
                 // Silently ignore unknown extension types or types
@@ -185,13 +249,18 @@ impl LzhHeader {
             os_id,
             data_offset,
             dos_attr: ext_data.dos_attr,
-            unix_uid: ext_data.unix_uid,
-            unix_gid: ext_data.unix_gid,
-            unix_group_name: ext_data.unix_group_name,
-            unix_user_name: ext_data.unix_user_name,
-            unix_mtime: ext_data.unix_mtime,
+            windows_creation: ext_data.windows_creation,
+            windows_access: ext_data.windows_access,
+            windows_modify: ext_data.windows_modify,
+            uncompressed_size64: ext_data.uncompressed_size64,
+            compressed_size64: ext_data.compressed_size64,
             comment: ext_data.comment,
             unix_permission: ext_data.unix_permission,
+            unix_owner_user: ext_data.unix_owner_user,
+            unix_owner_group: ext_data.unix_owner_group,
+            unix_uid: ext_data.unix_uid,
+            unix_gid: ext_data.unix_gid,
+            unix_mtime: ext_data.unix_mtime,
         }))
     }
 
@@ -301,13 +370,18 @@ impl LzhHeader {
             os_id,
             data_offset,
             dos_attr: ext_data.dos_attr,
-            unix_uid: ext_data.unix_uid,
-            unix_gid: ext_data.unix_gid,
-            unix_group_name: ext_data.unix_group_name,
-            unix_user_name: ext_data.unix_user_name,
-            unix_mtime: ext_data.unix_mtime,
+            windows_creation: ext_data.windows_creation,
+            windows_access: ext_data.windows_access,
+            windows_modify: ext_data.windows_modify,
+            uncompressed_size64: ext_data.uncompressed_size64,
+            compressed_size64: ext_data.compressed_size64,
             comment: ext_data.comment,
             unix_permission: ext_data.unix_permission,
+            unix_owner_user: ext_data.unix_owner_user,
+            unix_owner_group: ext_data.unix_owner_group,
+            unix_uid: ext_data.unix_uid,
+            unix_gid: ext_data.unix_gid,
+            unix_mtime: ext_data.unix_mtime,
         }))
     }
 
@@ -450,13 +524,13 @@ impl LzhHeader {
 
     /// Convert to Entry.
     ///
-    /// Extension-header metadata (0x40 / 0x41 / 0x44 / 0x46 / 0x50) is
-    /// merged into the returned [`Entry`] so that callers get a uniform
-    /// view: `dos_attr` shadows the fixed-header attribute byte,
-    /// `unix_uid`/`unix_gid` populate [`FileAttributes::uid`] and
-    /// [`FileAttributes::gid`], `unix_permission` populates
-    /// [`FileAttributes::unix_mode`], `unix_mtime` replaces the fixed
-    /// header mtime, and `comment` is surfaced on the entry directly.
+    /// Extension-header metadata is merged into the returned [`Entry`]:
+    /// - `dos_attr` (0x40, u16) low byte shadows the fixed-header attribute byte
+    /// - `unix_uid`/`unix_gid` (0x51, u32) populate [`FileAttributes::uid`]/[`FileAttributes::gid`]
+    /// - `unix_permission` (0x46) populates [`FileAttributes::unix_mode`]
+    /// - `unix_mtime` (0x54) replaces the fixed-header mtime when present
+    /// - `uncompressed_size64` (0x42) overrides the 32-bit size when present
+    /// - `comment` (0x44) is surfaced on the entry directly
     pub fn to_entry(&self) -> Entry {
         let entry_type = if self.filename.ends_with('/') || self.filename.ends_with('\\') {
             EntryType::Directory
@@ -472,29 +546,44 @@ impl LzhHeader {
             LzhMethod::Lh7 => CoreMethod::Lh7,
         };
 
-        // Prefer extension-provided Unix mtime over the fixed-header
-        // value when both are present. Extension 0x44 is the richer,
-        // modern encoding; the fixed-header mtime remains for
-        // compatibility with level-0/1/2 headers that lack 0x44.
+        // Prefer extension-provided Unix mtime (0x54) over the fixed-header
+        // value when both are present.
         let mtime_secs = self
             .unix_mtime
             .map(|m| m as u64)
             .unwrap_or(self.mtime as u64);
 
+        // Prefer 64-bit uncompressed size (0x42) when present; fall back to
+        // the 32-bit base-header field.
+        let uncompressed = self
+            .uncompressed_size64
+            .unwrap_or(self.original_size as u64);
+
+        // Prefer 64-bit compressed size (0x43) when present; fall back to
+        // the 32-bit base-header field.
+        let compressed = self
+            .compressed_size64
+            .unwrap_or(self.compressed_size as u64);
+
+        // dos_attr (0x40) is a u16 attribute word; take the low byte for
+        // FileAttributes which stores a u8 DOS attribute byte.  Fall back
+        // to the base-header attribute when no extension is present.
+        let dos_attributes = self.dos_attr.map(|w| w as u8).or(Some(self.attributes));
+
         Entry {
             name: self.filename.replace('\\', "/"),
             entry_type,
-            size: self.original_size as u64,
-            compressed_size: self.compressed_size as u64,
+            size: uncompressed,
+            compressed_size: compressed,
             method,
             modified: Some(UNIX_EPOCH + Duration::from_secs(mtime_secs)),
             created: None,
             accessed: None,
             attributes: FileAttributes {
-                dos_attributes: self.dos_attr.or(Some(self.attributes)),
+                dos_attributes,
                 unix_mode: self.unix_permission.map(u32::from),
-                uid: self.unix_uid.map(u32::from),
-                gid: self.unix_gid.map(u32::from),
+                uid: self.unix_uid,
+                gid: self.unix_gid,
             },
             crc32: None, // LZH uses CRC-16
             comment: self.comment.clone(),

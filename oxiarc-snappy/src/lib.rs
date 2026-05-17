@@ -42,21 +42,39 @@
 //! assert_eq!(output, b"Hello, streaming Snappy!");
 //! ```
 
+#[cfg(feature = "async-io")]
+pub mod async_snappy;
 pub mod compress;
 pub mod crc32c;
 pub mod decompress;
 pub mod error;
 pub mod frame;
+#[cfg(feature = "parallel")]
+pub mod frame_parallel;
+pub mod pool;
 
 // Re-export the main public API
 
+#[cfg(feature = "async-io")]
+pub use async_snappy::{
+    AsyncSnappyCompressor, AsyncSnappyDecompressor, compress_frame_async, decompress_frame_async,
+};
 pub use compress::compress;
+pub use compress::compress_block_with_dict;
 pub use compress::max_compress_len;
 pub use decompress::decompress;
+pub use decompress::decompress_block_with_dict;
 pub use decompress::get_decompress_len as decompress_len;
 pub use error::SnappyError;
 pub use frame::FrameDecoder;
 pub use frame::FrameEncoder;
+pub use frame::compress_frame_pooled;
+pub use frame::compress_frame_with_dict;
+pub use frame::decompress_frame_with_dict;
+#[cfg(feature = "parallel")]
+pub use frame_parallel::compress_parallel;
+pub use pool::PoolStats;
+pub use pool::SnappyPool;
 
 #[cfg(test)]
 mod tests {

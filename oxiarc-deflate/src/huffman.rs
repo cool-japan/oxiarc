@@ -251,6 +251,63 @@ impl HuffmanTree {
     }
 }
 
+/// Build a bit-cost table from code lengths.
+///
+/// Returns a Vec where `result[symbol] = lengths[symbol] as u32`.
+/// Symbols with length 0 are unreachable and get cost `u32::MAX`.
+pub(crate) fn cost_table_from_lengths(lengths: &[u8]) -> Vec<u32> {
+    lengths
+        .iter()
+        .map(|&l| if l == 0 { u32::MAX } else { l as u32 })
+        .collect()
+}
+
+/// Compute the total bit cost for encoding a (length, distance) match.
+///
+/// Returns `u32::MAX` if any required symbol is unreachable (cost == `u32::MAX`)
+/// or if integer overflow would occur.
+pub(crate) fn cost_of_match(
+    length: u16,
+    distance: u16,
+    litlen_costs: &[u32],
+    dist_costs: &[u32],
+) -> u32 {
+    use crate::tables::{DISTANCE_EXTRA_BITS, LENGTH_EXTRA_BITS, distance_to_code, length_to_code};
+
+    let (len_code, len_extra_bits, _) = length_to_code(length);
+    let len_sym_cost = litlen_costs
+        .get(len_code as usize)
+        .copied()
+        .unwrap_or(u32::MAX);
+    if len_sym_cost == u32::MAX {
+        return u32::MAX;
+    }
+
+    let (dist_code, dist_extra_bits, _) = distance_to_code(distance);
+    let dist_sym_cost = dist_costs
+        .get(dist_code as usize)
+        .copied()
+        .unwrap_or(u32::MAX);
+    if dist_sym_cost == u32::MAX {
+        return u32::MAX;
+    }
+
+    // Extra bits come from the tables; sanity-check the indices.
+    let len_eb = LENGTH_EXTRA_BITS
+        .get((len_code as usize).saturating_sub(257))
+        .copied()
+        .unwrap_or(len_extra_bits) as u32;
+    let dist_eb = DISTANCE_EXTRA_BITS
+        .get(dist_code as usize)
+        .copied()
+        .unwrap_or(dist_extra_bits) as u32;
+
+    len_sym_cost
+        .saturating_add(len_eb)
+        .saturating_add(dist_sym_cost)
+        .saturating_add(dist_eb)
+}
+
 /// Builder for creating Huffman code lengths from frequencies.
 #[derive(Debug)]
 pub struct HuffmanBuilder {

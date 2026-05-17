@@ -128,7 +128,7 @@ fn get_crc32c_fn() -> fn(&[u8]) -> u32 {
 pub fn crc32c(data: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        return get_crc32c_fn()(data);
+        get_crc32c_fn()(data)
     }
     #[cfg(not(target_arch = "x86_64"))]
     crc32c_scalar(data)

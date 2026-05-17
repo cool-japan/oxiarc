@@ -94,7 +94,7 @@ pub use async_io::{
 
 // Optional mmap re-exports
 #[cfg(feature = "mmap")]
-pub use mmap::{MmapOptions, MmapReader};
+pub use mmap::{MappedFile, MmapOptions, MmapReader};
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -107,7 +107,7 @@ pub mod prelude {
     pub use crate::entry::{CompressionMethod, Entry, EntryBuilder, EntryType};
     pub use crate::error::{OxiArcError, Result};
     #[cfg(feature = "mmap")]
-    pub use crate::mmap::{MmapOptions, MmapReader};
+    pub use crate::mmap::{MappedFile, MmapOptions, MmapReader};
     pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
     pub use crate::traits::{
         ArchiveReader, ArchiveWriter, CompressionLevel, Compressor, Decompressor,

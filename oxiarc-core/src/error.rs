@@ -120,6 +120,15 @@ pub enum OxiArcError {
     /// Operation was cancelled by the caller.
     #[error("operation cancelled")]
     Cancelled,
+
+    /// Requested allocation exceeds the configured memory budget.
+    #[error("memory budget exceeded: budget={budget}, requested={requested}")]
+    MemoryBudgetExceeded {
+        /// The configured budget in bytes.
+        budget: usize,
+        /// The allocation that would have been required.
+        requested: usize,
+    },
 }
 
 /// Result type alias for OxiArc operations.
@@ -204,6 +213,11 @@ impl OxiArcError {
         Self::EncodingError {
             message: message.into(),
         }
+    }
+
+    /// Create a memory budget exceeded error.
+    pub fn memory_budget_exceeded(budget: usize, requested: usize) -> Self {
+        Self::MemoryBudgetExceeded { budget, requested }
     }
 }
 

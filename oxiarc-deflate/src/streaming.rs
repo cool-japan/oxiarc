@@ -41,10 +41,10 @@
 //! ```
 
 use crate::deflate::Deflater;
-use crate::gzip::gzip_decompress;
+use crate::inflate::Inflater;
 use crate::zlib::{Adler32, zlib_decompress};
-use oxiarc_core::Crc32;
-use std::io::{self, Read, Write};
+use oxiarc_core::{BitReader, Crc32};
+use std::io::{self, Cursor, Read, Write};
 
 /// Default block size for incremental encoder flushing (128 KiB).
 const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
@@ -313,8 +313,18 @@ impl<R: Read> GzipStreamDecoder<R> {
 
     /// Read and decompress all compressed data from the inner reader.
     ///
-    /// Handles concatenated GZIP members by repeatedly decoding until all
-    /// input is consumed.
+    /// Handles concatenated GZIP members correctly by tracking exact DEFLATE
+    /// block boundaries via the inflater's bit-level parser rather than
+    /// scanning for magic bytes in the compressed payload (which would produce
+    /// false-positive splits whenever `0x1F 0x8B` appears inside DEFLATE data).
+    ///
+    /// Each GZIP member is decoded as:
+    ///   1. 10-byte fixed header (plus optional variable-length fields)
+    ///   2. DEFLATE compressed data  — consumed by `Inflater::inflate_consumed`
+    ///   3. 8-byte trailer: CRC-32 (LE) + ISIZE (LE)
+    ///
+    /// A single `BitReader` is shared across all members so the stream position
+    /// is always exact and no bytes are lost between members.
     fn fill_buffer(&mut self) -> io::Result<()> {
         if self.finished || self.output_pos < self.output_buffer.len() {
             return Ok(());
@@ -328,60 +338,157 @@ impl<R: Read> GzipStreamDecoder<R> {
             return Ok(());
         }
 
-        // Decompress concatenated GZIP members. Each member starts with the
-        // magic bytes 0x1f 0x8b. We try to decompress the first member; if
-        // there is trailing data that also starts with the magic bytes we
-        // decompress that too.
+        let cursor = Cursor::new(compressed);
+        let mut bit_reader = BitReader::new(cursor);
         let mut all_decompressed = Vec::new();
-        let mut remaining = &compressed[..];
 
-        while !remaining.is_empty() {
-            // Check for GZIP magic
-            if remaining.len() < 2 || remaining[0] != 0x1f || remaining[1] != 0x8b {
-                // Not a GZIP member; could be trailing garbage. Stop.
+        loop {
+            // ── 1. Peek at the first two bytes to detect GZIP magic ──────────
+            let mut magic = [0u8; 2];
+            match bit_reader.read_bytes(&mut magic) {
+                Ok(()) => {}
+                Err(oxiarc_core::error::OxiArcError::Io(ref e))
+                    if e.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
+                Err(oxiarc_core::error::OxiArcError::UnexpectedEof { .. }) => break,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            }
+
+            if magic[0] != GZIP_ID1 || magic[1] != GZIP_ID2 {
+                // Trailing non-GZIP data — stop gracefully.
                 break;
             }
 
-            // Try to decompress the full remaining data as a single GZIP member.
-            // gzip_decompress will parse the header/trailer and only consume one
-            // member's worth of DEFLATE data, but it expects the trailer to be
-            // at the end. For concatenated members we need to find member
-            // boundaries.
-            //
-            // Strategy: try decompress the entire remaining data. If it fails
-            // (because there is a second member concatenated), search for the
-            // next member boundary.
-            match gzip_decompress(remaining) {
-                Ok(decompressed) => {
-                    all_decompressed.extend_from_slice(&decompressed);
-                    // Successfully decoded the whole remaining data as one member.
-                    remaining = &[];
-                }
-                Err(_) => {
-                    // There might be concatenated members. Try to find the end
-                    // of the first member by looking for the next 0x1f 0x8b
-                    // after position 2.
-                    let mut decoded_one = false;
-                    for split_pos in 18..remaining.len().saturating_sub(1) {
-                        if remaining[split_pos] == 0x1f && remaining[split_pos + 1] == 0x8b {
-                            // Try to decode just the first part
-                            if let Ok(decompressed) = gzip_decompress(&remaining[..split_pos]) {
-                                all_decompressed.extend_from_slice(&decompressed);
-                                remaining = &remaining[split_pos..];
-                                decoded_one = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !decoded_one {
-                        // Could not split; return an error for the original data.
-                        return Err(io::Error::new(
+            // ── 2. Read the rest of the fixed 10-byte header ────────────────
+            // We already consumed 2 bytes (ID1, ID2); read the remaining 8.
+            let mut header_rest = [0u8; 8];
+            bit_reader.read_bytes(&mut header_rest).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("gzip header truncated: {e}"),
+                )
+            })?;
+            let cm = header_rest[0]; // compression method (byte 2)
+            let flg = header_rest[1]; // flags (byte 3)
+            // bytes 2-5: MTIME (ignored), byte 6: XFL (ignored), byte 7: OS (ignored)
+
+            if cm != GZIP_CM_DEFLATE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported gzip compression method: {cm}"),
+                ));
+            }
+
+            // ── 3. Skip optional header fields based on FLG ──────────────────
+            // FEXTRA (bit 2): 2-byte XLEN followed by XLEN bytes
+            if flg & 0x04 != 0 {
+                let mut xlen_buf = [0u8; 2];
+                bit_reader.read_bytes(&mut xlen_buf).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("gzip FEXTRA truncated: {e}"),
+                    )
+                })?;
+                let xlen = u16::from_le_bytes(xlen_buf) as usize;
+                let mut extra = vec![0u8; xlen];
+                bit_reader.read_bytes(&mut extra).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("gzip FEXTRA data truncated: {e}"),
+                    )
+                })?;
+            }
+
+            // FNAME (bit 3): null-terminated string
+            if flg & 0x08 != 0 {
+                let mut byte = [0u8; 1];
+                loop {
+                    bit_reader.read_bytes(&mut byte).map_err(|e| {
+                        io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "failed to decompress GZIP data",
-                        ));
+                            format!("gzip FNAME truncated: {e}"),
+                        )
+                    })?;
+                    if byte[0] == 0 {
+                        break;
                     }
                 }
             }
+
+            // FCOMMENT (bit 4): null-terminated comment
+            if flg & 0x10 != 0 {
+                let mut byte = [0u8; 1];
+                loop {
+                    bit_reader.read_bytes(&mut byte).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("gzip FCOMMENT truncated: {e}"),
+                        )
+                    })?;
+                    if byte[0] == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // FHCRC (bit 1): 2-byte header CRC16 (skip)
+            if flg & 0x02 != 0 {
+                let mut hcrc = [0u8; 2];
+                bit_reader.read_bytes(&mut hcrc).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("gzip FHCRC truncated: {e}"),
+                    )
+                })?;
+            }
+
+            // ── 4. Inflate the DEFLATE payload ────────────────────────────────
+            // `inflate_consumed` reads bits from the shared BitReader and returns
+            // the decompressed data.  On return the BitReader is aligned to the
+            // next byte boundary (any intra-byte padding is skipped), so reading
+            // the 8-byte footer next is safe and exact.
+            let mut inflater = Inflater::new();
+            let (decompressed, _consumed) =
+                inflater.inflate_consumed(&mut bit_reader).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("gzip deflate error: {e}"),
+                    )
+                })?;
+
+            // ── 5. Read and verify the 8-byte GZIP trailer ───────────────────
+            let mut trailer = [0u8; 8];
+            bit_reader.read_bytes(&mut trailer).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("gzip trailer truncated: {e}"),
+                )
+            })?;
+
+            let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+            let stored_isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+
+            let actual_crc = Crc32::compute(&decompressed);
+            if actual_crc != stored_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "gzip CRC-32 mismatch: stored {stored_crc:#010x}, computed {actual_crc:#010x}"
+                    ),
+                ));
+            }
+
+            let actual_isize = (decompressed.len() as u64 & 0xFFFF_FFFF) as u32;
+            if actual_isize != stored_isize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("gzip ISIZE mismatch: stored {stored_isize}, computed {actual_isize}"),
+                ));
+            }
+
+            all_decompressed.extend_from_slice(&decompressed);
         }
 
         self.output_buffer = all_decompressed;

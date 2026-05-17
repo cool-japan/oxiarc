@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -28,34 +28,34 @@ categories = ["compression", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-oxiarc-core = { version = "0.2", path ="oxiarc-core" }
-oxiarc-deflate = { version = "0.2", path ="oxiarc-deflate" }
-oxiarc-lzhuf = { version = "0.2", path ="oxiarc-lzhuf" }
-oxiarc-lzw = { version = "0.2", path ="oxiarc-lzw" }
-oxiarc-lzma = { version = "0.2", path ="oxiarc-lzma" }
-oxiarc-bzip2 = { version = "0.2", path ="oxiarc-bzip2" }
-oxiarc-lz4 = { version = "0.2", path ="oxiarc-lz4" }
-oxiarc-zstd = { version = "0.2", path ="oxiarc-zstd" }
-oxiarc-snappy = { version = "0.2", path ="oxiarc-snappy" }
-oxiarc-brotli = { version = "0.2", path ="oxiarc-brotli" }
-oxiarc-archive = { version = "0.2", path ="oxiarc-archive" }
+oxiarc-core = { version = "0.3", path ="oxiarc-core" }
+oxiarc-deflate = { version = "0.3", path ="oxiarc-deflate" }
+oxiarc-lzhuf = { version = "0.3", path ="oxiarc-lzhuf" }
+oxiarc-lzw = { version = "0.3", path ="oxiarc-lzw" }
+oxiarc-lzma = { version = "0.3", path ="oxiarc-lzma" }
+oxiarc-bzip2 = { version = "0.3", path ="oxiarc-bzip2" }
+oxiarc-lz4 = { version = "0.3", path ="oxiarc-lz4" }
+oxiarc-zstd = { version = "0.3", path ="oxiarc-zstd" }
+oxiarc-snappy = { version = "0.3", path ="oxiarc-snappy" }
+oxiarc-brotli = { version = "0.3", path ="oxiarc-brotli" }
+oxiarc-archive = { version = "0.3", path ="oxiarc-archive" }
 
 # External dependencies
 thiserror = "2.0.18"
 encoding_rs = "0.8.35"
 clap = { version = "4.6.1", features = ["derive"] }
-clap_complete = "4.6.3"
+clap_complete = "4.6.5"
 indicatif = "0.18.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 dialoguer = "0.12.0"
-filetime = "0.2.27"
+filetime = "0.2.29"
 owo-colors = "4.3.0"
 supports-color = "3.0.2"
 clap_mangen = "0.3.0"
 rpassword = "7.5.2"
 rayon = "1.12.0"
-tokio = { version = "1.52.2", features = ["io-util", "rt", "macros", "sync"] }
+tokio = { version = "1.52.3", features = ["io-util", "rt", "macros", "sync"] }
 memmap2 = "0.9.10"
 criterion = "0.8.2"
 weezl = "0.1.12"

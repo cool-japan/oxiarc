@@ -1,7 +1,7 @@
 //! LZ4 block compression/decompression.
 //!
 //! LZ4 block format:
-//! - Sequences of (token, [literal_length_ext], literals, [match_length_ext], offset)
+//! - Sequences of (token, `literal_length_ext`, literals, `match_length_ext`, offset)
 //! - Token: 4-bit literal length + 4-bit match length
 //! - If literal length = 15, additional bytes follow (add 255 until byte < 255)
 //! - Literals: raw bytes
@@ -62,6 +62,60 @@ pub fn compress_block_hc(input: &[u8], compression_level: i32) -> Result<Vec<u8>
         None => crate::hc::HcLevel::DEFAULT,
     };
     crate::hc::compress_hc_level(input, level)
+}
+
+/// Compress data using LZ4 block format with a prefix dictionary.
+///
+/// The dictionary allows references to bytes that exist in the dictionary,
+/// improving compression ratios for data that shares common patterns with it.
+/// The dictionary is automatically truncated to the last 64 KiB (LZ4 maximum
+/// match distance).
+///
+/// `acceleration` controls how aggressively the compressor skips positions
+/// after a hash miss. Values less than 1 are clamped to 1.
+///
+/// The compressed output must be decompressed with the **same** dictionary
+/// via [`decompress_block_dict`].
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_lz4::block::{compress_block_with_dict, decompress_block_dict};
+///
+/// let dict = b"The quick brown fox jumps over the lazy dog.";
+/// let data = b"The quick brown fox jumps over the lazy dog. And again!";
+/// let compressed = compress_block_with_dict(data, dict, 1).unwrap();
+/// let decompressed = decompress_block_dict(&compressed, dict, data.len() * 2).unwrap();
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn compress_block_with_dict(input: &[u8], dict: &[u8], accel: i32) -> Result<Vec<u8>> {
+    let lz4dict = crate::dict::Lz4Dict::new(dict);
+    crate::dict::compress_with_dict_accel(input, &lz4dict, accel)
+}
+
+/// Decompress LZ4 block data that was compressed with a prefix dictionary.
+///
+/// Back-references that point before the start of the decompressed output are
+/// resolved from the tail of `dict`. You must supply the **same** dictionary
+/// that was used during compression.
+///
+/// The dictionary is automatically truncated to its last 64 KiB to match the
+/// encoder's behaviour.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_lz4::block::{compress_block_with_dict, decompress_block_dict};
+///
+/// let dict = b"some common prefix data";
+/// let data = b"some common prefix data plus more unique bytes";
+/// let compressed = compress_block_with_dict(data, dict, 1).unwrap();
+/// let decompressed = decompress_block_dict(&compressed, dict, data.len() * 2).unwrap();
+/// assert_eq!(decompressed, data);
+/// ```
+pub fn decompress_block_dict(input: &[u8], dict: &[u8], output_capacity: usize) -> Result<Vec<u8>> {
+    let lz4dict = crate::dict::Lz4Dict::new(dict);
+    crate::dict::decompress_with_dict(input, output_capacity, &lz4dict)
 }
 
 /// Decompress LZ4 block data.

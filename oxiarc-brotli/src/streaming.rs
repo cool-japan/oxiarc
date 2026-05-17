@@ -30,9 +30,10 @@ use std::io::{self, Read, Write};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 
-use crate::compress::{BrotliParams, compress_with_hooks};
+use crate::compress::BrotliParams;
 use crate::decompress::decompress_with_hooks;
 use crate::error::BrotliError;
+use crate::pool::BrotliPool;
 
 /// Default buffer size for streaming operations (256KB).
 const DEFAULT_BUF_SIZE: usize = 256 * 1024;
@@ -74,6 +75,8 @@ pub struct BrotliCompressor<W: Write> {
     cancel: Option<CancellationToken>,
     /// Cumulative compressed bytes emitted so far.
     bytes_out: u64,
+    /// Optional buffer pool for per-encode allocations.
+    pool: Option<BrotliPool>,
 }
 
 impl<W: Write> BrotliCompressor<W> {
@@ -87,6 +90,7 @@ impl<W: Write> BrotliCompressor<W> {
             progress: None,
             cancel: None,
             bytes_out: 0,
+            pool: None,
         }
     }
 
@@ -101,7 +105,35 @@ impl<W: Write> BrotliCompressor<W> {
             progress: None,
             cancel: None,
             bytes_out: 0,
+            pool: None,
         }
+    }
+
+    /// Attach a buffer pool to amortise per-encode allocations.
+    ///
+    /// The pool is cloned internally (cheap `Arc` clone) so the caller can
+    /// reuse the same pool across multiple compressors without lifetime
+    /// constraints.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::io::Write;
+    /// use oxiarc_brotli::streaming::BrotliCompressor;
+    /// use oxiarc_brotli::compress::BrotliParams;
+    /// use oxiarc_brotli::pool::BrotliPool;
+    ///
+    /// let pool = BrotliPool::new();
+    /// let mut output = Vec::new();
+    /// let params = BrotliParams::default();
+    /// let mut compressor = BrotliCompressor::new(&mut output, params)
+    ///     .with_pool(&pool);
+    /// compressor.write_all(b"Hello, pooled Brotli!").unwrap();
+    /// let _ = compressor.finish();
+    /// ```
+    pub fn with_pool(mut self, pool: &BrotliPool) -> Self {
+        self.pool = Some(pool.clone());
+        self
     }
 
     /// Attach a progress sink.
@@ -139,14 +171,15 @@ impl<W: Write> BrotliCompressor<W> {
     /// Internal finish implementation.
     fn do_finish(&mut self) -> io::Result<()> {
         // Compress all buffered data, threading progress/cancel hooks into
-        // the per-meta-block loop inside compress_with_hooks.
+        // the per-meta-block loop inside compress_with_hooks(_pooled).
         let all_data = std::mem::take(&mut self.buffer);
 
-        let compressed = compress_with_hooks(
+        let compressed = crate::compress::compress_with_hooks_pooled(
             &all_data,
             &self.params,
             self.progress.as_ref(),
             self.cancel.as_ref(),
+            self.pool.as_ref(),
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -308,7 +341,7 @@ pub fn compress_to_writer<W: Write>(
         quality,
         ..BrotliParams::default()
     };
-    let compressed = compress_with_hooks(data, &params, None, None)?;
+    let compressed = crate::compress::compress_with_hooks_pooled(data, &params, None, None, None)?;
     writer.write_all(&compressed).map_err(BrotliError::from)?;
     Ok(())
 }

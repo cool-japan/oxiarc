@@ -3,11 +3,13 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.2.8-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.2.8** (2026-05-08) — 74 tests passing.
+**Version 0.3.0** (2026-05-17) — 139 tests passing.
+
+**What's new in 0.3.0**: `Bt4MatchFinder` — BT4 binary tree match finder with 3-table hash (h2/h3/h4), level 9 now uses BT4 for superior compression; `MatchFinder` trait abstracting both `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9); custom dictionary support via `LzmaEncoder::with_dictionary` and `LzmaDecoder::with_dictionary`; memory pool via `LzmaPool`, `PooledBuf`, and `LzmaDecoderPooled`; parallel LZMA2 compression via `lzma2_compress_parallel` and `ParallelLzma2Encoder` (requires `features = ["parallel"]`).
 
 **What's new in 0.2.8**: `with_progress(Arc<dyn ProgressSink>)` and `with_cancel(CancellationToken)` builder methods on `Lzma2Encoder`, `Lzma2Decoder`, and `Lzma2ChunkedEncoder` for progress reporting and cooperative cancellation.
 
@@ -36,6 +38,11 @@ It's used in:
 - **Range Coder** - Precise 11-bit probability model
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on LZMA2 codecs
 - **Cooperative cancellation** - `with_cancel(CancellationToken)` builder on LZMA2 codecs
+- **BT4 match finder** - `Bt4MatchFinder` with 3-table hash (h2/h3/h4); level 9 uses BT4 for superior compression
+- **Match finder trait** - `MatchFinder` abstracting `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9)
+- **Custom dictionary** - `LzmaEncoder::with_dictionary` and `LzmaDecoder::with_dictionary`
+- **Memory pool** - `LzmaPool`, `PooledBuf`, `LzmaDecoderPooled` for allocation-efficient workloads
+- **Parallel LZMA2** - `lzma2_compress_parallel` free function and `ParallelLzma2Encoder` builder for multi-threaded LZMA2 compression; output is a valid LZMA2 stream decodable by `Lzma2Decoder` (requires `features = ["parallel"]`)
 
 All features are implemented and tested. API is stable.
 
@@ -201,13 +208,54 @@ let bit = decoder.decode_bit(&mut prob)?;
 let value = decoder.decode_direct_bits(num_bits)?;
 ```
 
+### Parallel LZMA2 Compression
+
+Requires `features = ["parallel"]`. The output is a valid LZMA2 stream that can be decoded by `Lzma2Decoder`. Default chunk size is 1 MiB; note that compression ratio may be slightly lower than serial for small inputs because there is no cross-chunk dictionary.
+
+```rust
+use oxiarc_lzma::{lzma2_compress_parallel, Lzma2Decoder, ParallelLzma2Encoder};
+
+let data = b"Hello, LZMA2 parallel! ".repeat(10_000);
+
+// Free-function API (level, chunk_size, num_threads)
+let compressed = lzma2_compress_parallel(&data, 6, 1024 * 1024, None)?;
+
+// Decoder roundtrip
+let decompressed = Lzma2Decoder::new().decode(&compressed)?;
+assert_eq!(&decompressed, data.as_ref());
+
+// Builder API
+let compressed = ParallelLzma2Encoder::new()
+    .level(6)
+    .chunk_size(512 * 1024)
+    .encode(&data)?;
+
+let decompressed = Lzma2Decoder::new().decode(&compressed)?;
+assert_eq!(&decompressed, data.as_ref());
+```
+
+## Features (Cargo)
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `parallel` | no | Multi-threaded LZMA2 compression via Rayon |
+
+```toml
+[dependencies]
+# Default (serial only)
+oxiarc-lzma = "0.3.0"
+
+# With parallel LZMA2 compression
+oxiarc-lzma = { version = "0.3.0", features = ["parallel"] }
+```
+
 ## Usage
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.2.8"
+oxiarc-lzma = "0.3.0"
 ```
 
 ## Modules

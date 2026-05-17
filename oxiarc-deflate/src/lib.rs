@@ -45,6 +45,8 @@ pub mod gzip;
 pub mod huffman;
 pub mod inflate;
 pub mod lz77;
+pub mod optimal;
+pub mod pool;
 pub mod streaming;
 pub mod tables;
 pub mod zlib;
@@ -55,15 +57,26 @@ pub mod async_deflate;
 #[cfg(feature = "async-io")]
 pub mod raw_stream;
 
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
 #[cfg(feature = "async-io")]
 pub use raw_stream::{RawDeflateWriter, RawInflateReader};
+
+#[cfg(feature = "parallel")]
+pub use parallel::{
+    DEFAULT_PARALLEL_CHUNK_SIZE, ParallelGzipEncoder, compress_deflate_parallel,
+    compress_gzip_parallel, gzip_compress_parallel,
+};
 
 // Re-exports
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
 pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, inflate};
-pub use lz77::{Lz77Encoder, Lz77Token};
+pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
+pub use optimal::OptimalParser;
+pub use pool::{DeflatePool, PoolStats};
 pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
 pub use zlib::{
     Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,

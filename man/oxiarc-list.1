@@ -1,0 +1,57 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH oxiarc-list 1  "oxiarc-list " 
+.SH NAME
+oxiarc\-list \- List contents of an archive
+.SH SYNOPSIS
+\fBoxiarc\-list\fR [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-j\fR|\fB\-\-json\fR] [\fB\-T\fR|\fB\-\-tree\fR] [\fB\-s\fR|\fB\-\-sort\fR] [\fB\-r\fR|\fB\-\-reverse\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> 
+.SH DESCRIPTION
+List contents of an archive
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Show verbose output
+.TP
+\fB\-j\fR, \fB\-\-json\fR
+Output as JSON (machine\-readable)
+.TP
+\fB\-T\fR, \fB\-\-tree\fR
+Display as directory tree
+.TP
+\fB\-s\fR, \fB\-\-sort\fR \fI<SORT>\fR [default: name]
+Sort entries by: name, size, date, or ratio
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+name: Sort by name (alphabetical)
+.IP \(bu 2
+size: Sort by file size
+.IP \(bu 2
+date: Sort by modification date
+.IP \(bu 2
+ratio: Sort by compression ratio (compressed_size / original_size)
+.RE
+.TP
+\fB\-r\fR, \fB\-\-reverse\fR
+Reverse sort order
+.TP
+\fB\-I\fR, \fB\-\-include\fR \fI<INCLUDE>\fR
+Include only files matching pattern (glob syntax: *.txt, src/**/*)
+.TP
+\fB\-X\fR, \fB\-\-exclude\fR \fI<EXCLUDE>\fR
+Exclude files matching pattern (glob syntax)
+.TP
+\fB\-\-lenient\fR
+Continue on corruption when reading the archive (emit warnings to stderr)
+.TP
+\fB\-\-memory\-limit\fR \fI<MEMORY_LIMIT>\fR
+Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIARCHIVE\fR>
+Archive file to list
