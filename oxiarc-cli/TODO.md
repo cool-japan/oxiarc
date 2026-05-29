@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.2.8, 2026-05-08)
+# oxiarc-cli - Development Status (v0.3.1, 2026-05-30)
 
 ## Completed Features (COMPLETE)
 

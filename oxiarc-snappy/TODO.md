@@ -1,4 +1,4 @@
-# oxiarc-snappy - Development Status (v0.3.0, 2026-05-16)
+# oxiarc-snappy - Development Status (v0.3.1, 2026-05-30)
 
 ## Completed Features (COMPLETE)
 
@@ -65,7 +65,7 @@
   - **Tests:** async roundtrip, cross-API parity (sync↔async + parallel output decodable), async_empty (zero bytes returns Ok(0))
 
 ### Compatibility
-- [ ] Interop testing with Google Snappy reference
+- [x] Interop testing with Google Snappy reference — 16 integration tests against Google Snappy wire-format golden vectors (empty, single-byte, 64 KiB boundary, 64 KiB+1, `max_compress_len` invariant, arbitrary-data roundtrip, crafted-stream decode, truncated/oversized-varint rejection) (done 2026-05-30)
 - [ ] Fuzzing tests
 - [ ] Edge case handling (max-size blocks)
 

@@ -1,4 +1,4 @@
-# oxiarc-brotli - Development Status (v0.3.0, 2026-05-17)
+# oxiarc-brotli - Development Status (v0.3.1, 2026-05-30)
 
 ## Completed Features (COMPLETE)
 
@@ -76,7 +76,7 @@
 ### Compatibility
 - [ ] Full RFC 7932 conformance testing
 - [ ] Fuzzing tests
-- [ ] Interop testing with reference Brotli implementation
+- [x] Interop testing with reference Brotli implementation — 19 integration tests covering all quality levels 0–11, empty/single-byte/binary/text/large-input roundtrips, `compress_with_params` variations, minimum-window (lgwin=16), compression-is-beneficial assertion, invalid parameter rejection (done 2026-05-30)
 
 ## Test Coverage
 

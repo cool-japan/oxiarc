@@ -3,12 +3,12 @@
 
 Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.0 (2026-05-17) | 112 tests passing**
+**Version: 0.3.1 (2026-05-30) | 112 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-snappy = "0.3.0"
+oxiarc-snappy = "0.3.1"
 ```
 
 ### Block Format
@@ -90,10 +90,10 @@ All other functionality — block format, framing format, CRC32C (with SSE 4.2 h
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-snappy = "0.3.0"
+oxiarc-snappy = "0.3.1"
 
 # With parallel compression
-oxiarc-snappy = { version = "0.3.0", features = ["parallel"] }
+oxiarc-snappy = { version = "0.3.1", features = ["parallel"] }
 ```
 
 ## CRC32C
@@ -108,6 +108,21 @@ On x86_64 hosts, the CRC32C path is accelerated at runtime when SSE 4.2 is avail
 - Fast path uses `_mm_crc32_u64` (8 bytes/cycle), with `_mm_crc32_u8` for trailing 1–7 bytes.
 - The output is bitwise-identical to the scalar path — no difference in correctness.
 - On non-x86_64 platforms (e.g. aarch64/macOS) and on x86_64 without SSE 4.2, the scalar fallback is used transparently.
+
+## What's new in 0.3.1
+
+16 interop integration tests against Google Snappy wire-format golden vectors:
+
+- Empty input roundtrip
+- Single-byte roundtrip
+- 64 KiB boundary roundtrip
+- 64 KiB + 1 byte roundtrip
+- `max_compress_len` invariant verification
+- Arbitrary-data roundtrip
+- Crafted-stream decode
+- Truncated-varint rejection
+- Oversized-varint rejection
+- And 7 additional wire-format compatibility cases
 
 ## Part of OxiArc
 

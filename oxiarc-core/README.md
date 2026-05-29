@@ -3,11 +3,11 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.0** (2026-05-17) — 132 tests passing.
+**Version 0.3.1** (2026-05-30) — 132 tests passing.
 
 **What's new in 0.3.0**: Added `MappedFile` — a zero-copy memory-mapped file primitive backed by `memmap2` (enable the `mmap` feature). SIMD CRC-32 acceleration is now auto-enabled at compile time via `cfg(target_arch)` and no longer requires the `simd` feature flag; the flag is now a deprecated no-op.
 
@@ -177,14 +177,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.3.0"
+oxiarc-core = "0.3.1"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.3.0", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.3.1", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

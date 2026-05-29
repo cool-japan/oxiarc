@@ -2,13 +2,15 @@
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.0** (2026-05-17) — 99 tests passing.
+**Version 0.3.1** (2026-05-30) — 99 tests passing.
 
 **What's new in 0.3.0**: 4-byte multiplicative hash for better avalanche and fewer collisions; `LzssOptimalParser` — two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder; custom dictionary support via `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, and `LzssDecoder::preload_dictionary`.
+
+**What's new in 0.3.1**: Custom dictionary support — `LzhEncoder::with_dictionary(method, dict)` and `set_dictionary(&mut self, dict)` allow seeding the encoder with a known prefix corpus; `LzhDecoder::with_dictionary(method, size, dict)` and `set_dictionary` mirror the interface for the decoder; `LzssEncoder::preload_dictionary` and `LzssDecoder::preload_dictionary` seed hash chains and ring buffer from the dict tail, improving compression ratio when encoder and decoder share a known corpus prefix.
 
 ## Overview
 
@@ -171,7 +173,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzhuf = "0.2.6"
+oxiarc-lzhuf = "0.3.1"
 ```
 
 ## Compatibility

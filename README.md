@@ -72,6 +72,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Snappy Async I/O** - Async compression/decompression via `AsyncSnappyCompressor`, `AsyncSnappyDecompressor` (`async-io` feature in oxiarc-snappy)
 - **Zstd Multi-Frame** - Multi-frame decompression via `decompress_multi_frame`, `decompress_multi_frame_with_dict`; streaming dict multi-frame fix
 - **CLI Man Pages** - Full set of troff `.1` man pages for all CLI subcommands in `man/` directory
+- **Snappy/Brotli Interop Tests** - 35 new integration tests against wire-format golden vectors (16 Snappy, 19 Brotli) validating spec compliance
 
 ## Architecture
 
@@ -104,7 +105,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
 | `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~4,373 | 132 |
-| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip + streaming (GzipStream/ZlibStream) | ~4,522 | 205 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip + streaming (GzipStream/ZlibStream) | ~4,522 | 212 |
 | `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman + custom dictionaries | ~3,436 | 99 |
 | `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~2,037 | 41 |
 | `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, acceleration parameter | ~4,120 | 138 |
@@ -115,7 +116,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-brotli` | Brotli compression (RFC 7932) with static dictionary, quality 0-11, streaming | ~3,536 | 150 |
 | `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~1,451 | 112 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, man pages | ~2,947 | 37 |
-| **Total** | **Pure Rust archive/compression library** | **~70,968 SLoC (227 files)** | **1,640** |
+| **Total** | **Pure Rust archive/compression library** | **~71,000 SLoC (227 files)** | **1,647** |
 
 ## Installation
 
@@ -138,14 +139,14 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.3.0"  # For archive format support
-oxiarc-deflate = "0.3.0"  # For DEFLATE compression
-oxiarc-lzma = "0.3.0"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.3.0"    # For Bzip2 compression
-oxiarc-lz4 = "0.3.0"      # For LZ4 compression
-oxiarc-zstd = "0.3.0"     # For Zstandard compression
-oxiarc-brotli = "0.3.0"   # For Brotli compression
-oxiarc-snappy = "0.3.0"   # For Snappy compression
+oxiarc-archive = "0.3.1"  # For archive format support
+oxiarc-deflate = "0.3.1"  # For DEFLATE compression
+oxiarc-lzma = "0.3.1"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.3.1"    # For Bzip2 compression
+oxiarc-lz4 = "0.3.1"      # For LZ4 compression
+oxiarc-zstd = "0.3.1"     # For Zstandard compression
+oxiarc-brotli = "0.3.1"   # For Brotli compression
+oxiarc-snappy = "0.3.1"   # For Snappy compression
 ```
 
 ## Quick Start
@@ -271,21 +272,21 @@ Modern compression format:
 
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
-| oxiarc-core     | Stable  | 227        | 132           |
-| oxiarc-deflate  | Stable  | 128        | 205           |
-| oxiarc-lzhuf    | Stable  | 89         | 99            |
+| oxiarc-core     | Stable  | 228        | 132           |
+| oxiarc-deflate  | Stable  | 150        | 212           |
+| oxiarc-lzhuf    | Stable  | 94         | 99            |
 | oxiarc-bzip2    | Stable  | 39         | 41            |
-| oxiarc-lz4      | Stable  | 110        | 138           |
-| oxiarc-zstd     | Stable  | 156        | 179           |
-| oxiarc-lzma     | Stable  | 167        | 139           |
-| oxiarc-archive  | Stable  | 402        | 332           |
+| oxiarc-lz4      | Stable  | 123        | 138           |
+| oxiarc-zstd     | Stable  | 157        | 179           |
+| oxiarc-lzma     | Stable  | 186        | 139           |
+| oxiarc-archive  | Stable  | 404        | 332           |
 | oxiarc-lzw      | Stable  | 67         | 76            |
-| oxiarc-brotli   | Stable  | 78         | 150           |
-| oxiarc-snappy   | Stable  | 20         | 112           |
+| oxiarc-brotli   | Stable  | 90         | 150           |
+| oxiarc-snappy   | Stable  | 34         | 112           |
 | oxiarc-cli      | Stable  | 43         | 37            |
-| **Total**       |         | **1526**   | **1,640**     |
+| **Total**       |         | **1,615**  | **1,647**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.0 (2026-05-17).
+All crates are feature-complete, tested, and API-stable as of v0.3.1 (2026-05-30).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -742,7 +743,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 1,640 tests
+# Run all 1,647 tests
 cargo nextest run --all-features
 
 # Build CLI only

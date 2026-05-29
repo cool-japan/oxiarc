@@ -1,5 +1,5 @@
 
-# OxiArc - Development Roadmap (v0.3.0, 2026-05-17)
+# OxiArc - Development Roadmap (v0.3.1, 2026-05-30)
 
 ## Version History
 
@@ -217,6 +217,10 @@
   - **Prerequisites:** `archive-streaming-extraction` (this run)
   - **Tests:** none (meta-item)
   - **Risk:** none (tracking item only)
+
+### Quality / Testing
+- [x] Snappy interop integration tests (16 tests against wire-format golden vectors covering block and framed formats in oxiarc-snappy)
+- [x] Brotli interop integration tests (19 tests across quality levels 0-11 covering RFC 7932 compliance in oxiarc-brotli)
 
 ### Platform
 - [ ] WASM bindings

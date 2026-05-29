@@ -341,11 +341,18 @@ impl HuffmanBuilder {
     /// Build code lengths from frequencies.
     ///
     /// Returns an array where `result[i]` is the code length for symbol `i`.
+    ///
+    /// The result is guaranteed to be a **complete** length-limited prefix code
+    /// (Kraft sum exactly 1.0 over the used symbols), as required by
+    /// RFC 1951 §3.2.2 and by spec-compliant decoders (zlib `inflate_table`,
+    /// which rejects incomplete code-length / literal-length tables with
+    /// "invalid code lengths set"). The lengths are computed with the
+    /// package-merge algorithm (optimal under the `max_length` constraint).
     pub fn build_lengths(&self) -> Vec<u8> {
         let n = self.frequencies.len();
         let mut lengths = vec![0u8; n];
 
-        // Count non-zero frequencies
+        // Collect (frequency, symbol) for every used symbol.
         let mut symbols: Vec<(u32, usize)> = self
             .frequencies
             .iter()
@@ -359,16 +366,30 @@ impl HuffmanBuilder {
         }
 
         if symbols.len() == 1 {
-            // Single symbol gets length 1
-            lengths[symbols[0].1] = 1;
+            // A code with a single symbol cannot be a *complete* prefix code
+            // (a 1-bit code has Kraft sum 0.5, which spec decoders reject for
+            // the literal/length and code-length alphabets). Following zlib's
+            // deflate, we assign the lone symbol a 1-bit code and synthesise a
+            // second 1-bit code for the lowest unused symbol so the resulting
+            // table is complete. The phantom symbol has frequency 0 and is
+            // therefore never emitted in the data stream.
+            let only = symbols[0].1;
+            lengths[only] = 1;
+            let phantom = if only == 0 { 1.min(n - 1) } else { 0 };
+            // `n >= 1` here; if the alphabet has at least two slots we can place
+            // the phantom symbol, otherwise the single 1-bit code is the best we
+            // can represent (degenerate 1-symbol alphabet).
+            if phantom != only {
+                lengths[phantom] = 1;
+            }
             return lengths;
         }
 
-        // Sort by frequency (ascending)
+        // Sort by (frequency, symbol) ascending for deterministic, canonical
+        // tie-breaking.
         symbols.sort_by_key(|&(f, i)| (f, i));
 
-        // Build Huffman tree using package-merge algorithm for length-limited codes
-        let code_lengths = self.package_merge(&symbols);
+        let code_lengths = Self::package_merge(&symbols, self.max_length as usize);
 
         for (i, (_, symbol)) in symbols.iter().enumerate() {
             lengths[*symbol] = code_lengths[i];
@@ -377,89 +398,122 @@ impl HuffmanBuilder {
         lengths
     }
 
-    /// Package-merge algorithm for length-limited Huffman codes.
-    fn package_merge(&self, symbols: &[(u32, usize)]) -> Vec<u8> {
+    /// Length-limited optimal Huffman code lengths via the package-merge
+    /// (Larmore–Hirschberg) algorithm.
+    ///
+    /// `symbols` must be sorted by weight ascending and contain at least two
+    /// entries. `max_len` is the maximum permitted code length (≤ 15 for
+    /// DEFLATE literal/length and distance alphabets, ≤ 7 for the code-length
+    /// alphabet). Returns a `Vec<u8>` of code lengths parallel to `symbols`.
+    ///
+    /// The produced code is always **complete** (Kraft sum exactly 1.0): the
+    /// package-merge solution selects exactly `2*n - 2` coins, which is
+    /// equivalent to the Kraft equality for a full binary tree over `n` leaves.
+    fn package_merge(symbols: &[(u32, usize)], max_len: usize) -> Vec<u8> {
         let n = symbols.len();
-        let max_len = self.max_length as usize;
 
-        // Simple implementation using bit-length limiting
-        // For a more optimal implementation, use the full package-merge algorithm
-
-        let mut lengths = vec![0u8; n];
-
-        // Calculate ideal code lengths using Shannon-Fano approximation
-        let total: f64 = symbols.iter().map(|(f, _)| *f as f64).sum();
-
-        for (i, (freq, _)) in symbols.iter().enumerate() {
-            if *freq > 0 {
-                let prob = *freq as f64 / total;
-                let ideal_len = (-prob.log2()).ceil() as u8;
-                lengths[i] = ideal_len.max(1).min(self.max_length);
+        // The shortest length that can describe `n` symbols is ceil(log2(n)).
+        // If `max_len` is below that the alphabet is unrepresentable; clamp the
+        // effective limit up so we still emit a valid (complete) code. For the
+        // DEFLATE alphabets this never triggers (15 bits covers 286 symbols,
+        // 7 bits covers 19), but we stay defensive rather than panicking.
+        let min_bits = {
+            let mut b = 1usize;
+            while (1usize << b) < n {
+                b += 1;
             }
+            b
+        };
+        let limit = max_len.max(min_bits);
+
+        // Each "coin" references the index of an original symbol it covers.
+        // A package-merge "list" at a given bit-width is a sorted sequence of
+        // items; each item is either an original coin (one symbol) or a package
+        // (the merge of two items from the previous, wider list).
+        #[derive(Clone)]
+        struct Item {
+            weight: u64,
+            // Symbol indices (into `symbols`) covered by this item.
+            coverage: Vec<usize>,
         }
 
-        // Adjust lengths to satisfy Kraft inequality
-        self.adjust_lengths(&mut lengths, max_len);
+        // Base list: one coin per symbol, sorted ascending by weight (input is
+        // already sorted by (weight, symbol)).
+        let base: Vec<Item> = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, &(w, _))| Item {
+                weight: w as u64,
+                coverage: vec![idx],
+            })
+            .collect();
 
-        lengths
-    }
-
-    /// Adjust code lengths to satisfy Kraft inequality and length limit.
-    fn adjust_lengths(&self, lengths: &mut [u8], max_len: usize) {
-        // Iteratively increase lengths until Kraft inequality is satisfied.
-        // A single pass is not sufficient for large, highly skewed distributions
-        // (e.g. 1MB of identical bytes) where the Shannon-Fano approximation may
-        // under-estimate many code lengths at once.  We keep looping as long as
-        // the tree is over-subscribed AND at least one symbol can still be
-        // lengthened.
-        loop {
-            // Calculate Kraft sum
-            let kraft_sum: f64 = lengths
-                .iter()
-                .filter(|&&l| l > 0)
-                .map(|&l| 2.0f64.powi(-(l as i32)))
-                .sum();
-
-            if kraft_sum <= 1.0 {
-                return; // Satisfied
+        // Build successive lists from the widest bit position (`limit`) down to
+        // bit position 1. At each step we package adjacent pairs of the previous
+        // list, then merge those packages with the base coins.
+        let mut prev: Vec<Item> = base.clone();
+        for _ in 1..limit {
+            // Package adjacent pairs of `prev`.
+            let mut packages: Vec<Item> = Vec::with_capacity(prev.len() / 2);
+            let mut i = 0;
+            while i + 1 < prev.len() {
+                let a = &prev[i];
+                let b = &prev[i + 1];
+                let mut coverage = Vec::with_capacity(a.coverage.len() + b.coverage.len());
+                coverage.extend_from_slice(&a.coverage);
+                coverage.extend_from_slice(&b.coverage);
+                packages.push(Item {
+                    weight: a.weight + b.weight,
+                    coverage,
+                });
+                i += 2;
             }
 
-            // Gather indices of symbols that still have room to grow,
-            // sorted longest-first so we perturb the least-frequent symbols first.
-            let mut candidates: Vec<usize> = (0..lengths.len())
-                .filter(|&i| lengths[i] > 0 && lengths[i] < max_len as u8)
-                .collect();
-
-            if candidates.is_empty() {
-                // All symbols are at max_len; cannot fix further.
-                return;
-            }
-
-            candidates.sort_by(|&a, &b| lengths[b].cmp(&lengths[a]));
-
-            let mut made_progress = false;
-            for &i in &candidates {
-                if lengths[i] < max_len as u8 {
-                    lengths[i] += 1;
-                    made_progress = true;
-
-                    let new_kraft: f64 = lengths
-                        .iter()
-                        .filter(|&&l| l > 0)
-                        .map(|&l| 2.0f64.powi(-(l as i32)))
-                        .sum();
-
-                    if new_kraft <= 1.0 {
-                        return; // Satisfied
-                    }
+            // Merge `base` coins with `packages`, keeping ascending weight order.
+            let mut merged: Vec<Item> = Vec::with_capacity(base.len() + packages.len());
+            let mut bi = 0;
+            let mut pi = 0;
+            while bi < base.len() || pi < packages.len() {
+                let take_base = match (base.get(bi), packages.get(pi)) {
+                    (Some(b), Some(p)) => b.weight <= p.weight,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if take_base {
+                    merged.push(base[bi].clone());
+                    bi += 1;
+                } else {
+                    merged.push(packages[pi].clone());
+                    pi += 1;
                 }
             }
+            prev = merged;
+        }
 
-            if !made_progress {
-                // No symbol could be incremented; give up.
-                return;
+        // Select the first `2*n - 2` items of the final list. The code length of
+        // a symbol equals the number of selected items that cover it.
+        let select = 2 * n - 2;
+        let mut lengths = vec![0u8; n];
+        for item in prev.iter().take(select) {
+            for &sym_idx in &item.coverage {
+                lengths[sym_idx] = lengths[sym_idx].saturating_add(1);
             }
         }
+
+        // Every symbol must receive a positive length and none may exceed the
+        // limit (the algorithm guarantees both, but clamp defensively against
+        // saturation on pathological inputs).
+        for l in lengths.iter_mut() {
+            if *l == 0 {
+                *l = 1;
+            }
+            if *l as usize > limit {
+                *l = limit as u8;
+            }
+        }
+
+        lengths
     }
 }
 

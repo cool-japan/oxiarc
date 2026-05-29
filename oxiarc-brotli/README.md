@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.0 (2026-05-17) | 150 tests passing**
+**Version: 0.3.1 (2026-05-30) | 150 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.3.0"
+oxiarc-brotli = "0.3.1"
 ```
 
 ### One-shot compression / decompression
@@ -114,10 +114,10 @@ All other functionality — one-shot API, streaming API, Huffman coding, LZ77 en
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-brotli = "0.3.0"
+oxiarc-brotli = "0.3.1"
 
 # With parallel compression support
-oxiarc-brotli = { version = "0.3.0", features = ["parallel"] }
+oxiarc-brotli = { version = "0.3.1", features = ["parallel"] }
 ```
 
 ## Algorithm
@@ -136,6 +136,21 @@ Quality levels map to LZ77 search depth and the number of candidate matches cons
 | 1–4 | Fast | Comparable to gzip |
 | 5–9 | Balanced | Better than gzip |
 | 10–11 | Slow | Best (web-asset target) |
+
+## What's new in 0.3.1
+
+19 interop integration tests covering:
+
+- All quality levels 0–11 roundtrips
+- Empty input roundtrip
+- Single-byte roundtrip
+- Binary data roundtrip
+- Text data roundtrip
+- Large-input roundtrip
+- `compress_with_params` variations
+- Minimum-window roundtrip (lgwin=16)
+- Compression-is-beneficial assertion
+- Invalid parameter rejection
 
 ## Part of OxiArc
 

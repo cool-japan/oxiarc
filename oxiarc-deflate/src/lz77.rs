@@ -734,7 +734,15 @@ impl Lz77Encoder {
 
         let mut match_wpos = self.hash_table[h] as usize;
         let min_wpos = wpos.saturating_sub(WINDOW_SIZE);
-        let max_check = remaining.min(MAX_MATCH);
+        // Bound the comparison span by the bytes actually present in the window,
+        // not just the logical `remaining` count. `remaining` is measured against
+        // the full input length, but the window buffer is capped at WINDOW_SIZE,
+        // so for inputs larger than the window `wpos + len` could otherwise index
+        // past `self.window` and panic. Clamping here keeps every
+        // `self.window[wpos + len]` / `self.window[match_wpos + len]` access in
+        // bounds (note `match_wpos < wpos`, so the source side is covered too).
+        let window_room = self.window.len().saturating_sub(wpos);
+        let max_check = remaining.min(MAX_MATCH).min(window_room);
         let mut chain_len = 0;
 
         while match_wpos >= min_wpos && match_wpos < wpos && chain_len < MAX_CHAIN_LENGTH {

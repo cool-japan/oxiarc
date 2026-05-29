@@ -706,3 +706,540 @@ fn test_parallel_gzip_byte_count_return() {
     assert_eq!(out.len(), input.len(), "byte count mismatch");
     assert_eq!(out, input, "content mismatch in parallel gzip output");
 }
+
+// ===========================================================================
+// Strict spec-compliant inflater (regression guard for the dynamic-Huffman
+// "invalid code lengths set" bug).
+//
+// The encoder previously emitted *incomplete* Huffman code-length tables
+// (Kraft sum < 1.0) for the dynamic-block (BTYPE=10) path. oxiarc's own
+// inflater is lenient and accepted them, but spec-compliant decoders
+// (zlib `inflate_table`) reject incomplete literal/length and code-length
+// tables with "invalid code lengths set".
+//
+// The decoder below is deliberately STRICT and self-contained (no external
+// crates, no reliance on oxiarc's lenient inflater): when it builds a Huffman
+// table it verifies the code is *complete* exactly as zlib does. A
+// regression of the old bug therefore fails these tests at the
+// `build_huffman` step, even though oxiarc's production inflater would still
+// round-trip the broken stream.
+// ===========================================================================
+
+/// LSB-first bit reader over a DEFLATE byte stream.
+struct SpecBitReader<'a> {
+    data: &'a [u8],
+    /// Absolute bit position from the start of `data`.
+    bit_pos: usize,
+}
+
+impl<'a> SpecBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    /// Read `n` bits LSB-first (DEFLATE bit order), returning them as a u32.
+    fn read_bits(&mut self, n: u8) -> u32 {
+        let mut value = 0u32;
+        for i in 0..n {
+            let byte_index = self.bit_pos >> 3;
+            assert!(
+                byte_index < self.data.len(),
+                "spec inflater ran past end of stream (bit {})",
+                self.bit_pos
+            );
+            let bit = (self.data[byte_index] >> (self.bit_pos & 7)) & 1;
+            value |= (bit as u32) << i;
+            self.bit_pos += 1;
+        }
+        value
+    }
+
+    /// Skip to the next byte boundary (used before stored-block LEN/NLEN).
+    fn align_to_byte(&mut self) {
+        let rem = self.bit_pos & 7;
+        if rem != 0 {
+            self.bit_pos += 8 - rem;
+        }
+    }
+}
+
+/// A canonical Huffman decoding table built from per-symbol code lengths.
+///
+/// Construction enforces RFC 1951 / zlib completeness: the code must be
+/// neither over-subscribed nor incomplete (with the single documented
+/// exception of an all-zero table, which represents "no codes").
+struct SpecHuffman {
+    /// Map from (length, canonical_code) -> symbol.
+    codes: std::collections::HashMap<(u8, u32), u16>,
+    max_len: u8,
+}
+
+impl SpecHuffman {
+    /// Build a strict canonical Huffman decoder from `lengths`.
+    ///
+    /// `allow_incomplete_single` permits the lone legal incomplete case used by
+    /// the *distance* alphabet: exactly one distance code of length 1 (RFC 1951
+    /// allows a single-distance code). All other incomplete or over-subscribed
+    /// dynamic tables are rejected, mirroring zlib's `inflate_table`.
+    ///
+    /// `fixed_table` marks the two RFC 1951 §3.2.6 *fixed* tables, which zlib
+    /// hardcodes and accepts despite the fixed distance code being incomplete
+    /// (30 five-bit codes => Kraft 0.9375; codes 30/31 are reserved). The
+    /// dynamic-Huffman regression we are guarding never sets this flag.
+    fn build(
+        lengths: &[u8],
+        alphabet: &str,
+        allow_incomplete_single: bool,
+        fixed_table: bool,
+    ) -> Self {
+        let max_len = lengths.iter().copied().max().unwrap_or(0);
+        if max_len == 0 {
+            return Self {
+                codes: std::collections::HashMap::new(),
+                max_len: 0,
+            };
+        }
+
+        // Count codes of each length and check completeness via the "left"
+        // (available code space) accounting that zlib uses.
+        let mut bl_count = vec![0u32; (max_len as usize) + 1];
+        let mut used = 0u32;
+        for &l in lengths {
+            if l > 0 {
+                bl_count[l as usize] += 1;
+                used += 1;
+            }
+        }
+
+        // Single-code special case (one symbol of length 1): incomplete (Kraft
+        // 0.5). Allowed only for the distance alphabet.
+        if used == 1 && bl_count.get(1).copied().unwrap_or(0) == 1 && !fixed_table {
+            assert!(
+                allow_incomplete_single,
+                "{alphabet} alphabet has a single 1-bit code (incomplete, Kraft=0.5) \
+                 which spec decoders reject as 'invalid code lengths set'"
+            );
+        }
+
+        // zlib's `left` accounting: start with 1 code at length 0 doubling each
+        // level, subtracting the codes used at that length. `left` must reach
+        // exactly 0 for a complete code; `left < 0` is over-subscribed; `left >
+        // 0` after the last length is incomplete.
+        let mut left: i64 = 1;
+        for (len, &count) in bl_count.iter().enumerate().skip(1) {
+            left <<= 1;
+            left -= count as i64;
+            assert!(
+                left >= 0,
+                "{alphabet} Huffman table is OVER-SUBSCRIBED at length {len}"
+            );
+        }
+        if left != 0 && !fixed_table {
+            // Incomplete code. Allowed only for the documented single-distance
+            // case (already asserted above); everything else is the bug we are
+            // guarding against.
+            let is_single_distance =
+                allow_incomplete_single && used == 1 && bl_count.get(1).copied().unwrap_or(0) == 1;
+            assert!(
+                is_single_distance,
+                "{alphabet} Huffman table is INCOMPLETE (left={left}, Kraft sum < 1.0) — \
+                 spec decoders reject this as 'invalid code lengths set'"
+            );
+        }
+
+        // Assign canonical codes (RFC 1951 §3.2.2).
+        let mut next_code = vec![0u32; (max_len as usize) + 1];
+        let mut code = 0u32;
+        for bits in 1..=max_len as usize {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        let mut codes = std::collections::HashMap::new();
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len > 0 {
+                let c = next_code[len as usize];
+                next_code[len as usize] += 1;
+                codes.insert((len, c), sym as u16);
+            }
+        }
+
+        Self { codes, max_len }
+    }
+
+    /// Decode one symbol MSB-first over the canonical code space.
+    fn decode(&self, reader: &mut SpecBitReader) -> u16 {
+        assert!(self.max_len > 0, "decode on empty Huffman table");
+        let mut code = 0u32;
+        for len in 1..=self.max_len {
+            code = (code << 1) | reader.read_bits(1);
+            if let Some(&sym) = self.codes.get(&(len, code)) {
+                return sym;
+            }
+        }
+        panic!(
+            "spec inflater: no matching Huffman code (max_len={})",
+            self.max_len
+        );
+    }
+}
+
+/// Code-length alphabet order (RFC 1951 §3.2.7).
+const SPEC_CL_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Length base/extra-bit tables for the literal/length alphabet (codes 257-285).
+const SPEC_LEN_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const SPEC_LEN_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+/// Distance base/extra-bit tables for the distance alphabet (codes 0-29).
+const SPEC_DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const SPEC_DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+/// Fixed literal/length code lengths (RFC 1951 §3.2.6).
+fn spec_fixed_litlen_lengths() -> Vec<u8> {
+    let mut l = vec![0u8; 288];
+    for (i, len) in l.iter_mut().enumerate() {
+        *len = match i {
+            0..=143 => 8,
+            144..=255 => 9,
+            256..=279 => 7,
+            _ => 8,
+        };
+    }
+    l
+}
+
+/// Fully inflate a raw DEFLATE byte stream using the strict decoder above.
+///
+/// Panics (failing the test) if any Huffman table is over-subscribed or
+/// incomplete — i.e. exactly the spec violation that produced the
+/// "invalid code lengths set" error in real zlib.
+fn spec_inflate(data: &[u8]) -> Vec<u8> {
+    let mut reader = SpecBitReader::new(data);
+    let mut out: Vec<u8> = Vec::new();
+
+    loop {
+        let bfinal = reader.read_bits(1);
+        let btype = reader.read_bits(2);
+
+        match btype {
+            0 => {
+                // Stored block.
+                reader.align_to_byte();
+                let len = reader.read_bits(16) as usize;
+                let nlen = reader.read_bits(16);
+                assert_eq!(
+                    len as u32 & 0xFFFF,
+                    !nlen & 0xFFFF,
+                    "stored block LEN/NLEN mismatch"
+                );
+                for _ in 0..len {
+                    out.push(reader.read_bits(8) as u8);
+                }
+            }
+            1 | 2 => {
+                let (litlen, dist) = if btype == 1 {
+                    let litlen = SpecHuffman::build(
+                        &spec_fixed_litlen_lengths(),
+                        "fixed-litlen",
+                        false,
+                        true,
+                    );
+                    let dist = SpecHuffman::build(&[5u8; 30], "fixed-distance", false, true);
+                    (litlen, dist)
+                } else {
+                    // Dynamic block header.
+                    let hlit = reader.read_bits(5) as usize + 257;
+                    let hdist = reader.read_bits(5) as usize + 1;
+                    let hclen = reader.read_bits(4) as usize + 4;
+
+                    let mut cl_lengths = [0u8; 19];
+                    for i in 0..hclen {
+                        cl_lengths[SPEC_CL_ORDER[i]] = reader.read_bits(3) as u8;
+                    }
+                    // The code-length code MUST be complete.
+                    let cl_huff = SpecHuffman::build(&cl_lengths, "code-length", false, false);
+
+                    // Decode the combined litlen+dist length sequence.
+                    let total = hlit + hdist;
+                    let mut all_lengths: Vec<u8> = Vec::with_capacity(total);
+                    while all_lengths.len() < total {
+                        let sym = cl_huff.decode(&mut reader);
+                        match sym {
+                            0..=15 => all_lengths.push(sym as u8),
+                            16 => {
+                                let repeat = reader.read_bits(2) as usize + 3;
+                                let prev = *all_lengths
+                                    .last()
+                                    .expect("repeat-16 with no previous length");
+                                all_lengths.resize(all_lengths.len() + repeat, prev);
+                            }
+                            17 => {
+                                let repeat = reader.read_bits(3) as usize + 3;
+                                all_lengths.resize(all_lengths.len() + repeat, 0);
+                            }
+                            18 => {
+                                let repeat = reader.read_bits(7) as usize + 11;
+                                all_lengths.resize(all_lengths.len() + repeat, 0);
+                            }
+                            _ => panic!("invalid code-length symbol {sym}"),
+                        }
+                    }
+                    assert_eq!(
+                        all_lengths.len(),
+                        total,
+                        "code-length run overflowed HLIT+HDIST"
+                    );
+
+                    let litlen_lengths = &all_lengths[..hlit];
+                    let dist_lengths = &all_lengths[hlit..];
+
+                    // litlen MUST be complete; distance may be the single legal
+                    // incomplete case (one 1-bit code) or empty.
+                    let litlen = SpecHuffman::build(litlen_lengths, "litlen", false, false);
+                    let dist = SpecHuffman::build(dist_lengths, "distance", true, false);
+                    (litlen, dist)
+                };
+
+                // Decode symbols until end-of-block (256).
+                loop {
+                    let sym = litlen.decode(&mut reader);
+                    match sym {
+                        0..=255 => out.push(sym as u8),
+                        256 => break,
+                        257..=285 => {
+                            let li = (sym - 257) as usize;
+                            let length = SPEC_LEN_BASE[li] as usize
+                                + reader.read_bits(SPEC_LEN_EXTRA[li]) as usize;
+                            let dsym = dist.decode(&mut reader) as usize;
+                            assert!(dsym < 30, "distance symbol {dsym} out of range");
+                            let distance = SPEC_DIST_BASE[dsym] as usize
+                                + reader.read_bits(SPEC_DIST_EXTRA[dsym]) as usize;
+                            assert!(
+                                distance <= out.len(),
+                                "back-reference distance {distance} exceeds output length {}",
+                                out.len()
+                            );
+                            let start = out.len() - distance;
+                            for k in 0..length {
+                                let b = out[start + k];
+                                out.push(b);
+                            }
+                        }
+                        _ => panic!("invalid litlen symbol {sym}"),
+                    }
+                }
+            }
+            _ => panic!("invalid BTYPE 3 (reserved)"),
+        }
+
+        if bfinal == 1 {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Strip the 2-byte zlib header and 4-byte Adler-32 trailer, returning the
+/// raw DEFLATE payload.
+fn strip_zlib(compressed: &[u8]) -> &[u8] {
+    assert!(compressed.len() >= 6, "zlib stream too short");
+    &compressed[2..compressed.len() - 4]
+}
+
+/// Build a deterministic 512x512x3 RGB scanline stream (each row prefixed with
+/// a 0 filter byte), mirroring a real PNG IDAT input.
+fn png_scanline_stream() -> Vec<u8> {
+    let w = 512usize;
+    let h = 512usize;
+    let mut out = Vec::with_capacity(h * (1 + w * 3));
+    for y in 0..h {
+        out.push(0u8);
+        for x in 0..w {
+            out.push(((x * 7 + y * 3) & 0xFF) as u8);
+            out.push(((x ^ y) & 0xFF) as u8);
+            out.push(((x.wrapping_mul(y) >> 3) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// Self-test: the strict inflater must REJECT a hand-crafted incomplete
+/// code-length table (sanity check that the guard actually fires).
+#[test]
+#[should_panic(expected = "INCOMPLETE")]
+fn test_spec_inflater_rejects_incomplete_codelen() {
+    // Construct a minimal dynamic block whose code-length code is incomplete:
+    // a single code-length symbol of length 2 (Kraft = 0.25 < 1.0).
+    // BFINAL=1, BTYPE=10, HLIT=0(=>257), HDIST=0(=>1), HCLEN=0(=>4),
+    // then 4 x 3-bit code-length code lengths. We set only one to a nonzero
+    // value of 2 so the code-length alphabet is incomplete.
+    let mut bits: Vec<u8> = Vec::new();
+    let mut acc = 0u32;
+    let mut nbits = 0u8;
+    let push = |val: u32, n: u8, bits: &mut Vec<u8>, acc: &mut u32, nbits: &mut u8| {
+        *acc |= (val & ((1u32 << n) - 1)) << *nbits;
+        *nbits += n;
+        while *nbits >= 8 {
+            bits.push((*acc & 0xFF) as u8);
+            *acc >>= 8;
+            *nbits -= 8;
+        }
+    };
+    push(1, 1, &mut bits, &mut acc, &mut nbits); // BFINAL=1
+    push(2, 2, &mut bits, &mut acc, &mut nbits); // BTYPE=10 dynamic
+    push(0, 5, &mut bits, &mut acc, &mut nbits); // HLIT=0
+    push(0, 5, &mut bits, &mut acc, &mut nbits); // HDIST=0
+    push(0, 4, &mut bits, &mut acc, &mut nbits); // HCLEN=0 -> 4 codes
+    // 4 code-length code lengths (order: 16,17,18,0). Make only symbol "16"
+    // have length 2 -> incomplete code-length alphabet.
+    push(2, 3, &mut bits, &mut acc, &mut nbits);
+    push(0, 3, &mut bits, &mut acc, &mut nbits);
+    push(0, 3, &mut bits, &mut acc, &mut nbits);
+    push(0, 3, &mut bits, &mut acc, &mut nbits);
+    if nbits > 0 {
+        bits.push((acc & 0xFF) as u8);
+    }
+    // This must panic with "INCOMPLETE" inside SpecHuffman::build.
+    let _ = spec_inflate(&bits);
+}
+
+/// Core regression: every level 1-9 must produce a *spec-compliant* zlib
+/// stream for a repetitive buffer that takes the dynamic-Huffman path at
+/// level >= 5. Pre-fix, levels 5-9 emitted incomplete code-length tables and
+/// this test would panic with "INCOMPLETE"/"invalid code lengths set".
+#[test]
+fn test_dynamic_huffman_spec_compliant_repetitive_all_levels() {
+    let mut data = Vec::new();
+    let pat = b"the quick brown fox jumps over the lazy dog. ";
+    while data.len() < 200_000 {
+        data.extend_from_slice(pat);
+    }
+
+    for level in 1u8..=9 {
+        let compressed = zlib_compress(&data, level)
+            .unwrap_or_else(|e| panic!("zlib_compress level {level} failed: {e:?}"));
+        let raw = strip_zlib(&compressed);
+        let decoded = spec_inflate(raw);
+        assert_eq!(
+            decoded, data,
+            "strict spec inflater mismatch at level {level}"
+        );
+    }
+}
+
+/// The 512x512 RGB PNG-scanline stream must be spec-compliant at all levels
+/// 1-9 (this is the real-world ~750 KB case from the bug report).
+#[test]
+fn test_dynamic_huffman_spec_compliant_png_scanlines_all_levels() {
+    let data = png_scanline_stream();
+    for level in 1u8..=9 {
+        let compressed = zlib_compress(&data, level)
+            .unwrap_or_else(|e| panic!("zlib_compress level {level} failed: {e:?}"));
+        let decoded = spec_inflate(strip_zlib(&compressed));
+        assert_eq!(decoded, data, "PNG scanline spec mismatch at level {level}");
+    }
+}
+
+/// An incompressible (pseudo-random) buffer must also be spec-compliant at all
+/// levels (this path typically stays on fixed Huffman, but we verify it).
+#[test]
+fn test_dynamic_huffman_spec_compliant_random_all_levels() {
+    // Deterministic LCG, no rand crate needed.
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut data = Vec::with_capacity(200_000);
+    for _ in 0..200_000 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((state >> 33) as u8);
+    }
+    for level in 1u8..=9 {
+        let compressed = zlib_compress(&data, level)
+            .unwrap_or_else(|e| panic!("zlib_compress level {level} failed: {e:?}"));
+        let decoded = spec_inflate(strip_zlib(&compressed));
+        assert_eq!(
+            decoded, data,
+            "random buffer spec mismatch at level {level}"
+        );
+    }
+}
+
+/// The gzip path shares the same DEFLATE encoder; verify its DEFLATE payload
+/// is spec-compliant at level 9 (dynamic block) for a repetitive buffer.
+#[test]
+fn test_gzip_dynamic_huffman_spec_compliant_level9() {
+    let mut data = Vec::new();
+    let pat = b"compress me compress me 0123456789 ";
+    while data.len() < 150_000 {
+        data.extend_from_slice(pat);
+    }
+    let compressed = gzip_compress(&data, 9).expect("gzip_compress level 9 failed");
+    // gzip: 10-byte fixed header, then DEFLATE, then 8-byte trailer (CRC32+ISIZE).
+    assert!(compressed.len() > 18, "gzip stream too short");
+    let raw = &compressed[10..compressed.len() - 8];
+    let decoded = spec_inflate(raw);
+    assert_eq!(
+        decoded, data,
+        "gzip dynamic-Huffman payload not spec-compliant"
+    );
+}
+
+/// Single-distinct-symbol input ("allsame") used to produce a 1-bit (Kraft
+/// 0.5) literal/length table. The encoder must now synthesize a complete code
+/// (phantom second symbol) so the litlen table is accepted by strict decoders.
+#[test]
+fn test_dynamic_huffman_spec_compliant_single_symbol() {
+    // Highly repetitive single byte -> tiny alphabet -> dynamic path at L9.
+    let data = vec![b'X'; 100_000];
+    for level in [5u8, 6, 9] {
+        let compressed = zlib_compress(&data, level)
+            .unwrap_or_else(|e| panic!("zlib_compress level {level} failed: {e:?}"));
+        let decoded = spec_inflate(strip_zlib(&compressed));
+        assert_eq!(
+            decoded, data,
+            "single-symbol spec mismatch at level {level}"
+        );
+    }
+}
+
+/// The graph-based optimal parser (`Deflater::with_optimal_parsing`) shares the
+/// fixed `HuffmanBuilder`; verify its output is spec-compliant, including for
+/// inputs larger than the 64 KiB LZ77 window (regression for the
+/// `find_all_matches` window-overflow panic).
+#[test]
+fn test_optimal_parser_spec_compliant_large_input() {
+    use oxiarc_deflate::Deflater;
+
+    let mut data = Vec::new();
+    let pat = b"the quick brown fox jumps over the lazy dog 0123456789 ";
+    while data.len() < 150_000 {
+        data.extend_from_slice(pat);
+    }
+
+    for level in [6u8, 9] {
+        let mut d = Deflater::with_optimal_parsing(level);
+        let raw = d
+            .compress_to_vec(&data)
+            .unwrap_or_else(|e| panic!("optimal compress level {level} failed: {e:?}"));
+        let decoded = spec_inflate(&raw);
+        assert_eq!(
+            decoded, data,
+            "optimal parser spec mismatch at level {level}"
+        );
+    }
+}

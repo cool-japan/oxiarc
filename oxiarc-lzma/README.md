@@ -3,13 +3,15 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.0** (2026-05-17) — 139 tests passing.
+**Version 0.3.1** (2026-05-30) — 139 tests passing.
 
-**What's new in 0.3.0**: `Bt4MatchFinder` — BT4 binary tree match finder with 3-table hash (h2/h3/h4), level 9 now uses BT4 for superior compression; `MatchFinder` trait abstracting both `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9); custom dictionary support via `LzmaEncoder::with_dictionary` and `LzmaDecoder::with_dictionary`; memory pool via `LzmaPool`, `PooledBuf`, and `LzmaDecoderPooled`; parallel LZMA2 compression via `lzma2_compress_parallel` and `ParallelLzma2Encoder` (requires `features = ["parallel"]`).
+**What's new in 0.3.1**: Custom dictionary support via `LzmaEncoder::with_dictionary(level, dict_size, dict)` / `set_dictionary` and `LzmaDecoder::with_dictionary(reader, props, dict_size, dict)` / `set_dictionary`; thread-safe memory pool `LzmaPool` with `PooledBuf<'a>` RAII wrapper and `LzmaDecoderPooled<'p, R>` for amortizing large dict buffer allocations.
+
+**What's new in 0.3.0**: `Bt4MatchFinder` — BT4 binary tree match finder with 3-table hash (h2/h3/h4), level 9 now uses BT4 for superior compression quality; `MatchFinder` trait abstracting both `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9).
 
 **What's new in 0.2.8**: `with_progress(Arc<dyn ProgressSink>)` and `with_cancel(CancellationToken)` builder methods on `Lzma2Encoder`, `Lzma2Decoder`, and `Lzma2ChunkedEncoder` for progress reporting and cooperative cancellation.
 
@@ -243,10 +245,10 @@ assert_eq!(&decompressed, data.as_ref());
 ```toml
 [dependencies]
 # Default (serial only)
-oxiarc-lzma = "0.3.0"
+oxiarc-lzma = "0.3.1"
 
 # With parallel LZMA2 compression
-oxiarc-lzma = { version = "0.3.0", features = ["parallel"] }
+oxiarc-lzma = { version = "0.3.1", features = ["parallel"] }
 ```
 
 ## Usage
@@ -255,7 +257,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.3.0"
+oxiarc-lzma = "0.3.1"
 ```
 
 ## Modules
