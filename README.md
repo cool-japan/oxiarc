@@ -11,7 +11,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 ## Features
 
-### Archive Formats (12 supported)
+### Archive Formats (13 supported)
 - **ZIP** - PKZIP format with DEFLATE and Store methods, Zip64 support
 - **TAR** - POSIX tar with UStar and PAX extended headers
 - **GZIP** - GNU zip single-file compression (RFC 1952)
@@ -24,8 +24,9 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Bzip2** - Block-sorting compression
 - **Brotli** - Brotli compression (RFC 7932)
 - **Snappy** - Google's fast compression format
+- **AEC/SZIP** - CCSDS-121.0-B-2 adaptive entropy coding (HDF5/NetCDF scientific data)
 
-### Compression Algorithms (10 implemented)
+### Compression Algorithms (11 implemented)
 - **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
 - **LZH** - LZSS + Huffman (lh0, lh4-lh7)
@@ -36,6 +37,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Brotli** (RFC 7932) - LZ77 + context-dependent Huffman, static dictionary, quality 0-11
 - **Snappy** - Ultra-fast LZ77 variant with block and framed formats
 - **Store** - No compression
+- **AEC/SZIP** (CCSDS-121.0-B-2) - Adaptive entropy coding for scientific datasets
 
 ### Core Features
 - **Pure Rust** - No C/Fortran dependencies, 100% safe Rust
@@ -73,6 +75,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Zstd Multi-Frame** - Multi-frame decompression via `decompress_multi_frame`, `decompress_multi_frame_with_dict`; streaming dict multi-frame fix
 - **CLI Man Pages** - Full set of troff `.1` man pages for all CLI subcommands in `man/` directory
 - **Snappy/Brotli Interop Tests** - 35 new integration tests against wire-format golden vectors (16 Snappy, 19 Brotli) validating spec compliance
+- **AEC/SZIP Codec** - CCSDS-121.0-B-2 compliant adaptive entropy coding via `oxiarc-szip` with `BitReader`/`BitWriter`, `encode`/`decode`/`encode_bytes` entry points, `SzipParams` configuration, `SzipError` error type
 
 ## Architecture
 
@@ -94,6 +97,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 |     oxiarc-lzw: LZW (GIF/TIFF, MSB/LSB bitstream)       |
 |     oxiarc-brotli: Brotli (RFC 7932)                     |
 |     oxiarc-snappy: Snappy (block + framed)                |
+|     oxiarc-szip: AEC/SZIP (CCSDS-121.0-B-2 adaptive entropy coding)    |
 +----------------------------------------------------------+
 | L1: Core (oxiarc-core)                                   |
 |     BitReader/Writer, RingBuffer, CRC-16/32/64 (simd-8)  |
@@ -115,8 +119,9 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream, streaming encoder/decoder | ~2,094 | 76 |
 | `oxiarc-brotli` | Brotli compression (RFC 7932) with static dictionary, quality 0-11, streaming | ~3,536 | 150 |
 | `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~1,451 | 112 |
+| `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): BitReader/BitWriter, encode/decode/encode_bytes, SzipParams, SzipError | ~1,148 | 19 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, man pages | ~2,947 | 37 |
-| **Total** | **Pure Rust archive/compression library** | **~71,000 SLoC (227 files)** | **1,647** |
+| **Total** | **Pure Rust archive/compression library** | **~72,000 SLoC (234 files)** | **1,666** |
 
 ## Installation
 
@@ -139,14 +144,15 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.3.1"  # For archive format support
-oxiarc-deflate = "0.3.1"  # For DEFLATE compression
-oxiarc-lzma = "0.3.1"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.3.1"    # For Bzip2 compression
-oxiarc-lz4 = "0.3.1"      # For LZ4 compression
-oxiarc-zstd = "0.3.1"     # For Zstandard compression
-oxiarc-brotli = "0.3.1"   # For Brotli compression
-oxiarc-snappy = "0.3.1"   # For Snappy compression
+oxiarc-archive = "0.3.2"  # For archive format support
+oxiarc-deflate = "0.3.2"  # For DEFLATE compression
+oxiarc-lzma = "0.3.2"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.3.2"    # For Bzip2 compression
+oxiarc-lz4 = "0.3.2"      # For LZ4 compression
+oxiarc-zstd = "0.3.2"     # For Zstandard compression
+oxiarc-brotli = "0.3.2"   # For Brotli compression
+oxiarc-snappy = "0.3.2"   # For Snappy compression
+oxiarc-szip = "0.3.2"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
 ```
 
 ## Quick Start
@@ -267,6 +273,15 @@ Modern compression format:
 - Quality levels 0-11 (fast to best compression)
 - Streaming compression/decompression API
 
+### AEC/SZIP (CCSDS-121.0-B-2)
+
+Adaptive entropy coding for scientific data:
+- CCSDS-121.0-B-2 standard implementation (libaec-compatible)
+- Used in HDF5 and NetCDF scientific datasets
+- `BitReader`/`BitWriter` for efficient bit manipulation
+- `SzipParams` struct for encoding/decoding configuration
+- `encode` / `decode` / `encode_bytes` entry points
+
 
 ## Status
 
@@ -283,10 +298,11 @@ Modern compression format:
 | oxiarc-lzw      | Stable  | 67         | 76            |
 | oxiarc-brotli   | Stable  | 90         | 150           |
 | oxiarc-snappy   | Stable  | 34         | 112           |
+| oxiarc-szip     | Stable  | 27         | 19            |
 | oxiarc-cli      | Stable  | 43         | 37            |
-| **Total**       |         | **1,615**  | **1,647**     |
+| **Total**       |         | **1,642**  | **1,666**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.1 (2026-05-30).
+All crates are feature-complete, tested, and API-stable as of v0.3.2 (2026-05-31).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -743,7 +759,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 1,647 tests
+# Run all 1,666 tests
 cargo nextest run --all-features
 
 # Build CLI only

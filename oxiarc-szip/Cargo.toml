@@ -1,0 +1,26 @@
+[package]
+name = "oxiarc-szip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust CCSDS-121.0-B-2 / libaec-compatible adaptive entropy coding (AEC/SZIP) implementation"
+readme = "README.md"
+keywords = ["szip", "aec", "ccsds", "compression", "decompression"]
+categories = ["compression", "encoding", "science"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "szip_bench"
+harness = false
+
+[lints]
+workspace = true

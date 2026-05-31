@@ -5,6 +5,14 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-05-31
+
+### Added
+- **oxiarc-szip**: Full AEC/SZIP encoding and decoding compliant with CCSDS-121.0-B-2 — `BitReader`/`BitWriter` for efficient bit manipulation; `encode` compresses sample arrays into AEC/SZIP bit streams; `decode` decompresses AEC/SZIP byte streams into raw sample bytes; `SzipParams` struct manages encoding/decoding parameters; `SzipError` enum for error handling. Round-trip tests cover various sample scenarios.
+
+### Quality
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file)
+
 ## [0.3.1] - 2026-05-30
 
 ### Added

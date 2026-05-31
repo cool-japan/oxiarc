@@ -1,8 +1,9 @@
 
-# OxiArc - Development Roadmap (v0.3.1, 2026-05-30)
+# OxiArc - Development Roadmap (v0.3.2, 2026-05-31)
 
 ## Version History
 
+- **v0.3.2** (2026-05-31): AEC/SZIP codec (oxiarc-szip) — full CCSDS-121.0-B-2 compliant encoder/decoder with `BitReader`/`BitWriter` bit manipulation primitives, `SzipParams` configuration struct, `SzipError` error enum. Round-trip tests for all sample scenarios.
 - **v0.3.1** (2026-05-16): LZH custom dictionary (`LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder/Decoder::preload_dictionary`). LZMA custom dictionary (`LzmaEncoder/Decoder::with_dictionary`). LZMA memory pool (`LzmaPool`, `PooledBuf`, `LzmaDecoderPooled`) — amortizes large dict allocations. Archive repair/recovery (`repair_zip`, `repair_tar`, `ZipRepair`, `TarRepair`, `RepairReport`) for truncated/corrupt ZIP+TAR archives. Snappy + Brotli interop test vectors (35 new integration tests). 1446 tests (77 new), 3 skipped, zero warnings.
 - **v0.3.0** (2026-05-17): DEFLATE Zopfli-style optimal parsing (`OptimalParser`, `with_optimal_parsing`). Snappy parallel frame compression (`compress_parallel`, `parallel` feature). LZ4 true bounded-memory streaming (block-level `Lz4Compressor`/`Lz4Decompressor`, `with_memory_budget`). LZH 4-byte hash + `LzssOptimalParser` + `with_optimal()` builder. LZMA BT4 binary tree match finder (`Bt4MatchFinder`, `MatchFinder` trait; level 9 now uses BT4). `MappedFile` zero-copy memory-mapped primitive in oxiarc-core (`mmap` feature). 1325 tests (44 new), 3 skipped, zero warnings.
 - **v0.2.8** (2026-05-08): SIMD CRC32 via aarch64 PMULL (Apple Silicon) and x86_64 SSE 4.2 (Snappy CRC32C). Progress/cancel builders (`with_progress`, `with_cancel`) on lz4, zstd, and lzma2. Raw-preserve append in `oxiarc add` (ZIP/LZH byte-for-byte). ISO 9660 read support (list/extract/info/detect). CLI `--memory-limit` option for extract and list. 1281 tests passing (2 skipped), 1442 public API items, 58,356 lines, 12 crates, 182 Rust files.
@@ -266,7 +267,7 @@
 
 - oxiarc-core: 132 tests
   - CRC-32/64 slicing-by-8, DualCrc optimization, SIMD CRC32 (aarch64 PMULL), size boundary tests, bitstream, ringbuffer, EntryBuilder, Serde serialization
-- oxiarc-deflate: 205 tests
+- oxiarc-deflate: 212 tests
   - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module, streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder, flush modes), optimal parsing, streaming improvements, parallel GZIP (gzip_compress_parallel, ParallelGzipEncoder), LZ77 tuning (Lz77Params, Lz77Preset), DEFLATE memory pool (DeflatePool, PooledBuf), streaming compliance fixes
 - oxiarc-lzhuf: 99 tests
   - LH5 roundtrip encoding/decoding, LZSS, Huffman trees, optimal parser, streaming integration, custom dictionary (LzhEncoder::with_dictionary, LzhDecoder::with_dictionary, LzssEncoder/Decoder::preload_dictionary), extension header DOS attributes
@@ -286,10 +287,12 @@
   - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API, interop integration tests, encoder bug fixes
 - oxiarc-snappy: 112 tests
   - Snappy block format, framed format with CRC32C checksums (SSE 4.2 hardware acceleration on x86_64), streaming Write/Read API, interop integration tests, parallel frame compression, memory pool (SnappyPool, PoolStats, compress_frame_pooled), dictionary APIs (compress_block_with_dict, compress_frame_with_dict, decompress_block_with_dict, decompress_frame_with_dict), async I/O (AsyncSnappyCompressor, AsyncSnappyDecompressor)
+- oxiarc-szip: 19 tests
+  - AEC/SZIP CCSDS-121.0-B-2 encoder/decoder, BitReader/BitWriter bit primitives, SzipParams configuration, SzipError error type, round-trip encode/decode tests
 - oxiarc-cli: 37 tests
-- Total: 1,640 tests (1,640 passed, 2 skipped, zero warnings)
+- Total: 1,666 tests (1,666 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.3.0, 2026-05-17)
+## Code Statistics (v0.3.2, 2026-05-31)
 
 | Crate | Lines of Code |
 |-------|---------------|
@@ -301,8 +304,9 @@
 | oxiarc-zstd | ~5,741 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
 | oxiarc-brotli | ~3,460 (LZ77, context Huffman, static dictionary, streaming) |
 | oxiarc-snappy | ~1,428 (block format, framed format, CRC32C) |
+| oxiarc-szip | ~1,148 (BitReader/BitWriter, encode, decode, encode_bytes, SzipParams, SzipError, CCSDS-121.0-B-2) |
 | oxiarc-archive | ~7,897 (ZIP header refactored; async_zip module; Brotli/Snappy integration) |
 | oxiarc-cli | ~2,443 |
 | oxiarc-lzma | ~3,868 |
 | oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
-| **Total** | **~70,968** (227 files) |
+| **Total** | **~72,000** (234 files) |
