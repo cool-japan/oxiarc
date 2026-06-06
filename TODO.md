@@ -1,5 +1,5 @@
 
-# OxiArc - Development Roadmap (v0.3.3, 2026-06-06)
+# OxiArc - Development Roadmap (v0.3.4, 2026-06-06)
 
 ## Version History
 

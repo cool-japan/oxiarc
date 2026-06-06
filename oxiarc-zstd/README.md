@@ -7,7 +7,7 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.3 (2026-06-06) | 179 tests passing**
+**Version: 0.3.4 (2026-06-06) | 179 tests passing**
 
 ## Overview
 
@@ -121,10 +121,10 @@ The `with_progress` and `with_cancel` builders can be chained together.
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-zstd = "0.3.3"
+oxiarc-zstd = "0.3.4"
 
 # With parallel compression
-oxiarc-zstd = { version = "0.3.3", features = ["parallel"] }
+oxiarc-zstd = { version = "0.3.4", features = ["parallel"] }
 ```
 
 ## Algorithm

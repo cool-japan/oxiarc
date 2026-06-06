@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.3 (2026-06-06) | 163 tests passing**
+**Version: 0.3.4 (2026-06-06) | 163 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.3.3"
+oxiarc-brotli = "0.3.4"
 ```
 
 ### One-shot compression / decompression
@@ -114,10 +114,10 @@ All other functionality — one-shot API, streaming API, Huffman coding, LZ77 en
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-brotli = "0.3.3"
+oxiarc-brotli = "0.3.4"
 
 # With parallel compression support
-oxiarc-brotli = { version = "0.3.3", features = ["parallel"] }
+oxiarc-brotli = { version = "0.3.4", features = ["parallel"] }
 ```
 
 ## Algorithm
