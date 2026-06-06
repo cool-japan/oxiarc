@@ -1,5 +1,5 @@
 
-# oxiarc-lzma - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-lzma - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -175,7 +175,7 @@
 
 ## Test Coverage
 
-- Total: 66 tests (range_coder 3, model 4, encoder 7, decoder 2, lzma2 5, optimal 7, lib 13, plus more)
+- Total: 139 tests (range_coder 3, model 4, encoder 7, decoder 2, lzma2 5, optimal 7, lib 13, plus more)
 
 ## Code Statistics
 

@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.1 (2026-05-30) | 332 tests passing**
+**Version: 0.3.3 (2026-06-06) | 332 tests passing**
 
 
 ## Features
@@ -107,16 +107,16 @@ Supported async compression methods: `Stored`, `Deflate`.
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.3.1"
+oxiarc-archive = "0.3.3"
 
 # With memory-mapped I/O
-oxiarc-archive = { version = "0.3.1", features = ["mmap"] }
+oxiarc-archive = { version = "0.3.3", features = ["mmap"] }
 
 # With async ZIP support
-oxiarc-archive = { version = "0.3.1", features = ["async-io"] }
+oxiarc-archive = { version = "0.3.3", features = ["async-io"] }
 
 # With all features
-oxiarc-archive = { version = "0.3.1", features = ["mmap", "async-io"] }
+oxiarc-archive = { version = "0.3.3", features = ["mmap", "async-io"] }
 ```
 
 ## Format Detection

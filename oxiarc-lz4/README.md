@@ -7,7 +7,7 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.1 (2026-05-30) | 138 tests passing**
+**Version: 0.3.3 (2026-06-06) | 138 tests passing**
 
 ## Overview
 
@@ -145,10 +145,10 @@ The same pattern applies to `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4Di
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-lz4 = "0.3.1"
+oxiarc-lz4 = "0.3.3"
 
 # With parallel compression
-oxiarc-lz4 = { version = "0.3.1", features = ["parallel"] }
+oxiarc-lz4 = { version = "0.3.3", features = ["parallel"] }
 ```
 
 ## Use Cases

@@ -1,4 +1,4 @@
-# oxiarc-snappy - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-snappy - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -76,7 +76,7 @@
 - frame: ~15 tests (streaming, CRC verification, chunks)
 - crc32c: ~10 tests (known vectors, masked CRC)
 - lib: ~4 tests
-- Total: 58 tests
+- Total: 112 tests
 
 ## Code Statistics
 
@@ -93,6 +93,4 @@
 
 ## Known Limitations
 
-1. Single-threaded only
-2. Hardware CRC32C acceleration (SSE 4.2) implemented on x86_64
-3. No dictionary support
+- Dictionary support is an OxiArc-specific extension: the standard Snappy specification has no dictionary semantics, so dictionary-compressed streams are not interoperable with other Snappy implementations.

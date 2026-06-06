@@ -1,5 +1,5 @@
 
-# oxiarc-lzhuf - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-lzhuf - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -93,7 +93,7 @@
 
 ## Test Coverage
 
-- Total: 57 tests (34 lib + 20 streaming_integration + 3 doctests)
+- Total: 99 tests (34 lib + 20 streaming_integration + 3 doctests)
 
 ## Code Statistics
 

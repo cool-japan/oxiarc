@@ -5,6 +5,24 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-06-06
+
+### Fixed
+- **oxiarc-brotli**: High-entropy / incompressible data now round-trips byte-for-byte across all quality levels (1–11); previously near-uniform or incompressible inputs failed to decode. Two distinct underlying bugs were fixed:
+  1. **Incomplete length-limited Huffman codes** — for near-uniform, all-symbols-present literal distributions, the old `compute_code_lengths` heuristic (ideal `ceil(-log2 p)` lengths plus a Kraft-inequality fix-up loop) could emit a code-length table whose Kraft sum was strictly below `2^15`, i.e. an *incomplete* prefix code; the decoder then hit bit patterns that decoded to no symbol and failed with "invalid Huffman code: no matching code found".
+  2. **Insert lengths above 319 silently truncated** — a single incompressible meta-block is emitted as one insert-and-copy command whose insert length spans the whole block, but the encoder only had insert-length categories 0–15 (max base 192, i.e. insert length ≤ 319) and wrote the excess in a 7-bit field that wrapped around, so the decoder ended the literal run early and desynchronised (content mismatch); the old decoder's extended-insert branch also did not invert the encoder.
+
+### Changed
+- **oxiarc-brotli**: `compute_code_lengths` now uses the **package-merge algorithm** (Larmore–Hirschberg) instead of the `ceil(-log2 p)` heuristic, always producing a *complete* and length-optimal (minimum-redundancy) length-limited code; adds `package_merge_lengths` and `is_complete_code` (a Kraft-sum invariant used in a debug assertion).
+- **oxiarc-brotli**: Insert-length code table unified into a single source of truth `insert_length_code_info(cat) -> (base, extra_bits)` shared by encoder and decoder; insert categories extended from 15 up to `MAX_INSERT_LENGTH_CATEGORY = 40` (covering inserts up to ~4 MiB) via the extended insert-and-copy symbols 128–703; the decoder's split `decode_insert_length_short` / `decode_insert_length_extended` functions are collapsed into a single `decode_insert_length` driven by that shared table, guaranteeing encoder/decoder agreement across the full insert-length range.
+
+### Added
+- **oxiarc-brotli**: `high_entropy_roundtrip.rs` regression suite — byte-for-byte round-trip assertions across quality levels 1–11 for random 4 KiB and 64 KiB data, an incompressible counter sequence, all-distinct-byte and all-same-byte blocks, the empty input, varied sizes, and mixed compressible/incompressible content; plus a `decode_insert_length` ↔ `insert_length_code_info` inverse-check unit test over categories 0–40.
+
+### Quality
+- 1679 tests passing, 2 skipped (13 new); zero clippy warnings (`-D warnings`), zero rustdoc warnings
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file)
+
 ## [0.3.2] - 2026-05-31
 
 ### Added

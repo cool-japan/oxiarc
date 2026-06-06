@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.1 (2026-05-30) | 150 tests passing**
+**Version: 0.3.3 (2026-06-06) | 163 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-brotli = "0.3.1"
+oxiarc-brotli = "0.3.3"
 ```
 
 ### One-shot compression / decompression
@@ -114,10 +114,10 @@ All other functionality — one-shot API, streaming API, Huffman coding, LZ77 en
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-brotli = "0.3.1"
+oxiarc-brotli = "0.3.3"
 
 # With parallel compression support
-oxiarc-brotli = { version = "0.3.1", features = ["parallel"] }
+oxiarc-brotli = { version = "0.3.3", features = ["parallel"] }
 ```
 
 ## Algorithm
@@ -136,6 +136,15 @@ Quality levels map to LZ77 search depth and the number of candidate matches cons
 | 1–4 | Fast | Comparable to gzip |
 | 5–9 | Balanced | Better than gzip |
 | 10–11 | Slow | Best (web-asset target) |
+
+## What's new in 0.3.3
+
+**High-entropy / incompressible data now round-trips byte-for-byte across all quality levels (1–11).** Previously, near-uniform or incompressible inputs (random bytes, counters, all-distinct sequences) could fail to decode. Two underlying encoder bugs were fixed:
+
+1. **Incomplete length-limited Huffman codes.** The old `compute_code_lengths` heuristic derived lengths from `ceil(-log2 p)` and patched them with a Kraft fix-up, which could emit an *incomplete* prefix code (Kraft sum below 2^15). The decoder then failed with "invalid Huffman code: no matching code found". This is replaced with the **package-merge algorithm** (Larmore–Hirschberg), which always produces a complete, length-optimal prefix code under the length limit.
+2. **Insert lengths above 319 silently truncated.** A single incompressible meta-block is encoded as one insert-and-copy command spanning the whole block, but the encoder only had insert-length categories 0–15 (covering inserts up to 319 bytes) and wrapped the excess into 7 bits, corrupting the stream. The insert-length code table is now a **single source of truth shared by encoder and decoder**, with categories extended to cover inserts up to ~4 MiB.
+
+A new `high_entropy_roundtrip.rs` regression suite exercises quality levels 1–11 over random 4 KiB / 64 KiB buffers, an incompressible counter, all-distinct and all-same-byte inputs, empty input, and mixed content — adding 13 new tests (150 → 163 passing).
 
 ## What's new in 0.3.1
 

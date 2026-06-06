@@ -565,101 +565,42 @@ fn decode_insert_copy_lengths(
     // Symbols 128-703 encode larger values with extra bits.
 
     if sym < 128 {
-        // Short codes.
+        // Short codes: insert categories 0–15.
         let insert_cat = sym / 8;
         let copy_cat = sym % 8;
 
-        let insert_length = decode_insert_length_short(reader, insert_cat)?;
+        let insert_length = decode_insert_length(reader, insert_cat)?;
         let copy_length = decode_copy_length_short(reader, copy_cat)?;
 
         Ok((insert_length, copy_length))
     } else {
-        // Extended codes.
+        // Extended codes: insert categories ≥ 16.
         let adjusted = sym - 128;
         let insert_cat = adjusted / 8 + 16;
         let copy_cat = adjusted % 8;
 
-        let insert_length = decode_insert_length_extended(reader, insert_cat)?;
+        let insert_length = decode_insert_length(reader, insert_cat)?;
         let copy_length = decode_copy_length_short(reader, copy_cat)?;
 
         Ok((insert_length, copy_length))
     }
 }
 
-/// Decode a short insert length category.
-fn decode_insert_length_short(reader: &mut BitReader<'_>, cat: u32) -> BrotliResult<usize> {
-    match cat {
-        0 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => {
-            let extra = reader.read_bits(1)?;
-            Ok(4 + extra as usize)
-        }
-        5 => {
-            let extra = reader.read_bits(1)?;
-            Ok(6 + extra as usize)
-        }
-        6 => {
-            let extra = reader.read_bits(2)?;
-            Ok(8 + extra as usize)
-        }
-        7 => {
-            let extra = reader.read_bits(2)?;
-            Ok(12 + extra as usize)
-        }
-        8 => {
-            let extra = reader.read_bits(3)?;
-            Ok(16 + extra as usize)
-        }
-        9 => {
-            let extra = reader.read_bits(3)?;
-            Ok(24 + extra as usize)
-        }
-        10 => {
-            let extra = reader.read_bits(4)?;
-            Ok(32 + extra as usize)
-        }
-        11 => {
-            let extra = reader.read_bits(4)?;
-            Ok(48 + extra as usize)
-        }
-        12 => {
-            let extra = reader.read_bits(5)?;
-            Ok(64 + extra as usize)
-        }
-        13 => {
-            let extra = reader.read_bits(5)?;
-            Ok(96 + extra as usize)
-        }
-        14 => {
-            let extra = reader.read_bits(6)?;
-            Ok(128 + extra as usize)
-        }
-        15 => {
-            let extra = reader.read_bits(7)?;
-            Ok(192 + extra as usize)
-        }
-        _ => Ok(0),
-    }
-}
-
-/// Decode an extended insert length.
-fn decode_insert_length_extended(reader: &mut BitReader<'_>, cat: u32) -> BrotliResult<usize> {
-    let extra_bits = cat.saturating_sub(14);
-    let base = match cat {
-        16 => 320,
-        17 => 448,
-        18 => 576,
-        _ => {
-            let eb = extra_bits.min(24);
-            let base: usize = 576 + (1 << (eb.saturating_sub(1)));
-            base
-        }
+/// Decode an insert length for any category using the canonical insert-length
+/// table shared with the encoder ([`crate::compress::insert_length_code_info`]).
+///
+/// This single function replaces the former split short/extended decoders, whose
+/// extended branch did not invert the encoder, and guarantees encoder/decoder
+/// agreement across the full insert-length range (including the large inserts
+/// produced for incompressible meta-blocks).
+fn decode_insert_length(reader: &mut BitReader<'_>, cat: u32) -> BrotliResult<usize> {
+    let (base, extra_bits) = crate::compress::insert_length_code_info(cat);
+    let extra = if extra_bits == 0 {
+        0
+    } else {
+        reader.read_bits(extra_bits)? as usize
     };
-    let extra = reader.read_bits(extra_bits.min(24))?;
-    Ok(base + extra as usize)
+    Ok(base + extra)
 }
 
 /// Decode a short copy length category.
@@ -783,14 +724,36 @@ mod tests {
 
     #[test]
     fn test_decode_insert_length_short() {
-        // Category 0: length 0, no extra bits needed.
-        // We need a dummy reader with some data.
+        // Categories 0–3: lengths 0–3, no extra bits needed.
         let data = [0xFF; 4];
         let mut reader = BitReader::new(&data);
-        assert_eq!(decode_insert_length_short(&mut reader, 0).ok(), Some(0));
-        assert_eq!(decode_insert_length_short(&mut reader, 1).ok(), Some(1));
-        assert_eq!(decode_insert_length_short(&mut reader, 2).ok(), Some(2));
-        assert_eq!(decode_insert_length_short(&mut reader, 3).ok(), Some(3));
+        assert_eq!(decode_insert_length(&mut reader, 0).ok(), Some(0));
+        assert_eq!(decode_insert_length(&mut reader, 1).ok(), Some(1));
+        assert_eq!(decode_insert_length(&mut reader, 2).ok(), Some(2));
+        assert_eq!(decode_insert_length(&mut reader, 3).ok(), Some(3));
+    }
+
+    #[test]
+    fn test_decode_insert_length_extended_matches_encoder() {
+        // The decoder's insert-length table must invert the encoder's across the
+        // full category range. For categories with extra bits, feed all-zero
+        // extra bits so the decoded value equals the category base.
+        for cat in 0u32..=40 {
+            let (base, extra_bits) = crate::compress::insert_length_code_info(cat);
+            // Zero extra bits → decoded == base.
+            let data = [0u8; 8];
+            let mut reader = BitReader::new(&data);
+            let decoded = decode_insert_length(&mut reader, cat).expect("decode");
+            assert_eq!(decoded, base, "cat={cat} base mismatch");
+            // Max extra bits → decoded == base + (1<<extra_bits) - 1.
+            if extra_bits > 0 {
+                let ones = [0xFFu8; 8];
+                let mut reader = BitReader::new(&ones);
+                let decoded = decode_insert_length(&mut reader, cat).expect("decode");
+                let expected = base + (1usize << extra_bits) - 1;
+                assert_eq!(decoded, expected, "cat={cat} max mismatch");
+            }
+        }
     }
 
     #[test]

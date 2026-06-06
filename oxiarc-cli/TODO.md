@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-cli - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -151,7 +151,7 @@
 ## Command Reference
 
 ```
-oxiarc 0.2.6
+oxiarc 0.3.3
 The Oxidized Archiver - Pure Rust archive utility
 
 USAGE:

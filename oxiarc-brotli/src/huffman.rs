@@ -538,10 +538,26 @@ pub fn build_huffman_tree_limited(
     HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
 }
 
-/// Compute code lengths using a two-queue Huffman algorithm with length limiting.
+/// Compute length-limited canonical Huffman code lengths.
 ///
-/// Uses the classic two-queue approach (leaf queue + internal node queue)
-/// to build the Huffman tree, then limits code lengths to `max_length`.
+/// Returns a `code_lengths` vector (indexed by symbol, `0` = absent) that
+/// always describes a **complete** prefix code limited to `max_length` bits,
+/// i.e. one whose Kraft sum is exactly `2^max_length`:
+///
+/// ```text
+///   Σ_{i : len_i > 0} 2^(max_length − len_i) = 2^max_length
+/// ```
+///
+/// Completeness is the property the Brotli decoder relies on: the canonical
+/// code it reconstructs from these lengths must cover *every* bit pattern of
+/// the maximum length, with no gaps. An incomplete code (Kraft sum strictly
+/// below the limit) leaves bit patterns that decode to no symbol, which is the
+/// "no matching code found" failure that previously struck near-uniform,
+/// all-symbols-present (high-entropy) literal distributions.
+///
+/// The lengths are also length-*optimal* for the limit because they are
+/// produced by the package-merge algorithm (Larmore–Hirschberg), which yields
+/// a minimum-redundancy prefix code subject to the `max_length` constraint.
 fn compute_code_lengths(
     sorted_symbols: &[(u32, usize)],
     alphabet_size: usize,
@@ -550,67 +566,194 @@ fn compute_code_lengths(
     let num_symbols = sorted_symbols.len();
     let mut code_lengths = vec![0u8; alphabet_size];
 
+    // Zero or one symbol: callers (build_huffman_tree_limited) handle the
+    // single-symbol case before reaching here, but guard anyway. A lone symbol
+    // is assigned length 1 (a one-symbol *complete* code uses a single bit; the
+    // true zero-bit single-symbol case is handled by `single_symbol`).
     if num_symbols <= 1 {
         if let Some((_, sym)) = sorted_symbols.first() {
-            code_lengths[*sym] = 1;
+            if *sym < code_lengths.len() {
+                code_lengths[*sym] = 1;
+            }
         }
         return Ok(code_lengths);
     }
 
-    // Sort symbols by frequency descending, assign code lengths based on probability.
-    let mut sorted_desc: Vec<(u32, usize)> = sorted_symbols.to_vec();
-    sorted_desc.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-
-    let total: f64 = sorted_desc.iter().map(|(f, _)| *f as f64).sum();
-    if total == 0.0 {
-        return Ok(code_lengths);
+    // A complete code limited to `max_length` bits exists only if the number of
+    // leaves fits the code space: num_symbols ≤ 2^max_length. Every Brotli
+    // alphabet satisfies this (256/704/64 symbols with a 15-bit limit; 18
+    // code-length symbols with a 5-bit limit), but assert it defensively so the
+    // package-merge invariants below hold.
+    if (num_symbols as u64) > (1u64 << max_length) {
+        return Err(BrotliError::InvalidParameter(format!(
+            "{num_symbols} symbols cannot fit in a {max_length}-bit prefix code"
+        )));
     }
 
-    // Assign ideal code lengths: ceil(-log2(freq/total)), clamped to [1, max_length].
-    let mut ideal_lengths: Vec<(usize, u32)> = sorted_desc
-        .iter()
-        .map(|(freq, sym)| {
-            let p = *freq as f64 / total;
-            let ideal = (-p.log2()).ceil() as u32;
-            let clamped = ideal.clamp(1, max_length);
-            (*sym, clamped)
-        })
-        .collect();
+    let lengths = package_merge_lengths(sorted_symbols, max_length);
 
-    // Adjust to satisfy Kraft inequality: sum(2^(max_length - len)) <= 2^max_length.
-    let kraft_limit = 1u64 << max_length;
-    for _ in 0..1000 {
-        let kraft_sum: u64 = ideal_lengths
-            .iter()
-            .map(|(_, len)| 1u64 << (max_length - *len))
-            .sum();
-
-        if kraft_sum <= kraft_limit {
-            break;
-        }
-
-        // Find the symbol with shortest code and increase its length.
-        let pos = ideal_lengths
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, len))| *len < max_length)
-            .min_by_key(|(_, (_, len))| *len)
-            .map(|(i, _)| i);
-
-        if let Some(p) = pos {
-            ideal_lengths[p].1 += 1;
-        } else {
-            break;
+    for (len, &(_, sym)) in lengths.iter().zip(sorted_symbols.iter()) {
+        if sym < code_lengths.len() {
+            code_lengths[sym] = *len;
         }
     }
 
-    for (sym, len) in &ideal_lengths {
-        if *sym < code_lengths.len() {
-            code_lengths[*sym] = *len as u8;
-        }
-    }
+    debug_assert!(
+        is_complete_code(&code_lengths, max_length),
+        "package-merge produced an incomplete code"
+    );
 
     Ok(code_lengths)
+}
+
+/// Check that `code_lengths` describe a complete prefix code under `max_length`
+/// (Kraft sum equals exactly `2^max_length`). Used by the `debug_assert!` in
+/// `compute_code_lengths`; cheap enough to always compile.
+fn is_complete_code(code_lengths: &[u8], max_length: u32) -> bool {
+    let mut kraft: u64 = 0;
+    for &cl in code_lengths {
+        if cl > 0 {
+            if cl as u32 > max_length {
+                return false;
+            }
+            kraft += 1u64 << (max_length - cl as u32);
+        }
+    }
+    kraft == (1u64 << max_length)
+}
+
+/// Compute optimal length-limited code lengths via the package-merge algorithm.
+///
+/// `sorted_symbols` must contain ≥ 2 entries and be sorted ascending by
+/// frequency (the caller guarantees both). The returned vector is parallel to
+/// `sorted_symbols`: `result[k]` is the bit length assigned to
+/// `sorted_symbols[k]`. The resulting code is always complete (Kraft sum =
+/// `2^max_length`) and minimises `Σ freq · length` subject to every length
+/// being ≤ `max_length`.
+///
+/// ## Algorithm
+///
+/// Package-merge views the problem as the "binary coin collector" problem. For
+/// each level `l` in `1..=max_length` we conceptually have one coin per symbol
+/// of denomination `2^(−l)` and numismatic value equal to the symbol weight; we
+/// must collect coins of total denomination `num_symbols − 1` while minimising
+/// total value. The dynamic program builds, level by level, the cheapest list
+/// of items: starting from the leaves, each pass *packages* adjacent pairs of
+/// the previous list and *merges* them with that level's leaves (both kept
+/// sorted by weight). Selecting the `2·num_symbols − 2` cheapest items from the
+/// final list and counting, for each symbol, how many selected items contain it
+/// gives that symbol's code length.
+///
+/// Items are tracked by an index into a flat arena of nodes; each node stores
+/// its weight, and either a leaf symbol-slot or two child node indices. Symbol
+/// membership counts are recovered by walking the selected items' subtrees.
+/// With Brotli's small alphabets (≤ 704 symbols) and `max_length ≤ 15`, the
+/// arena stays small and the whole computation is inexpensive.
+fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Vec<u8> {
+    let n = sorted_symbols.len();
+
+    // Arena of package-merge nodes. A node is either a leaf (referencing the
+    // index `k` of a symbol within `sorted_symbols`) or an internal package
+    // (referencing two child node indices). We only need the weight plus enough
+    // structure to count, per symbol, how many final items cover it.
+    enum Node {
+        /// Leaf for `sorted_symbols[k]`.
+        Leaf { k: usize },
+        /// Package of two previously created nodes.
+        Pair { left: usize, right: usize },
+    }
+
+    let mut arena: Vec<Node> = Vec::new();
+    let mut weight: Vec<u64> = Vec::new();
+
+    // Helper to push a leaf node and return its arena index.
+    let push_leaf = |arena: &mut Vec<Node>, weight: &mut Vec<u64>, k: usize| -> usize {
+        let id = arena.len();
+        arena.push(Node::Leaf { k });
+        weight.push(sorted_symbols[k].0 as u64);
+        id
+    };
+
+    // The list of leaf node indices for one level, in ascending weight order
+    // (identical for every level, so build it once as a template of (weight, k)).
+    // We rebuild concrete leaf nodes per level to keep node identities distinct,
+    // which matters when counting subtree membership.
+
+    // `prev` holds the previous level's list as arena indices, ascending by weight.
+    // Level 1 (the deepest, l = max_length) starts as just the leaves.
+    let mut prev: Vec<usize> = Vec::with_capacity(n);
+    for k in 0..n {
+        let id = push_leaf(&mut arena, &mut weight, k);
+        prev.push(id);
+    }
+    // `prev` is already ascending because `sorted_symbols` is ascending by weight.
+
+    // Perform `max_length - 1` package+merge passes. After the loop, `prev`
+    // is the list for the top level from which we select 2n-2 items.
+    for _ in 1..max_length {
+        // Package adjacent pairs of `prev` (drop a trailing odd item).
+        let mut packaged: Vec<usize> = Vec::with_capacity(prev.len() / 2 + n);
+        let mut j = 0;
+        while j + 1 < prev.len() {
+            let left = prev[j];
+            let right = prev[j + 1];
+            let w = weight[left] + weight[right];
+            let id = arena.len();
+            arena.push(Node::Pair { left, right });
+            weight.push(w);
+            packaged.push(id);
+            j += 2;
+        }
+
+        // Fresh leaves for this level.
+        let mut leaves: Vec<usize> = Vec::with_capacity(n);
+        for k in 0..n {
+            let id = push_leaf(&mut arena, &mut weight, k);
+            leaves.push(id);
+        }
+
+        // Merge `leaves` and `packaged`, both ascending by weight, into `prev`.
+        // Stable on ties: leaves before packages, preserving leaf order, which
+        // keeps the selection deterministic and the result canonical.
+        let mut merged: Vec<usize> = Vec::with_capacity(leaves.len() + packaged.len());
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < leaves.len() && b < packaged.len() {
+            if weight[leaves[a]] <= weight[packaged[b]] {
+                merged.push(leaves[a]);
+                a += 1;
+            } else {
+                merged.push(packaged[b]);
+                b += 1;
+            }
+        }
+        merged.extend_from_slice(&leaves[a..]);
+        merged.extend_from_slice(&packaged[b..]);
+        prev = merged;
+    }
+
+    // Select the cheapest `2n - 2` items from the final list and count, for each
+    // symbol, how many selected items cover it. That count is the symbol length.
+    let select = 2 * n - 2;
+    let mut lengths = vec![0u8; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for &item in prev.iter().take(select) {
+        // Walk the item's subtree, incrementing the length of every leaf symbol.
+        stack.clear();
+        stack.push(item);
+        while let Some(id) = stack.pop() {
+            match &arena[id] {
+                Node::Leaf { k } => {
+                    lengths[*k] = lengths[*k].saturating_add(1);
+                }
+                Node::Pair { left, right } => {
+                    stack.push(*left);
+                    stack.push(*right);
+                }
+            }
+        }
+    }
+
+    lengths
 }
 
 /// Write a prefix code for the given set of non-zero symbols and return the Huffman tree
@@ -939,5 +1082,116 @@ mod tests {
             let decoded = tree.decode_symbol(&mut reader).expect("should decode");
             assert_eq!(decoded, expected);
         }
+    }
+
+    /// Kraft sum of a code-length table under the given limit.
+    fn kraft_sum(code_lengths: &[u8], max_length: u32) -> u64 {
+        let mut sum = 0u64;
+        for &cl in code_lengths {
+            if cl > 0 {
+                assert!(
+                    cl as u32 <= max_length,
+                    "code length {cl} exceeds {max_length}"
+                );
+                sum += 1u64 << (max_length - cl as u32);
+            }
+        }
+        sum
+    }
+
+    /// The package-merge length assignment must always produce a **complete**
+    /// code (Kraft sum == 2^max_length) for the near-uniform, all-symbols-present
+    /// distribution that previously yielded an incomplete code and the
+    /// "no matching code found" decode failure.
+    #[test]
+    fn test_compute_code_lengths_complete_for_near_uniform() {
+        // 256 symbols with small, slightly-varying frequencies — the shape that
+        // arises from high-entropy literal data.
+        let mut freqs = vec![0u32; 256];
+        for (i, f) in freqs.iter_mut().enumerate() {
+            *f = 8 + ((i as u32).wrapping_mul(2654435761) % 24); // range [8, 31]
+        }
+        let tree = build_huffman_tree(&freqs, 256).expect("build");
+        assert_eq!(
+            kraft_sum(&tree.code_lengths, MAX_HUFFMAN_CODE_LENGTH),
+            1u64 << MAX_HUFFMAN_CODE_LENGTH,
+            "near-uniform 256-symbol code must be complete"
+        );
+        // Every present symbol must have a positive length.
+        for (sym, &f) in freqs.iter().enumerate() {
+            if f > 0 {
+                assert!(tree.code_lengths[sym] > 0, "symbol {sym} lost its code");
+            }
+        }
+    }
+
+    /// Completeness must hold across many random distributions, alphabet sizes,
+    /// and length limits (including the tight 18-symbol / 5-bit code-length
+    /// alphabet and limits that force the length-limiting path).
+    #[test]
+    fn test_compute_code_lengths_complete_random_sweep() {
+        let mut state = 0x1357_9BDFu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+
+        for &(alphabet, max_len) in &[(256u32, 15u32), (704, 15), (64, 15), (18, 5), (32, 6)] {
+            for _ in 0..50 {
+                let mut freqs = vec![0u32; alphabet as usize];
+                let mut nonzero = 0;
+                for f in freqs.iter_mut() {
+                    if next() % 4 != 0 {
+                        *f = next() % 1000 + 1;
+                        nonzero += 1;
+                    }
+                }
+                if nonzero < 2 {
+                    continue;
+                }
+                let tree =
+                    build_huffman_tree_limited(&freqs, alphabet, max_len).expect("build limited");
+                assert_eq!(
+                    kraft_sum(&tree.code_lengths, max_len),
+                    1u64 << max_len,
+                    "incomplete code: alphabet={alphabet} max_len={max_len}"
+                );
+            }
+        }
+    }
+
+    /// Highly skewed weights (Fibonacci) would naturally need > 15-bit codes;
+    /// the length-limiting path must clamp to ≤ max_length and stay complete.
+    #[test]
+    fn test_compute_code_lengths_complete_when_limiting() {
+        let mut freqs = vec![0u32; 64];
+        let (mut a, mut b) = (1u32, 1u32);
+        for f in freqs.iter_mut() {
+            *f = a;
+            let c = a.saturating_add(b);
+            a = b;
+            b = c;
+        }
+        let tree = build_huffman_tree_limited(&freqs, 64, 15).expect("build");
+        let max = tree.code_lengths.iter().copied().max().unwrap_or(0);
+        assert!(max <= 15, "limiting failed: max code length {max} > 15");
+        assert_eq!(
+            kraft_sum(&tree.code_lengths, 15),
+            1u64 << 15,
+            "limited code must remain complete"
+        );
+    }
+
+    /// Uniform full alphabet maps to all length-8 codes (Kraft sum exactly 2^15).
+    #[test]
+    fn test_compute_code_lengths_uniform_full_alphabet() {
+        let freqs = vec![7u32; 256];
+        let tree = build_huffman_tree(&freqs, 256).expect("build");
+        for &cl in &tree.code_lengths {
+            assert_eq!(cl, 8, "uniform 256 alphabet should be all length 8");
+        }
+        assert_eq!(kraft_sum(&tree.code_lengths, 15), 1u64 << 15);
     }
 }

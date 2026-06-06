@@ -1,4 +1,4 @@
-# oxiarc-brotli - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-brotli - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -77,6 +77,10 @@
 - [ ] Full RFC 7932 conformance testing
 - [ ] Fuzzing tests
 - [x] Interop testing with reference Brotli implementation — 19 integration tests covering all quality levels 0–11, empty/single-byte/binary/text/large-input roundtrips, `compress_with_params` variations, minimum-window (lgwin=16), compression-is-beneficial assertion, invalid parameter rejection (done 2026-05-30)
+- [x] High-entropy / incompressible round-trip fix (done 2026-06-06) — near-uniform and incompressible inputs now decode byte-for-byte across all quality levels 1–11. Two encoder bugs fixed:
+  1. **Incomplete length-limited Huffman codes** — the `compute_code_lengths` heuristic (`ceil(-log2 p)` + Kraft fix-up) could emit an incomplete prefix code (Kraft sum below 2^15), causing the decoder to fail with "invalid Huffman code: no matching code found". Replaced with the **package-merge algorithm** (Larmore–Hirschberg), which always yields a complete, length-optimal code under the length limit.
+  2. **Insert lengths above 319 silently truncated** — a single incompressible meta-block is one insert-and-copy command spanning the whole block, but the encoder only had insert-length categories 0–15 (≤319) and wrapped the excess in 7 bits. **Unified the insert-length code table into one source of truth shared by encoder and decoder**, extending categories to cover inserts up to ~4 MiB.
+  - **Tests:** NEW `tests/high_entropy_roundtrip.rs` regression suite — quality 1–11 over random 4 KiB / 64 KiB buffers, incompressible counter, all-distinct / all-same-byte, empty, and mixed content. +13 new tests (150 → 163 passing).
 
 ## Test Coverage
 
@@ -85,7 +89,8 @@
 - huffman: ~10 tests (prefix codes, context maps)
 - streaming: ~15 tests (compressor/decompressor, empty, large data)
 - bit_reader/bit_writer: ~15 tests
-- Total: 79 tests
+- high_entropy_roundtrip: 13 tests (quality 1–11; random 4 KiB/64 KiB, incompressible counter, all-distinct/all-same-byte, empty, mixed content) — new in 0.3.3
+- Total: 163 tests passing
 
 ## Code Statistics
 
@@ -111,3 +116,4 @@
 3. No shared dictionary support yet
 4. ~~Quality-1 encoder produces incorrect output for repeated-pattern data~~ — **Fixed 2026-05-17** (copy_length tail guard in `build_insert_copy_commands`)
 5. ~~Multi-block encoder is broken: inputs > 256 KiB at quality 4 (> 1 MiB at quality 5+) produce invalid bitstreams~~ — **Fixed 2026-05-17** (same root cause as #4)
+6. ~~High-entropy / incompressible data fails to decode at some quality levels ("invalid Huffman code: no matching code found" / truncated insert lengths)~~ — **Fixed 2026-06-06** (package-merge length-limited Huffman codes + unified insert-length code table covering inserts up to ~4 MiB)

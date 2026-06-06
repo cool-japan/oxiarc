@@ -1,5 +1,5 @@
 
-# oxiarc-archive - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-archive - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -208,7 +208,7 @@
 - cab: ~5 tests
 - lz4/zstd/bzip2 archive: ~15 tests
 - integration: ~5 tests
-- Total: ~172 tests
+- Total: ~332 tests
 
 ## Code Statistics
 

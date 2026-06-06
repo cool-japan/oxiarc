@@ -568,32 +568,79 @@ fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand
     result
 }
 
-/// Compute the insert length category and extra-bit count for the given insert length.
-/// Returns (category, extra_bits, base_value) matching decode_insert_length_short.
-fn insert_length_cat(insert_length: usize) -> (usize, u32, usize) {
-    match insert_length {
-        0 => (0, 0, 0),
-        1 => (1, 0, 1),
-        2 => (2, 0, 2),
-        3 => (3, 0, 3),
-        4..=5 => (4, 1, 4),
-        6..=7 => (5, 1, 6),
-        8..=11 => (6, 2, 8),
-        12..=15 => (7, 2, 12),
-        16..=23 => (8, 3, 16),
-        24..=31 => (9, 3, 24),
-        32..=47 => (10, 4, 32),
-        48..=63 => (11, 4, 48),
-        64..=95 => (12, 5, 64),
-        96..=127 => (13, 5, 96),
-        128..=191 => (14, 6, 128),
-        _ => (15, 7, 192),
+/// Largest insert-length category the encoder will emit.
+///
+/// Category `c` maps to insert-and-copy symbols `128 + (c-16)*8 + copy_cat` for
+/// `c >= 16`; the insert-and-copy alphabet has 704 symbols, so the insert
+/// category must satisfy `128 + (c-16)*8 + 7 <= 703`, i.e. `c <= 87`. We cap
+/// well below that. Category 30 already covers inserts up to ~4 MiB (the
+/// largest meta-block this encoder produces), so 40 is a comfortable ceiling.
+pub(crate) const MAX_INSERT_LENGTH_CATEGORY: u32 = 40;
+
+/// Canonical insert-length code table: `(base, extra_bits)` for a category.
+///
+/// This is the single source of truth shared by the encoder
+/// ([`insert_length_cat`], [`write_insert_length_extra`]) and the decoder
+/// (`decompress::decode_insert_length`). A category covers the inclusive range
+/// `base ..= base + (1 << extra_bits) - 1`.
+///
+/// Categories 0–15 reproduce the original short table exactly. Categories ≥ 16
+/// extend it with a regular doubling rule so that arbitrarily large literal
+/// runs (e.g. a whole incompressible meta-block) can be represented by a single
+/// insert-and-copy command. Without this extension, inserts above 319 wrapped
+/// around in 7 bits, silently truncating the literal run — the content-mismatch
+/// half of the high-entropy round-trip bug.
+///
+/// Closed form for `cat >= 16`: `extra_bits = cat - 8`, `base = 64 + 2^(cat-8)`,
+/// which chains seamlessly onto category 15 (which ends at 319, so category 16
+/// begins at 320).
+pub(crate) fn insert_length_code_info(cat: u32) -> (usize, u32) {
+    match cat {
+        0 => (0, 0),
+        1 => (1, 0),
+        2 => (2, 0),
+        3 => (3, 0),
+        4 => (4, 1),
+        5 => (6, 1),
+        6 => (8, 2),
+        7 => (12, 2),
+        8 => (16, 3),
+        9 => (24, 3),
+        10 => (32, 4),
+        11 => (48, 4),
+        12 => (64, 5),
+        13 => (96, 5),
+        14 => (128, 6),
+        15 => (192, 7),
+        _ => {
+            let extra_bits = (cat - 8).min(24);
+            let base = 64usize + (1usize << extra_bits);
+            (base, extra_bits)
+        }
+    }
+}
+
+/// Compute the insert length category, extra-bit count, and base value for the
+/// given insert length. The returned `(category, extra_bits, base)` is the exact
+/// inverse of [`insert_length_code_info`] / the decoder's insert-length table.
+fn insert_length_cat(insert_length: usize) -> (u32, u32, usize) {
+    // Categories are monotonically increasing in covered length, so scan upward
+    // and pick the category whose range contains `insert_length`. The loop runs
+    // at most `MAX_INSERT_LENGTH_CATEGORY` times and only once per command.
+    let mut cat = 0u32;
+    loop {
+        let (base, extra_bits) = insert_length_code_info(cat);
+        let span = 1usize << extra_bits;
+        if insert_length < base + span || cat >= MAX_INSERT_LENGTH_CATEGORY {
+            return (cat, extra_bits, base);
+        }
+        cat += 1;
     }
 }
 
 /// Compute the copy length category and extra-bit count for the given copy length.
 /// Returns (category, extra_bits, base_value) matching decode_copy_length_short.
-fn copy_length_cat(copy_length: usize) -> (usize, u32, usize) {
+fn copy_length_cat(copy_length: usize) -> (u32, u32, usize) {
     match copy_length {
         0..=2 => (0, 0, 2),
         3 => (1, 0, 3),
@@ -606,23 +653,29 @@ fn copy_length_cat(copy_length: usize) -> (usize, u32, usize) {
     }
 }
 
-/// Compute the insert-and-copy length code.
+/// Compute the insert-and-copy length symbol.
 ///
-/// Per RFC 7932 Section 5, the insert-and-copy length is encoded
-/// as a single symbol from a combined alphabet. The symbol encodes
-/// category indices for both insert and copy lengths, with extra bits
-/// appended afterward. This matches decode_insert_copy_lengths exactly.
+/// The insert-and-copy length is encoded as a single symbol from a 704-entry
+/// combined alphabet, with the insert- and copy-length extra bits appended
+/// afterward. This is the exact inverse of `decompress::decode_insert_copy_lengths`:
+///
+/// - insert category 0–15 → "short" symbols `insert_cat * 8 + copy_cat` (0–127)
+/// - insert category ≥ 16  → "extended" symbols
+///   `128 + (insert_cat - 16) * 8 + copy_cat`
 fn insert_copy_length_code(insert_length: usize, copy_length: usize) -> u16 {
     let (insert_cat, _, _) = insert_length_cat(insert_length);
     let (copy_cat, _, _) = copy_length_cat(copy_length);
 
-    // Symbols 0-127: short codes (insert_cat 0-15, copy_cat 0-7).
-    let code = insert_cat * 8 + copy_cat;
+    let code = if insert_cat < 16 {
+        insert_cat * 8 + copy_cat
+    } else {
+        128 + (insert_cat - 16) * 8 + copy_cat
+    };
     code.min(703) as u16
 }
 
 /// Write extra bits for insert length.
-/// Must match decode_insert_length_short/extended exactly.
+/// Must match the decoder's insert-length table exactly.
 fn write_insert_length_extra(writer: &mut BitWriter, insert_length: usize) -> BrotliResult<()> {
     let (_, extra_bits, base) = insert_length_cat(insert_length);
     if extra_bits == 0 {

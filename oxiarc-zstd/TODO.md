@@ -1,4 +1,4 @@
-# oxiarc-zstd - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-zstd - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -10,7 +10,7 @@
 - [x] Dictionary support
 - [x] Checksum support (XXH64)
 - [x] Streaming API
-- [x] All features tested (170 tests passing)
+- [x] All features tested (179 tests passing)
 
 ## Milestone: COMPLETE
 

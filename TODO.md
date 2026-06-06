@@ -1,8 +1,9 @@
 
-# OxiArc - Development Roadmap (v0.3.2, 2026-05-31)
+# OxiArc - Development Roadmap (v0.3.3, 2026-06-06)
 
 ## Version History
 
+- **v0.3.3** (2026-06-06): oxiarc-brotli high-entropy/incompressible round-trip fix — incompressible data now round-trips byte-for-byte across all quality levels (1–11). Fixed two underlying bugs: (1) incomplete length-limited Huffman codes (replaced the `ceil(-log2 p)` heuristic with the package-merge algorithm, which always yields a complete, length-optimal code) and (2) insert lengths above 319 were silently truncated (unified the insert-length code table between encoder and decoder, extending categories up to ~4 MiB inserts). 13 new high-entropy regression tests. 1,679 tests passing, 2 skipped, zero warnings. No other crate changed.
 - **v0.3.2** (2026-05-31): AEC/SZIP codec (oxiarc-szip) — full CCSDS-121.0-B-2 compliant encoder/decoder with `BitReader`/`BitWriter` bit manipulation primitives, `SzipParams` configuration struct, `SzipError` error enum. Round-trip tests for all sample scenarios.
 - **v0.3.1** (2026-05-16): LZH custom dictionary (`LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder/Decoder::preload_dictionary`). LZMA custom dictionary (`LzmaEncoder/Decoder::with_dictionary`). LZMA memory pool (`LzmaPool`, `PooledBuf`, `LzmaDecoderPooled`) — amortizes large dict allocations. Archive repair/recovery (`repair_zip`, `repair_tar`, `ZipRepair`, `TarRepair`, `RepairReport`) for truncated/corrupt ZIP+TAR archives. Snappy + Brotli interop test vectors (35 new integration tests). 1446 tests (77 new), 3 skipped, zero warnings.
 - **v0.3.0** (2026-05-17): DEFLATE Zopfli-style optimal parsing (`OptimalParser`, `with_optimal_parsing`). Snappy parallel frame compression (`compress_parallel`, `parallel` feature). LZ4 true bounded-memory streaming (block-level `Lz4Compressor`/`Lz4Decompressor`, `with_memory_budget`). LZH 4-byte hash + `LzssOptimalParser` + `with_optimal()` builder. LZMA BT4 binary tree match finder (`Bt4MatchFinder`, `MatchFinder` trait; level 9 now uses BT4). `MappedFile` zero-copy memory-mapped primitive in oxiarc-core (`mmap` feature). 1325 tests (44 new), 3 skipped, zero warnings.
@@ -222,6 +223,7 @@
 ### Quality / Testing
 - [x] Snappy interop integration tests (16 tests against wire-format golden vectors covering block and framed formats in oxiarc-snappy)
 - [x] Brotli interop integration tests (19 tests across quality levels 0-11 covering RFC 7932 compliance in oxiarc-brotli)
+- [x] Brotli high-entropy/incompressible round-trip fix (v0.3.3) — package-merge length-limited Huffman codes + unified encoder/decoder insert-length table (inserts up to ~4 MiB); incompressible data round-trips byte-for-byte across quality 1–11; 13 new high-entropy regression tests in oxiarc-brotli
 
 ### Platform
 - [ ] WASM bindings
@@ -283,16 +285,16 @@
   - LZMA/LZMA2, optimal parsing, range coder, price calculation, progress/cancel builders, BT4 match finder, Bt4MatchFinder, MatchFinder trait, parallel LZMA2 (lzma2_compress_parallel, ParallelLzma2Encoder, parallel feature), custom dictionary (LzmaEncoder::with_dictionary, LzmaDecoder::with_dictionary), LZMA memory pool (LzmaPool, PooledBuf, LzmaDecoderPooled)
 - oxiarc-lzw: 76 tests
   - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests, streaming encoder/decoder tests
-- oxiarc-brotli: 150 tests
-  - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API, interop integration tests, encoder bug fixes
+- oxiarc-brotli: 163 tests
+  - Brotli RFC 7932, LZ77, context-dependent Huffman coding, static dictionary, quality levels 0-11, streaming API, interop integration tests, encoder bug fixes, high-entropy/incompressible round-trip regression tests (package-merge Huffman + unified insert-length table)
 - oxiarc-snappy: 112 tests
   - Snappy block format, framed format with CRC32C checksums (SSE 4.2 hardware acceleration on x86_64), streaming Write/Read API, interop integration tests, parallel frame compression, memory pool (SnappyPool, PoolStats, compress_frame_pooled), dictionary APIs (compress_block_with_dict, compress_frame_with_dict, decompress_block_with_dict, decompress_frame_with_dict), async I/O (AsyncSnappyCompressor, AsyncSnappyDecompressor)
 - oxiarc-szip: 19 tests
   - AEC/SZIP CCSDS-121.0-B-2 encoder/decoder, BitReader/BitWriter bit primitives, SzipParams configuration, SzipError error type, round-trip encode/decode tests
 - oxiarc-cli: 37 tests
-- Total: 1,666 tests (1,666 passed, 2 skipped, zero warnings)
+- Total: 1,679 tests (1,679 passed, 2 skipped, zero warnings)
 
-## Code Statistics (v0.3.2, 2026-05-31)
+## Code Statistics (v0.3.3, 2026-06-06)
 
 | Crate | Lines of Code |
 |-------|---------------|

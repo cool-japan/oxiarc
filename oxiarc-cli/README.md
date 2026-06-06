@@ -7,7 +7,7 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.1 (2026-05-30) | 37 tests passing**
+**Version: 0.3.3 (2026-06-06) | 37 tests passing**
 
 
 ## Features

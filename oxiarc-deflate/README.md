@@ -3,11 +3,11 @@
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-![Version](https://img.shields.io/badge/version-0.3.1-blue)
+![Version](https://img.shields.io/badge/version-0.3.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.1** (2026-05-30) — 212 tests passing.
+**Version 0.3.3** (2026-06-06) — 212 tests passing.
 
 **What's new in 0.3.x (latest)**:
 - **Parallel GZIP compression** (`parallel` feature): pigz-style multi-member GZIP via `gzip_compress_parallel()` and `ParallelGzipEncoder` builder.
@@ -60,21 +60,21 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-deflate = "0.3.1"
+oxiarc-deflate = "0.3.3"
 ```
 
 With async I/O support:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.3.1", features = ["async-io"] }
+oxiarc-deflate = { version = "0.3.3", features = ["async-io"] }
 ```
 
 With parallel GZIP compression:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.3.1", features = ["parallel"] }
+oxiarc-deflate = { version = "0.3.3", features = ["parallel"] }
 ```
 
 ## Quick Start

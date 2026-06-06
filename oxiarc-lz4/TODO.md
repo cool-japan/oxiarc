@@ -1,4 +1,4 @@
-# oxiarc-lz4 - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-lz4 - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -86,7 +86,7 @@
 - xxhash: 8 tests
 - hc: 9 tests
 - lib: 51 tests
-- Total: 114 tests
+- Total: 138 tests
 
 ## Code Statistics
 

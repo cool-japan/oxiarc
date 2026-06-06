@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-lzma = { version = "0.3.2", features = ["async-io"] }
+//! oxiarc-lzma = { version = "0.3.3", features = ["async-io"] }
 //! ```
 //!
 //! # Memory Model

@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.3.1, 2026-05-30)
+# oxiarc-deflate - Development Status (v0.3.3, 2026-06-06)
 
 ## Completed Features (COMPLETE)
 
@@ -171,7 +171,7 @@
 - async_deflate: ~12 tests
 - gzip: ~7 tests
 - edge_cases: 14 tests (integration test)
-- Total: 126 tests
+- Total: 212 tests
 
 ## Code Statistics
 
