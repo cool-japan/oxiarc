@@ -312,3 +312,10 @@
 | oxiarc-lzma | ~3,868 |
 | oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
 | **Total** | **~72,000** (234 files) |
+
+## Stubs to implement (added 2026-06-22 by /cooljapan-stub-check)
+
+- [ ] **oxiarc** `oxiarc-archive`: `oxiarc-archive/src/xz/header.rs:913` — `TODO`: `LZH compression (lh5) encoder not compatible` (round-trip tests disabled; lh5 Huffman emission not spec-compatible)
+  - **Priority:** P2  **Scope:** large  **Cross-project:** none
+  - **Approach:** Align the LZH `lh5` encoder's Huffman code-length table emission with the LHA/LZH spec (code-length list encoding + offset/length symbol tables), then re-enable the disabled round-trip tests by decoding against reference `.lzh` archives.
+  - **Risk:** Bitstream-level format work; an off-by-one in code-length packing silently produces archives no other extractor can read. Needs reference-archive corpus to validate, not just self-round-trip.
