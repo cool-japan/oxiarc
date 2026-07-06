@@ -5,6 +5,8 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - Unreleased
+
 ## [0.3.4] - 2026-07-06
 
 Interoperability hardening release: a batch of spec-conformance defects found via downstream FVRS integration testing was root-caused and fixed across the LZMA, bzip2, LZH, 7z, ZIP, TAR, and XZ stacks. All codecs were validated bidirectionally against reference implementations (liblzma, libbz2, bsdtar/libarchive, CPython stdlib) during development; the committed test suites are fully hermetic (golden vectors embedded, no external tools invoked at test time).
