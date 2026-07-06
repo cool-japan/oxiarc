@@ -254,11 +254,9 @@ pub fn cmd_create(
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
-            // Note: LZH compression (lh5) is not fully production-ready yet
-            // Using Store mode for now
             let level = match compression {
                 CompressionLevel::Store => LzhCompressionLevel::Store,
-                _ => LzhCompressionLevel::Store, // Fall back to Store for now
+                _ => LzhCompressionLevel::Lh5,
             };
             lzh.set_compression(level);
 

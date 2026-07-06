@@ -95,10 +95,7 @@ mod tests {
     #[test]
     fn utf8_names_decode_with_and_without_efs() {
         // EFS flag set: UTF-8 as mandated by APPNOTE.
-        assert_eq!(
-            decode_zip_text("日本語.txt".as_bytes(), true),
-            "日本語.txt"
-        );
+        assert_eq!(decode_zip_text("日本語.txt".as_bytes(), true), "日本語.txt");
         // No EFS flag but valid UTF-8 (typical Unix-produced ZIP).
         assert_eq!(
             decode_zip_text("日本語.txt".as_bytes(), false),

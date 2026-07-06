@@ -28,10 +28,8 @@ pub fn cmd_convert(
     // instead of silently emitting a different format under that name.
     let output_format = match format {
         Some(f) => f,
-        None => crate::commands::create::output_format_from_extension(
-            &output.to_string_lossy(),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        None => crate::commands::create::output_format_from_extension(&output.to_string_lossy())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     };
 
     println!(
@@ -106,8 +104,11 @@ pub fn cmd_convert(
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
-            // LZH compression is stored mode only for now
-            lzh.set_compression(LzhCompressionLevel::Store);
+            let level = match compression {
+                CompressionLevel::Store => LzhCompressionLevel::Store,
+                _ => LzhCompressionLevel::Lh5,
+            };
+            lzh.set_compression(level);
 
             for (name, is_dir, data) in &entries {
                 if *is_dir {

@@ -191,7 +191,9 @@ fn ascii_names_still_roundtrip_through_writer_and_reader() {
     let mut bytes = Vec::new();
     {
         let mut writer = oxiarc_archive::zip::ZipWriter::new(&mut bytes);
-        writer.add_file("plain.txt", b"plain body").expect("add_file");
+        writer
+            .add_file("plain.txt", b"plain body")
+            .expect("add_file");
         writer.finish().expect("finish");
     }
     let mut reader = ZipReader::new(Cursor::new(bytes)).expect("roundtrip must parse");

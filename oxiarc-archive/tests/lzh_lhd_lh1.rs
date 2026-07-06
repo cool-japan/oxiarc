@@ -65,7 +65,10 @@ fn level1_member(
 
     // Extension chain: first size, then each block with the next block's
     // size (or the terminator) trailing it.
-    let mut sizes: Vec<u16> = ext_blocks.iter().map(|(_, d)| (3 + d.len()) as u16).collect();
+    let mut sizes: Vec<u16> = ext_blocks
+        .iter()
+        .map(|(_, d)| (3 + d.len()) as u16)
+        .collect();
     sizes.push(0); // terminator
     member.extend_from_slice(&sizes[0].to_le_bytes());
     for (i, (ext_type, data)) in ext_blocks.iter().enumerate() {

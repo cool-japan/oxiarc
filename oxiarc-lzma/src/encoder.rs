@@ -897,8 +897,7 @@ impl LzmaEncoder {
 
         if write_end_marker {
             // Write end marker (a match with distance 0xFFFF_FFFF)
-            let pos_state =
-                (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
+            let pos_state = (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
             let state_idx = self.state.value();
 
             self.rc

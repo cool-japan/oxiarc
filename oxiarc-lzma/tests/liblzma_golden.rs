@@ -134,7 +134,11 @@ fn decodes_liblzma_lzma1_alone_container() {
 fn decodes_liblzma_lzma2_raw_small() {
     let decoded = oxiarc_lzma::decode_lzma2(LIBLZMA_LZMA2_RAW_SMALL, 1 << 23)
         .expect("raw LZMA2 stream must decode");
-    assert_eq!(decoded, small_fixture(), "liblzma raw LZMA2 (small) mismatch");
+    assert_eq!(
+        decoded,
+        small_fixture(),
+        "liblzma raw LZMA2 (small) mismatch"
+    );
 }
 
 #[test]
@@ -154,11 +158,17 @@ fn decodes_liblzma_lzma2_raw_large() {
 fn decodes_embedded_oxiarc_lzma1_raw_vectors() {
     let expected = small_fixture();
     let decoded = decode_raw_lzma1(OXIARC_LZMA1_RAW_SMALL, expected.len() as u64);
-    assert_eq!(decoded, expected, "embedded oxiarc raw LZMA1 (small) mismatch");
+    assert_eq!(
+        decoded, expected,
+        "embedded oxiarc raw LZMA1 (small) mismatch"
+    );
 
     let expected = large_fixture();
     let decoded = decode_raw_lzma1(OXIARC_LZMA1_RAW_LARGE, expected.len() as u64);
-    assert_eq!(decoded, expected, "embedded oxiarc raw LZMA1 (large) mismatch");
+    assert_eq!(
+        decoded, expected,
+        "embedded oxiarc raw LZMA1 (large) mismatch"
+    );
 }
 
 #[test]
@@ -172,7 +182,11 @@ fn decodes_embedded_oxiarc_lzma1_alone_vector() {
 fn decodes_embedded_oxiarc_lzma2_vectors() {
     let decoded = oxiarc_lzma::decode_lzma2(OXIARC_LZMA2_SMALL, 1 << 23)
         .expect("embedded oxiarc LZMA2 stream must decode");
-    assert_eq!(decoded, small_fixture(), "embedded oxiarc LZMA2 (small) mismatch");
+    assert_eq!(
+        decoded,
+        small_fixture(),
+        "embedded oxiarc LZMA2 (small) mismatch"
+    );
 
     let expected = large_fixture();
     let decoded = oxiarc_lzma::decode_lzma2(OXIARC_LZMA2_LARGE, 1 << 23)
@@ -188,11 +202,13 @@ fn decodes_embedded_oxiarc_lzma2_vectors() {
 fn round_trips_raw_lzma1_greedy_and_optimal() {
     let expected = large_fixture();
     for level in [1u8, 6, 9] {
-        let packed =
-            oxiarc_lzma::compress_raw(&expected, LzmaLevel::new(level), 1 << 20)
-                .expect("compress_raw must succeed");
+        let packed = oxiarc_lzma::compress_raw(&expected, LzmaLevel::new(level), 1 << 20)
+            .expect("compress_raw must succeed");
         let decoded = decode_raw_lzma1(&packed, expected.len() as u64);
-        assert_eq!(decoded, expected, "raw LZMA1 round-trip failed at level {level}");
+        assert_eq!(
+            decoded, expected,
+            "raw LZMA1 round-trip failed at level {level}"
+        );
     }
 }
 
@@ -201,8 +217,7 @@ fn round_trips_lzma_alone_container() {
     let expected = small_fixture();
     let packed =
         oxiarc_lzma::compress(&expected, LzmaLevel::new(6)).expect("compress must succeed");
-    let decoded =
-        oxiarc_lzma::decompress_bytes(&packed).expect("own .lzma stream must decode");
+    let decoded = oxiarc_lzma::decompress_bytes(&packed).expect("own .lzma stream must decode");
     assert_eq!(decoded, expected, ".lzma round-trip failed");
 }
 
@@ -210,8 +225,7 @@ fn round_trips_lzma_alone_container() {
 fn round_trips_lzma2_chunked() {
     let expected = large_fixture();
     let packed = oxiarc_lzma::lzma2_compress(&expected, 6).expect("lzma2_compress must succeed");
-    let decoded =
-        oxiarc_lzma::lzma2_decompress(&packed).expect("own LZMA2 stream must decode");
+    let decoded = oxiarc_lzma::lzma2_decompress(&packed).expect("own LZMA2 stream must decode");
     assert_eq!(decoded, expected, "LZMA2 chunked round-trip failed");
 }
 
@@ -238,8 +252,7 @@ fn lzma2_state_reset_chunk_keeps_dictionary() {
     let payload2 = enc2.compress_chunk(&part2).expect("chunk 2 compress");
 
     let mut stream = Vec::new();
-    for (control_base, payload, raw) in [(0xE0u8, &payload1, &part1), (0xC0u8, &payload2, &part2)]
-    {
+    for (control_base, payload, raw) in [(0xE0u8, &payload1, &part1), (0xC0u8, &payload2, &part2)] {
         let unpacked_minus_1 = raw.len() - 1;
         let control = control_base | ((unpacked_minus_1 >> 16) & 0x1F) as u8;
         stream.push(control);
@@ -254,5 +267,8 @@ fn lzma2_state_reset_chunk_keeps_dictionary() {
         oxiarc_lzma::decode_lzma2(&stream, 1 << 23).expect("two-chunk LZMA2 stream must decode");
     let mut expected = part1;
     expected.extend_from_slice(&part2);
-    assert_eq!(decoded, expected, "0xC0 chunk must not reset the dictionary");
+    assert_eq!(
+        decoded, expected,
+        "0xC0 chunk must not reset the dictionary"
+    );
 }

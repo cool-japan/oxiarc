@@ -42,9 +42,7 @@ pub(crate) struct Bz2Crc {
 impl Bz2Crc {
     /// Create a new calculator with the initial register value.
     pub(crate) fn new() -> Self {
-        Self {
-            value: 0xFFFF_FFFF,
-        }
+        Self { value: 0xFFFF_FFFF }
     }
 
     /// Reset the register for a new block.
@@ -55,8 +53,8 @@ impl Bz2Crc {
     /// Feed data into the CRC register.
     pub(crate) fn update(&mut self, data: &[u8]) {
         for &byte in data {
-            self.value = (self.value << 8)
-                ^ BZ2_CRC_TABLE[(((self.value >> 24) as u8) ^ byte) as usize];
+            self.value =
+                (self.value << 8) ^ BZ2_CRC_TABLE[(((self.value >> 24) as u8) ^ byte) as usize];
         }
     }
 

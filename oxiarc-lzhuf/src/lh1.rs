@@ -350,9 +350,8 @@ fn encode_position(writer: &mut BitWriter, pos: usize, p_code: &[u8; 64], p_len:
 ///
 /// Returns an error if `original_size` does not fit in `usize`.
 pub fn decode_lh1(data: &[u8], original_size: u64) -> Result<Vec<u8>> {
-    let expected = usize::try_from(original_size).map_err(|_| {
-        OxiArcError::corrupted(0, "lh1: original size does not fit in memory")
-    })?;
+    let expected = usize::try_from(original_size)
+        .map_err(|_| OxiArcError::corrupted(0, "lh1: original size does not fit in memory"))?;
 
     let mut tree = AdaptiveHuffman::new();
     let mut reader = BitReader::new(data);

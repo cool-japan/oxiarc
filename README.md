@@ -29,7 +29,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 ### Compression Algorithms (11 implemented)
 - **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
-- **LZH** - LZSS + Huffman (lh0, lh4-lh7)
+- **LZH** - LZSS + Huffman (lh0, lh4-lh7) plus lh1 (LZHUF adaptive Huffman) and lhd directory entries
 - **Bzip2** - BWT + MTF + RLE + Huffman
 - **LZ4** - Ultra-fast LZ77 variant with LZ4-HC
 - **Zstandard** - FSE + Huffman entropy coding
@@ -224,7 +224,8 @@ The standard compression used in ZIP, GZIP, and PNG:
 Japanese archive format compression:
 - LZSS with configurable window sizes (4KB-64KB)
 - Static Huffman coding with dual trees (codes + offsets)
-- Methods: lh0 (stored), lh4, lh5, lh6, lh7
+- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh4, lh5, lh6, lh7, lhd (directory); unknown methods are listed and skipped per entry
+- Shift_JIS filenames and level-2 headers (LHA 2.x standard) on write
 
 ### LZMA/LZMA2
 

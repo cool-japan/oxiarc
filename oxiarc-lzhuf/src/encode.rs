@@ -3,8 +3,8 @@
 //! This module implements LZH compression for methods lh4-lh7.
 
 use crate::lzss::{LzssEncoder, LzssToken};
-use crate::methods::{LzhMethod, p_tree_count_bits};
 use crate::methods::constants::{NC, NT};
+use crate::methods::{LzhMethod, p_tree_count_bits};
 use crate::optimal::LzssOptimalParser;
 use oxiarc_core::BitWriter;
 use oxiarc_core::error::{OxiArcError, Result};
@@ -224,10 +224,7 @@ impl LzhEncoder {
                 block_size += token_bytes;
                 block_end += 1;
             }
-            debug_assert!(
-                block_end > pos,
-                "a single token must always fit in a block"
-            );
+            debug_assert!(block_end > pos, "a single token must always fit in a block");
             let block_tokens = &tokens[pos..block_end];
 
             self.encode_block(block_tokens, writer, np, block_size)?;

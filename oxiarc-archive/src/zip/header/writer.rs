@@ -21,6 +21,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// General-purpose bit flag bit 1: LZMA EOS marker present.
 const FLAG_LZMA_EOS: u16 = 0x0002;
 
+/// General-purpose bit flag bit 11: language encoding flag (EFS).
+///
+/// Signals that the filename and comment are encoded in UTF-8
+/// (APPNOTE Appendix D). Set for any non-ASCII name so interoperating
+/// tools do not fall back to CP437 and garble the name.
+const FLAG_UTF8: u16 = 0x0800;
+
+/// EFS flag for a name: `FLAG_UTF8` when the name needs UTF-8 signaling,
+/// `0` for pure-ASCII names (which decode identically under CP437).
+fn utf8_name_flag(name: &str) -> u16 {
+    if name.is_ascii() { 0 } else { FLAG_UTF8 }
+}
+
 /// LZMA method-14 version bytes written into the method-14 header.
 const LZMA_METHOD14_MAJOR_VER: u8 = 0x13;
 const LZMA_METHOD14_MINOR_VER: u8 = 0x00;
@@ -146,6 +159,7 @@ impl<W: Write> ZipWriter<W> {
 
         // Write local file header
         let filename_bytes = name.as_bytes();
+        let flags = utf8_name_flag(name);
 
         // Build Zip64 extra field for local header if needed
         let mut local_extra = Vec::new();
@@ -173,8 +187,8 @@ impl<W: Write> ZipWriter<W> {
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
         self.writer.write_all(&version_needed.to_le_bytes())?;
-        // Flags (0 = no special flags)
-        self.writer.write_all(&0u16.to_le_bytes())?;
+        // Flags (EFS bit for non-ASCII UTF-8 names)
+        self.writer.write_all(&flags.to_le_bytes())?;
         // Compression method
         self.writer.write_all(&method.to_le_bytes())?;
         // Modification time
@@ -211,7 +225,7 @@ impl<W: Write> ZipWriter<W> {
         self.entries.push(CentralDirEntry {
             version_made_by: 0x031E, // Unix, version 3.0
             version_needed,
-            flags: 0,
+            flags,
             method,
             mtime,
             mdate,
@@ -306,8 +320,9 @@ impl<W: Write> ZipWriter<W> {
             uncompressed_size as u32
         };
 
-        // General-purpose bit flag: bit 1 = EOS marker present in LZMA stream
-        let flags: u16 = FLAG_LZMA_EOS;
+        // General-purpose bit flag: bit 1 = EOS marker present in LZMA
+        // stream, plus the EFS bit for non-ASCII UTF-8 names
+        let flags: u16 = FLAG_LZMA_EOS | utf8_name_flag(name);
         // Compression method 14 = LZMA
         let method: u16 = 14;
 
@@ -514,14 +529,15 @@ impl<W: Write> ZipWriter<W> {
 
         // Write local file header
         let filename_bytes = name.as_bytes();
+        let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
         // Signature
         self.writer
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
         self.writer.write_all(&version_needed.to_le_bytes())?;
-        // Flags (bit 0 = encrypted)
-        self.writer.write_all(&FLAG_ENCRYPTED.to_le_bytes())?;
+        // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
+        self.writer.write_all(&flags.to_le_bytes())?;
         // Compression method (99 = AES encrypted)
         self.writer.write_all(&METHOD_AES_ENCRYPTED.to_le_bytes())?;
         // Modification time
@@ -559,7 +575,7 @@ impl<W: Write> ZipWriter<W> {
         self.entries.push(CentralDirEntry {
             version_made_by: 0x031E, // Unix, version 3.0
             version_needed,
-            flags: FLAG_ENCRYPTED,
+            flags,
             method: METHOD_AES_ENCRYPTED,
             mtime,
             mdate,
@@ -708,14 +724,15 @@ impl<W: Write> ZipWriter<W> {
 
         // Write local file header
         let filename_bytes = name.as_bytes();
+        let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
         // Signature
         self.writer
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
         self.writer.write_all(&version_needed.to_le_bytes())?;
-        // Flags (bit 0 = encrypted)
-        self.writer.write_all(&FLAG_ENCRYPTED.to_le_bytes())?;
+        // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
+        self.writer.write_all(&flags.to_le_bytes())?;
         // Compression method
         self.writer.write_all(&method.to_le_bytes())?;
         // Modification time
@@ -753,7 +770,7 @@ impl<W: Write> ZipWriter<W> {
         self.entries.push(CentralDirEntry {
             version_made_by: 0x031E,
             version_needed,
-            flags: FLAG_ENCRYPTED,
+            flags,
             method,
             mtime,
             mdate,
@@ -811,8 +828,12 @@ impl<W: Write> ZipWriter<W> {
         };
 
         let method_u16 = method.to_u16();
-        // LZMA (method 14) requires bit 1 set in flags to indicate EOS marker.
-        let flags: u16 = if method_u16 == 14 { FLAG_LZMA_EOS } else { 0 };
+        // LZMA (method 14) requires bit 1 set in flags to indicate EOS
+        // marker; the EFS bit is set for non-ASCII UTF-8 names.
+        let mut flags: u16 = utf8_name_flag(name);
+        if method_u16 == 14 {
+            flags |= FLAG_LZMA_EOS;
+        }
 
         let compressed_size = compressed_data.len() as u64;
         let local_header_offset = self.offset;
@@ -920,12 +941,13 @@ impl<W: Write> ZipWriter<W> {
         let (mtime, mdate) = Self::current_dos_time();
         let local_header_offset = self.offset;
         let filename_bytes = dir_name.as_bytes();
+        let flags = utf8_name_flag(&dir_name);
 
         // Write local file header for directory
         self.writer
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         self.writer.write_all(&10u16.to_le_bytes())?; // Version needed
-        self.writer.write_all(&0u16.to_le_bytes())?; // Flags
+        self.writer.write_all(&flags.to_le_bytes())?; // Flags (EFS bit if non-ASCII)
         self.writer.write_all(&0u16.to_le_bytes())?; // Method (stored)
         self.writer.write_all(&mtime.to_le_bytes())?;
         self.writer.write_all(&mdate.to_le_bytes())?;
@@ -943,7 +965,7 @@ impl<W: Write> ZipWriter<W> {
         self.entries.push(CentralDirEntry {
             version_made_by: 0x031E,
             version_needed: 10,
-            flags: 0,
+            flags,
             method: 0,
             mtime,
             mdate,

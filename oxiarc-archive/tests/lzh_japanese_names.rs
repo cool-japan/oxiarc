@@ -112,7 +112,10 @@ fn ascii_names_unaffected_by_shift_jis_encoding() {
     let mut reader = LzhReader::new(Cursor::new(&archive)).expect("open");
     let entries = reader.entries();
     assert_eq!(entries[0].name, "plain_ascii.txt");
-    assert_eq!(reader.extract_to_vec(&entries[0]).expect("extract"), b"ascii");
+    assert_eq!(
+        reader.extract_to_vec(&entries[0]).expect("extract"),
+        b"ascii"
+    );
 }
 
 #[test]

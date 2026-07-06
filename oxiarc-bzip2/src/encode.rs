@@ -317,8 +317,10 @@ pub fn compress_parallel(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>
 
     // Transform blocks in parallel (heavy computation only, no writing).
     let chunks: Vec<&[u8]> = data.chunks(input_chunk_limit(level)).collect();
-    let prepared: Vec<Result<PreparedBlock>> =
-        chunks.par_iter().map(|chunk| prepare_block(chunk)).collect();
+    let prepared: Vec<Result<PreparedBlock>> = chunks
+        .par_iter()
+        .map(|chunk| prepare_block(chunk))
+        .collect();
 
     // Write blocks sequentially to keep the bit stream contiguous.
     let mut combined_crc = 0u32;
@@ -506,7 +508,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    #[ignore = "heavy: stress test (>120s), may consume significant resources"]
     fn test_parallel_repeated_data() {
         use crate::decompress;
         // Reduced from repeat(10000) to repeat(200) for faster testing
@@ -525,7 +526,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    #[ignore = "heavy: stress test (>100s), tests all compression levels"]
     fn test_parallel_different_levels() {
         use crate::decompress;
         // Reduced from repeat(1000) to repeat(100) for faster testing (4400 bytes)

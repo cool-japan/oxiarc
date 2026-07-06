@@ -617,10 +617,7 @@ impl<R: Read + Seek> SevenZReader<R> {
             .checked_add(size)
             .filter(|&end| end <= folder_data.len())
             .ok_or_else(|| {
-                OxiArcError::corrupted(
-                    offset as u64,
-                    "7z entry exceeds decoded folder bounds",
-                )
+                OxiArcError::corrupted(offset as u64, "7z entry exceeds decoded folder bounds")
             })?;
         let data = folder_data[offset..end].to_vec();
 
@@ -1172,11 +1169,7 @@ fn assemble_entries(streams: &StreamsInfo, files: FilesInfo) -> Result<Vec<Seven
             .get(global_stream)
             .copied()
             .ok_or_else(|| OxiArcError::invalid_header("7z substream size list too short"))?;
-        let crc = streams
-            .substream_crcs
-            .get(global_stream)
-            .copied()
-            .flatten();
+        let crc = streams.substream_crcs.get(global_stream).copied().flatten();
 
         entries.push(SevenZEntry {
             name,

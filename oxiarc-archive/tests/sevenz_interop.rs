@@ -60,7 +60,10 @@ fn assert_bsdtar_listing(reader: &SevenZReader<Cursor<&'static [u8]>>) {
 
     let empty = &entries[find("empty.txt")];
     assert_eq!(empty.size, 0, "empty.txt size");
-    assert!(!empty.is_dir, "empty.txt must be a zero-byte file, not a dir");
+    assert!(
+        !empty.is_dir,
+        "empty.txt must be a zero-byte file, not a dir"
+    );
     assert!(empty.folder_index.is_none(), "empty.txt has no substream");
 
     let dir = &entries[find("subdir")];
@@ -143,7 +146,10 @@ fn zero_byte_member_does_not_abort_extraction() {
         .position(|e| e.name == "empty.txt")
         .expect("empty.txt present");
     let data = reader.extract(empty_index).expect("extract empty.txt");
-    assert!(data.is_empty(), "zero-byte member must extract to empty data");
+    assert!(
+        data.is_empty(),
+        "zero-byte member must extract to empty data"
+    );
 }
 
 #[test]

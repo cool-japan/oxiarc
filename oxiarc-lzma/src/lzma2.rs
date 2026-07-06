@@ -727,8 +727,13 @@ impl Lzma2Encoder {
             return Ok(output);
         }
 
-        // For simplicity, encode all data in a single LZMA chunk
-        // A full implementation would split into multiple chunks
+        // A single LZMA2 chunk header carries a 21-bit uncompressed size and a
+        // 16-bit compressed size. Inputs that cannot fit either field must be
+        // split into multiple chunks; delegate those to the chunked encoder
+        // instead of silently truncating the size fields.
+        if data.len() > crate::lzma2_chunk::LZMA_CHUNK_MAX_UNCOMPRESSED {
+            return self.encode_chunked(data);
+        }
 
         // Create encoder to get properties
         let encoder = LzmaEncoder::new(self.level, self.dict_size);
@@ -740,8 +745,17 @@ impl Lzma2Encoder {
 
         // Check if compression is worthwhile
         if compressed.len() >= data.len() {
+            if data.len() > crate::lzma2_chunk::UNCOMPRESSED_CHUNK_MAX {
+                // A single uncompressed chunk holds at most 64 KiB; split via
+                // the chunked encoder.
+                return self.encode_chunked(data);
+            }
             // Use uncompressed chunk
             self.write_uncompressed_chunk(&mut output, data, true)?;
+        } else if compressed.len() > crate::lzma2_chunk::LZMA_CHUNK_MAX_COMPRESSED {
+            // The compressed payload overflows the 16-bit chunk size field;
+            // split via the chunked encoder.
+            return self.encode_chunked(data);
         } else {
             // Use LZMA compressed chunk
             self.write_lzma_chunk(&mut output, data.len(), &compressed, props, true)?;
@@ -756,6 +770,24 @@ impl Lzma2Encoder {
         }
 
         Ok(output)
+    }
+
+    /// Encode via the multi-chunk LZMA2 encoder.
+    ///
+    /// Used for inputs that cannot be represented as a single LZMA2 chunk
+    /// (uncompressed size over 2 MiB, compressed payload over 64 KiB, or an
+    /// incompressible input over 64 KiB).
+    fn encode_chunked(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let config =
+            crate::lzma2_chunk::Lzma2Config::with_level(self.level).dict_size(self.dict_size);
+        let mut encoder = crate::lzma2_chunk::Lzma2ChunkedEncoder::with_config(config);
+        if let Some(ref handle) = self.progress {
+            encoder = encoder.with_progress(handle.clone());
+        }
+        if let Some(ref token) = self.cancel {
+            encoder = encoder.with_cancel(token.clone());
+        }
+        encoder.encode(data)
     }
 
     /// Write an uncompressed chunk.

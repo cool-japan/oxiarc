@@ -1289,7 +1289,8 @@ mod tests {
             }
             let decompressed = inflate(&compressed).expect("inflate dynamic round-trip");
             assert_eq!(
-                &decompressed, input,
+                &decompressed,
+                input,
                 "round-trip mismatch for {}-byte input",
                 input.len()
             );
