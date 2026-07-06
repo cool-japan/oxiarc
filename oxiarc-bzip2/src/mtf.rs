@@ -4,8 +4,13 @@
 //! in a dynamic list. After each byte, that byte is moved to the front
 //! of the list. This converts local byte clusters into many zeros.
 
-/// Perform Move-to-Front transform.
+/// Perform Move-to-Front transform over the full 256-byte alphabet.
 /// Returns the transformed data.
+///
+/// The bzip2 pipeline itself uses [`transform_with_alphabet`] with the
+/// block's used-symbol list; this full-alphabet variant is kept as a
+/// general-purpose utility.
+#[allow(dead_code)]
 pub fn transform(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -16,11 +21,12 @@ pub fn transform(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
 
     for &byte in data {
-        // Find the position of the byte in the list (always exists since list contains 0-255)
+        // The list is a permutation of 0-255, so every byte is present; the
+        // fallback index can never be used but avoids a panicking lookup.
         let pos = list
             .iter()
             .position(|&b| b == byte)
-            .expect("MTF: byte must exist in 0-255 list");
+            .unwrap_or(usize::from(byte));
         result.push(pos as u8);
 
         // Move the byte to the front
@@ -33,7 +39,8 @@ pub fn transform(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Perform inverse Move-to-Front transform.
+/// Perform inverse Move-to-Front transform over the full 256-byte alphabet.
+#[allow(dead_code)]
 pub fn inverse_transform(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -57,9 +64,10 @@ pub fn inverse_transform(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Optimized MTF using a limited alphabet.
-/// Only includes symbols that appear in the input.
-#[allow(dead_code)]
+/// MTF over a limited alphabet (the bzip2 used-symbol list).
+///
+/// `alphabet` must contain every byte value that occurs in `data`, in
+/// ascending order, exactly as recovered from the block's symbol map.
 pub fn transform_with_alphabet(data: &[u8], alphabet: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();

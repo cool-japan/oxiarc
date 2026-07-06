@@ -180,10 +180,14 @@ impl Lzma2Decoder {
         output: &mut Vec<u8>,
         control: u8,
     ) -> Result<()> {
-        // Parse control byte
-        let reset_dict = (control & 0x20) != 0;
-        let reset_state = (control & 0x40) != 0 || reset_dict;
-        let new_props = (control & 0x40) != 0;
+        // Parse control byte. Bits 5-6 form the reset field (LZMA2 spec):
+        //   0 = no reset, 1 = state reset,
+        //   2 = state reset + new properties,
+        //   3 = state reset + new properties + dictionary reset.
+        let reset = (control >> 5) & 0x3;
+        let reset_state = reset >= 1;
+        let new_props = reset >= 2;
+        let reset_dict = reset == 3;
 
         // Read uncompressed size (high 5 bits from control + 16-bit)
         let uncompressed_hi = ((control & 0x1F) as usize) << 16;
@@ -552,13 +556,16 @@ impl Lzma2Decoder {
         let mut dist = (2 | (slot & 1)) << num_direct_bits;
 
         if slot < END_POS_MODEL_INDEX as u32 {
-            let base_idx = (slot as usize) - (slot as usize >> 1) - 1;
+            // Specification layout `PosDecoders + dist - posSlot` (LzmaSpec.cpp):
+            // the reverse bit tree for this slot starts at `dist_base - slot`
+            // and is addressed by the bit-tree node index `m` (starting at 1).
+            let base_idx = (dist as usize) - (slot as usize);
 
             let mut result = 0u32;
             let mut m = 1usize;
 
             for i in 0..num_direct_bits {
-                let bit = rc.decode_bit(&mut model.distance.special[base_idx + m - 1])?;
+                let bit = rc.decode_bit(&mut model.distance.special[base_idx + m])?;
                 m = (m << 1) | bit as usize;
                 result |= bit << i;
             }
@@ -727,8 +734,9 @@ impl Lzma2Encoder {
         let encoder = LzmaEncoder::new(self.level, self.dict_size);
         let props = encoder.properties();
 
-        // Compress with LZMA
-        let compressed = encoder.compress(data)?;
+        // Compress with LZMA (chunk payload: no end-of-stream marker, since
+        // the chunk header carries the exact sizes)
+        let compressed = encoder.compress_chunk(data)?;
 
         // Check if compression is worthwhile
         if compressed.len() >= data.len() {

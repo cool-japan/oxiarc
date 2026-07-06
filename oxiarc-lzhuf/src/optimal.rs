@@ -223,24 +223,21 @@ impl LzssOptimalParser {
     /// Parse `data` using the optimal DP algorithm and return the resulting
     /// LZSS token stream.
     ///
-    /// For each pass, the encoder's hash chains are cleared and rebuilt
-    /// incrementally (forward scan, same as the greedy encoder) while the DP
-    /// table is computed.  The window content is preserved across passes
-    /// because it was populated once before the first pass.
+    /// For each pass, the encoder's window state is restored to the pre-block
+    /// snapshot and its hash chains are rebuilt incrementally (forward scan,
+    /// same as the greedy encoder) while the DP table is computed.  Bytes are
+    /// pushed into the window one position at a time so the window always
+    /// holds true history, even for blocks larger than the window size.
     ///
-    /// After all passes, the encoder's hash state reflects a full forward scan
-    /// through `data` — consistent with having called `encode(data)`.
+    /// After all passes, the encoder's window state reflects a full forward
+    /// scan through `data` — consistent with having called `encode(data)`.
     pub fn parse(&mut self, data: &[u8], encoder: &mut LzssEncoder) -> Vec<LzssToken> {
         if data.is_empty() {
             return Vec::new();
         }
 
-        // Commit all bytes into the circular window so that lookahead reads
-        // inside find_all_matches are valid for any position.
-        let data_start_abs = encoder.abs_write_pos();
-        for &byte in data {
-            encoder.push_byte(byte);
-        }
+        // Snapshot the pre-block window so each pass replays the same input.
+        let snapshot = encoder.save_window_state();
 
         let mut tokens = Vec::new();
 
@@ -251,26 +248,27 @@ impl LzssOptimalParser {
                 CostModel::from_tokens(&tokens)
             };
 
-            // Each pass starts with empty hash chains so that the incremental
-            // seeding in dp_pass_seeding always sees a forward-ordered chain.
-            encoder.reset_hash_only();
-            tokens = self.dp_pass_seeding(data, data_start_abs, encoder, &model);
+            // Each pass starts from the pre-block window with empty hash
+            // chains so the incremental seeding in dp_pass_seeding always
+            // sees a forward-ordered chain.
+            encoder.restore_window_state(&snapshot);
+            tokens = self.dp_pass_seeding(data, encoder, &model);
         }
 
         tokens
     }
 
-    /// First-pass DP that seeds the hash chains while scanning forward.
+    /// First-pass DP that seeds the window and hash chains while scanning
+    /// forward.
     ///
     /// This mirrors the structure of `LzssEncoder::encode`: for each position
-    /// we first call `update_hash(cur_abs)` to insert the current position,
-    /// then call `find_all_matches` to search backward in the already-indexed
-    /// prefix.  This guarantees that `find_all_matches` never returns a
-    /// self-match (distance = 0).
+    /// we first call `find_all_matches` (which only sees strictly earlier,
+    /// already-pushed positions — no self-match with distance 0 is possible),
+    /// then push `data[pos]` into the window so the next position sees it as
+    /// history.
     fn dp_pass_seeding(
         &self,
         data: &[u8],
-        data_start_abs: u64,
         encoder: &mut LzssEncoder,
         model: &CostModel,
     ) -> Vec<LzssToken> {
@@ -281,20 +279,18 @@ impl LzssOptimalParser {
         costs[0] = 0;
 
         for pos in 0..n {
-            let cur_abs = data_start_abs + pos as u64;
-
             let cost_here = costs[pos];
 
-            // Search BEFORE inserting cur_abs so the hash chain points to strictly
-            // earlier positions (no self-match with dist = 0).
+            // Search BEFORE pushing data[pos]; the hash chain only contains
+            // strictly earlier positions (no self-match with dist = 0).
             let matches = if cost_here < INF_COST {
                 encoder.find_all_matches(data, pos)
             } else {
                 Vec::new()
             };
 
-            // Insert cur_abs into the hash chain.
-            encoder.update_hash(cur_abs);
+            // Commit the current byte into the window (and hash chains).
+            encoder.push_bytes(&data[pos..pos + 1]);
 
             if cost_here >= INF_COST {
                 continue;

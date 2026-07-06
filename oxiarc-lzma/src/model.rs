@@ -54,6 +54,16 @@ pub const FULL_DISTANCES: usize = 128;
 /// End position model index.
 pub const END_POS_MODEL_INDEX: usize = 14;
 
+/// Number of special position probabilities.
+///
+/// Matches the LZMA reference implementation (`LzmaSpec.cpp`):
+/// `CProb PosDecoders[1 + kNumFullDistances - kEndPosModelIndex]`.
+/// The table is addressed as `special[(dist_base - slot) + m]` where
+/// `dist_base = (2 | (slot & 1)) << ((slot >> 1) - 1)` and `m` is the
+/// bit-tree node index starting at 1, so index 0 is never touched and the
+/// highest index used is `(96 - 13) + 31 = 114`.
+pub const SPEC_POS_PROBS: usize = 1 + FULL_DISTANCES - END_POS_MODEL_INDEX;
+
 /// LZMA state machine state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct State(u8);
@@ -80,12 +90,14 @@ impl State {
     }
 
     /// Update state after literal.
+    ///
+    /// Follows the LZMA specification (`LzmaSpec.cpp`, `UpdateState_Literal`):
+    /// `state < 4 -> 0`, `state < 10 -> state - 3`, otherwise `state - 6`.
     pub fn update_literal(&mut self) {
         self.0 = match self.0 {
             0..=3 => 0,
             4..=9 => self.0 - 3,
-            10 => 6,
-            _ => 5,
+            _ => self.0 - 6,
         };
     }
 
@@ -245,8 +257,13 @@ impl LiteralModel {
 pub struct DistanceModel {
     /// Distance slot probabilities (per length state).
     pub slot: [[u16; DIST_SLOTS]; 4],
-    /// Special position probabilities (flat array for slots 4-13).
-    pub special: [u16; FULL_DISTANCES - END_POS_MODEL_INDEX],
+    /// Special position probabilities for slots 4-13.
+    ///
+    /// Uses the LZMA specification layout (`PosDecoders + dist - posSlot`):
+    /// the reverse bit tree for slot `s` starts at `dist_base - s` and is
+    /// addressed by the bit-tree node index `m` (starting at 1). Adjacent
+    /// slots deliberately share the flat array exactly as liblzma does.
+    pub special: [u16; SPEC_POS_PROBS],
     /// Alignment probabilities.
     pub align: [u16; DIST_ALIGN_SIZE],
 }
@@ -256,7 +273,7 @@ impl DistanceModel {
     pub fn new() -> Self {
         Self {
             slot: [[PROB_INIT; DIST_SLOTS]; 4],
-            special: [PROB_INIT; FULL_DISTANCES - END_POS_MODEL_INDEX],
+            special: [PROB_INIT; SPEC_POS_PROBS],
             align: [PROB_INIT; DIST_ALIGN_SIZE],
         }
     }

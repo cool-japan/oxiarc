@@ -31,6 +31,7 @@
 pub mod crypto;
 pub mod encryption;
 mod header;
+pub(crate) mod name_codec;
 pub mod stream;
 pub use stream::{ZipStreamEntry, ZipStreamEntryMeta, ZipStreamReader};
 

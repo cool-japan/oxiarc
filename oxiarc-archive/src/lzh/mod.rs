@@ -12,6 +12,8 @@ mod extensions_tests;
 pub mod header;
 pub use header::LzhHeader;
 
+pub(crate) mod name_codec;
+
 pub mod reader;
 pub use reader::LzhReader;
 #[cfg(feature = "mmap")]

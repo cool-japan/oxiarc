@@ -7,6 +7,12 @@ use std::io::Write;
 use super::header::TarHeader;
 use super::{BLOCK_SIZE, PAX_HEADER};
 
+/// Maximum byte length of the UStar `name` field.
+const TAR_NAME_MAX: usize = 100;
+
+/// Maximum byte length of the UStar `linkname` field.
+const TAR_LINKNAME_MAX: usize = 100;
+
 /// TAR archive writer.
 pub struct TarWriter<W: Write> {
     writer: W,
@@ -49,13 +55,14 @@ impl<W: Write> TarWriter<W> {
         self.entry_index += 1;
 
         // Check if we need PAX extended header for long filename
-        let needs_pax = name.len() > 100;
+        let needs_pax = name.len() > TAR_NAME_MAX;
 
         if needs_pax {
             self.write_pax_header(name, None)?;
-            // Use truncated name for the regular header
-            let short_name = &name[name.len().saturating_sub(100)..];
-            let header = TarHeader::new_file(short_name, data.len() as u64, mode);
+            // Use a char-boundary-safe truncated fallback name for the
+            // regular header; PAX-aware readers restore the full name.
+            let short_name = Self::tar_fallback_name(name);
+            let header = TarHeader::new_file(&short_name, data.len() as u64, mode);
             self.write_header(&header)?;
         } else {
             let header = TarHeader::new_file(name, data.len() as u64, mode);
@@ -117,6 +124,56 @@ impl<W: Write> TarWriter<W> {
         format!("{} {}={}\n", total_len, key, value)
     }
 
+    /// Build a fallback name for the UStar `name` field when the real name
+    /// exceeds [`TAR_NAME_MAX`] bytes and the full name travels in a PAX
+    /// `path` record.
+    ///
+    /// Keeps the trailing portion of the name (most significant for humans
+    /// inspecting the archive with non-PAX tools), truncated at a UTF-8
+    /// character boundary (floored) so multi-byte names such as Japanese
+    /// never panic or produce invalid UTF-8. A trailing `/` (directory
+    /// marker) is preserved.
+    pub(crate) fn tar_fallback_name(name: &str) -> String {
+        // The header serializer NUL-terminates the 100-byte `name` field,
+        // leaving 99 usable bytes; budget accordingly so the fallback lands
+        // in the block without further truncation.
+        let field_budget = TAR_NAME_MAX - 1;
+        let had_trailing_slash = name.ends_with('/');
+        let trimmed = name.trim_end_matches('/');
+        let budget = if had_trailing_slash {
+            field_budget - 1
+        } else {
+            field_budget
+        };
+        let mut start = trimmed.len().saturating_sub(budget);
+        while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut fallback = trimmed[start..].to_string();
+        if had_trailing_slash {
+            fallback.push('/');
+        }
+        if fallback.trim_end_matches('/').is_empty() {
+            fallback = "long_name".to_string();
+        }
+        fallback
+    }
+
+    /// Build a fallback link target for the UStar `linkname` field when the
+    /// real target exceeds [`TAR_LINKNAME_MAX`] bytes and the full target
+    /// travels in a PAX `linkpath` record.
+    ///
+    /// Keeps the leading portion, truncated at a UTF-8 character boundary
+    /// (floored).
+    pub(crate) fn tar_fallback_linkname(target: &str) -> String {
+        // 99 usable bytes: the serializer NUL-terminates the field.
+        let mut end = target.len().min(TAR_LINKNAME_MAX - 1);
+        while end > 0 && !target.is_char_boundary(end) {
+            end -= 1;
+        }
+        target[..end].to_string()
+    }
+
     /// Add a directory to the archive.
     pub fn add_directory(&mut self, name: &str) -> Result<()> {
         self.add_directory_with_mode(name, 0o755)
@@ -130,14 +187,44 @@ impl<W: Write> TarWriter<W> {
         } else {
             format!("{}/", name)
         };
-        let header = TarHeader::new_directory(&dir_name, mode);
-        self.write_header(&header)?;
+
+        if dir_name.len() > TAR_NAME_MAX {
+            // Long directory name: full path travels in a PAX record, the
+            // UStar header carries a char-boundary-safe fallback.
+            self.write_pax_header(&dir_name, None)?;
+            let short_name = Self::tar_fallback_name(&dir_name);
+            let header = TarHeader::new_directory(&short_name, mode);
+            self.write_header(&header)?;
+        } else {
+            let header = TarHeader::new_directory(&dir_name, mode);
+            self.write_header(&header)?;
+        }
         Ok(())
     }
 
     /// Add a symlink to the archive.
     pub fn add_symlink(&mut self, name: &str, target: &str) -> Result<()> {
-        let header = TarHeader::new_symlink(name, target);
+        let needs_pax_path = name.len() > TAR_NAME_MAX;
+        let needs_pax_link = target.len() > TAR_LINKNAME_MAX;
+
+        if needs_pax_path || needs_pax_link {
+            let path_str = if needs_pax_path { name } else { "" };
+            let link_str = if needs_pax_link { Some(target) } else { None };
+            self.write_pax_header(path_str, link_str)?;
+        }
+
+        let short_name = if needs_pax_path {
+            Self::tar_fallback_name(name)
+        } else {
+            name.to_string()
+        };
+        let short_target = if needs_pax_link {
+            Self::tar_fallback_linkname(target)
+        } else {
+            target.to_string()
+        };
+
+        let header = TarHeader::new_symlink(&short_name, &short_target);
         self.write_header(&header)?;
         Ok(())
     }
@@ -161,8 +248,9 @@ impl<W: Write> TarWriter<W> {
         // For long names/links, emit PAX headers first so downstream readers
         // can handle names longer than 100 bytes and links longer than 100
         // bytes correctly. Both conditions are checked independently.
-        let needs_pax_path = header.name.len() > 100;
-        let needs_pax_link = !header.linkname.is_empty() && header.linkname.len() > 100;
+        let needs_pax_path = header.name.len() > TAR_NAME_MAX;
+        let needs_pax_link =
+            !header.linkname.is_empty() && header.linkname.len() > TAR_LINKNAME_MAX;
 
         if needs_pax_path || needs_pax_link {
             let path_str = if needs_pax_path {
@@ -176,9 +264,20 @@ impl<W: Write> TarWriter<W> {
                 None
             };
             self.write_pax_header(path_str, link_str)?;
-        }
 
-        self.write_header(header)?;
+            // The UStar block itself must carry char-boundary-safe fallback
+            // values; PAX-aware readers restore the exact name and target.
+            let mut short = header.clone();
+            if needs_pax_path {
+                short.name = Self::tar_fallback_name(&header.name);
+            }
+            if needs_pax_link {
+                short.linkname = Self::tar_fallback_linkname(&header.linkname);
+            }
+            self.write_header(&short)?;
+        } else {
+            self.write_header(header)?;
+        }
 
         if !data.is_empty() {
             self.write_data(data)?;

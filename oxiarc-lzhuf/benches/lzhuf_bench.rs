@@ -150,6 +150,8 @@ mod data_sizes {
             LzhMethod::Lh5 => 7 * 1024,  // 8KB window -> use 7KB
             LzhMethod::Lh6 => 31 * 1024, // 32KB window -> use 31KB
             LzhMethod::Lh7 => 63 * 1024, // 64KB window -> use 63KB
+            // lh1 / lhd / unknown methods are not benchmarked
+            _ => 4 * 1024,
         }
     }
 }

@@ -64,6 +64,31 @@ impl HuffmanTree {
     /// * `code_lengths` - Array where `code_lengths[i]` is the bit length for symbol `i`.
     ///   A length of 0 means the symbol is not used.
     pub fn from_code_lengths(code_lengths: &[u8]) -> Result<Self> {
+        Self::from_code_lengths_inner(code_lengths, false)
+    }
+
+    /// Build a Huffman tree from code lengths, additionally REQUIRING that the
+    /// resulting code be *complete* (Kraft sum exactly 1.0).
+    ///
+    /// This is used for the DEFLATE code-length (19-symbol) alphabet, which
+    /// RFC 1951 §3.2.7 requires to be a complete Huffman code and which
+    /// spec-compliant decoders (zlib `inflate_table`) reject when incomplete
+    /// ("invalid code lengths set"). Enforcing completeness here means an
+    /// encoder that ever regresses to emitting an incomplete code-length code
+    /// can no longer silently round-trip through our own inflate — the defect
+    /// is caught by the self-test instead of being hidden by it.
+    ///
+    /// The literal/length and distance alphabets are intentionally *not* routed
+    /// through this stricter path: DEFLATE permits legitimately incomplete codes
+    /// there — most notably the fixed distance code (30 codes of 5 bits, Kraft
+    /// 30/32) and the single-distance case (RFC 1951 §3.2.7) — and zlib accepts
+    /// them, deferring any error to the moment an unused code is actually
+    /// decoded (which this decoder also does).
+    pub fn from_code_length_code(code_lengths: &[u8]) -> Result<Self> {
+        Self::from_code_lengths_inner(code_lengths, true)
+    }
+
+    fn from_code_lengths_inner(code_lengths: &[u8], require_complete: bool) -> Result<Self> {
         if code_lengths.is_empty() {
             return Err(OxiArcError::invalid_header("Empty code lengths"));
         }
@@ -107,12 +132,24 @@ impl HuffmanTree {
             next_code[bits] = code;
         }
 
-        // Validate: check that we don't exceed the code space
+        // Validate the code space. A canonical Huffman code fills the code
+        // space exactly (Kraft sum == 1) when *complete*; `filled` is the number
+        // of leaves the assigned lengths occupy at the deepest level. `> ` means
+        // over-subscribed (always invalid); `< ` means incomplete.
         let total_codes: u32 = bl_count[1..=max_length as usize].iter().sum();
         if total_codes > 0 {
             let max_codes = 1u32 << max_length;
-            if code + bl_count[max_length as usize] > max_codes {
+            let filled = code + bl_count[max_length as usize];
+            if filled > max_codes {
                 return Err(OxiArcError::invalid_header("Over-subscribed Huffman tree"));
+            }
+            // Incomplete (under-subscribed) codes are rejected only where the
+            // spec unconditionally forbids them (the code-length alphabet).
+            // Elsewhere we stay lenient — see `from_code_length_code`.
+            if require_complete && filled < max_codes {
+                return Err(OxiArcError::invalid_header(
+                    "Incomplete code-length Huffman code",
+                ));
             }
         }
 
@@ -588,5 +625,155 @@ mod tests {
         assert_eq!(HuffmanTree::reverse_bits(0b101, 3), 0b101);
         assert_eq!(HuffmanTree::reverse_bits(0b1100, 4), 0b0011);
         assert_eq!(HuffmanTree::reverse_bits(0b10101010, 8), 0b01010101);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Regression: `build_lengths` must ALWAYS yield a COMPLETE, length-limited
+    // canonical Huffman code (Kraft sum exactly 1.0, no length > max_bits).
+    //
+    // The historical dynamic-Huffman corruption bug was an *incomplete*
+    // code-length code (Kraft sum 0.75 < 1.0), which oxiarc's own lenient
+    // inflate accepted but which standard `zlib`/`unzip` reject at bit 0 with
+    // "invalid compressed data to inflate". This battery — degenerate
+    // distributions, two-symbol alphabets, and skews that force length-limiting
+    // — would have caught that class of defect directly, with no external
+    // dependency. Kraft is evaluated in exact integer arithmetic.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns `Some(())` if `lengths` is a COMPLETE prefix code within
+    /// `max_bits`, else `None`. Complete ⇔ Σ 2^(-len) over used symbols == 1.
+    fn assert_complete_within(lengths: &[u8], max_bits: u8, label: &str) {
+        let max_len = lengths.iter().copied().max().unwrap_or(0);
+        if max_len == 0 {
+            // No used symbols (empty alphabet) — vacuously fine.
+            return;
+        }
+        assert!(
+            max_len <= max_bits,
+            "{label}: max code length {max_len} exceeds limit {max_bits}: {lengths:?}"
+        );
+        // Σ 2^(max_len - len) must equal 2^max_len for a complete code.
+        let mut num: u128 = 0;
+        for &l in lengths {
+            if l > 0 {
+                num += 1u128 << (max_len as u32 - l as u32);
+            }
+        }
+        assert_eq!(
+            num,
+            1u128 << max_len as u32,
+            "{label}: INCOMPLETE code (Kraft {num}/{} != 1): {lengths:?}",
+            1u128 << max_len as u32
+        );
+    }
+
+    fn build_from(freqs: &[(u16, u32)], alphabet: usize, max_bits: u8) -> Vec<u8> {
+        let mut b = HuffmanBuilder::new(alphabet, max_bits);
+        for &(s, c) in freqs {
+            b.add_count(s, c);
+        }
+        b.build_lengths()
+    }
+
+    #[test]
+    fn test_build_lengths_degenerate_is_complete() {
+        // Code-length alphabet (19 symbols, max 7) and litlen/dist (max 15).
+        for &(alpha, max_bits) in &[(19usize, 7u8), (30, 15), (286, 15)] {
+            // Exactly one symbol carries all the frequency, at three positions.
+            for &pos in &[0u16, (alpha as u16) / 2, alpha as u16 - 1] {
+                let l = build_from(&[(pos, 9_999)], alpha, max_bits);
+                assert_complete_within(&l, max_bits, &format!("one-sym a{alpha} pos{pos}"));
+                // The lone symbol must actually receive a code.
+                assert!(l[pos as usize] > 0, "one-sym: used symbol got length 0");
+            }
+            // Exactly two symbols, wildly skewed.
+            for &(a, c) in &[(0u16, 1u16), (0, alpha as u16 - 1), (3, 9)] {
+                let l = build_from(&[(a, 1_000_000), (c, 1)], alpha, max_bits);
+                assert_complete_within(&l, max_bits, &format!("two-sym a{alpha} {a},{c}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_lengths_length_limited_is_complete() {
+        // Fibonacci and power-of-two frequency profiles drive the natural
+        // Huffman depth far past the alphabet limit, forcing the length-limiting
+        // machinery to rebalance while preserving completeness.
+        for &(alpha, max_bits) in &[(19usize, 7u8), (30, 15), (286, 15)] {
+            let mut fib = Vec::new();
+            let (mut a, mut b) = (1u32, 1u32);
+            for s in 0..alpha {
+                fib.push((s as u16, a));
+                let n = a.saturating_add(b);
+                a = b;
+                b = n;
+            }
+            let lf = build_from(&fib, alpha, max_bits);
+            assert_complete_within(&lf, max_bits, &format!("fib a{alpha}"));
+
+            let pow: Vec<(u16, u32)> = (0..alpha)
+                .map(|s| (s as u16, 1u32 << (s.min(30) as u32)))
+                .collect();
+            let lp = build_from(&pow, alpha, max_bits);
+            assert_complete_within(&lp, max_bits, &format!("pow2 a{alpha}"));
+        }
+    }
+
+    #[test]
+    fn test_build_lengths_fuzz_is_complete() {
+        // Deterministic xorshift fuzz across all three alphabets and a
+        // heavy-tailed frequency distribution.
+        let mut rng: u64 = 0x0f1e_2d3c_4b5a_6978;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..20_000 {
+            let (alpha, max_bits) = match next() % 3 {
+                0 => (19usize, 7u8),
+                1 => (30, 15),
+                _ => (286, 15),
+            };
+            let used = 1 + (next() as usize % alpha);
+            let mut freqs = Vec::with_capacity(used);
+            for _ in 0..used {
+                let s = (next() as usize % alpha) as u16;
+                let c = match next() % 5 {
+                    0 => 1u32,
+                    1 => (next() % 10) as u32 + 1,
+                    2 => (next() % 1_000) as u32 + 1,
+                    _ => (next() % 3_000_000) as u32 + 1,
+                };
+                freqs.push((s, c));
+            }
+            let l = build_from(&freqs, alpha, max_bits);
+            assert_complete_within(&l, max_bits, "fuzz");
+        }
+    }
+
+    #[test]
+    fn test_from_code_length_code_rejects_incomplete() {
+        // Three symbols each of length 2 → Kraft 3/4 (the historical corruption).
+        let incomplete = [2u8, 2, 2];
+        assert!(
+            HuffmanTree::from_code_length_code(&incomplete).is_err(),
+            "strict constructor must reject an incomplete code-length code"
+        );
+        // The lenient constructor still accepts it (used for litlen/dist, and to
+        // preserve decoding of the legitimately-incomplete fixed distance code).
+        assert!(HuffmanTree::from_code_lengths(&incomplete).is_ok());
+
+        // A complete code-length code is accepted by both.
+        let complete = [1u8, 2, 2];
+        assert!(HuffmanTree::from_code_length_code(&complete).is_ok());
+        assert!(HuffmanTree::from_code_lengths(&complete).is_ok());
+
+        // The legitimately-incomplete fixed distance code (30 × 5 bits, Kraft
+        // 30/32) MUST still build via the lenient path — tightening must not
+        // break fixed-Huffman decompression.
+        let fixed_dist = [5u8; 30];
+        assert!(HuffmanTree::from_code_lengths(&fixed_dist).is_ok());
     }
 }

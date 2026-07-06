@@ -490,8 +490,10 @@ pub fn get_distance_price(
         let dist_reduced = dist - base;
 
         if dist_slot < END_POS_MODEL_INDEX as u32 {
-            // Reverse bit tree price
-            let base_idx = (dist_slot as usize) - (dist_slot as usize >> 1) - 1;
+            // Reverse bit tree price, spec layout `PosEncoders + dist - posSlot`:
+            // the tree for this slot starts at `dist_base - slot` and
+            // `get_bit_tree_reverse_price` indexes from node `m = 1`.
+            let base_idx = (base as usize) - (dist_slot as usize);
             price +=
                 get_bit_tree_reverse_price(&special[base_idx..], num_direct_bits, dist_reduced);
         } else {

@@ -5,6 +5,7 @@
 //! 2. Final RLE (rle2): Encodes runs of zeros after MTF
 
 use oxiarc_core::Result;
+use oxiarc_core::error::OxiArcError;
 
 /// Encode data with initial RLE (rle1).
 /// Runs of 4 or more identical bytes are encoded as:
@@ -46,33 +47,28 @@ pub fn rle1_encode(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decode RLE1-encoded data.
+///
+/// Any 4 consecutive identical bytes in the encoded stream must be followed
+/// by a count byte; a missing count byte is a corruption error.
 pub fn rle1_decode(data: &[u8]) -> Result<Vec<u8>> {
-    if data.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut result = Vec::with_capacity(data.len() * 2);
-    let mut i = 0;
+    let mut i = 0usize;
 
     while i < data.len() {
         let byte = data[i];
-        result.push(byte);
-        i += 1;
-
-        // Check for run of 4
-        if i + 2 < data.len() && data[i] == byte && data[i + 1] == byte && data[i + 2] == byte {
-            // Found run of 4
-            result.extend_from_slice(&[byte, byte, byte]);
-            i += 3;
-
-            // Read count byte
-            if i < data.len() {
-                let count = data[i] as usize;
-                for _ in 0..count {
-                    result.push(byte);
-                }
-                i += 1;
-            }
+        let mut run = 1usize;
+        while run < 4 && i + run < data.len() && data[i + run] == byte {
+            run += 1;
+        }
+        if run == 4 {
+            let extra = *data.get(i + 4).ok_or_else(|| {
+                OxiArcError::corrupted(i as u64, "BZip2 RLE run length byte missing")
+            })? as usize;
+            result.resize(result.len() + 4 + extra, byte);
+            i += 5;
+        } else {
+            result.resize(result.len() + run, byte);
+            i += run;
         }
     }
 
@@ -84,9 +80,9 @@ pub fn rle1_decode(data: &[u8]) -> Result<Vec<u8>> {
 /// - RUNA (0) and RUNB (1) encode the run length in bijective base-2.
 /// - Non-zero MTF values are output directly (shifted by +1 for RUNA/RUNB)
 ///
-/// Note: The MTF output values are directly used. In BZip2, the symbol bitmap
-/// tells the decoder which MTF output values are valid.
-#[allow(dead_code)]
+/// The input values are MTF indices over the block's used-symbol list, so a
+/// non-zero value `v` maps to the bzip2 alphabet symbol `v + 1` (symbols 0
+/// and 1 are RUNA/RUNB; the end-of-block symbol is appended by the caller).
 pub fn encode_zero_runs(data: &[u8]) -> Vec<u16> {
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -128,53 +124,7 @@ pub fn encode_zero_runs(data: &[u8]) -> Vec<u16> {
     result
 }
 
-/// Encode zeros using RUNA/RUNB encoding with symbol remapping.
-/// Maps MTF values to compact symbol indices based on which values are used.
-pub fn encode_zero_runs_compact(data: &[u8], used: &[bool; 256]) -> Vec<u16> {
-    // Build mapping from MTF values to compact indices
-    let mut mtf_to_symbol = [0u16; 256];
-    let mut idx = 2u16; // Start at 2 (0=RUNA, 1=RUNB)
-    for (mtf_val, &is_used) in used.iter().enumerate() {
-        if is_used {
-            mtf_to_symbol[mtf_val] = idx;
-            idx += 1;
-        }
-    }
-
-    let mut result = Vec::with_capacity(data.len());
-    let mut i = 0;
-
-    while i < data.len() {
-        if data[i] == 0 {
-            // Count zeros
-            let mut count = 0usize;
-            while i < data.len() && data[i] == 0 {
-                count += 1;
-                i += 1;
-            }
-
-            // Encode using RUNA/RUNB (bijective numeration)
-            let mut n = count;
-            while n > 0 {
-                if n & 1 == 1 {
-                    result.push(0); // RUNA
-                } else {
-                    result.push(1); // RUNB
-                }
-                n = (n - 1) >> 1;
-            }
-        } else {
-            // Non-zero MTF value: map to compact symbol index
-            let mtf_val = data[i] as usize;
-            result.push(mtf_to_symbol[mtf_val]);
-            i += 1;
-        }
-    }
-
-    result
-}
-
-/// Decode zero-run encoded data (simple version for compatibility).
+/// Decode zero-run encoded data (utility counterpart of `encode_zero_runs`).
 #[allow(dead_code)]
 pub fn decode_zero_runs(data: &[u16], num_symbols: usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len());
@@ -208,54 +158,6 @@ pub fn decode_zero_runs(data: &[u16], num_symbols: usize) -> Vec<u8> {
         } else {
             // End of block symbol
             break;
-        }
-    }
-
-    result
-}
-
-/// Decode zero-run encoded data with compact symbol mapping.
-/// Maps compact symbol indices back to MTF values using the used bitmap.
-pub fn decode_zero_runs_compact(data: &[u16], used: &[bool; 256]) -> Vec<u8> {
-    // Build mapping from compact indices to MTF values
-    let mut symbol_to_mtf = Vec::new();
-    for (mtf_val, &is_used) in used.iter().enumerate() {
-        if is_used {
-            symbol_to_mtf.push(mtf_val as u8);
-        }
-    }
-
-    let mut result = Vec::with_capacity(data.len());
-    let mut i = 0;
-
-    while i < data.len() {
-        let sym = data[i] as usize;
-
-        if sym == 0 || sym == 1 {
-            // RUNA or RUNB - decode run of zeros
-            let mut power = 1usize;
-            let mut count = 0usize;
-
-            while i < data.len() && (data[i] == 0 || data[i] == 1) {
-                if data[i] == 0 {
-                    // RUNA
-                    count += power;
-                } else {
-                    // RUNB
-                    count += 2 * power;
-                }
-                power *= 2;
-                i += 1;
-            }
-
-            result.resize(result.len() + count, 0);
-        } else {
-            // Regular symbol: map compact index (sym - 2) to MTF value
-            let compact_idx = sym - 2;
-            if compact_idx < symbol_to_mtf.len() {
-                result.push(symbol_to_mtf[compact_idx]);
-            }
-            i += 1;
         }
     }
 

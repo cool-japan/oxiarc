@@ -1249,6 +1249,57 @@ mod tests {
         );
     }
 
+    /// Read the first DEFLATE block's BTYPE (bit0=BFINAL, bits1-2=BTYPE,
+    /// LSB-first) from a raw stream.
+    fn first_block_btype(stream: &[u8]) -> u8 {
+        let b0 = stream.first().copied().unwrap_or(0);
+        (b0 >> 1) & 0b11
+    }
+
+    #[test]
+    fn test_dynamic_block_roundtrip_forces_btype10() {
+        // Regression for the dynamic-Huffman corruption bug: these inputs are
+        // engineered so the level-9 encoder actually selects a dynamic block
+        // (BTYPE=10), whose header carries the code-length / litlen / distance
+        // Huffman codes. Each must round-trip through inflate byte-exactly, and
+        // — with the tightened decoder — an incomplete code-length code would
+        // now fail the round trip instead of silently decoding.
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
+        // Structured text with a skewed byte distribution.
+        inputs.push(
+            (0..4000)
+                .flat_map(|i| format!("line {i} value={}\n", i * 7 % 13).into_bytes())
+                .collect(),
+        );
+        // Repetitive natural-language text (forces matches + skewed litlen).
+        let line = b"The quick brown fox jumps over the lazy dog. \
+                     Pack my box with five dozen liquor jugs. ";
+        inputs.push(line.iter().cycle().take(32_768).copied().collect());
+        // All-same byte: literal + distance-1 matches → single distance symbol
+        // (the degenerate distance case, handled via the phantom second code).
+        inputs.push(vec![0x41u8; 65_536]);
+        // Two-symbol alphabet.
+        inputs.push(b"AB".iter().cycle().take(60_000).copied().collect());
+
+        let mut saw_dynamic = false;
+        for input in &inputs {
+            let compressed = deflate(input, 9).expect("deflate level 9");
+            if first_block_btype(&compressed) == 0b10 {
+                saw_dynamic = true;
+            }
+            let decompressed = inflate(&compressed).expect("inflate dynamic round-trip");
+            assert_eq!(
+                &decompressed, input,
+                "round-trip mismatch for {}-byte input",
+                input.len()
+            );
+        }
+        assert!(
+            saw_dynamic,
+            "expected at least one input to encode as a dynamic (BTYPE=10) block"
+        );
+    }
+
     #[test]
     fn test_deflater_with_lz77_preset_ultra_roundtrip() {
         // Use small input so the uncapped (u32::MAX) chain doesn't time out.

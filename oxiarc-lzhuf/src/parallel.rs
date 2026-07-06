@@ -218,7 +218,7 @@ fn build_level1_header(
     // [1] checksum placeholder
     header.push(0u8);
     // [2..7] method id
-    header.extend_from_slice(method.id());
+    header.extend_from_slice(&method.id());
     // [7..11] compressed size
     header.extend_from_slice(&compressed_size.to_le_bytes());
     // [11..15] original size

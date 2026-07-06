@@ -14,6 +14,8 @@
 
 /// Burrows-Wheeler Transform implementation.
 pub mod bwt;
+mod bitio;
+mod crc;
 mod decode;
 mod encode;
 mod huffman;

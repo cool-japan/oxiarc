@@ -3,10 +3,18 @@
 //! LZSS (Lempel-Ziv-Storer-Szymanski) is a derivative of LZ77 that uses
 //! a flag bit to distinguish between literals and matches.
 //!
-//! The encoder uses hash chain traversal for O(1) amortized match finding,
-//! replacing the previous O(n) linear scan. A 4-byte hash table maps byte
-//! 4-grams to chains of positions in the circular window, using a
-//! multiplicative hash with better avalanche properties than a 3-byte hash.
+//! The encoder uses hash chain traversal for O(1) amortized match finding.
+//! A 3-byte hash table maps byte trigrams (the minimum match length) to
+//! chains of positions in the circular window.
+//!
+//! # Window correctness invariant
+//!
+//! The circular window only ever contains bytes that have already been
+//! *consumed* by the encoder (i.e. true history).  Lookahead bytes are read
+//! directly from the caller-supplied input slice, never from the window.
+//! This guarantees that inputs larger than the window size cannot clobber
+//! history that match candidates still reference (the root cause of a
+//! former round-trip corruption bug for payloads beyond one window).
 
 use oxiarc_core::RingBuffer;
 use oxiarc_core::error::{OxiArcError, Result};
@@ -114,6 +122,12 @@ const EMPTY: u32 = u32::MAX;
 /// Balances compression quality vs. speed.
 const MAX_CHAIN_LEN: usize = 128;
 
+/// Maximum distance representable in an [`LzssToken::Match`] (`u16` field).
+///
+/// lh7 has a 65536-byte window, but a full-window distance of 65536 cannot
+/// be represented in 16 bits, so matches are capped at 65535.
+const MAX_TOKEN_DISTANCE: usize = u16::MAX as usize;
+
 /// Compute hash table size for a given window size.
 /// Returns a power-of-two that gives good distribution density.
 fn hash_table_size_for_window(window_size: usize) -> usize {
@@ -135,15 +149,21 @@ fn hash_table_size_for_window(window_size: usize) -> usize {
 /// existing chain entries after a window slide. Each `window[pos %
 /// window_size]` cell stores the byte written at that absolute position.
 ///
-/// The hash table maps a 4-byte 4-gram hash → most-recent absolute position
-/// that had that 4-gram. The hash chain maps `abs_pos % window_size` →
-/// previous absolute position with the same 4-gram hash (or EMPTY).
+/// The window only contains *consumed* bytes (true history). The hash table
+/// maps a 3-byte trigram hash → most-recent absolute position that had that
+/// trigram. The hash chain maps `abs_pos % window_size` → previous absolute
+/// position with the same trigram hash (or EMPTY).
 #[derive(Debug)]
 pub struct LzssEncoder {
-    /// Circular sliding window.
+    /// Circular sliding window (consumed history only).
     window: Vec<u8>,
     /// Absolute position of the next byte to be written into the window.
     abs_write_pos: u64,
+    /// Absolute position of the next window byte to be inserted into the
+    /// hash chains. Positions `q < hashed_upto` are indexed; a position can
+    /// only be indexed once bytes `q..q+3` are all present in the window
+    /// (`q + 3 <= abs_write_pos`).
+    hashed_upto: u64,
     /// Window size (always a power of two so we can use masking).
     window_size: usize,
     /// window_size - 1, used for fast modular indexing.
@@ -162,6 +182,15 @@ pub struct LzssEncoder {
     lazy_match: bool,
 }
 
+/// Snapshot of the encoder's window state, used by the optimal parser to
+/// replay the same input block over multiple DP passes.
+#[derive(Debug, Clone)]
+pub(crate) struct LzssWindowSnapshot {
+    window: Vec<u8>,
+    abs_write_pos: u64,
+    hashed_upto: u64,
+}
+
 impl LzssEncoder {
     /// Create a new LZSS encoder.
     ///
@@ -176,9 +205,10 @@ impl LzssEncoder {
         Self {
             window: vec![0u8; window_size],
             abs_write_pos: 0,
+            hashed_upto: 0,
             window_size,
             window_mask,
-            min_match,
+            min_match: min_match.max(1),
             max_match,
             hash_table: vec![EMPTY; ht_size],
             hash_chain: vec![EMPTY; window_size],
@@ -192,18 +222,25 @@ impl LzssEncoder {
         Self::new(8192, 3, 256)
     }
 
-    /// Return the current absolute write position (number of bytes written).
-    #[inline]
-    pub(crate) fn abs_write_pos(&self) -> u64 {
-        self.abs_write_pos
+    /// Capture the current window state (used by the optimal parser).
+    pub(crate) fn save_window_state(&self) -> LzssWindowSnapshot {
+        LzssWindowSnapshot {
+            window: self.window.clone(),
+            abs_write_pos: self.abs_write_pos,
+            hashed_upto: self.hashed_upto,
+        }
     }
 
-    /// Clear just the hash tables (not the window) so that the current window
-    /// content remains valid but all hash chains are empty.
+    /// Restore a previously captured window state and clear all hash chains.
     ///
-    /// Used by the optimal parser to re-seed the hash chains for a new DP pass
-    /// without discarding the already-pushed byte window.
-    pub(crate) fn reset_hash_only(&mut self) {
+    /// After this call the hash chains are empty; `hashed_upto` is set to the
+    /// snapshot's `abs_write_pos` so that only bytes pushed *after* the
+    /// restore are (re-)indexed. This mirrors the multi-pass behaviour of the
+    /// optimal parser, which re-seeds chains fresh on each forward scan.
+    pub(crate) fn restore_window_state(&mut self, snap: &LzssWindowSnapshot) {
+        self.window.copy_from_slice(&snap.window);
+        self.abs_write_pos = snap.abs_write_pos;
+        self.hashed_upto = snap.abs_write_pos.max(snap.hashed_upto);
         self.hash_table.fill(EMPTY);
         self.hash_chain.fill(EMPTY);
     }
@@ -211,6 +248,7 @@ impl LzssEncoder {
     /// Reset the encoder to initial state.
     pub fn reset(&mut self) {
         self.abs_write_pos = 0;
+        self.hashed_upto = 0;
         self.window.fill(0);
         self.hash_table.fill(EMPTY);
         self.hash_chain.fill(EMPTY);
@@ -230,80 +268,35 @@ impl LzssEncoder {
         }
 
         // Take only the last `window_size` bytes if dict is larger.
-        let window_size = self.window_size;
-        let start = dict.len().saturating_sub(window_size);
-        let tail = &dict[start..];
-        let dict_len = tail.len(); // ≤ window_size
-
-        // Write each byte into the circular window and advance the write cursor.
-        // We begin at abs_write_pos == 0 (fresh encoder), so slot indices equal
-        // abs positions masked by window_mask.
-        for &byte in tail {
-            let slot = (self.abs_write_pos as usize) & self.window_mask;
-            self.window[slot] = byte;
-            self.abs_write_pos += 1;
-        }
-
-        // Populate hash chains for every position in the loaded dictionary that
-        // has at least 3 bytes following it (update_hash requires abs_pos + 3 ≤
-        // abs_write_pos, i.e. at least a 4-byte context is readable from the window).
-        // We iterate from position 0 up to abs_write_pos - 3 (exclusive of the
-        // last 3 positions, which cannot form a valid 4-gram yet).
-        let hash_limit = self.abs_write_pos.saturating_sub(3);
-        for pos in 0..hash_limit {
-            self.update_hash(pos);
-        }
-
-        // Sanity: ensure the loaded count fits in the variable.
-        debug_assert_eq!(self.abs_write_pos, dict_len as u64);
+        let start = dict.len().saturating_sub(self.window_size);
+        self.push_bytes(&dict[start..]);
     }
 
     // -------------------------------------------------------------------------
     // Hash helpers
     // -------------------------------------------------------------------------
 
-    /// Compute a 4-byte multiplicative hash, masked to `[0, hash_mask]`.
-    ///
-    /// Uses distinct large primes per byte position to maximise avalanche:
-    /// small changes in any single byte perturb many hash bits.
+    /// Compute a 3-byte multiplicative hash, masked to `[0, mask]`.
     #[inline(always)]
-    fn hash4(b0: u8, b1: u8, b2: u8, b3: u8, mask: usize) -> usize {
-        let h = (b0 as usize).wrapping_mul(506_832_829)
-            ^ ((b1 as usize).wrapping_mul(2_654_435_761) << 8)
-            ^ ((b2 as usize).wrapping_mul(374_761_393) << 16)
-            ^ ((b3 as usize).wrapping_mul(1_000_000_007) << 24);
-        (h ^ (h >> 15)) & mask
+    fn hash3(b0: u8, b1: u8, b2: u8, mask: usize) -> usize {
+        let v = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        let h = v.wrapping_mul(2_654_435_761);
+        ((h >> 12) as usize) & mask
     }
 
-    /// Insert the 4-gram at absolute position `abs_pos` into the hash chain.
+    /// Insert the trigram at absolute position `abs_pos` into the hash chain.
     ///
-    /// Reads all four bytes from the circular window.  The window must have
-    /// at least 4 bytes written ahead of `abs_pos`; this is guaranteed
-    /// because callers always push the full input block before inserting
-    /// hash entries.  Silently returns if fewer than 3 bytes have been
-    /// written yet (cannot form even the minimum trigram context).
-    pub(crate) fn update_hash(&mut self, abs_pos: u64) {
-        if abs_pos + 3 > self.abs_write_pos {
-            return;
-        }
-        let ws = self.window_size;
+    /// The caller must guarantee that bytes `abs_pos..abs_pos+3` have already
+    /// been written into the window (`abs_pos + 3 <= abs_write_pos`).
+    #[inline]
+    fn insert_hash(&mut self, abs_pos: u64) {
         let p0 = (abs_pos as usize) & self.window_mask;
         let p1 = (abs_pos as usize + 1) & self.window_mask;
         let p2 = (abs_pos as usize + 2) & self.window_mask;
-        let p3 = (abs_pos as usize + 3) & self.window_mask;
-        // The 4th byte is always read from the window (wrapping). The caller
-        // guarantees all relevant bytes have been written into the window before
-        // update_hash is called.  For the last 3 positions of a block, the
-        // window slot at p3 may contain a zero-filled or old byte — but the
-        // matching logic in find_match / find_all_matches performs an exact
-        // byte-by-byte comparison after the hash lookup, so any extra hash
-        // collision is benign.
-        let b3 = self.window[p3];
-        let h = Self::hash4(
+        let h = Self::hash3(
             self.window[p0],
             self.window[p1],
             self.window[p2],
-            b3,
             self.hash_mask,
         );
 
@@ -319,39 +312,72 @@ impl LzssEncoder {
         };
 
         let prev = self.hash_table[h];
-        self.hash_chain[p0 % ws] = prev;
+        self.hash_chain[p0] = prev;
         self.hash_table[h] = abs_pos_u32;
+    }
+
+    /// Index every window position that has become hashable since the last
+    /// call (i.e. all `q` with `q + 3 <= abs_write_pos`).
+    #[inline]
+    fn advance_hashes(&mut self) {
+        while self.hashed_upto + 3 <= self.abs_write_pos {
+            let q = self.hashed_upto;
+            self.insert_hash(q);
+            self.hashed_upto += 1;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Window management
+    // -------------------------------------------------------------------------
+
+    /// Write a single byte into the circular window and advance the cursor.
+    #[inline]
+    fn push_byte_raw(&mut self, byte: u8) {
+        let slot = (self.abs_write_pos as usize) & self.window_mask;
+        self.window[slot] = byte;
+        self.abs_write_pos += 1;
+    }
+
+    /// Push consumed bytes into the window and index the newly completed
+    /// trigram positions in the hash chains.
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.push_byte_raw(b);
+        }
+        self.advance_hashes();
     }
 
     // -------------------------------------------------------------------------
     // Match finding
     // -------------------------------------------------------------------------
 
-    /// Find the longest match for the bytes starting at `lookahead`.
+    /// Maximum distance valid for a match ending at the current position.
+    #[inline]
+    fn max_distance(&self) -> usize {
+        self.window_size.min(MAX_TOKEN_DISTANCE)
+    }
+
+    /// Find the longest match for the bytes in `lookahead`.
     ///
-    /// `cur_abs` is the absolute position of `lookahead[0]` in the stream.
+    /// `cur_abs` is the absolute position of `lookahead[0]` in the stream and
+    /// must satisfy `cur_abs <= abs_write_pos` (history for all positions in
+    /// `[cur_abs - window, cur_abs)` must still be intact in the window,
+    /// which holds whenever at most `window_size` bytes past `cur_abs` have
+    /// been pushed — the encoder never pushes past the current position).
     ///
     /// Returns `(best_length, best_distance)` where both are 0 if no match of
     /// at least `min_match` bytes was found.
     fn find_match(&self, cur_abs: u64, lookahead: &[u8]) -> (usize, usize) {
-        if lookahead.len() < self.min_match {
+        if lookahead.len() < self.min_match || lookahead.len() < 3 {
             return (0, 0);
         }
 
         let max_len = lookahead.len().min(self.max_match);
-        let ws = self.window_size;
+        let max_dist = self.max_distance();
         let wm = self.window_mask;
 
-        // Use the window byte at offset 3 for the 4th hash byte (matches update_hash).
-        let p3_fnd = (cur_abs as usize + 3) & self.window_mask;
-        let b3_fnd = self.window[p3_fnd];
-        let h = Self::hash4(
-            lookahead[0],
-            lookahead[1],
-            lookahead[2],
-            b3_fnd,
-            self.hash_mask,
-        );
+        let h = Self::hash3(lookahead[0], lookahead[1], lookahead[2], self.hash_mask);
         let mut match_abs = self.hash_table[h];
         let mut best_len = self.min_match - 1;
         let mut best_dist = 0usize;
@@ -363,37 +389,29 @@ impl LzssEncoder {
             // Compute distance (unsigned subtraction; wrapping handles any
             // case where match_abs was written before a counter wrap).
             let dist = cur_abs.wrapping_sub(match_abs as u64) as usize;
-            if dist == 0 || dist > ws {
+            if dist == 0 || dist > max_dist {
                 // Position is outside the valid window; stop traversal.
                 break;
             }
 
             // Quick-reject: the byte at offset `best_len` in the candidate
             // must equal `lookahead[best_len]` before we do a full compare.
-            let quick_idx = (match_abs as usize + best_len) & wm;
-            if self.window[quick_idx] != lookahead[best_len] {
+            // For overlapping candidates the probe byte comes from the
+            // periodic extension of the lookahead itself.
+            let probe = if dist <= best_len {
+                lookahead[best_len % dist]
+            } else {
+                self.window[(match_abs as usize + best_len) & wm]
+            };
+            if probe != lookahead[best_len] {
                 // Advance chain.
                 let chain_slot = (match_abs as usize) & wm;
                 match_abs = self.hash_chain[chain_slot];
                 continue;
             }
 
-            // Full match comparison – support overlapping copies (dist < match_len).
-            let mut len = 0usize;
-            while len < max_len {
-                let src_byte = if dist <= len {
-                    // Overlapping: the source wraps into the already-copied
-                    // region, so the pattern repeats with period `dist`.
-                    lookahead[len % dist]
-                } else {
-                    let src_idx = (match_abs as usize + len) & wm;
-                    self.window[src_idx]
-                };
-                if src_byte != lookahead[len] {
-                    break;
-                }
-                len += 1;
-            }
+            // Full match comparison – support overlapping copies (dist <= len).
+            let len = self.match_length(match_abs as u64, dist, lookahead, max_len);
 
             if len > best_len {
                 best_len = len;
@@ -414,31 +432,53 @@ impl LzssEncoder {
         }
     }
 
+    /// Compare the candidate at `match_abs` (distance `dist` back from the
+    /// current position) against `lookahead`, returning the match length.
+    ///
+    /// Bytes at source offsets `< dist` are read from the window (true
+    /// history); once the source overlaps the copy region the periodic
+    /// extension of the already-matched lookahead prefix is used, exactly as
+    /// an LZSS decoder would reproduce it.
+    #[inline]
+    fn match_length(&self, match_abs: u64, dist: usize, lookahead: &[u8], max_len: usize) -> usize {
+        let wm = self.window_mask;
+        let mut len = 0usize;
+        while len < max_len {
+            let src_byte = if dist <= len {
+                // Overlapping: the source wraps into the already-copied
+                // region, so the pattern repeats with period `dist`.
+                lookahead[len % dist]
+            } else {
+                self.window[(match_abs as usize + len) & wm]
+            };
+            if src_byte != lookahead[len] {
+                break;
+            }
+            len += 1;
+        }
+        len
+    }
+
     /// Find all matches for bytes starting at `pos` within `data`, returned as
     /// a `Vec<(length, distance)>` in strictly increasing length order.
     ///
-    /// This is used by the optimal parser to enumerate candidate matches at
-    /// every position without committing to any particular choice yet.
+    /// The caller must have pushed exactly `data[..pos]` of the current block
+    /// into the window (i.e. the absolute position of `data[pos]` is
+    /// `abs_write_pos`). This is used by the optimal parser to enumerate
+    /// candidate matches at every position without committing to any choice.
     /// Only matches with length in `[min_match, max_match]` are returned.
     pub(crate) fn find_all_matches(&self, data: &[u8], pos: usize) -> Vec<(u16, u16)> {
-        if pos + self.min_match > data.len() {
+        if pos + self.min_match > data.len() || pos + 3 > data.len() {
             return Vec::new();
         }
 
         let lookahead = &data[pos..];
-        if lookahead.len() < self.min_match {
-            return Vec::new();
-        }
-
-        let cur_abs = self.abs_write_pos.saturating_sub(data.len() as u64) + pos as u64;
+        let cur_abs = self.abs_write_pos;
         let max_len = lookahead.len().min(self.max_match);
+        let max_dist = self.max_distance();
         let wm = self.window_mask;
 
-        // Use the same 4th byte that update_hash uses: read directly from the
-        // circular window (always consistent with the insertion path).
-        let p3 = (cur_abs as usize + 3) & self.window_mask;
-        let b3 = self.window[p3];
-        let h = Self::hash4(lookahead[0], lookahead[1], lookahead[2], b3, self.hash_mask);
+        let h = Self::hash3(lookahead[0], lookahead[1], lookahead[2], self.hash_mask);
         let mut match_abs = self.hash_table[h];
         let mut chain_steps = 0usize;
 
@@ -451,24 +491,11 @@ impl LzssEncoder {
             chain_steps += 1;
 
             let dist = cur_abs.wrapping_sub(match_abs as u64) as usize;
-            if dist == 0 || dist > self.window_size {
+            if dist == 0 || dist > max_dist {
                 break;
             }
 
-            // Full match comparison (supports overlapping copies).
-            let mut len = 0usize;
-            while len < max_len {
-                let src_byte = if dist <= len {
-                    lookahead[len % dist]
-                } else {
-                    let src_idx = (match_abs as usize + len) & wm;
-                    self.window[src_idx]
-                };
-                if src_byte != lookahead[len] {
-                    break;
-                }
-                len += 1;
-            }
+            let len = self.match_length(match_abs as u64, dist, lookahead, max_len);
 
             if len >= self.min_match {
                 // Record the best (shortest) distance for each match length.
@@ -492,8 +519,6 @@ impl LzssEncoder {
         }
 
         // Build a de-duplicated, strictly-increasing-length list.
-        // Only keep a length entry if it improves (increases) the matched
-        // length relative to what was already achievable at earlier distances.
         let mut result: Vec<(u16, u16)> = Vec::with_capacity(best_at_len.len());
         let mut last_len = 0usize;
         for (len, dist) in &best_at_len {
@@ -506,121 +531,65 @@ impl LzssEncoder {
     }
 
     // -------------------------------------------------------------------------
-    // Window management
-    // -------------------------------------------------------------------------
-
-    /// Write a single byte into the circular window at `abs_pos` and advance
-    /// the absolute write cursor.
-    #[inline]
-    pub(crate) fn push_byte(&mut self, byte: u8) {
-        let slot = (self.abs_write_pos as usize) & self.window_mask;
-        self.window[slot] = byte;
-        self.abs_write_pos += 1;
-    }
-
-    // -------------------------------------------------------------------------
     // Encoding
     // -------------------------------------------------------------------------
 
     /// Encode `data` and return a list of LZSS tokens.
+    ///
+    /// Bytes are consumed incrementally: the lookahead is always read from
+    /// `data` itself, and only consumed bytes enter the sliding window, so
+    /// inputs of any size (including far beyond the window size) are handled
+    /// correctly.
     pub fn encode(&mut self, data: &[u8]) -> Vec<LzssToken> {
-        let mut tokens = Vec::with_capacity(data.len());
+        let mut tokens = Vec::with_capacity(data.len() / 2 + 1);
+        let n = data.len();
+        let mut pos = 0usize;
 
-        // Stage 1: write all data bytes into the circular window so that
-        // look-ahead byte reads are always valid during find_match.
-        let data_start_abs = self.abs_write_pos;
-        for &byte in data {
-            self.push_byte(byte);
-        }
+        while pos < n {
+            let cur_abs = self.abs_write_pos;
+            let la_end = n.min(pos + self.max_match);
+            let (len, dist) = self.find_match(cur_abs, &data[pos..la_end]);
 
-        // Stage 2: walk through the data, maintaining the hash chain for the
-        // prefix already "consumed" by the encoder, and finding matches for
-        // the current lookahead.
-        let data_len = data.len();
-        let mut pos = 0usize; // position within `data`
+            if len >= self.min_match && dist > 0 {
+                if self.lazy_match && pos + 1 < n && len < self.max_match {
+                    // Push the current byte so the window and hash chains
+                    // reflect it while probing the next position.
+                    self.push_bytes(&data[pos..pos + 1]);
+                    let nla_end = n.min(pos + 1 + self.max_match);
+                    let (next_len, next_dist) =
+                        self.find_match(cur_abs + 1, &data[pos + 1..nla_end]);
 
-        while pos < data_len {
-            let cur_abs = data_start_abs + pos as u64;
-
-            // Build a lookahead slice from the circular window.
-            // Because the window is circular and data_len can exceed window_size,
-            // we cap the lookahead at max_match bytes (and actual remaining).
-            let lookahead_len = (data_len - pos).min(self.max_match);
-            let mut lookahead_buf = Vec::with_capacity(lookahead_len);
-            for i in 0..lookahead_len {
-                let slot = (cur_abs as usize + i) & self.window_mask;
-                lookahead_buf.push(self.window[slot]);
-            }
-            let lookahead = &lookahead_buf;
-
-            // Search BEFORE inserting cur_abs so that hash_table[h] points to
-            // a strictly earlier position (no self-match with dist == 0).
-            let (len, dist) = self.find_match(cur_abs, lookahead);
-
-            // Now insert cur_abs into the hash chain (it becomes the new head).
-            self.update_hash(cur_abs);
-
-            if len >= self.min_match && self.lazy_match && pos + 1 < data_len {
-                // Lazy match: check if position pos+1 gives a strictly longer match.
-                let next_abs = cur_abs + 1;
-
-                let next_lookahead_len = (data_len - pos - 1).min(self.max_match);
-                let mut next_lookahead_buf = Vec::with_capacity(next_lookahead_len);
-                for i in 0..next_lookahead_len {
-                    let slot = (next_abs as usize + i) & self.window_mask;
-                    next_lookahead_buf.push(self.window[slot]);
-                }
-                let next_lookahead = &next_lookahead_buf;
-
-                // Search at next_abs; at this point hash contains positions ≤ cur_abs.
-                let (next_len, next_dist) = self.find_match(next_abs, next_lookahead);
-
-                if next_len > len {
-                    // Emit literal at pos, then use the longer match at pos+1.
-                    let lit_slot = cur_abs as usize & self.window_mask;
-                    tokens.push(LzssToken::Literal(self.window[lit_slot]));
-                    pos += 1;
-
-                    // Insert next_abs into hash and emit the better match.
-                    self.update_hash(next_abs);
-
-                    if next_len >= self.min_match && next_dist > 0 {
+                    if next_len > len && next_dist > 0 {
+                        // Emit literal at pos, then the longer match at pos+1.
+                        tokens.push(LzssToken::Literal(data[pos]));
+                        pos += 1;
+                        self.push_bytes(&data[pos..pos + next_len]);
                         tokens.push(LzssToken::Match {
                             length: next_len as u16,
                             distance: next_dist as u16,
                         });
-                        // Update hash for each position skipped during the match
-                        // (positions next_abs+1 .. next_abs+next_len-1).
-                        for skip in 1..next_len {
-                            self.update_hash(next_abs + skip as u64);
-                        }
                         pos += next_len;
                     } else {
-                        // The next match was not good after all – emit literal.
-                        let lit_slot2 = next_abs as usize & self.window_mask;
-                        tokens.push(LzssToken::Literal(self.window[lit_slot2]));
-                        pos += 1;
+                        // Keep the original match; data[pos] is already pushed.
+                        self.push_bytes(&data[pos + 1..pos + len]);
+                        tokens.push(LzssToken::Match {
+                            length: len as u16,
+                            distance: dist as u16,
+                        });
+                        pos += len;
                     }
-                    continue;
+                } else {
+                    self.push_bytes(&data[pos..pos + len]);
+                    tokens.push(LzssToken::Match {
+                        length: len as u16,
+                        distance: dist as u16,
+                    });
+                    pos += len;
                 }
-                // Original match was at least as good; fall through.
-            }
-
-            if len >= self.min_match && dist > 0 {
-                tokens.push(LzssToken::Match {
-                    length: len as u16,
-                    distance: dist as u16,
-                });
-                // Update hash for each position within the match span
-                // (positions cur_abs+1 .. cur_abs+len-1; cur_abs was handled above).
-                for skip in 1..len {
-                    self.update_hash(cur_abs + skip as u64);
-                }
-                pos += len;
             } else {
                 // Emit literal.
-                let lit_slot = cur_abs as usize & self.window_mask;
-                tokens.push(LzssToken::Literal(self.window[lit_slot]));
+                self.push_bytes(&data[pos..pos + 1]);
+                tokens.push(LzssToken::Literal(data[pos]));
                 pos += 1;
             }
         }
@@ -748,6 +717,19 @@ mod tests {
         );
     }
 
+    /// Deterministic xorshift32 pseudo-random data (incompressible).
+    fn xorshift_data(len: usize, mut state: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 4);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
     #[test]
     fn test_hash_chain_roundtrip_lh5() {
         // lh5: 8 KB window
@@ -790,6 +772,52 @@ mod tests {
         roundtrip_with_window(ws, &rep);
         let same = vec![0xBBu8; 32768];
         roundtrip_with_window(ws, &same);
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression tests: inputs larger than the window (former corruption bug)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_roundtrip_beyond_window_incompressible() {
+        // 16 KB of incompressible data through an 8 KB window used to
+        // corrupt because the whole block was pre-written into the circular
+        // window, clobbering both history and lookahead.
+        let data = xorshift_data(16 * 1024, 0x1234_5678);
+        roundtrip_with_window(8192, &data);
+
+        // 100 KB through lh5/lh6/lh7 windows.
+        let data = xorshift_data(100 * 1024, 0x0BAD_F00D);
+        roundtrip_with_window(8192, &data);
+        roundtrip_with_window(32768, &data);
+        roundtrip_with_window(65536, &data);
+    }
+
+    #[test]
+    fn test_roundtrip_beyond_window_compressible() {
+        let data: Vec<u8> = b"compressible pattern beyond the window! "
+            .iter()
+            .cycle()
+            .take(96 * 1024)
+            .copied()
+            .collect();
+        roundtrip_with_window(8192, &data);
+        roundtrip_with_window(32768, &data);
+        roundtrip_with_window(65536, &data);
+    }
+
+    #[test]
+    fn test_token_distances_never_exceed_u16() {
+        // lh7 window is 65536, but token distances must fit in u16.
+        let ws = 65536usize;
+        let mut encoder = LzssEncoder::new(ws, 3, 256);
+        let data: Vec<u8> = b"Z".iter().cycle().take(70 * 1024).copied().collect();
+        let tokens = encoder.encode(&data);
+        for token in &tokens {
+            if let LzssToken::Match { distance, .. } = token {
+                assert!(*distance >= 1, "distance must be at least 1");
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -841,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_match_roundtrip() {
-        // "AAAAAAAAA..." – forces overlapping copies (dist=1, len > dist).
+        // "XXXXXXXXX..." – forces overlapping copies (len > dist).
         let input: Vec<u8> = vec![b'X'; 512];
         roundtrip_with_window(1024, &input);
     }

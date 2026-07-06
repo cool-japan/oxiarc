@@ -145,6 +145,22 @@ impl<R: Read + Seek> LzhReader<R> {
             handle.on_entry(&entry.name, 0);
         }
 
+        // Directory entries (-lhd-) carry no data.
+        if info.method.is_directory() {
+            if let Some(ref handle) = self.progress {
+                handle.on_progress(0, Some(0));
+            }
+            return Ok(0);
+        }
+
+        // Unsupported methods are listed but rejected per entry at
+        // extraction time (the rest of the archive stays accessible).
+        if let LzhMethod::Unknown(id) = info.method {
+            return Err(OxiArcError::unsupported_method(
+                String::from_utf8_lossy(&id).into_owned(),
+            ));
+        }
+
         // Seek to data offset
         self.reader.seek(SeekFrom::Start(entry.offset))?;
 

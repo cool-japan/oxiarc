@@ -624,15 +624,18 @@ impl LzmaEncoder {
             let dist_reduced = dist - base;
 
             if slot < END_POS_MODEL_INDEX as u32 {
-                // Encode with model (reverse bit tree)
-                let base_idx = (slot as usize) - (slot as usize >> 1) - 1;
+                // Encode with model (reverse bit tree) using the LZMA
+                // specification layout `PosEncoders + dist - posSlot`
+                // (LzmaSpec.cpp): the tree for this slot starts at
+                // `dist_base - slot` and is addressed by the bit-tree node
+                // index `m` (starting at 1).
+                let base_idx = (base as usize) - (slot as usize);
 
-                // Encode reverse bit tree manually since we need flat array indexing
                 let mut m = 1usize;
                 for i in 0..num_direct_bits {
                     let bit = (dist_reduced >> i) & 1;
                     self.rc
-                        .encode_bit(&mut self.model.distance.special[base_idx + m - 1], bit);
+                        .encode_bit(&mut self.model.distance.special[base_idx + m], bit);
                     m = (m << 1) | bit as usize;
                 }
             } else {
@@ -660,7 +663,26 @@ impl LzmaEncoder {
     ///
     /// [`set_dictionary`]: Self::set_dictionary
     /// [`with_dictionary`]: Self::with_dictionary
-    pub fn compress(mut self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn compress(self, data: &[u8]) -> Result<Vec<u8>> {
+        self.compress_impl(data, true)
+    }
+
+    /// Compress data as an LZMA2 chunk payload (no end-of-stream marker).
+    ///
+    /// LZMA2 chunks declare their exact uncompressed and compressed sizes in
+    /// the chunk header, so the LZMA end-of-stream marker must **not** appear
+    /// inside the chunk: spec-conforming decoders (liblzma, 7-Zip) verify
+    /// that the chunk's compressed bytes are consumed exactly and reject
+    /// trailing marker bytes as corrupt data. The range coder is still
+    /// flushed, which is required for the final bytes to be decodable.
+    pub fn compress_chunk(self, data: &[u8]) -> Result<Vec<u8>> {
+        self.compress_impl(data, false)
+    }
+
+    /// Shared compression driver; `write_end_marker` selects between a
+    /// standalone LZMA1 stream (marker present) and an LZMA2 chunk payload
+    /// (marker absent).
+    fn compress_impl(mut self, data: &[u8], write_end_marker: bool) -> Result<Vec<u8>> {
         // When a preset dictionary is active, build a combined buffer and remember
         // the offset at which real data starts. The encoder loop runs over `buf`
         // starting at `data_start` so that the match finder already has the dict
@@ -873,24 +895,27 @@ impl LzmaEncoder {
             h.on_progress(real_consumed, Some(total));
         }
 
-        // Write end marker
-        let pos_state = (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
-        let state_idx = self.state.value();
+        if write_end_marker {
+            // Write end marker (a match with distance 0xFFFF_FFFF)
+            let pos_state =
+                (self.bytes_encoded as usize) & (self.model.props.num_pos_states() - 1);
+            let state_idx = self.state.value();
 
-        self.rc
-            .encode_bit(&mut self.model.is_match[state_idx][pos_state], 1);
-        self.rc.encode_bit(&mut self.model.is_rep[state_idx], 0);
+            self.rc
+                .encode_bit(&mut self.model.is_match[state_idx][pos_state], 1);
+            self.rc.encode_bit(&mut self.model.is_rep[state_idx], 0);
 
-        // Encode minimum length
-        encode_length(
-            &mut self.rc,
-            &mut self.model.match_len,
-            MATCH_LEN_MIN as u32,
-            pos_state,
-        );
+            // Encode minimum length
+            encode_length(
+                &mut self.rc,
+                &mut self.model.match_len,
+                MATCH_LEN_MIN as u32,
+                pos_state,
+            );
 
-        // Encode end marker distance
-        self.encode_distance(0xFFFF_FFFF, MATCH_LEN_MIN as u32);
+            // Encode end marker distance
+            self.encode_distance(0xFFFF_FFFF, MATCH_LEN_MIN as u32);
+        }
 
         Ok(self.rc.finish())
     }

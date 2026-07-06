@@ -37,6 +37,10 @@ pub const DATA_DESCRIPTOR_SIG: u32 = 0x08074B50;
 /// Flag bit for data descriptor presence.
 pub const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 
+/// Flag bit for the language encoding flag (EFS, general-purpose bit 11):
+/// when set, the entry name and comment are encoded in UTF-8.
+pub const FLAG_EFS: u16 = 0x0800;
+
 /// AES encryption method value in ZIP (compression method field).
 pub const METHOD_AES_ENCRYPTED: u16 = 99;
 
@@ -126,8 +130,12 @@ pub struct LocalFileHeader {
     pub compressed_size: u32,
     /// Uncompressed size (use uncompressed_size_64 for actual value if Zip64).
     pub uncompressed_size: u32,
-    /// File name.
+    /// File name, decoded from [`LocalFileHeader::filename_raw`]
+    /// (strict UTF-8, then Shift_JIS when the EFS flag is absent, then
+    /// an injective CP437 fallback).
     pub filename: String,
+    /// Raw (undecoded) file-name bytes exactly as stored in the header.
+    pub filename_raw: Vec<u8>,
     /// Extra field.
     pub extra: Vec<u8>,
     /// Offset to file data.
@@ -163,10 +171,12 @@ impl LocalFileHeader {
         let filename_len = u16::from_le_bytes([buf[26], buf[27]]) as usize;
         let extra_len = u16::from_le_bytes([buf[28], buf[29]]) as usize;
 
-        // Read filename
+        // Read filename and decode it (EFS flag: UTF-8; otherwise strict
+        // UTF-8 -> Shift_JIS -> injective CP437 fallback).
         let mut filename_bytes = vec![0u8; filename_len];
         reader.read_exact(&mut filename_bytes)?;
-        let filename = String::from_utf8_lossy(&filename_bytes).into_owned();
+        let filename =
+            crate::zip::name_codec::decode_zip_text(&filename_bytes, flags & FLAG_EFS != 0);
 
         // Read extra field
         let mut extra = vec![0u8; extra_len];
@@ -190,6 +200,7 @@ impl LocalFileHeader {
             compressed_size,
             uncompressed_size,
             filename,
+            filename_raw: filename_bytes,
             extra,
             data_offset: 0, // Set by caller
             uncompressed_size_64,

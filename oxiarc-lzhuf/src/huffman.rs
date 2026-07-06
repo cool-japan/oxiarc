@@ -51,21 +51,23 @@ pub struct LzhHuffmanTree {
 
 impl LzhHuffmanTree {
     /// Create a Huffman tree from code lengths.
+    ///
+    /// `table_bits` is the *minimum* lookup width; if any code is longer,
+    /// the table is widened to the maximum code length so that every code
+    /// remains decodable in a single lookup.
     pub fn from_lengths(lengths: &[u8], table_bits: u8) -> Result<Self> {
+        // Find max length
+        let max_length = *lengths.iter().max().unwrap_or(&0);
+        if max_length as usize > MAX_CODE_LENGTH {
+            return Err(OxiArcError::invalid_huffman(0));
+        }
+
+        // Widen the table if any code exceeds the requested lookup width.
+        let table_bits = table_bits.max(max_length);
         let table_size = 1 << table_bits;
         let mut table = vec![TableEntry::INVALID; table_size];
 
-        if lengths.is_empty() {
-            return Ok(Self {
-                table,
-                table_bits,
-                max_length: 0,
-            });
-        }
-
-        // Find max length
-        let max_length = *lengths.iter().max().unwrap_or(&0);
-        if max_length == 0 {
+        if lengths.is_empty() || max_length == 0 {
             return Ok(Self {
                 table,
                 table_bits,
@@ -252,17 +254,21 @@ pub fn read_c_tree<R: Read>(reader: &mut BitReader<R>) -> Result<LzhHuffmanTree>
 }
 
 /// Read the position/distance Huffman tree from the stream.
+///
+/// The width of the code-count field depends on `np`: lh4/lh5 (`np = 14`)
+/// use 4 bits, lh6/lh7 (`np = 16`/`17`) need 5 bits.
 pub fn read_p_tree<R: Read>(reader: &mut BitReader<R>, np: usize) -> Result<LzhHuffmanTree> {
     #[cfg(test)]
     eprintln!("[read_p_tree] start, bit_pos={}", reader.bit_position());
 
-    let n = reader.read_bits(4)? as usize; // Number of codes
+    let nbit = crate::methods::p_tree_count_bits(np);
+    let n = reader.read_bits(nbit)? as usize; // Number of codes
     #[cfg(test)]
     eprintln!("[read_p_tree] n={}", n);
 
     if n == 0 {
         // Special case: single code
-        let c = reader.read_bits(4)? as usize;
+        let c = reader.read_bits(nbit)? as usize;
         #[cfg(test)]
         eprintln!(
             "[read_p_tree] single code: {}, bit_pos={}",
