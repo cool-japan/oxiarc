@@ -1,8 +1,9 @@
 
-# OxiArc - Development Roadmap (v0.3.4, 2026-06-06)
+# OxiArc - Development Roadmap (v0.3.4, 2026-07-06)
 
 ## Version History
 
+- **v0.3.4** (2026-07-06): Interoperability hardening release — spec-conformance defects found via downstream FVRS integration testing were root-caused and fixed across LZMA/LZMA2 (distance-slot probability layout, state mapping, LZMA2 control-byte reset field, embedded EOS markers), bzip2 (bit order, CRC-32 variant, MTF/Huffman pipeline, format minimums), 7z (substream sizes, 0-byte members, varint decoding, header/CRC handling), ZIP (Shift-JIS/EFS/CP437 name decoding, writer EFS flag), TAR (char-boundary panic, PAX long-name write support), XZ (block-header CRC, index unpadded size, self-describing chunk framing), and LZH (`-lh1-`/`-lhd-`/unknown-method listing, beyond-window LZSS/Huffman fixes, Shift_JIS filenames). All codecs validated bidirectionally against liblzma/libbz2/bsdtar/CPython; hermetic golden-vector test suites committed. 1,799 tests passing (all features), zero clippy/check/rustdoc warnings.
 - **v0.3.3** (2026-06-06): oxiarc-brotli high-entropy/incompressible round-trip fix — incompressible data now round-trips byte-for-byte across all quality levels (1–11). Fixed two underlying bugs: (1) incomplete length-limited Huffman codes (replaced the `ceil(-log2 p)` heuristic with the package-merge algorithm, which always yields a complete, length-optimal code) and (2) insert lengths above 319 were silently truncated (unified the insert-length code table between encoder and decoder, extending categories up to ~4 MiB inserts). 13 new high-entropy regression tests. 1,679 tests passing, 2 skipped, zero warnings. No other crate changed.
 - **v0.3.2** (2026-05-31): AEC/SZIP codec (oxiarc-szip) — full CCSDS-121.0-B-2 compliant encoder/decoder with `BitReader`/`BitWriter` bit manipulation primitives, `SzipParams` configuration struct, `SzipError` error enum. Round-trip tests for all sample scenarios.
 - **v0.3.1** (2026-05-16): LZH custom dictionary (`LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder/Decoder::preload_dictionary`). LZMA custom dictionary (`LzmaEncoder/Decoder::with_dictionary`). LZMA memory pool (`LzmaPool`, `PooledBuf`, `LzmaDecoderPooled`) — amortizes large dict allocations. Archive repair/recovery (`repair_zip`, `repair_tar`, `ZipRepair`, `TarRepair`, `RepairReport`) for truncated/corrupt ZIP+TAR archives. Snappy + Brotli interop test vectors (35 new integration tests). 1446 tests (77 new), 3 skipped, zero warnings.
@@ -262,27 +263,27 @@
 ## Known Issues
 
 1. Bzip2 parallel compression bit-alignment issues have been RESOLVED
-2. LZMA encoder has known issues with certain complex data patterns (simple data works)
+2. LZMA/LZMA2 liblzma interop issues have been RESOLVED (v0.3.4: distance-slot probability layout, state mapping, LZMA2 control-byte reset field, embedded LZMA2 EOS marker)
 3. BWT has O(n² log n) worst-case for highly repetitive data (mitigated by 900KB block size limit)
 
 ## Test Coverage
 
 - oxiarc-core: 132 tests
   - CRC-32/64 slicing-by-8, DualCrc optimization, SIMD CRC32 (aarch64 PMULL), size boundary tests, bitstream, ringbuffer, EntryBuilder, Serde serialization
-- oxiarc-deflate: 212 tests
+- oxiarc-deflate: 217 tests
   - Dynamic Huffman, Zlib wrapper, Adler-32, edge cases, compression levels, async deflate, gzip module, streaming (GzipStreamEncoder/Decoder, ZlibStreamEncoder/Decoder, flush modes), optimal parsing, streaming improvements, parallel GZIP (gzip_compress_parallel, ParallelGzipEncoder), LZ77 tuning (Lz77Params, Lz77Preset), DEFLATE memory pool (DeflatePool, PooledBuf), streaming compliance fixes
-- oxiarc-lzhuf: 99 tests
-  - LH5 roundtrip encoding/decoding, LZSS, Huffman trees, optimal parser, streaming integration, custom dictionary (LzhEncoder::with_dictionary, LzhDecoder::with_dictionary, LzssEncoder/Decoder::preload_dictionary), extension header DOS attributes
-- oxiarc-bzip2: 41 tests (2 skipped)
-  - BWT, MTF, RLE, Huffman, roundtrip, parallel compression
+- oxiarc-lzhuf: 122 tests
+  - LH1/LH5 roundtrip encoding/decoding (incl. beyond-window regression tests), LZSS, Huffman trees, optimal parser, streaming integration, custom dictionary (LzhEncoder::with_dictionary, LzhDecoder::with_dictionary, LzssEncoder/Decoder::preload_dictionary), extension header DOS attributes
+- oxiarc-bzip2: 68 tests
+  - MSB-first bit I/O, non-reflected CRC-32, BWT, MTF/symbol-map Huffman, roundtrip, libbz2 interop, parallel compression
 - oxiarc-lz4: 138 tests
   - Official frame format, XXHash32, LZ4-HC, block/frame compression, parallel compression, acceleration parameter tests, progress/cancel builders, bounded-memory streaming, memory_budget, block-layer prefix dictionary (Lz4DictBlockEncoder, Lz4DictBlockDecoder, compress_block_with_dict, decompress_block_dict)
 - oxiarc-zstd: 179 tests
   - FSE, Huffman, XXHash64, frame parsing, full encoder (bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict), parallel compression, progress/cancel builders, multi-frame decompression (decompress_multi_frame, decompress_multi_frame_with_dict), streaming dict multi-frame fix
-- oxiarc-archive: 332 tests
-  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers, Zip64 and data descriptors, async ZIP, Brotli/Snappy integration, ISO 9660 read support, raw-preserve append, archive repair/recovery (repair_zip, repair_tar, ZipRepair, TarRepair, RepairReport)
-- oxiarc-lzma: 139 tests
-  - LZMA/LZMA2, optimal parsing, range coder, price calculation, progress/cancel builders, BT4 match finder, Bt4MatchFinder, MatchFinder trait, parallel LZMA2 (lzma2_compress_parallel, ParallelLzma2Encoder, parallel feature), custom dictionary (LzmaEncoder::with_dictionary, LzmaDecoder::with_dictionary), LZMA memory pool (LzmaPool, PooledBuf, LzmaDecoderPooled)
+- oxiarc-archive: 380 tests
+  - ZIP/TAR/LZH/XZ/7z/CAB/LZ4/Zstd/Bzip2 support, PAX headers (incl. write-side PAX long names), Zip64 and data descriptors, async ZIP, Brotli/Snappy integration, ISO 9660 read support, raw-preserve append, archive repair/recovery (repair_zip, repair_tar, ZipRepair, TarRepair, RepairReport), liblzma/libbz2/bsdtar/CPython interop suites (7z, ZIP name encoding, TAR PAX Japanese names)
+- oxiarc-lzma: 151 tests
+  - LZMA/LZMA2 (spec-conformant distance-slot table, state mapping, LZMA2 control-byte, chunked encoder), optimal parsing, range coder, price calculation, progress/cancel builders, BT4 match finder, Bt4MatchFinder, MatchFinder trait, parallel LZMA2 (lzma2_compress_parallel, ParallelLzma2Encoder, parallel feature), custom dictionary (LzmaEncoder::with_dictionary, LzmaDecoder::with_dictionary), LZMA memory pool (LzmaPool, PooledBuf, LzmaDecoderPooled), liblzma golden-vector interop
 - oxiarc-lzw: 76 tests
   - GIF/TIFF configurations, GIF LZW codec (gif_lzw), LSB bitstream (bitstream_lsb), dictionary management, roundtrip tests, streaming encoder/decoder tests
 - oxiarc-brotli: 163 tests
@@ -291,31 +292,30 @@
   - Snappy block format, framed format with CRC32C checksums (SSE 4.2 hardware acceleration on x86_64), streaming Write/Read API, interop integration tests, parallel frame compression, memory pool (SnappyPool, PoolStats, compress_frame_pooled), dictionary APIs (compress_block_with_dict, compress_frame_with_dict, decompress_block_with_dict, decompress_frame_with_dict), async I/O (AsyncSnappyCompressor, AsyncSnappyDecompressor)
 - oxiarc-szip: 19 tests
   - AEC/SZIP CCSDS-121.0-B-2 encoder/decoder, BitReader/BitWriter bit primitives, SzipParams configuration, SzipError error type, round-trip encode/decode tests
-- oxiarc-cli: 37 tests
-- Total: 1,679 tests (1,679 passed, 2 skipped, zero warnings)
+- oxiarc-cli: 42 tests
+- Total: 1,799 tests (1,799 passed, 0 skipped, zero warnings, all features)
 
-## Code Statistics (v0.3.3, 2026-06-06)
+## Code Statistics (v0.3.4, 2026-07-06)
 
 | Crate | Lines of Code |
 |-------|---------------|
-| oxiarc-core | ~3,565 (CRC-32/64 slicing-by-8, optimized DualCrc, EntryBuilder, Serde) |
-| oxiarc-deflate | ~3,479 (Zlib wrapper, Adler-32, async_deflate, gzip, streaming modules) |
-| oxiarc-lzhuf | ~2,746 |
-| oxiarc-bzip2 | ~1,548 |
-| oxiarc-lz4 | ~3,656 (official frame, XXHash32, LZ4-HC, acceleration; refactored frame/ module) |
-| oxiarc-zstd | ~5,741 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
-| oxiarc-brotli | ~3,460 (LZ77, context Huffman, static dictionary, streaming) |
-| oxiarc-snappy | ~1,428 (block format, framed format, CRC32C) |
-| oxiarc-szip | ~1,148 (BitReader/BitWriter, encode, decode, encode_bytes, SzipParams, SzipError, CCSDS-121.0-B-2) |
-| oxiarc-archive | ~7,897 (ZIP header refactored; async_zip module; Brotli/Snappy integration) |
-| oxiarc-cli | ~2,443 |
-| oxiarc-lzma | ~3,868 |
-| oxiarc-lzw | ~1,092 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
-| **Total** | **~72,000** (234 files) |
+| oxiarc-core | ~4,969 (CRC-32/64 slicing-by-8, optimized DualCrc, EntryBuilder, Serde) |
+| oxiarc-deflate | ~7,835 (Zlib wrapper, Adler-32, async_deflate, gzip, streaming modules) |
+| oxiarc-lzhuf | ~5,889 (lh1/lh5 beyond-window fixes) |
+| oxiarc-bzip2 | ~2,500 (MSB-first bit I/O, libbz2-compatible CRC/Huffman) |
+| oxiarc-lz4 | ~5,484 (official frame, XXHash32, LZ4-HC, acceleration; refactored frame/ module) |
+| oxiarc-zstd | ~6,566 (full encoder: bitwriter, compressed_block, fse_encoder, huffman_encoder, lz77, streaming, dict) |
+| oxiarc-brotli | ~5,677 (LZ77, context Huffman, static dictionary, streaming) |
+| oxiarc-snappy | ~3,451 (block format, framed format, CRC32C) |
+| oxiarc-szip | ~776 (BitReader/BitWriter, encode, decode, encode_bytes, SzipParams, SzipError, CCSDS-121.0-B-2) |
+| oxiarc-archive | ~18,067 (7z/ZIP/TAR/XZ/LZH interop hardening, name_codec, source_map) |
+| oxiarc-cli | ~4,988 |
+| oxiarc-lzma | ~7,222 (spec-conformant distance-slot table, state mapping) |
+| oxiarc-lzw | ~2,140 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
+| **Total** | **~75,564** (250 files) |
 
 ## Stubs to implement (added 2026-06-22 by /cooljapan-stub-check)
 
-- [ ] **oxiarc** `oxiarc-archive`: `oxiarc-archive/src/xz/header.rs:913` — `TODO`: `LZH compression (lh5) encoder not compatible` (round-trip tests disabled; lh5 Huffman emission not spec-compatible)
+- [x] **oxiarc** `oxiarc-archive`: `oxiarc-archive/src/xz/header.rs:913` — `TODO`: `LZH compression (lh5) encoder not compatible` (round-trip tests disabled; lh5 Huffman emission not spec-compatible)
+  - **Resolved (v0.3.4, 2026-07-06):** lh5 (and lh4/lh6/lh7) beyond-window corruption root-caused to three bugs in `oxiarc-lzhuf` — the LZSS encoder clobbering history for inputs larger than the window, a 16-bit per-block size field silently overflowing past 65535 bytes, and 4/5-bit p-tree count fields for np=16/17. Fixed with new beyond-window regression tests (8/16/64/100 KB, CRC-16 verified). The stale in-source comment at `xz/header.rs:957` (an XZ/LZMA test file, not LZH) references this same tracking note and should be revisited/removed in a follow-up cleanup pass.
   - **Priority:** P2  **Scope:** large  **Cross-project:** none
-  - **Approach:** Align the LZH `lh5` encoder's Huffman code-length table emission with the LHA/LZH spec (code-length list encoding + offset/length symbol tables), then re-enable the disabled round-trip tests by decoding against reference `.lzh` archives.
-  - **Risk:** Bitstream-level format work; an off-by-one in code-length packing silently produces archives no other extractor can read. Needs reference-archive corpus to validate, not just self-round-trip.

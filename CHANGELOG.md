@@ -5,7 +5,7 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.4] - Unreleased
+## [0.3.4] - 2026-07-06
 
 Interoperability hardening release: a batch of spec-conformance defects found via downstream FVRS integration testing was root-caused and fixed across the LZMA, bzip2, LZH, 7z, ZIP, TAR, and XZ stacks. All codecs were validated bidirectionally against reference implementations (liblzma, libbz2, bsdtar/libarchive, CPython stdlib) during development; the committed test suites are fully hermetic (golden vectors embedded, no external tools invoked at test time).
 
@@ -50,6 +50,7 @@ Interoperability hardening release: a batch of spec-conformance defects found vi
 - **oxiarc-archive**: `LzhWriter` default header level changed 1 → 2 (the LHA 2.x/Lhaplus standard, required for spec-conformant Shift_JIS dirname/basename extension blocks); levels 1 and 3 remain selectable via `with_header_level`. `LzhWriter` also writes `-lhd-` entries for directories.
 - **oxiarc-lzma**: `DistanceModel::special` array size changed 114 → 115 to match the spec layout (public field; no external users).
 - **oxiarc-archive**: 7z `extract()` now errors on CRC mismatch instead of returning unverified data, and returns `Ok` with empty data for directories/0-byte files/anti-items.
+- Dependency bumps: `clap_complete` 4.6.5 → 4.6.6, `indicatif` 0.18.4 → 0.18.6, `memmap2` 0.9.10 → 0.9.11.
 
 ### Added
 - **oxiarc-lzhuf**: `-lh1-` (LZHUF: 4 KB window + adaptive Huffman) decoder and spec-conformant greedy encoder, ported from a validated implementation.
@@ -534,6 +535,11 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/cool-japan/oxiarc/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/cool-japan/oxiarc/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/cool-japan/oxiarc/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/cool-japan/oxiarc/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/cool-japan/oxiarc/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/cool-japan/oxiarc/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/cool-japan/oxiarc/compare/v0.2.3...v0.2.4

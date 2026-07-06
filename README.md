@@ -289,21 +289,21 @@ Adaptive entropy coding for scientific data:
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
 | oxiarc-core     | Stable  | 228        | 132           |
-| oxiarc-deflate  | Stable  | 150        | 212           |
-| oxiarc-lzhuf    | Stable  | 94         | 99            |
-| oxiarc-bzip2    | Stable  | 39         | 41            |
-| oxiarc-lz4      | Stable  | 123        | 138           |
-| oxiarc-zstd     | Stable  | 157        | 179           |
-| oxiarc-lzma     | Stable  | 186        | 139           |
-| oxiarc-archive  | Stable  | 404        | 332           |
+| oxiarc-deflate  | Stable  | 168        | 217           |
+| oxiarc-lzhuf    | Stable  | 106        | 122           |
+| oxiarc-bzip2    | Stable  | 56         | 68            |
+| oxiarc-lz4      | Stable  | 126        | 138           |
+| oxiarc-zstd     | Stable  | 161        | 179           |
+| oxiarc-lzma     | Stable  | 188        | 151           |
+| oxiarc-archive  | Stable  | 438        | 380           |
 | oxiarc-lzw      | Stable  | 67         | 76            |
-| oxiarc-brotli   | Stable  | 90         | 163           |
-| oxiarc-snappy   | Stable  | 34         | 112           |
+| oxiarc-brotli   | Stable  | 101        | 163           |
+| oxiarc-snappy   | Stable  | 35         | 112           |
 | oxiarc-szip     | Stable  | 27         | 19            |
-| oxiarc-cli      | Stable  | 43         | 37            |
-| **Total**       |         | **1,642**  | **1,679**     |
+| oxiarc-cli      | Stable  | 45         | 42            |
+| **Total**       |         | **1,746**  | **1,799**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.4 (2026-06-06).
+All crates are feature-complete, tested, and API-stable as of v0.3.4 (2026-07-06).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -760,7 +760,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 1,679 tests
+# Run all 1,799 tests
 cargo nextest run --all-features
 
 # Build CLI only
