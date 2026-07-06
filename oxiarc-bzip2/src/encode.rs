@@ -1,14 +1,170 @@
 //! BZip2 encoder.
+//!
+//! Produces streams in the real bzip2 format (readable by libbz2 and
+//! compatible tools): MSB-first bit stream, bzip2-specific block CRC,
+//! symbol map of used byte values, MTF over the used-byte list, RUNA/RUNB
+//! zero-run coding, and canonical Huffman coding with the minimum required
+//! two coding tables (all selectors referencing table 0).
 
-use crate::{BLOCK_MAGIC, BZIP2_MAGIC, CompressionLevel, EOS_MAGIC, bwt, huffman, mtf, rle};
+use crate::bitio::MsbBitWriter;
+use crate::crc::Bz2Crc;
+use crate::{BZIP2_MAGIC, CompressionLevel, bwt, huffman, mtf, rle};
 use oxiarc_core::cancel::CancellationToken;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
-use oxiarc_core::{BitWriter, Crc32};
 use std::io::Write;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Block magic as a 48-bit value (BCD digits of pi).
+const BLOCK_MAGIC_BITS: u64 = 0x3141_5926_5359;
+
+/// End-of-stream magic as a 48-bit value (BCD digits of sqrt(pi)).
+const EOS_MAGIC_BITS: u64 = 0x1772_4538_5090;
+
+/// Number of Huffman tables this encoder emits (the format minimum).
+const NUM_TABLES: u32 = huffman::MIN_TABLES as u32;
+
+/// Maximum raw input bytes per block for a given level.
+///
+/// The block size limit applies to the *RLE1-encoded* data (libbz2 reserves
+/// `BZ_N_OVERSHOOT` slack, hence the `- 20`). RLE1 can expand its input by
+/// at most 5/4 (a 4-byte run becomes 5 bytes), so feeding at most 4/5 of the
+/// limit guarantees the encoded block never exceeds it.
+fn input_chunk_limit(level: CompressionLevel) -> usize {
+    let block_limit = level.block_size() - 20;
+    block_limit * 4 / 5
+}
+
+/// A fully transformed block, ready for bit-level serialization.
+struct PreparedBlock {
+    /// bzip2 CRC of the raw (pre-RLE1) block data.
+    block_crc: u32,
+    /// BWT original pointer.
+    orig_ptr: u32,
+    /// Which byte values occur in the block.
+    used: [bool; 256],
+    /// MTF + RUNA/RUNB symbol stream, terminated by the EOB symbol.
+    symbols: Vec<u16>,
+    /// Canonical Huffman table for the block alphabet.
+    table: huffman::HuffmanTable,
+}
+
+/// Run the compression pipeline (CRC, RLE1, BWT, MTF, RLE2, Huffman build)
+/// for one non-empty block of raw data.
+fn prepare_block(raw: &[u8]) -> Result<PreparedBlock> {
+    debug_assert!(!raw.is_empty());
+
+    // The block CRC covers the raw data, before RLE1.
+    let block_crc = Bz2Crc::compute(raw);
+
+    let rle1_data = rle::rle1_encode(raw);
+    let (bwt_data, orig_ptr) = bwt::transform(&rle1_data);
+
+    // Symbol map: byte values used in the BWT string.
+    let mut used = [false; 256];
+    for &b in &bwt_data {
+        used[b as usize] = true;
+    }
+    let used_symbols: Vec<u8> = (0..=255u8).filter(|&b| used[b as usize]).collect();
+    let alpha_size = used_symbols.len() + 2;
+    let eob = (alpha_size - 1) as u16;
+
+    // MTF over the used-byte list, then RUNA/RUNB zero-run coding.
+    // MTF value 0 becomes a zero run; value v >= 1 becomes symbol v + 1.
+    let mtf_values = mtf::transform_with_alphabet(&bwt_data, &used_symbols);
+    let mut symbols = rle::encode_zero_runs(&mtf_values);
+    symbols.push(eob);
+
+    // Canonical, length-limited Huffman code for the block alphabet.
+    let mut freqs = vec![0u32; alpha_size];
+    for &sym in &symbols {
+        let idx = sym as usize;
+        if idx >= alpha_size {
+            return Err(OxiArcError::corrupted(0, "BZip2 symbol out of alphabet"));
+        }
+        freqs[idx] += 1;
+    }
+    let lengths = huffman::build_code_lengths(&freqs, huffman::MAX_ENCODE_LEN as u8);
+    let table = huffman::HuffmanTable::from_lengths(&lengths)?;
+
+    Ok(PreparedBlock {
+        block_crc,
+        orig_ptr,
+        used,
+        symbols,
+        table,
+    })
+}
+
+/// Serialize one prepared block into the bit stream.
+fn write_block_bits<W: Write>(writer: &mut MsbBitWriter<W>, block: &PreparedBlock) -> Result<()> {
+    writer.write_bits_u64(BLOCK_MAGIC_BITS, 48)?;
+    writer.write_bits(block.block_crc, 32)?;
+    writer.write_bit(0)?; // randomised = 0 (deprecated feature)
+    writer.write_bits(block.orig_ptr, 24)?;
+
+    // Symbol map: 16-bit group map, then a 16-bit map per used group.
+    let mut group_bits = 0u32;
+    for group in 0..16usize {
+        if (0..16).any(|bit| block.used[group * 16 + bit]) {
+            group_bits |= 1 << (15 - group);
+        }
+    }
+    writer.write_bits(group_bits, 16)?;
+    for group in 0..16usize {
+        if group_bits & (1 << (15 - group)) != 0 {
+            let mut bits = 0u32;
+            for bit in 0..16usize {
+                if block.used[group * 16 + bit] {
+                    bits |= 1 << (15 - bit);
+                }
+            }
+            writer.write_bits(bits, 16)?;
+        }
+    }
+
+    // Two identical Huffman tables (format minimum); every 50-symbol group
+    // selects table 0, which MTF-codes to a single 0 bit per selector. The
+    // selector count includes the group holding the EOB symbol.
+    let num_selectors = block.symbols.len().div_ceil(huffman::SYMBOLS_PER_GROUP);
+    writer.write_bits(NUM_TABLES, 3)?;
+    writer.write_bits(num_selectors as u32, 15)?;
+    for _ in 0..num_selectors {
+        writer.write_bit(0)?;
+    }
+
+    // Delta-coded code lengths, once per table.
+    let lengths = &block.table.lengths;
+    for _ in 0..NUM_TABLES {
+        let mut current = i32::from(lengths[0]);
+        writer.write_bits(current as u32, 5)?;
+        for &len in lengths {
+            let target = i32::from(len);
+            while current < target {
+                writer.write_bits(0b10, 2)?; // increment
+                current += 1;
+            }
+            while current > target {
+                writer.write_bits(0b11, 2)?; // decrement
+                current -= 1;
+            }
+            writer.write_bit(0)?; // this symbol is done
+        }
+    }
+
+    // The Huffman-coded symbol stream (EOB included).
+    for &sym in &block.symbols {
+        let (code, len) = block
+            .table
+            .get_code(sym)
+            .ok_or_else(|| OxiArcError::corrupted(0, "BZip2 symbol without Huffman code"))?;
+        writer.write_bits(code, u32::from(len))?;
+    }
+
+    Ok(())
+}
 
 /// BZip2 encoder.
 ///
@@ -16,10 +172,8 @@ use rayon::prelude::*;
 /// cooperative cancellation via [`CancellationToken`] using the
 /// [`BzEncoder::with_progress`] / [`BzEncoder::with_cancel`] builders.
 pub struct BzEncoder<W: Write> {
-    writer: BitWriter<W>,
-    #[allow(dead_code)]
+    writer: MsbBitWriter<W>,
     level: CompressionLevel,
-    block_crc: u32,
     combined_crc: u32,
     /// Optional progress sink. Notified with cumulative uncompressed bytes
     /// after each block is successfully written.
@@ -33,21 +187,19 @@ pub struct BzEncoder<W: Write> {
 impl<W: Write> BzEncoder<W> {
     /// Create a new encoder.
     pub fn new(writer: W, level: CompressionLevel) -> Result<Self> {
-        let mut bit_writer = BitWriter::new(writer);
+        let mut bit_writer = MsbBitWriter::new(writer);
 
-        // Write stream header
-        // "BZ" magic
-        bit_writer.write_bits(BZIP2_MAGIC[0] as u32, 8)?;
-        bit_writer.write_bits(BZIP2_MAGIC[1] as u32, 8)?;
-
-        // 'h' for Huffman + block size digit
-        bit_writer.write_bits(b'h' as u32, 8)?;
-        bit_writer.write_bits((b'0' + level.level()) as u32, 8)?;
+        // Stream header: "BZh" + block size digit.
+        bit_writer.write_bytes_aligned(&[
+            BZIP2_MAGIC[0],
+            BZIP2_MAGIC[1],
+            b'h',
+            b'0' + level.level(),
+        ])?;
 
         Ok(Self {
             writer: bit_writer,
             level,
-            block_crc: 0,
             combined_crc: 0,
             progress: None,
             cancel: None,
@@ -76,157 +228,24 @@ impl<W: Write> BzEncoder<W> {
     }
 
     /// Write a data block.
+    ///
+    /// Data larger than the level's per-block capacity is split into
+    /// multiple bzip2 blocks so that every emitted block stays within the
+    /// format's block size limit.
     pub fn write_block(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
 
-        // Cooperative cancellation check before starting the block.
-        if let Some(ref token) = self.cancel {
-            token.check()?;
-        }
-
-        // Calculate CRC
-        let block_crc = Crc32::compute(data);
-        self.block_crc = block_crc;
-        self.combined_crc = self.combined_crc.rotate_left(1) ^ block_crc;
-
-        // Step 1: Initial RLE
-        let rle1_data = rle::rle1_encode(data);
-
-        // Step 2: Burrows-Wheeler Transform
-        let (bwt_data, orig_ptr) = bwt::transform(&rle1_data);
-
-        // Step 3: Move-to-Front Transform
-        let mtf_data = mtf::transform(&bwt_data);
-
-        // Build used symbol bitmap from MTF output
-        let mut used = [false; 256];
-        for &b in &mtf_data {
-            used[b as usize] = true;
-        }
-
-        // Step 4: Zero-run encoding with compact symbol mapping
-        let zrle_data = rle::encode_zero_runs_compact(&mtf_data, &used);
-
-        // Write block header
-        for &b in &BLOCK_MAGIC {
-            self.writer.write_bits(b as u32, 8)?;
-        }
-
-        // Write block CRC
-        self.writer.write_bits(block_crc, 32)?;
-
-        // Randomised flag (always 0 for modern bzip2)
-        self.writer.write_bits(0, 1)?;
-
-        // Original pointer
-        self.writer.write_bits(orig_ptr, 24)?;
-
-        // Write 16-bit "in use" map for each group of 16 symbols
-        // (used bitmap was already computed before ZRLE encoding)
-        let mut in_use_16 = 0u16;
-        for i in 0..16 {
-            let mut group_used = false;
-            for j in 0..16 {
-                if used[i * 16 + j] {
-                    group_used = true;
-                    break;
-                }
+        let chunk_limit = input_chunk_limit(self.level);
+        for chunk in data.chunks(chunk_limit) {
+            // Cooperative cancellation check before each block.
+            if let Some(ref token) = self.cancel {
+                token.check()?;
             }
-            if group_used {
-                in_use_16 |= 1 << (15 - i);
-            }
-        }
-        self.writer.write_bits(in_use_16 as u32, 16)?;
-
-        // Write individual symbol maps for used groups
-        for i in 0..16 {
-            if (in_use_16 >> (15 - i)) & 1 == 1 {
-                let mut group_map = 0u16;
-                for j in 0..16 {
-                    if used[i * 16 + j] {
-                        group_map |= 1 << (15 - j);
-                    }
-                }
-                self.writer.write_bits(group_map as u32, 16)?;
-            }
-        }
-
-        // Count used symbols for Huffman coding
-        // BZip2 alphabet: RUNA (0), RUNB (1), MTF values 1..num_used_symbols shifted by 1 (+2), EOB
-        let num_used_symbols = used.iter().filter(|&&u| u).count();
-        // Total alphabet size = 2 (RUNA, RUNB) + num_used_symbols (MTF values) + 1 (EOB)
-        let alphabet_size = num_used_symbols + 3;
-
-        // Number of Huffman tables (1-6, based on data size)
-        let num_tables = ((zrle_data.len() / 50).clamp(1, 6)).max(1);
-        self.writer.write_bits(num_tables as u32, 3)?;
-
-        // Number of selector groups (each group is 50 symbols)
-        let num_selectors = zrle_data.len().div_ceil(50);
-        self.writer.write_bits(num_selectors as u32, 15)?;
-
-        // Write selectors (which table to use for each group)
-        // For simplicity, use table 0 for all (write 0 bits in unary)
-        for _ in 0..num_selectors {
-            // Unary code: single 0-bit means "use table 0"
-            self.writer.write_bits(0, 1)?;
-        }
-
-        // Build frequency table for all symbols in alphabet
-        let mut freqs = vec![0u32; alphabet_size];
-        for &sym in &zrle_data {
-            let sym_idx = sym as usize;
-            if sym_idx < freqs.len() {
-                freqs[sym_idx] += 1;
-            }
-        }
-        // EOB symbol (last in alphabet) needs non-zero frequency
-        freqs[alphabet_size - 1] = freqs[alphabet_size - 1].max(1);
-
-        // Build Huffman code lengths (max 17 bits for BZip2)
-        let lengths = huffman::build_code_lengths(&freqs, 17);
-
-        // Write Huffman tables (delta-encoded code lengths)
-        for _ in 0..num_tables {
-            // Write initial 5-bit starting length
-            let start_len = lengths.first().copied().map_or(5i32, |v| v as i32);
-            self.writer.write_bits(start_len as u32, 5)?;
-
-            let mut current_len = start_len;
-
-            for &len in &lengths {
-                let target_len = len as i32;
-                // Delta encode: write bits to adjust from current to target
-                while current_len != target_len {
-                    self.writer.write_bits(1, 1)?; // Signal "adjust"
-                    if target_len > current_len {
-                        self.writer.write_bits(0, 1)?; // Increment
-                        current_len += 1;
-                    } else {
-                        self.writer.write_bits(1, 1)?; // Decrement
-                        current_len -= 1;
-                    }
-                }
-                self.writer.write_bits(0, 1)?; // Signal "done with this symbol"
-            }
-        }
-
-        // Build Huffman table with canonical codes
-        let table = huffman::HuffmanTable::from_lengths(&lengths)?;
-
-        // Write Huffman-encoded data using canonical codes
-        for &sym in &zrle_data {
-            if let Some((code, len)) = table.get_code(sym) {
-                self.write_code(code, len)?;
-            }
-        }
-
-        // Write EOB symbol
-        let eob_sym = (alphabet_size - 1) as u16;
-        if let Some((code, len)) = table.get_code(eob_sym) {
-            self.write_code(code, len)?;
+            let block = prepare_block(chunk)?;
+            write_block_bits(&mut self.writer, &block)?;
+            self.combined_crc = self.combined_crc.rotate_left(1) ^ block.block_crc;
         }
 
         // Update cumulative uncompressed byte count and notify progress.
@@ -238,35 +257,19 @@ impl<W: Write> BzEncoder<W> {
         Ok(())
     }
 
-    /// Write a Huffman code (MSB-first).
-    fn write_code(&mut self, code: u32, len: u8) -> Result<()> {
-        // Write bits MSB-first (BZip2 convention)
-        for i in (0..len).rev() {
-            let bit = (code >> i) & 1;
-            self.writer.write_bits(bit, 1)?;
-        }
-        Ok(())
-    }
-
     /// Finish encoding and write the stream footer.
     pub fn finish(mut self) -> Result<W> {
-        // Write end of stream marker
-        for &b in &EOS_MAGIC {
-            self.writer.write_bits(b as u32, 8)?;
-        }
-
-        // Write combined CRC
+        // End-of-stream marker and the combined CRC of all blocks.
+        self.writer.write_bits_u64(EOS_MAGIC_BITS, 48)?;
         self.writer.write_bits(self.combined_crc, 32)?;
-
-        // Flush any remaining bits
-        self.writer.flush()?;
+        self.writer.finish()?;
 
         // Notify progress completion.
         if let Some(ref handle) = self.progress {
             handle.on_finish();
         }
 
-        self.writer.into_inner()
+        Ok(self.writer.into_inner())
     }
 }
 
@@ -274,41 +277,16 @@ impl<W: Write> BzEncoder<W> {
 pub fn compress(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>> {
     let output = Vec::new();
     let mut encoder = BzEncoder::new(output, level)?;
-
-    let block_size = level.block_size();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        let end = (offset + block_size).min(data.len());
-        encoder.write_block(&data[offset..end])?;
-        offset = end;
-    }
-
+    encoder.write_block(data)?;
     encoder.finish()
-}
-
-/// Intermediate block data for parallel compression.
-/// Holds all pre-computed data needed to write a block.
-#[cfg(feature = "parallel")]
-struct CompressedBlockData {
-    /// CRC32 of original block data
-    crc: u32,
-    /// BWT original pointer
-    orig_ptr: u32,
-    /// Used symbol bitmap (256 entries)
-    used: [bool; 256],
-    /// Zero-run encoded data
-    zrle_data: Vec<u16>,
-    /// Huffman code lengths
-    lengths: Vec<u8>,
 }
 
 /// Compress data using parallel block compression (requires `parallel` feature).
 ///
 /// This function splits the input into independent blocks and compresses them
-/// in parallel using rayon. The heavy work (RLE, BWT, MTF, Huffman table building)
-/// is done in parallel, while the final bitstream writing is done sequentially
-/// to maintain proper bit alignment.
+/// in parallel using rayon. The heavy work (RLE1, BWT, MTF, Huffman table
+/// building) is done in parallel, while the final bitstream writing is done
+/// sequentially to maintain proper bit alignment.
 ///
 /// # Arguments
 ///
@@ -320,179 +298,42 @@ struct CompressedBlockData {
 /// Compressed data in BZip2 format.
 #[cfg(feature = "parallel")]
 pub fn compress_parallel(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>> {
-    let output = Vec::new();
-    let mut bit_writer = BitWriter::new(output);
+    let mut bit_writer = MsbBitWriter::new(Vec::new());
 
-    // Write stream header
-    bit_writer.write_bits(BZIP2_MAGIC[0] as u32, 8)?;
-    bit_writer.write_bits(BZIP2_MAGIC[1] as u32, 8)?;
-    bit_writer.write_bits(b'h' as u32, 8)?;
-    bit_writer.write_bits((b'0' + level.level()) as u32, 8)?;
+    // Stream header: "BZh" + block size digit.
+    bit_writer.write_bytes_aligned(&[
+        BZIP2_MAGIC[0],
+        BZIP2_MAGIC[1],
+        b'h',
+        b'0' + level.level(),
+    ])?;
 
     if data.is_empty() {
-        // Write end of stream marker
-        for &b in &EOS_MAGIC {
-            bit_writer.write_bits(b as u32, 8)?;
-        }
-        bit_writer.write_bits(0, 32)?; // Combined CRC
-        bit_writer.flush()?;
-        return bit_writer.into_inner();
+        bit_writer.write_bits_u64(EOS_MAGIC_BITS, 48)?;
+        bit_writer.write_bits(0, 32)?; // Combined CRC of zero blocks
+        bit_writer.finish()?;
+        return Ok(bit_writer.into_inner());
     }
 
-    // Split input into blocks
-    let block_size = level.block_size();
-    let chunks: Vec<&[u8]> = data.chunks(block_size).collect();
-
-    // Compress blocks in parallel (heavy computation only, no writing)
-    let compressed_blocks: Vec<Result<CompressedBlockData>> = chunks
+    // Transform blocks in parallel (heavy computation only, no writing).
+    let chunks: Vec<&[u8]> = data.chunks(input_chunk_limit(level)).collect();
+    let prepared: Vec<Result<PreparedBlock>> = chunks
         .par_iter()
-        .map(|chunk| {
-            let block_crc = Crc32::compute(chunk);
-
-            // Compress block data
-            let rle1_data = rle::rle1_encode(chunk);
-            let (bwt_data, orig_ptr) = bwt::transform(&rle1_data);
-            let mtf_data = mtf::transform(&bwt_data);
-
-            let mut used = [false; 256];
-            for &b in &mtf_data {
-                used[b as usize] = true;
-            }
-
-            let zrle_data = rle::encode_zero_runs_compact(&mtf_data, &used);
-
-            // Build Huffman tables
-            let num_used_symbols = used.iter().filter(|&&u| u).count();
-            let alphabet_size = num_used_symbols + 3;
-
-            let mut freqs = vec![0u32; alphabet_size];
-            for &sym in &zrle_data {
-                let sym_idx = sym as usize;
-                if sym_idx < freqs.len() {
-                    freqs[sym_idx] += 1;
-                }
-            }
-            freqs[alphabet_size - 1] = freqs[alphabet_size - 1].max(1);
-
-            let lengths = huffman::build_code_lengths(&freqs, 17);
-
-            Ok(CompressedBlockData {
-                crc: block_crc,
-                orig_ptr,
-                used,
-                zrle_data,
-                lengths,
-            })
-        })
+        .map(|chunk| prepare_block(chunk))
         .collect();
 
-    // Write blocks sequentially with single BitWriter (maintains proper bit alignment)
+    // Write blocks sequentially to keep the bit stream contiguous.
     let mut combined_crc = 0u32;
-    for result in compressed_blocks {
+    for result in prepared {
         let block = result?;
-        combined_crc = combined_crc.rotate_left(1) ^ block.crc;
-
-        // Write block header
-        for &b in &BLOCK_MAGIC {
-            bit_writer.write_bits(b as u32, 8)?;
-        }
-        bit_writer.write_bits(block.crc, 32)?;
-        bit_writer.write_bits(0, 1)?; // Randomised flag
-        bit_writer.write_bits(block.orig_ptr, 24)?;
-
-        // Write symbol maps
-        let mut in_use_16 = 0u16;
-        for i in 0..16 {
-            let mut group_used = false;
-            for j in 0..16 {
-                if block.used[i * 16 + j] {
-                    group_used = true;
-                    break;
-                }
-            }
-            if group_used {
-                in_use_16 |= 1 << (15 - i);
-            }
-        }
-        bit_writer.write_bits(in_use_16 as u32, 16)?;
-
-        for i in 0..16 {
-            if (in_use_16 >> (15 - i)) & 1 == 1 {
-                let mut group_map = 0u16;
-                for j in 0..16 {
-                    if block.used[i * 16 + j] {
-                        group_map |= 1 << (15 - j);
-                    }
-                }
-                bit_writer.write_bits(group_map as u32, 16)?;
-            }
-        }
-
-        // Write Huffman metadata
-        let num_used_symbols = block.used.iter().filter(|&&u| u).count();
-        let alphabet_size = num_used_symbols + 3;
-        let num_tables = ((block.zrle_data.len() / 50).clamp(1, 6)).max(1);
-        bit_writer.write_bits(num_tables as u32, 3)?;
-
-        let num_selectors = block.zrle_data.len().div_ceil(50);
-        bit_writer.write_bits(num_selectors as u32, 15)?;
-
-        for _ in 0..num_selectors {
-            bit_writer.write_bits(0, 1)?;
-        }
-
-        // Write Huffman tables (delta-encoded code lengths)
-        for _ in 0..num_tables {
-            let start_len = block.lengths.first().copied().map_or(5i32, |v| v as i32);
-            bit_writer.write_bits(start_len as u32, 5)?;
-            let mut current_len = start_len;
-
-            for &len in &block.lengths {
-                let target_len = len as i32;
-                while current_len != target_len {
-                    bit_writer.write_bits(1, 1)?;
-                    if target_len > current_len {
-                        bit_writer.write_bits(0, 1)?;
-                        current_len += 1;
-                    } else {
-                        bit_writer.write_bits(1, 1)?;
-                        current_len -= 1;
-                    }
-                }
-                bit_writer.write_bits(0, 1)?;
-            }
-        }
-
-        // Build Huffman table and write encoded data
-        let table = huffman::HuffmanTable::from_lengths(&block.lengths)?;
-
-        for &sym in &block.zrle_data {
-            if let Some((code, len)) = table.get_code(sym) {
-                for i in (0..len).rev() {
-                    let bit = (code >> i) & 1;
-                    bit_writer.write_bits(bit, 1)?;
-                }
-            }
-        }
-
-        // Write EOB symbol
-        let eob_sym = (alphabet_size - 1) as u16;
-        if let Some((code, len)) = table.get_code(eob_sym) {
-            for i in (0..len).rev() {
-                let bit = (code >> i) & 1;
-                bit_writer.write_bits(bit, 1)?;
-            }
-        }
+        write_block_bits(&mut bit_writer, &block)?;
+        combined_crc = combined_crc.rotate_left(1) ^ block.block_crc;
     }
 
-    // Write end of stream marker
-    for &b in &EOS_MAGIC {
-        bit_writer.write_bits(b as u32, 8)?;
-    }
+    bit_writer.write_bits_u64(EOS_MAGIC_BITS, 48)?;
     bit_writer.write_bits(combined_crc, 32)?;
-    bit_writer.flush()?;
-
-    bit_writer.into_inner()
+    bit_writer.finish()?;
+    Ok(bit_writer.into_inner())
 }
 
 #[cfg(test)]
@@ -502,8 +343,8 @@ mod tests {
     #[test]
     fn test_compress_empty() {
         let result = compress(b"", CompressionLevel::default()).expect("compress empty input");
-        // Should have at least header and footer
-        assert!(result.len() >= 10);
+        // Header (4) + EOS magic (6) + combined CRC (4).
+        assert_eq!(result.len(), 14);
         assert_eq!(&result[0..2], &BZIP2_MAGIC);
     }
 
@@ -667,7 +508,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    #[ignore = "heavy: stress test (>120s), may consume significant resources"]
     fn test_parallel_repeated_data() {
         use crate::decompress;
         // Reduced from repeat(10000) to repeat(200) for faster testing
@@ -686,7 +526,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "parallel")]
-    #[ignore = "heavy: stress test (>100s), tests all compression levels"]
     fn test_parallel_different_levels() {
         use crate::decompress;
         // Reduced from repeat(1000) to repeat(100) for faster testing (4400 bytes)

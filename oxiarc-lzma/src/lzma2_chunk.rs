@@ -345,9 +345,10 @@ impl Lzma2ChunkedEncoder {
         // must also reset its state to match.
         let reset_state = true;
 
-        // Try to compress with LZMA
+        // Try to compress with LZMA (chunk payload: no end-of-stream marker,
+        // since the chunk header carries the exact sizes)
         let encoder = LzmaEncoder::new(self.config.level, self.config.dict_size);
-        let compressed = encoder.compress(data)?;
+        let compressed = encoder.compress_chunk(data)?;
 
         // Check if compression is worthwhile
         if compressed.len() >= data.len() {
@@ -478,9 +479,9 @@ impl Lzma2ChunkedEncoder {
             let chunk_size = remaining.min(sub_chunk_size);
             let chunk = &data[offset..offset + chunk_size];
 
-            // Compress this sub-chunk
+            // Compress this sub-chunk (chunk payload: no end-of-stream marker)
             let encoder = LzmaEncoder::new(self.config.level, self.config.dict_size);
-            let compressed = encoder.compress(chunk)?;
+            let compressed = encoder.compress_chunk(chunk)?;
 
             // Check if compression is worthwhile
             if compressed.len() >= chunk.len() || compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {

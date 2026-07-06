@@ -78,8 +78,25 @@ impl LzhDecoder {
             return self.decode_stored(reader);
         }
 
+        if self.method == LzhMethod::Lh1 {
+            return self.decode_lh1_stream(reader);
+        }
+
         let mut bit_reader = BitReader::new(reader);
         self.decode_compressed(&mut bit_reader)
+    }
+
+    /// Decode `-lh1-` (LZHUF adaptive Huffman) data.
+    ///
+    /// lh1 uses an MSB-first bitstream with its own adaptive coder, so the
+    /// whole payload is buffered and handed to the dedicated codec.
+    fn decode_lh1_stream<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed)?;
+        let output = crate::lh1::decode_lh1(&compressed, self.uncompressed_size)?;
+        self.bytes_decoded = output.len() as u64;
+        self.finished = true;
+        Ok(output)
     }
 
     /// Decode stored (lh0) data.
@@ -98,7 +115,9 @@ impl LzhDecoder {
             LzhMethod::Lh5 => 14,
             LzhMethod::Lh6 => 16,
             LzhMethod::Lh7 => 17,
-            LzhMethod::Lh0 => return Err(OxiArcError::unsupported_method("lh0")),
+            other => {
+                return Err(OxiArcError::unsupported_method(other.to_string()));
+            }
         };
 
         #[cfg(test)]
@@ -186,12 +205,22 @@ impl LzhDecoder {
                 // Calculate distance
                 // For p >= 1, we read p extra bits
                 // distance = (1 << p) + extra_value
+                //
+                // p >= 16 would imply a distance >= 65536, which is not
+                // representable in the 16-bit token distance; reject it
+                // instead of overflowing.
+                if p >= 16 {
+                    return Err(OxiArcError::corrupted(
+                        reader.bit_position(),
+                        format!("position code {} out of range", p),
+                    ));
+                }
                 let distance = if p == 0 {
                     1
                 } else {
                     let extra_bits = p as u8;
                     let extra = reader.read_bits(extra_bits)?;
-                    (1 << p) + extra as u16
+                    (1u16 << p) + extra as u16
                 };
 
                 self.lzss.decode_match(length, distance)?;

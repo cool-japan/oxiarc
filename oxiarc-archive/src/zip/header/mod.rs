@@ -343,6 +343,7 @@ mod tests {
             compressed_size: 0,
             uncompressed_size: 0,
             filename: "test.txt".to_string(),
+            filename_raw: b"test.txt".to_vec(),
             extra: Vec::new(),
             data_offset: 0,
             uncompressed_size_64: None,

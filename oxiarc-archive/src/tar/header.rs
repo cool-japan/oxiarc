@@ -363,11 +363,18 @@ impl TarHeader {
     pub fn to_block(&self) -> Result<[u8; BLOCK_SIZE]> {
         let mut block = [0u8; BLOCK_SIZE];
 
-        // Split name if too long
+        // Split name if too long.
+        //
+        // The split point is searched on the raw bytes so that multi-byte
+        // UTF-8 names (e.g. Japanese) never cause a slice at a non-char
+        // boundary: a `b'/'` byte in valid UTF-8 is always a character
+        // boundary, so slicing at `split_pos` is safe.
         let (prefix, name) = if self.name.len() > 100 {
-            // Find a good split point (at a /)
-            let split_pos = self.name[..155.min(self.name.len())]
-                .rfind('/')
+            let name_bytes = self.name.as_bytes();
+            let limit = 155.min(name_bytes.len());
+            let split_pos = name_bytes[..limit]
+                .iter()
+                .rposition(|&b| b == b'/')
                 .unwrap_or(0);
             if split_pos > 0 && self.name.len() - split_pos - 1 <= 100 {
                 (&self.name[..split_pos], &self.name[split_pos + 1..])
@@ -430,9 +437,16 @@ impl TarHeader {
     }
 
     /// Write a null-terminated string to a field.
+    ///
+    /// When the string does not fit, it is truncated at the largest UTF-8
+    /// character boundary that fits (floor), so multi-byte characters are
+    /// never split in the middle.
     fn write_string(field: &mut [u8], s: &str) {
         let bytes = s.as_bytes();
-        let len = bytes.len().min(field.len() - 1);
+        let mut len = bytes.len().min(field.len() - 1);
+        while len > 0 && !s.is_char_boundary(len) {
+            len -= 1;
+        }
         field[..len].copy_from_slice(&bytes[..len]);
         // Rest is already zeroed
     }

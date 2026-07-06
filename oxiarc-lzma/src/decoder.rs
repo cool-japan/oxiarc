@@ -289,9 +289,12 @@ impl<R: Read> LzmaDecoder<R> {
         let mut dist = (2 | (slot & 1)) << num_direct_bits;
 
         if slot < END_POS_MODEL_INDEX as u32 {
-            // Use special probabilities (reverse bit tree)
-            // base_idx points to start of probability block for this slot
-            let base_idx = (slot as usize) - (slot as usize >> 1) - 1;
+            // Use special probabilities (reverse bit tree) with the LZMA
+            // specification layout `PosDecoders + dist - posSlot`
+            // (LzmaSpec.cpp): the tree for this slot starts at
+            // `dist_base - slot` and is addressed by the bit-tree node
+            // index `m` (starting at 1).
+            let base_idx = (dist as usize) - (slot as usize);
 
             let mut result = 0u32;
             let mut m = 1usize;
@@ -299,7 +302,7 @@ impl<R: Read> LzmaDecoder<R> {
             for i in 0..num_direct_bits {
                 let bit = self
                     .rc
-                    .decode_bit(&mut self.model.distance.special[base_idx + m - 1])?;
+                    .decode_bit(&mut self.model.distance.special[base_idx + m])?;
                 m = (m << 1) | bit as usize;
                 result |= bit << i;
             }

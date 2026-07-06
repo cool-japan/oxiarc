@@ -24,27 +24,13 @@ pub fn cmd_convert(
     let (input_format, _) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
 
-    // Determine output format
-    let output_format = format.unwrap_or_else(|| {
-        let ext = output
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        match ext.as_str() {
-            "zip" => OutputFormat::Zip,
-            "tar" => OutputFormat::Tar,
-            "gz" | "gzip" => OutputFormat::Gzip,
-            "lzh" | "lha" => OutputFormat::Lzh,
-            "xz" => OutputFormat::Xz,
-            "lz4" => OutputFormat::Lz4,
-            "bz2" | "bzip2" => OutputFormat::Bz2,
-            "zst" | "zstd" => OutputFormat::Zst,
-            "br" | "brotli" => OutputFormat::Br,
-            "sz" | "snappy" => OutputFormat::Snappy,
-            _ => OutputFormat::Zip,
-        }
-    });
+    // Determine output format — refuse extensions we cannot write (e.g. .7z)
+    // instead of silently emitting a different format under that name.
+    let output_format = match format {
+        Some(f) => f,
+        None => crate::commands::create::output_format_from_extension(&output.to_string_lossy())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    };
 
     println!(
         "Converting {} ({}) to {} ({:?})",
@@ -118,8 +104,11 @@ pub fn cmd_convert(
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
-            // LZH compression is stored mode only for now
-            lzh.set_compression(LzhCompressionLevel::Store);
+            let level = match compression {
+                CompressionLevel::Store => LzhCompressionLevel::Store,
+                _ => LzhCompressionLevel::Lh5,
+            };
+            lzh.set_compression(level);
 
             for (name, is_dir, data) in &entries {
                 if *is_dir {

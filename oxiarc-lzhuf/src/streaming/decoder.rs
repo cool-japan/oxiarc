@@ -178,7 +178,7 @@ impl StreamingLzhDecoder {
             LzhMethod::Lh4 | LzhMethod::Lh5 => 14,
             LzhMethod::Lh6 => 16,
             LzhMethod::Lh7 => 17,
-            LzhMethod::Lh0 => 0,
+            LzhMethod::Lh0 | LzhMethod::Lh1 | LzhMethod::Lhd | LzhMethod::Unknown(_) => 0,
         };
 
         Self {
@@ -270,9 +270,19 @@ impl StreamingLzhDecoder {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
-        // Handle stored (lh0) data separately
+        // Handle stored (lh0) and directory (lhd, zero bytes) data separately
         if self.method.is_stored() {
             return self.decompress_stored(input, output);
+        }
+
+        // lh1 uses an MSB-first adaptive-Huffman bitstream that this
+        // incremental state machine does not model; use
+        // `oxiarc_lzhuf::decode_lzh` (or `lh1::decode_lh1`) for lh1 payloads.
+        if matches!(self.method, LzhMethod::Lh1 | LzhMethod::Unknown(_)) {
+            return Err(OxiArcError::unsupported_method(format!(
+                "streaming decode not supported for {}",
+                self.method
+            )));
         }
 
         // Reset bit reader position for new input
@@ -839,8 +849,12 @@ impl StreamingLzhDecoder {
                 state.phase
             };
 
+            // Code-count field width: 4 bits for lh4/lh5 (np = 14),
+            // 5 bits for lh6/lh7 (np = 16/17).
+            let nbit = crate::methods::p_tree_count_bits(self.np);
+
             match phase {
-                PTreePhase::ReadN => match self.bit_reader.read_bits(input, 4) {
+                PTreePhase::ReadN => match self.bit_reader.read_bits(input, nbit) {
                     Some(n) => {
                         let state = self
                             .p_tree_state
@@ -856,7 +870,7 @@ impl StreamingLzhDecoder {
                     None => return Ok(false),
                 },
 
-                PTreePhase::ReadSingleCode => match self.bit_reader.read_bits(input, 4) {
+                PTreePhase::ReadSingleCode => match self.bit_reader.read_bits(input, nbit) {
                     Some(c) => {
                         let lengths = {
                             let state = self
@@ -950,8 +964,6 @@ impl StreamingLzhDecoder {
         output: &mut [u8],
         output_pos: &mut usize,
     ) -> Result<BlockDecodeResult> {
-        let target = (self.bytes_decoded + self.block_size as u64).min(self.uncompressed_size);
-
         let c_tree = self
             .c_tree
             .clone()
@@ -961,7 +973,13 @@ impl StreamingLzhDecoder {
             .clone()
             .ok_or_else(|| OxiArcError::corrupted(0, "P-tree missing during decode"))?;
 
-        while self.bytes_decoded < target {
+        // Decode until the *block* is exhausted (block_bytes_decoded is
+        // maintained across decompress() calls; recomputing a target from
+        // bytes_decoded here would overcount when a block is resumed and
+        // run past the block's token boundary into the next block header).
+        while self.block_bytes_decoded < self.block_size
+            && self.bytes_decoded < self.uncompressed_size
+        {
             // Check if output buffer is full
             if *output_pos >= output.len() {
                 return Ok(BlockDecodeResult::NeedsOutput);
@@ -1013,6 +1031,16 @@ impl StreamingLzhDecoder {
             };
 
             // Calculate distance from position code + extra bits.
+            //
+            // p >= 16 would imply a distance >= 65536, which is not
+            // representable in the 16-bit token distance; reject it instead
+            // of overflowing.
+            if p >= 16 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    format!("position code {} out of range", p),
+                ));
+            }
             let distance = if p == 0 {
                 1u16
             } else {

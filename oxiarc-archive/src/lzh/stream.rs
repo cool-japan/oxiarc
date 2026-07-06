@@ -96,8 +96,21 @@ impl<R: Read> LzhStreamReader<R> {
         let mut compressed = vec![0u8; compressed_size];
         self.reader.read_exact(&mut compressed)?;
 
-        let decompressed = if header.method == LzhMethod::Lh0 {
+        // Advance the running offset past the header bytes and compressed
+        // data *before* decoding, so a per-entry failure below leaves the
+        // stream positioned at the next header and iteration can continue.
+        self.current_offset = header.data_offset + compressed_size as u64;
+
+        let decompressed = if header.method.is_directory() {
+            Vec::new()
+        } else if header.method == LzhMethod::Lh0 {
             compressed
+        } else if let LzhMethod::Unknown(id) = header.method {
+            // Unsupported method: skip this entry (its bytes are already
+            // consumed) and report it; subsequent next_entry calls proceed.
+            return Err(OxiArcError::unsupported_method(
+                String::from_utf8_lossy(&id).into_owned(),
+            ));
         } else {
             decode_lzh(&compressed, header.method, header.original_size as u64).map_err(|e| {
                 OxiArcError::corrupted(
@@ -107,20 +120,19 @@ impl<R: Read> LzhStreamReader<R> {
             })?
         };
 
-        // Verify CRC-16.
-        let computed_crc = Crc16::compute(&decompressed);
-        if computed_crc != header.crc16 {
-            return Err(OxiArcError::corrupted(
-                header.data_offset,
-                format!(
-                    "CRC-16 mismatch for '{}': expected {:04X}, computed {:04X}",
-                    header.filename, header.crc16, computed_crc
-                ),
-            ));
+        // Verify CRC-16 (directories carry no data and no meaningful CRC).
+        if !header.method.is_directory() {
+            let computed_crc = Crc16::compute(&decompressed);
+            if computed_crc != header.crc16 {
+                return Err(OxiArcError::corrupted(
+                    header.data_offset,
+                    format!(
+                        "CRC-16 mismatch for '{}': expected {:04X}, computed {:04X}",
+                        header.filename, header.crc16, computed_crc
+                    ),
+                ));
+            }
         }
-
-        // Advance the running offset past the header bytes and compressed data.
-        self.current_offset = header.data_offset + compressed_size as u64;
 
         let idx = self.entry_index;
         self.entry_index += 1;

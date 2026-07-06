@@ -29,7 +29,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 ### Compression Algorithms (11 implemented)
 - **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
-- **LZH** - LZSS + Huffman (lh0, lh4-lh7)
+- **LZH** - LZSS + Huffman (lh0, lh4-lh7) plus lh1 (LZHUF adaptive Huffman) and lhd directory entries
 - **Bzip2** - BWT + MTF + RLE + Huffman
 - **LZ4** - Ultra-fast LZ77 variant with LZ4-HC
 - **Zstandard** - FSE + Huffman entropy coding
@@ -144,15 +144,15 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.3.3"  # For archive format support
-oxiarc-deflate = "0.3.3"  # For DEFLATE compression
-oxiarc-lzma = "0.3.3"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.3.3"    # For Bzip2 compression
-oxiarc-lz4 = "0.3.3"      # For LZ4 compression
-oxiarc-zstd = "0.3.3"     # For Zstandard compression
-oxiarc-brotli = "0.3.3"   # For Brotli compression
-oxiarc-snappy = "0.3.3"   # For Snappy compression
-oxiarc-szip = "0.3.3"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
+oxiarc-archive = "0.3.4"  # For archive format support
+oxiarc-deflate = "0.3.4"  # For DEFLATE compression
+oxiarc-lzma = "0.3.4"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.3.4"    # For Bzip2 compression
+oxiarc-lz4 = "0.3.4"      # For LZ4 compression
+oxiarc-zstd = "0.3.4"     # For Zstandard compression
+oxiarc-brotli = "0.3.4"   # For Brotli compression
+oxiarc-snappy = "0.3.4"   # For Snappy compression
+oxiarc-szip = "0.3.4"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
 ```
 
 ## Quick Start
@@ -224,7 +224,8 @@ The standard compression used in ZIP, GZIP, and PNG:
 Japanese archive format compression:
 - LZSS with configurable window sizes (4KB-64KB)
 - Static Huffman coding with dual trees (codes + offsets)
-- Methods: lh0 (stored), lh4, lh5, lh6, lh7
+- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh4, lh5, lh6, lh7, lhd (directory); unknown methods are listed and skipped per entry
+- Shift_JIS filenames and level-2 headers (LHA 2.x standard) on write
 
 ### LZMA/LZMA2
 
@@ -288,21 +289,21 @@ Adaptive entropy coding for scientific data:
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
 | oxiarc-core     | Stable  | 228        | 132           |
-| oxiarc-deflate  | Stable  | 150        | 212           |
-| oxiarc-lzhuf    | Stable  | 94         | 99            |
-| oxiarc-bzip2    | Stable  | 39         | 41            |
-| oxiarc-lz4      | Stable  | 123        | 138           |
-| oxiarc-zstd     | Stable  | 157        | 179           |
-| oxiarc-lzma     | Stable  | 186        | 139           |
-| oxiarc-archive  | Stable  | 404        | 332           |
+| oxiarc-deflate  | Stable  | 168        | 217           |
+| oxiarc-lzhuf    | Stable  | 106        | 122           |
+| oxiarc-bzip2    | Stable  | 56         | 68            |
+| oxiarc-lz4      | Stable  | 126        | 138           |
+| oxiarc-zstd     | Stable  | 161        | 179           |
+| oxiarc-lzma     | Stable  | 188        | 151           |
+| oxiarc-archive  | Stable  | 438        | 380           |
 | oxiarc-lzw      | Stable  | 67         | 76            |
-| oxiarc-brotli   | Stable  | 90         | 163           |
-| oxiarc-snappy   | Stable  | 34         | 112           |
+| oxiarc-brotli   | Stable  | 101        | 163           |
+| oxiarc-snappy   | Stable  | 35         | 112           |
 | oxiarc-szip     | Stable  | 27         | 19            |
-| oxiarc-cli      | Stable  | 43         | 37            |
-| **Total**       |         | **1,642**  | **1,679**     |
+| oxiarc-cli      | Stable  | 45         | 42            |
+| **Total**       |         | **1,746**  | **1,799**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.3 (2026-06-06).
+All crates are feature-complete, tested, and API-stable as of v0.3.4 (2026-07-06).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -759,7 +760,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 1,679 tests
+# Run all 1,799 tests
 cargo nextest run --all-features
 
 # Build CLI only

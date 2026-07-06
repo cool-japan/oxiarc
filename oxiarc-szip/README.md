@@ -3,11 +3,11 @@
 
 Pure Rust implementation of CCSDS-121.0-B-2 / libaec-compatible AEC (Adaptive Entropy Coding) / SZIP compression.
 
-![Version](https://img.shields.io/badge/version-0.3.3-blue)
+![Version](https://img.shields.io/badge/version-0.3.4-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.3** (2026-06-06) — 19 tests passing.
+**Version 0.3.4** (2026-06-06) — 19 tests passing.
 
 **What's new in 0.3.2**: Initial release of `oxiarc-szip`. Implements the full AEC/SZIP encode/decode pipeline as specified in CCSDS-121.0-B-2 and compatible with the `libaec` reference library. Supports configurable `bits_per_pixel` (1–32), `pixels_per_block` (8/16/32), `reference_sample_interval`, MSB/LSB bit ordering, NN preprocessing (unit-delay predictor), and RSI byte alignment. Exposed via `encode`, `encode_bytes`, and `decode` free functions together with `SzipParams` and `SzipError` public types.
 
@@ -75,7 +75,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-szip = "0.3.3"
+oxiarc-szip = "0.3.4"
 ```
 
 ## API Reference

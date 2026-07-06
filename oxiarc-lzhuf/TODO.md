@@ -53,7 +53,8 @@
 ## Future Enhancements
 
 ### Additional Methods
-- [ ] lh1, lh2, lh3 (legacy methods)
+- [x] lh1 (LZHUF: 4 KB window + adaptive Huffman) — decoder and spec-conformant greedy encoder (done 2026-07-06)
+- [ ] lh2, lh3 (legacy methods)
 - [ ] lzs (LZSS without Huffman)
 - [ ] lz4, lz5 (LZ methods)
 - [ ] pm0, pm2 (PMarc methods)

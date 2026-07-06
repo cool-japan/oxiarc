@@ -5,6 +5,69 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-07-06
+
+Interoperability hardening release: a batch of spec-conformance defects found via downstream FVRS integration testing was root-caused and fixed across the LZMA, bzip2, LZH, 7z, ZIP, TAR, and XZ stacks. All codecs were validated bidirectionally against reference implementations (liblzma, libbz2, bsdtar/libarchive, CPython stdlib) during development; the committed test suites are fully hermetic (golden vectors embedded, no external tools invoked at test time).
+
+### Fixed
+- **oxiarc-lzma**: Four LZMA/LZMA2 spec deviations that made oxiarc streams mutually incompatible with liblzma:
+  1. **Distance-slot special probability table layout** — the table used a custom overlapping layout instead of the spec's `PosDecoders + dist - posSlot` indexing (LzmaSpec.cpp); fixed consistently in the decoder, LZMA2 decoder, encoder, and optimal-parser pricing, with the table resized 114 → 115 (`1 + FULL_DISTANCES - END_POS_MODEL_INDEX`, exposed as `SPEC_POS_PROBS`).
+  2. **`State::update_literal` state mapping** — states ≥ 10 mapped 10 → 6 instead of the spec's `state - 6` (10 → 4), corrupting decode of real liblzma streams past ~64 KB.
+  3. **LZMA2 control-byte reset field** — parsed bit 5 as a dictionary-reset flag instead of the spec's 2-bit field `(control >> 5) & 3` (1 = state reset, 2 = + props, 3 = + dict reset), so state-reset chunks wrongly discarded the dictionary.
+  4. **End-of-stream marker inside LZMA2 chunks** — chunk payloads embedded the LZMA EOS marker, which liblzma rejects as corrupt because chunk compressed sizes must be consumed exactly; all three LZMA2 chunk writers now use the new additive `LzmaEncoder::compress_chunk` API.
+- **oxiarc-lzma**: `Lzma2Encoder::encode` no longer silently truncates the 21-bit uncompressed / 16-bit compressed chunk-header size fields — inputs over 2 MiB, compressed payloads over 64 KiB, or incompressible inputs over 64 KiB now delegate to the chunked encoder internally (dict size, progress, and cancellation forwarded).
+- **oxiarc-bzip2**: Complete bidirectional interop fix — oxiarc could previously neither decode real bzip2 streams nor produce streams bzip2 could decode. Root causes, all corrected:
+  1. **Bit order** — the codec used LSB-first (DEFLATE-style) bit I/O while the bzip2 format is an MSB-first bit stream; new private MSB-first bit I/O module.
+  2. **CRC-32 variant** — block and combined stream CRCs used the reflected ZIP/GZIP CRC-32 (0xEDB88320) instead of bzip2's non-reflected MSB-first CRC-32 (poly 0x04C11DB7, init 0xFFFFFFFF, final complement).
+  3. **Pipeline layering** — MTF ran over the full 256-byte alphabet with a "compact remap" of MTF positions, instead of a symbol map of used byte values with MTF over the used-byte list (symbol `s` → MTF index `s-1`, EOB = `nUsed+1`).
+  4. **Huffman alphabet off-by-one** — the decoder read `alpha_size + 1` code lengths and treated EOB as `num_symbols`; the encoder used `used + 3` symbols.
+  5. **Format minimums** — the encoder could emit a single Huffman table (format minimum is 2) and undercounted selectors by excluding EOB from the symbol count.
+  Decoding now follows the libbz2 limit/base/perm scheme; encoding uses weight-halving length-limited (17-bit) code construction with canonical `hbAssignCodes` assignment, and input is chunked per level (4/5 of `blockSize - 20`) so RLE1 expansion never exceeds the block limit. Corrupt-input handling hardened: `orig_ptr` bounds check, zero-run length cap, block-size overflow checks, selector-exhaustion/MTF-range errors, randomized-block rejection, RLE1 truncation errors — malformed streams now return errors instead of panicking or allocating unboundedly. Public API unchanged.
+- **oxiarc-archive**: 7z reader spec-conformance overhaul (ported from a liblzma/bsdtar-validated implementation):
+  - Listings report real per-entry sizes via proper `kSubStreamsInfo` size/CRC parsing (previously a size-zeroing bug left solid-folder members listed as 0 bytes).
+  - 0-byte members, directories, and anti-items extract as empty data instead of aborting extraction with an error.
+  - Variable-length numbers decode little-endian per 7zFormat.txt (values ≥ 16384 were previously misread).
+  - Encoded (compressed) headers no longer contaminate main-streams state; pack-CRC digests are parsed per defined-bitmap; `kWinAttributes` external byte consumed per spec; backslash path separators normalized.
+  - Extraction now verifies folder and per-entry CRC-32 with linear coder-chain support (Copy/LZMA/LZMA2/Deflate/BZip2/Delta/BCJ-x86) and errors on out-of-bounds entry ranges instead of silently returning truncated data.
+- **oxiarc-archive**: ZIP name decoding data loss — non-EFS entry names were decoded with `String::from_utf8_lossy`, collapsing distinct Shift-JIS names (e.g. `あ.txt` / `い.txt`) into identical U+FFFD strings so extraction silently overwrote files. New `zip/name_codec` module implements the chain: strict UTF-8 (mandatory when EFS bit 11 is set) → Shift_JIS (only when EFS absent) → injective CP437 fallback (never emits U+FFFD; distinct raw names always decode distinct), wired into both the central-directory path (names and comments) and the local-file-header path used by `ZipStreamReader`.
+- **oxiarc-archive**: ZIP writer now sets the EFS language-encoding flag (bit 11, 0x0800) for non-ASCII UTF-8 names in all entry paths (files, LZMA, AES/traditional encryption, raw append, directories), in both local headers and the central directory — previously python/bsdtar decoded oxiarc's Japanese names as cp437 mojibake.
+- **oxiarc-archive**: TAR writer panicked on a char boundary (`byte index 155 is not a char boundary`) when splitting multibyte names for the UStar prefix field; `TarHeader::to_block` now splits on raw bytes at a `/` (always a UTF-8 boundary) and `write_string` floors truncation to a char boundary. Short-name (≤ 100 byte) and ASCII prefix/name-split blocks remain byte-identical to the previous serialization (locked by golden tests).
+- **oxiarc-archive**: XZ container fixes (both directions were incompatible with liblzma despite correct LZMA2 payloads):
+  - Writer: block-header CRC32 now covers the Block Header Size byte plus padded content per xz spec §3.1 (previously content-only, causing liblzma to reject all oxiarc `.xz` output as corrupt); index-record Unpadded Size now excludes block padding (previously off by up to 3 bytes).
+  - Reader: blocks without a declared compressed size (i.e. every real liblzma stream) are now parsed via the self-describing LZMA2 chunk framing instead of scanning for the first 0x00 byte, which truncated at the first zero byte inside compressed data; block-padding read errors and invalid control bytes are now rejected instead of silently swallowed.
+- **oxiarc-lzhuf**: lh5 (and lh4/lh6/lh7) streams were corrupt for inputs beyond the window size; three independent root causes fixed:
+  1. `LzssEncoder::encode` pre-wrote the entire input into the circular window before matching, clobbering both history and lookahead for inputs larger than the window; the encoder now consumes input incrementally, keeping only true history in the window.
+  2. The 16-bit per-block uncompressed-size field silently overflowed for blocks covering > 65535 bytes (blocks were split by token count); blocks are now capped at 0xFFFF bytes.
+  3. lh6/lh7: the p-tree count field was written/read as 4 bits though np = 16/17 needs 5; lh7 full-window distance 65536 overflowed the u16 token (now capped, with guards in both decoders).
+  Also fixed while auditing: Huffman lookup tables could not decode codes longer than `table_bits`, and the streaming decoder desynchronized when resuming mid-block in multi-block streams.
+- **oxiarc-archive**: LZH archives containing `-lh1-` or `-lhd-` entries, or any unrecognized method, previously aborted the whole listing; unknown methods now list and skip per entry, `-lhd-` entries list as directories, level-1 extension chains (skip-size semantics) and spec-correct level-2 headers are now parsed.
+- **oxiarc-archive**: LZH writer now encodes filenames as Shift_JIS (the LHA convention) at all header levels instead of raw UTF-8, so Japanese names are readable by standard LHA tools; the level-1 header-size byte was corrected to the spec value `25 + name_len`.
+- **oxiarc-cli**: `oxiarc create` / `oxiarc convert` with an unwritable or unknown output extension (`.7z`, `.cab`, `.iso`, extension-less) silently fell back to writing ZIP data under the requested name; both now error up front (before any input is read or output created) listing the supported creation formats.
+- **oxiarc-cli**: `create`/`convert` no longer force LZH entries to Store — non-Store compression levels now map to lh5 (the workaround for the encoder window bug above was removed; `convert` previously ignored its compression setting entirely for LZH output).
+
+### Changed
+- **oxiarc-lzhuf**: `LzhMethod` gained `Lh1`, `Lhd`, and `Unknown([u8; 5])` variants, and `LzhMethod::id()` now returns `[u8; 5]` by value; **oxiarc-core** `CompressionMethod` gained `Lh1`/`Lhd` (additive).
+- **oxiarc-archive**: `LzhWriter` default header level changed 1 → 2 (the LHA 2.x/Lhaplus standard, required for spec-conformant Shift_JIS dirname/basename extension blocks); levels 1 and 3 remain selectable via `with_header_level`. `LzhWriter` also writes `-lhd-` entries for directories.
+- **oxiarc-lzma**: `DistanceModel::special` array size changed 114 → 115 to match the spec layout (public field; no external users).
+- **oxiarc-archive**: 7z `extract()` now errors on CRC mismatch instead of returning unverified data, and returns `Ok` with empty data for directories/0-byte files/anti-items.
+- Dependency bumps: `clap_complete` 4.6.5 → 4.6.6, `indicatif` 0.18.4 → 0.18.6, `memmap2` 0.9.10 → 0.9.11.
+
+### Added
+- **oxiarc-lzhuf**: `-lh1-` (LZHUF: 4 KB window + adaptive Huffman) decoder and spec-conformant greedy encoder, ported from a validated implementation.
+- **oxiarc-archive**: TAR write-side PAX long-name support — all `TarWriter` paths emit PAX `path`/`linkpath` records for names/linknames exceeding 100 bytes, with a char-boundary-safe trailing-suffix fallback name in the UStar block for non-PAX readers; round-trips exactly through `TarReader`'s existing PAX path and extracts byte-exact under bsdtar.
+- **oxiarc-archive**: `ZipReader::entry_name_bytes(index)` accessor exposing per-entry raw name bytes, and `LocalFileHeader::filename_raw` (additive).
+- **oxiarc-lzma**: `LzmaEncoder::compress_chunk` — encodes a chunk without the end-of-stream marker, for exact-size container framing (used by all LZMA2 chunk writers).
+- Hermetic interop regression suites (golden vectors generated once with liblzma/libbz2/bsdtar/CPython during development, embedded as test data; no external tools at test time):
+  - **oxiarc-lzma**: 12 tests decoding real liblzma raw LZMA1/`.lzma`/LZMA2 streams (small and > 64 KB) and liblzma-verified oxiarc outputs.
+  - **oxiarc-bzip2**: 13 tests covering real libbz2 streams (incl. a 1.2 MB two-block stream crossing the 900 KB boundary), blessed encoder bytes, and corrupt-CRC rejection.
+  - **oxiarc-archive**: 7z suite (bsdtar Copy/LZMA1/LZMA2 fixtures incl. LZMA-encoded headers, solid-folder substream sizes, 0-byte members), ZIP name-encoding suite (Shift-JIS no-EFS, EFS UTF-8, CP437 fixtures), and TAR PAX Japanese long-name suite (incl. a python3-tarfile golden and pre-fix UStar byte-compatibility goldens).
+  - **oxiarc-lzhuf** / **oxiarc-archive**: lh5 beyond-window regression tests (8/16/64/100 KB, compressible and incompressible, CRC-16 verified) and an LHA level-1 fixture with `-lhd-`, Japanese-named `-lh1-`, and unknown-method entries.
+
+### Quality
+- 1799 tests passing (all features, 0 skipped); zero clippy, check, and rustdoc warnings across the workspace
+- Bidirectional byte-exact interop verified at development time: xz/bz2 vs CPython liblzma/libbz2, 7z/tar vs bsdtar, ZIP Japanese names vs python zipfile and bsdtar
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file)
+
 ## [0.3.3] - 2026-06-06
 
 ### Fixed
@@ -472,6 +535,11 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/cool-japan/oxiarc/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/cool-japan/oxiarc/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/cool-japan/oxiarc/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/cool-japan/oxiarc/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/cool-japan/oxiarc/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/cool-japan/oxiarc/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/cool-japan/oxiarc/compare/v0.2.3...v0.2.4

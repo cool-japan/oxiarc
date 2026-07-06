@@ -1,7 +1,14 @@
 //! LZH archive writer.
+//!
+//! By default entries are written with **level-2 headers** (the standard
+//! for LHA 2.x, Lhaplus and modern readers) and **Shift_JIS filenames**
+//! (the LZH convention; legacy Japanese tools neither write nor read UTF-8
+//! names). Directories are emitted as `-lhd-` entries. Level 1 and level 3
+//! headers remain available via [`LzhWriter::with_header_level`].
 
 use crate::lzh::extensions;
 use crate::lzh::extensions::LzhExtensionMetadata;
+use crate::lzh::name_codec;
 use oxiarc_core::Crc16;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
@@ -33,13 +40,14 @@ pub struct LzhWriter<W: Write> {
 }
 
 impl<W: Write> LzhWriter<W> {
-    /// Create a new LZH writer with default compression (lh5).
+    /// Create a new LZH writer with default compression (lh5) and level-2
+    /// headers (Shift_JIS filenames — the standard LZH form).
     pub fn new(writer: W) -> Self {
         Self {
             writer,
             compression: LzhCompressionLevel::default(),
             finished: false,
-            header_level: 1,
+            header_level: 2,
             entry_index: 0,
             progress: None,
         }
@@ -180,6 +188,14 @@ impl<W: Write> LzhWriter<W> {
                 method,
                 effective_meta,
             )?,
+            2 => self.write_level2_header(
+                name,
+                compressed.len() as u32,
+                original_size_u32,
+                crc16,
+                mtime,
+                method,
+            )?,
             _ => self.write_level1_header(
                 name,
                 &compressed,
@@ -271,6 +287,14 @@ impl<W: Write> LzhWriter<W> {
                 method,
                 effective_meta,
             )?,
+            2 => self.write_level2_header(
+                name,
+                compressed_data.len() as u32,
+                original_size_u32,
+                crc16,
+                mtime,
+                method,
+            )?,
             _ => self.write_level1_header(
                 name,
                 compressed_data,
@@ -293,6 +317,11 @@ impl<W: Write> LzhWriter<W> {
     }
 
     /// Add a directory to the archive.
+    ///
+    /// With level-2 headers (the default) the directory is stored as a
+    /// standard `-lhd-` entry (directory path in a `0x02` extension header,
+    /// Shift_JIS encoded) — the form produced by LHA and Lhaplus. Level 1
+    /// and level 3 keep the legacy `lh0` empty entry with a trailing `/`.
     pub fn add_directory(&mut self, name: &str) -> Result<()> {
         // Ensure directory name ends with /
         let dir_name = if name.ends_with('/') || name.ends_with('\\') {
@@ -310,9 +339,9 @@ impl<W: Write> LzhWriter<W> {
         }
         self.entry_index += 1;
 
-        // Write level 1 header for empty directory (level 3 dirs also use same approach)
         match self.header_level {
             3 => self.write_level3_header(&dir_name, &[], 0, 0, mtime, LzhMethod::Lh0, None)?,
+            2 => self.write_level2_header(&dir_name, 0, 0, 0, mtime, LzhMethod::Lhd)?,
             _ => self.write_level1_header(&dir_name, &[], 0, 0, mtime, LzhMethod::Lh0)?,
         }
 
@@ -347,7 +376,7 @@ impl<W: Write> LzhWriter<W> {
         method: LzhMethod,
         metadata: Option<&LzhExtensionMetadata>,
     ) -> Result<()> {
-        let filename_bytes = filename.as_bytes();
+        let filename_bytes = name_codec::encode_lzh_name(filename);
         let compressed_size = compressed.len() as u32;
 
         // Canonical extension-header payload list. Each element is a
@@ -358,7 +387,7 @@ impl<W: Write> LzhWriter<W> {
         // Filename extension (0x01)
         let mut fname = Vec::with_capacity(1 + filename_bytes.len());
         fname.push(0x01u8);
-        fname.extend_from_slice(filename_bytes);
+        fname.extend_from_slice(&filename_bytes);
         payloads.push(fname);
 
         // Metadata-derived extensions (0x40 / 0x41 / 0x42 / 0x43 / 0x44 / 0x46 / 0x50)
@@ -382,7 +411,7 @@ impl<W: Write> LzhWriter<W> {
         header.extend_from_slice(&4u16.to_le_bytes());
 
         // Method ID (5 bytes)
-        header.extend_from_slice(method.id());
+        header.extend_from_slice(&method.id());
 
         // Compressed size (4 bytes)
         header.extend_from_slice(&compressed_size.to_le_bytes());
@@ -423,6 +452,111 @@ impl<W: Write> LzhWriter<W> {
         Ok(())
     }
 
+    /// Write a level 2 header (the standard modern LZH header form).
+    ///
+    /// Layout (all fields little-endian):
+    ///   total_size(2) | method(5) | compressed_size(4) | original_size(4) |
+    ///   mtime(4, Unix) | attribute(1, 0x20) | level(1 = 2) | crc16(2) |
+    ///   os_id(1) | ext chain | padding?
+    ///
+    /// The extension chain carries the filename (`0x01`) and directory path
+    /// (`0x02`, components terminated by `0xFF`), both Shift_JIS encoded.
+    /// Each block is emitted as `[size(2)][type(1)][data]` where the
+    /// declared size covers `type + data + next-size(2)`; the chain ends
+    /// with a zero size. If the total header size would be a multiple of
+    /// 256, one padding byte is appended (the low size byte must not be 0,
+    /// which is the end-of-archive marker — same convention as LHA).
+    fn write_level2_header(
+        &mut self,
+        filename: &str,
+        compressed_size: u32,
+        original_size: u32,
+        crc16: u16,
+        mtime: u32,
+        method: LzhMethod,
+    ) -> Result<()> {
+        let normalized = filename.replace('\\', "/");
+        let normalized = normalized.trim_end_matches('/');
+        let is_dir = method.is_directory();
+
+        // Split the path into a directory part and a file part.
+        let (dir_part, file_part): (Option<&str>, &str) = if is_dir {
+            (Some(normalized), "")
+        } else {
+            match normalized.rsplit_once('/') {
+                Some((dir, file)) => (Some(dir), file),
+                None => (None, normalized),
+            }
+        };
+
+        // Extension blocks: (type, payload).
+        let mut blocks: Vec<(u8, Vec<u8>)> = Vec::new();
+        if !file_part.is_empty() {
+            blocks.push((0x01, name_codec::encode_lzh_name(file_part)));
+        }
+        if let Some(dir) = dir_part {
+            if !dir.is_empty() {
+                blocks.push((0x02, name_codec::encode_lzh_dirname(dir)));
+            }
+        }
+        if blocks.is_empty() {
+            return Err(OxiArcError::invalid_header("Empty LZH entry name"));
+        }
+
+        // Declared block size = type(1) + data + next-size(2).
+        let block_sizes: Vec<usize> = blocks.iter().map(|(_, data)| 3 + data.len()).collect();
+        for &size in &block_sizes {
+            if size > u16::MAX as usize {
+                return Err(OxiArcError::invalid_header("LZH entry name too long"));
+            }
+        }
+
+        // Fixed part (24) + first-ext-size (2) + blocks (declared sizes
+        // already include each trailing next-size / terminator field).
+        let mut total: usize = 26 + block_sizes.iter().sum::<usize>();
+        let pad = total % 256 == 0;
+        if pad {
+            total += 1;
+        }
+        if total > u16::MAX as usize {
+            return Err(OxiArcError::invalid_header("LZH header too long"));
+        }
+
+        let mut header = Vec::with_capacity(total);
+        header.extend_from_slice(&(total as u16).to_le_bytes()); // total header size
+        header.extend_from_slice(&method.id());
+        header.extend_from_slice(&compressed_size.to_le_bytes());
+        header.extend_from_slice(&original_size.to_le_bytes());
+        header.extend_from_slice(&mtime.to_le_bytes());
+        header.push(0x20); // attribute
+        header.push(0x02); // header level 2
+        header.extend_from_slice(&crc16.to_le_bytes());
+        header.push(b'M'); // OS ID: 'M' (generic MS-DOS)
+
+        // Extension chain: first size at the end of the base header, then
+        // each block, with the next block's size (or the terminator)
+        // written where the previous block's declared size expects it.
+        for (index, (ext_type, data)) in blocks.iter().enumerate() {
+            header.extend_from_slice(&(block_sizes[index] as u16).to_le_bytes());
+            header.push(*ext_type);
+            header.extend_from_slice(data);
+        }
+        header.extend_from_slice(&0u16.to_le_bytes()); // chain terminator
+
+        if pad {
+            header.push(0);
+        }
+
+        if header.len() != total {
+            return Err(OxiArcError::invalid_header(
+                "LZH level 2 header construction size mismatch",
+            ));
+        }
+
+        self.writer.write_all(&header)?;
+        Ok(())
+    }
+
     /// Write a level 1 header.
     fn write_level1_header(
         &mut self,
@@ -433,19 +567,25 @@ impl<W: Write> LzhWriter<W> {
         mtime: u32,
         method: LzhMethod,
     ) -> Result<()> {
-        let filename_bytes = filename.as_bytes();
-        if filename_bytes.len() > 255 {
+        // Shift_JIS per LZH convention (raw UTF-8 breaks legacy tools).
+        let filename_bytes = name_codec::encode_lzh_name(filename);
+        // Level-1 base header size byte = 25 + name_len and must fit in u8.
+        if filename_bytes.len() > (u8::MAX as usize) - 25 {
             return Err(OxiArcError::invalid_header("Filename too long"));
         }
 
         let compressed_size = compressed.len() as u32;
 
-        // Calculate header size
-        // Base header: 22 bytes + filename_len + 2 (extended header size = 0)
-        let header_len = 22 + filename_bytes.len();
+        // Total emitted bytes: base header (25 + name_len) plus the 2-byte
+        // first-extension-size field (0 = no extension chain).
+        let header_len = 27 + filename_bytes.len();
 
-        // Header size byte (excludes the first 2 bytes: size and checksum)
-        let header_size = (header_len - 2) as u8;
+        // Level-1 header size byte: counts the base header from offset 0
+        // (size and checksum included) up to but excluding the 2-byte
+        // first-extension-size field. [size(1) checksum(1) method(5)
+        // compressed(4) original(4) mtime(4) attr(1) level(1) name_len(1)
+        // name(n) crc(2) os(1)] = 25 + n.
+        let header_size = (25 + filename_bytes.len()) as u8;
 
         // Build header
         let mut header = Vec::with_capacity(header_len);
@@ -455,7 +595,7 @@ impl<W: Write> LzhWriter<W> {
         header.push(0u8); // Checksum placeholder
 
         // Method ID (5 bytes)
-        header.extend_from_slice(method.id());
+        header.extend_from_slice(&method.id());
 
         // Compressed size (4 bytes)
         header.extend_from_slice(&compressed_size.to_le_bytes());
@@ -476,7 +616,7 @@ impl<W: Write> LzhWriter<W> {
         header.push(filename_bytes.len() as u8);
 
         // Filename
-        header.extend_from_slice(filename_bytes);
+        header.extend_from_slice(&filename_bytes);
 
         // CRC-16 (2 bytes)
         header.extend_from_slice(&crc16.to_le_bytes());

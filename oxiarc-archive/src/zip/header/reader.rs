@@ -4,9 +4,10 @@ use super::super::crypto::{ENCRYPTION_HEADER_SIZE, ZipCrypto};
 use super::super::encryption::{
     AesExtraField, PASSWORD_VERIFICATION_LEN, WINZIP_AUTH_CODE_LEN, ZipAesDecryptor,
 };
+use super::super::name_codec;
 use super::types::{
     CENTRAL_DIR_HEADER_SIG, CompressionMethod, DataDescriptor, END_OF_CENTRAL_DIR_SIG,
-    FLAG_DATA_DESCRIPTOR, LOCAL_FILE_HEADER_SIG, LocalFileHeader,
+    FLAG_DATA_DESCRIPTOR, FLAG_EFS, LOCAL_FILE_HEADER_SIG, LocalFileHeader,
     ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_32,
     get_entry_aes_encryption_info, is_entry_encrypted, is_entry_traditional_encrypted,
 };
@@ -24,6 +25,9 @@ use std::time::{Duration, UNIX_EPOCH};
 pub struct ZipReader<R: Read + Seek> {
     reader: R,
     entries: Vec<Entry>,
+    /// Raw (undecoded) name bytes of each entry, index-aligned with
+    /// [`ZipReader::entries`]. Exposed via [`ZipReader::entry_name_bytes`].
+    raw_names: Vec<Vec<u8>>,
     progress: Option<ProgressHandle>,
     /// Monotonic counter for entries extracted (used with progress callbacks).
     extract_index: u64,
@@ -39,10 +43,11 @@ pub struct ZipReader<R: Read + Seek> {
 impl<R: Read + Seek> ZipReader<R> {
     /// Create a new ZIP reader.
     pub fn new(mut reader: R) -> Result<Self> {
-        let entries = Self::read_entries(&mut reader)?;
+        let (entries, raw_names) = Self::read_entries(&mut reader)?;
         Ok(Self {
             reader,
             entries,
+            raw_names,
             progress: None,
             extract_index: 0,
             lenient: false,
@@ -74,12 +79,13 @@ impl<R: Read + Seek> ZipReader<R> {
         &self.warnings
     }
 
-    /// Read all entries from the archive.
+    /// Read all entries from the archive, together with the raw
+    /// (undecoded) name bytes of each entry.
     /// Uses the central directory for accurate metadata (handles data descriptors).
-    fn read_entries(reader: &mut R) -> Result<Vec<Entry>> {
+    fn read_entries(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
         // Try to find and read from central directory first
-        if let Ok(entries) = Self::read_from_central_directory(reader) {
-            return Ok(entries);
+        if let Ok(result) = Self::read_from_central_directory(reader) {
+            return Ok(result);
         }
 
         // Fall back to scanning local headers
@@ -87,7 +93,7 @@ impl<R: Read + Seek> ZipReader<R> {
     }
 
     /// Read entries from the central directory (preferred method).
-    fn read_from_central_directory(reader: &mut R) -> Result<Vec<Entry>> {
+    fn read_from_central_directory(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
         // Find end of central directory record
         let file_size = reader.seek(SeekFrom::End(0))?;
 
@@ -183,16 +189,18 @@ impl<R: Read + Seek> ZipReader<R> {
         // Read central directory entries
         reader.seek(SeekFrom::Start(cd_offset))?;
         let mut entries = Vec::with_capacity(total_entries as usize);
+        let mut raw_names = Vec::with_capacity(total_entries as usize);
 
         for _ in 0..total_entries {
-            let entry = Self::read_central_dir_entry(reader)?;
+            let (entry, raw_name) = Self::read_central_dir_entry(reader)?;
             entries.push(entry);
+            raw_names.push(raw_name);
         }
 
         // Validate we consumed the expected amount
         let _expected_end = cd_offset + cd_size;
 
-        Ok(entries)
+        Ok((entries, raw_names))
     }
 
     /// Parse standard EOCD record.
@@ -208,8 +216,9 @@ impl<R: Read + Seek> ZipReader<R> {
         Ok((cd_offset, cd_size, total_entries))
     }
 
-    /// Read a single central directory entry.
-    fn read_central_dir_entry(reader: &mut R) -> Result<Entry> {
+    /// Read a single central directory entry, returning the entry and its
+    /// raw (undecoded) name bytes.
+    fn read_central_dir_entry(reader: &mut R) -> Result<(Entry, Vec<u8>)> {
         let mut buf = [0u8; 46];
         reader.read_exact(&mut buf)?;
 
@@ -233,17 +242,21 @@ impl<R: Read + Seek> ZipReader<R> {
         let comment_len = u16::from_le_bytes([buf[32], buf[33]]) as usize;
         let local_header_offset = u32::from_le_bytes([buf[42], buf[43], buf[44], buf[45]]);
 
-        // Read variable-length fields
+        // Read variable-length fields. Names (and comments) are decoded
+        // with the EFS-aware chain (strict UTF-8 -> Shift_JIS -> injective
+        // CP437) so that distinct raw names never collapse into the same
+        // decoded name (see `crate::zip::name_codec`).
+        let utf8_flag = flags & FLAG_EFS != 0;
         let mut filename_bytes = vec![0u8; filename_len];
         reader.read_exact(&mut filename_bytes)?;
-        let filename = String::from_utf8_lossy(&filename_bytes).into_owned();
+        let filename = name_codec::decode_zip_text(&filename_bytes, utf8_flag);
 
         let mut extra = vec![0u8; extra_len];
         reader.read_exact(&mut extra)?;
 
         let mut comment_bytes = vec![0u8; comment_len];
         reader.read_exact(&mut comment_bytes)?;
-        let comment = String::from_utf8_lossy(&comment_bytes).into_owned();
+        let comment = name_codec::decode_zip_text(&comment_bytes, utf8_flag);
 
         // Parse Zip64 extra field if needed
         let mut uncompressed_size_64 = None;
@@ -357,7 +370,7 @@ impl<R: Read + Seek> ZipReader<R> {
             entry_extra.extend_from_slice(&[0xDD, 0xDD]); // Custom marker
         }
 
-        Ok(Entry {
+        let entry = Entry {
             name: filename,
             entry_type,
             size: actual_uncompressed,
@@ -376,12 +389,15 @@ impl<R: Read + Seek> ZipReader<R> {
             link_target: None,
             offset: data_offset,
             extra: entry_extra,
-        })
+        };
+
+        Ok((entry, filename_bytes))
     }
 
     /// Read entries from local headers (fallback, doesn't handle data descriptors well).
-    fn read_from_local_headers(reader: &mut R) -> Result<Vec<Entry>> {
+    fn read_from_local_headers(reader: &mut R) -> Result<(Vec<Entry>, Vec<Vec<u8>>)> {
         let mut entries = Vec::new();
+        let mut raw_names = Vec::new();
 
         // Start from beginning
         reader.seek(SeekFrom::Start(0))?;
@@ -430,6 +446,7 @@ impl<R: Read + Seek> ZipReader<R> {
                 }
 
                 entries.push(header.to_entry());
+                raw_names.push(header.filename_raw);
             } else if signature == CENTRAL_DIR_HEADER_SIG || signature == END_OF_CENTRAL_DIR_SIG {
                 // Reached central directory, stop
                 break;
@@ -439,12 +456,27 @@ impl<R: Read + Seek> ZipReader<R> {
             }
         }
 
-        Ok(entries)
+        Ok((entries, raw_names))
     }
 
     /// Get the list of entries.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Get the raw (undecoded) name bytes of the entry at `index`, exactly
+    /// as stored in the archive headers.
+    ///
+    /// Entry names in [`ZipReader::entries`] are decoded to UTF-8 `String`s
+    /// (strict UTF-8, then Shift_JIS when the EFS flag is absent, then an
+    /// injective CP437 fallback). Callers that need the original on-disk
+    /// byte string — for example to re-encode it or to interoperate with
+    /// legacy tools — can retrieve it here. The index matches the position
+    /// of the entry in [`ZipReader::entries`].
+    ///
+    /// Returns `None` when `index` is out of bounds.
+    pub fn entry_name_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.raw_names.get(index).map(|raw| raw.as_slice())
     }
 
     /// Extract an entry.

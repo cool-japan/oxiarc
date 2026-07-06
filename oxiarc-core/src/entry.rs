@@ -17,6 +17,10 @@ pub enum CompressionMethod {
     Deflate,
     /// LZH method lh0 (stored).
     Lh0,
+    /// LZH method lh1 (4KB window, adaptive Huffman — LHarc 1.x legacy).
+    Lh1,
+    /// LZH method lhd (directory entry marker, no data).
+    Lhd,
     /// LZH method lh4 (4KB window).
     Lh4,
     /// LZH method lh5 (8KB window).
@@ -39,8 +43,10 @@ pub enum CompressionMethod {
 
 impl CompressionMethod {
     /// Check if this method is "stored" (no compression).
+    ///
+    /// Directory markers (`lhd`) carry no data and are treated as stored.
     pub fn is_stored(&self) -> bool {
-        matches!(self, Self::Stored | Self::Lh0)
+        matches!(self, Self::Stored | Self::Lh0 | Self::Lhd)
     }
 
     /// Get the method name as a string.
@@ -49,6 +55,8 @@ impl CompressionMethod {
             Self::Stored => "Stored",
             Self::Deflate => "Deflate",
             Self::Lh0 => "lh0",
+            Self::Lh1 => "lh1",
+            Self::Lhd => "lhd",
             Self::Lh4 => "lh4",
             Self::Lh5 => "lh5",
             Self::Lh6 => "lh6",

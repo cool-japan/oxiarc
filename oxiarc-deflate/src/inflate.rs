@@ -256,8 +256,12 @@ impl Inflater {
             code_length_lengths[CODE_LENGTH_ORDER[i]] = reader.read_bits(3)? as u8;
         }
 
-        // Build code length tree
-        let code_length_tree = HuffmanTree::from_code_lengths(&code_length_lengths)?;
+        // Build code length tree. The code-length (19-symbol) alphabet MUST be
+        // a complete Huffman code per RFC 1951 §3.2.7, so use the strict
+        // constructor that rejects an incomplete set (as zlib does). This is
+        // the exact class of corruption a buggy dynamic-Huffman encoder produces
+        // and it must not be silently accepted.
+        let code_length_tree = HuffmanTree::from_code_length_code(&code_length_lengths)?;
 
         // Read literal/length and distance code lengths
         let mut all_lengths = vec![0u8; hlit + hdist];

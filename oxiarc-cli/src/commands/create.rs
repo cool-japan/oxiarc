@@ -46,6 +46,45 @@ pub enum OutputFormat {
     Snappy,
 }
 
+/// Human-readable list of formats `oxiarc create` can write.
+pub(crate) const SUPPORTED_CREATE_FORMATS: &str =
+    "zip, tar, gz/gzip, lzh/lha, xz, lz4, bz2/bzip2, zst/zstd, br/brotli, sz/snappy";
+
+/// Resolve the output format from the archive filename extension.
+///
+/// Returns an error for extensions that have no writer (e.g. `7z`, `cab`,
+/// `iso`) instead of silently falling back to ZIP, which would produce a
+/// file whose contents contradict its name.
+pub(crate) fn output_format_from_extension(archive: &str) -> Result<OutputFormat, String> {
+    let ext = PathBuf::from(archive)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "zip" => Ok(OutputFormat::Zip),
+        "tar" => Ok(OutputFormat::Tar),
+        "gz" | "gzip" => Ok(OutputFormat::Gzip),
+        "lzh" | "lha" => Ok(OutputFormat::Lzh),
+        "xz" => Ok(OutputFormat::Xz),
+        "lz4" => Ok(OutputFormat::Lz4),
+        "bz2" | "bzip2" => Ok(OutputFormat::Bz2),
+        "zst" | "zstd" => Ok(OutputFormat::Zst),
+        "br" | "brotli" => Ok(OutputFormat::Br),
+        "sz" | "snappy" => Ok(OutputFormat::Snappy),
+        "" => Err(format!(
+            "cannot determine output format for '{}' (no file extension); \
+             pass --format explicitly. Supported creation formats: {}",
+            archive, SUPPORTED_CREATE_FORMATS
+        )),
+        other => Err(format!(
+            "creating '.{}' archives is not supported; refusing to write a \
+             different format under that name. Supported creation formats: {}",
+            other, SUPPORTED_CREATE_FORMATS
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_create(
     archive: &str,
@@ -86,9 +125,16 @@ pub fn cmd_create(
         }
     }
 
+    // Resolve the output format up front so an unsupported target (e.g. .7z)
+    // fails before any input is read or any output file is created.
+    let format = match format {
+        Some(f) => f,
+        None => output_format_from_extension(archive)?,
+    };
+
     // Validate file input for single-file formats
     let single_file_format = matches!(
-        format.unwrap_or(OutputFormat::Zip),
+        format,
         OutputFormat::Gzip
             | OutputFormat::Xz
             | OutputFormat::Bz2
@@ -111,7 +157,7 @@ pub fn cmd_create(
         if input_path.is_dir() {
             return Err(format!(
                 "{:?} cannot compress directories directly. Use TAR first.",
-                format.unwrap_or(OutputFormat::Zip)
+                format
             )
             .into());
         }
@@ -128,32 +174,6 @@ pub fn cmd_create(
     } else {
         return Err("Single-file formats only support one file at a time".into());
     };
-
-    // Determine format from extension if not specified
-    let format = format.unwrap_or_else(|| {
-        if to_stdout {
-            OutputFormat::Gzip // Default for stdout if somehow not specified
-        } else {
-            let ext = PathBuf::from(archive)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            match ext.as_str() {
-                "zip" => OutputFormat::Zip,
-                "tar" => OutputFormat::Tar,
-                "gz" | "gzip" => OutputFormat::Gzip,
-                "lzh" | "lha" => OutputFormat::Lzh,
-                "xz" => OutputFormat::Xz,
-                "lz4" => OutputFormat::Lz4,
-                "bz2" | "bzip2" => OutputFormat::Bz2,
-                "zst" | "zstd" => OutputFormat::Zst,
-                "br" | "brotli" => OutputFormat::Br,
-                "sz" | "snappy" => OutputFormat::Snappy,
-                _ => OutputFormat::Zip, // Default to ZIP
-            }
-        }
-    });
 
     if !to_stdout && verbose {
         eprintln!("Creating {:?} archive: {}", format, archive);
@@ -234,11 +254,9 @@ pub fn cmd_create(
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
-            // Note: LZH compression (lh5) is not fully production-ready yet
-            // Using Store mode for now
             let level = match compression {
                 CompressionLevel::Store => LzhCompressionLevel::Store,
-                _ => LzhCompressionLevel::Store, // Fall back to Store for now
+                _ => LzhCompressionLevel::Lh5,
             };
             lzh.set_compression(level);
 
@@ -390,30 +408,11 @@ fn cmd_create_dry_run(
     let to_stdout = archive == "-";
 
     // Determine format
-    let format = format.unwrap_or_else(|| {
-        if to_stdout {
-            OutputFormat::Gzip
-        } else {
-            let ext = PathBuf::from(archive)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            match ext.as_str() {
-                "zip" => OutputFormat::Zip,
-                "tar" => OutputFormat::Tar,
-                "gz" | "gzip" => OutputFormat::Gzip,
-                "lzh" | "lha" => OutputFormat::Lzh,
-                "xz" => OutputFormat::Xz,
-                "lz4" => OutputFormat::Lz4,
-                "bz2" | "bzip2" => OutputFormat::Bz2,
-                "zst" | "zstd" => OutputFormat::Zst,
-                "br" | "brotli" => OutputFormat::Br,
-                "sz" | "snappy" => OutputFormat::Snappy,
-                _ => OutputFormat::Zip,
-            }
-        }
-    });
+    let format = match format {
+        Some(f) => f,
+        None if to_stdout => OutputFormat::Gzip,
+        None => output_format_from_extension(archive)?,
+    };
 
     println!("[DRY RUN] Would create {:?} archive: {}", format, archive);
     println!("[DRY RUN] Compression level: {:?}", compression);

@@ -3,11 +3,11 @@
 //! This module implements LZH compression for methods lh4-lh7.
 
 use crate::lzss::{LzssEncoder, LzssToken};
-use crate::methods::LzhMethod;
 use crate::methods::constants::{NC, NT};
+use crate::methods::{LzhMethod, p_tree_count_bits};
 use crate::optimal::LzssOptimalParser;
 use oxiarc_core::BitWriter;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
 use oxiarc_core::traits::{CompressStatus, Compressor, FlushMode};
 use std::io::Write;
@@ -15,8 +15,16 @@ use std::io::Write;
 /// Maximum code length for Huffman codes.
 const MAX_CODE_LEN: usize = 16;
 
-/// Block size for encoding.
-const BLOCK_SIZE: usize = 0x4000; // 16KB
+/// Maximum number of tokens per block.
+const BLOCK_SIZE: usize = 0x4000; // 16K tokens
+
+/// Maximum number of uncompressed bytes per block.
+///
+/// The per-block size field in the bitstream is 16 bits wide, so a block
+/// may never cover more than 65535 uncompressed bytes. Without this cap,
+/// blocks dense in long matches (compressible data >= 64 KB) silently
+/// truncated the size field and corrupted the stream.
+const MAX_BLOCK_BYTES: usize = 0xFFFF;
 
 /// LZH encoder.
 pub struct LzhEncoder {
@@ -124,12 +132,32 @@ impl LzhEncoder {
     /// Encode data.
     pub fn encode<W: Write>(&mut self, data: &[u8], writer: &mut W, finish: bool) -> Result<()> {
         if self.method.is_stored() {
-            // lh0: just copy data
+            // lh0 / lhd: just copy data (lhd entries carry no data at all)
             writer.write_all(data)?;
             if finish {
                 self.finished = true;
             }
             return Ok(());
+        }
+
+        if self.method == LzhMethod::Lh1 {
+            // lh1 uses an adaptive coder whose state cannot be resumed
+            // across calls in this API — require single-shot encoding.
+            if !finish {
+                return Err(OxiArcError::unsupported_method(
+                    "lh1 encoding requires a single call with finish=true",
+                ));
+            }
+            let encoded = crate::lh1::encode_lh1(data);
+            writer.write_all(&encoded)?;
+            self.finished = true;
+            return Ok(());
+        }
+
+        if let LzhMethod::Unknown(id) = self.method {
+            return Err(OxiArcError::unsupported_method(
+                String::from_utf8_lossy(&id).into_owned(),
+            ));
         }
 
         let mut bit_writer = BitWriter::new(writer);
@@ -160,7 +188,7 @@ impl LzhEncoder {
             LzhMethod::Lh4 | LzhMethod::Lh5 => 14,
             LzhMethod::Lh6 => 16,
             LzhMethod::Lh7 => 17,
-            LzhMethod::Lh0 => 0,
+            _ => 0,
         }
     }
 
@@ -178,20 +206,26 @@ impl LzhEncoder {
         // Cumulative uncompressed bytes consumed across all blocks so far.
         let mut total_input_consumed: u64 = 0;
 
-        // Process in blocks
+        // Process in blocks. A block is capped both by token count
+        // (BLOCK_SIZE, keeps the Huffman tables fresh) and by uncompressed
+        // byte count (MAX_BLOCK_BYTES, the 16-bit size field limit).
         let mut pos = 0;
         while pos < tokens.len() {
-            let block_end = (pos + BLOCK_SIZE).min(tokens.len());
-            let block_tokens = &tokens[pos..block_end];
-
-            // Count uncompressed size of this block
+            let mut block_end = pos;
             let mut block_size = 0usize;
-            for token in block_tokens {
-                match token {
-                    LzssToken::Literal(_) => block_size += 1,
-                    LzssToken::Match { length, .. } => block_size += *length as usize,
+            while block_end < tokens.len() && block_end - pos < BLOCK_SIZE {
+                let token_bytes = match tokens[block_end] {
+                    LzssToken::Literal(_) => 1,
+                    LzssToken::Match { length, .. } => length as usize,
+                };
+                if block_size + token_bytes > MAX_BLOCK_BYTES {
+                    break;
                 }
+                block_size += token_bytes;
+                block_end += 1;
             }
+            debug_assert!(block_end > pos, "a single token must always fit in a block");
+            let block_tokens = &tokens[pos..block_end];
 
             self.encode_block(block_tokens, writer, np, block_size)?;
 
@@ -705,12 +739,17 @@ impl LzhEncoder {
     }
 
     /// Write P-tree (position/distance Huffman tree).
+    ///
+    /// The width of the code-count field depends on `np`: lh4/lh5 (`np = 14`)
+    /// use 4 bits, lh6/lh7 (`np = 16`/`17`) need 5 bits — a 4-bit field
+    /// cannot represent counts above 15 and would silently truncate.
     fn write_p_tree<W: Write>(
         &self,
         writer: &mut BitWriter<W>,
         lengths: &[u8],
         np: usize,
     ) -> Result<()> {
+        let nbit = p_tree_count_bits(np);
         let n = lengths
             .iter()
             .take(np)
@@ -719,20 +758,20 @@ impl LzhEncoder {
             .unwrap_or(0);
 
         if n == 0 {
-            writer.write_bits(0, 4)?;
-            writer.write_bits(0, 4)?;
+            writer.write_bits(0, nbit)?;
+            writer.write_bits(0, nbit)?;
             return Ok(());
         }
 
         let used_count = lengths.iter().take(np).filter(|&&l| l > 0).count();
         if used_count == 1 {
             let code = lengths.iter().take(np).position(|&l| l > 0).unwrap_or(0);
-            writer.write_bits(0, 4)?;
-            writer.write_bits(code as u32, 4)?;
+            writer.write_bits(0, nbit)?;
+            writer.write_bits(code as u32, nbit)?;
             return Ok(());
         }
 
-        writer.write_bits(n as u32, 4)?;
+        writer.write_bits(n as u32, nbit)?;
 
         for &len in lengths.iter().take(n.min(np)) {
             if len < 7 {

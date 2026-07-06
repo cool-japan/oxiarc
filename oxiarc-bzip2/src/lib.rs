@@ -12,8 +12,10 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+mod bitio;
 /// Burrows-Wheeler Transform implementation.
 pub mod bwt;
+mod crc;
 mod decode;
 mod encode;
 mod huffman;

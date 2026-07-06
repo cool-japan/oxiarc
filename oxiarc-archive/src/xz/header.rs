@@ -414,22 +414,56 @@ impl<R: Read> XzReader<R> {
         Ok(data)
     }
 
-    /// Decompress a block without known size (fallback).
+    /// Decompress a block whose header does not declare the compressed size
+    /// (real liblzma streams omit the optional size fields).
+    ///
+    /// LZMA2 chunk framing is self-describing: each chunk header carries the
+    /// exact payload length, so the block payload can be collected chunk by
+    /// chunk until the end-of-stream control byte (0x00).
     fn decompress_block(&mut self, dict_size: u32) -> Result<Vec<u8>> {
-        // Read all data until we find the block check
-        // In a proper implementation, we would parse compressed/uncompressed sizes
-
-        // For now, read until LZMA2 end marker (0x00)
         let mut compressed = Vec::new();
         loop {
-            let mut byte = [0u8; 1];
-            self.reader.read_exact(&mut byte)?;
-            compressed.push(byte[0]);
+            let mut ctrl = [0u8; 1];
+            self.reader.read_exact(&mut ctrl)?;
+            compressed.push(ctrl[0]);
 
-            // Check if this is the LZMA2 end marker
-            if byte[0] == 0x00 && !compressed.is_empty() {
-                // Could be end marker, try to decode
-                break;
+            match ctrl[0] {
+                // End of LZMA2 stream.
+                0x00 => break,
+                // Uncompressed chunk: 2-byte big-endian (size - 1) + payload.
+                0x01 | 0x02 => {
+                    let mut size_bytes = [0u8; 2];
+                    self.reader.read_exact(&mut size_bytes)?;
+                    compressed.extend_from_slice(&size_bytes);
+                    let size = u16::from_be_bytes(size_bytes) as usize + 1;
+                    let start = compressed.len();
+                    compressed.resize(start + size, 0);
+                    self.reader.read_exact(&mut compressed[start..])?;
+                }
+                // LZMA chunk: 2 bytes unpacked-size low bits, 2 bytes
+                // (compressed size - 1), a props byte when the reset field
+                // (bits 5-6) includes a property reset, then the payload.
+                ctrl_byte if ctrl_byte >= 0x80 => {
+                    let mut hdr = [0u8; 4];
+                    self.reader.read_exact(&mut hdr)?;
+                    compressed.extend_from_slice(&hdr);
+                    let chunk_compressed = u16::from_be_bytes([hdr[2], hdr[3]]) as usize + 1;
+                    let reset = (ctrl_byte >> 5) & 0x03;
+                    if reset >= 2 {
+                        let mut props = [0u8; 1];
+                        self.reader.read_exact(&mut props)?;
+                        compressed.push(props[0]);
+                    }
+                    let start = compressed.len();
+                    compressed.resize(start + chunk_compressed, 0);
+                    self.reader.read_exact(&mut compressed[start..])?;
+                }
+                invalid => {
+                    return Err(OxiArcError::corrupted(
+                        0,
+                        format!("Invalid LZMA2 control byte 0x{invalid:02X}"),
+                    ));
+                }
             }
 
             // Safety limit
@@ -443,12 +477,12 @@ impl<R: Read> XzReader<R> {
         let mut cursor = std::io::Cursor::new(&compressed);
         let data = decoder.decode(&mut cursor)?;
 
-        // Read block padding (to 4-byte boundary)
-        let unpadded_size = compressed.len();
-        let padding = (4 - (unpadded_size % 4)) % 4;
-        let mut pad = vec![0u8; padding];
+        // Read block padding (compressed data is padded to a 4-byte
+        // boundary; the block header is always 4-aligned already)
+        let padding = (4 - (compressed.len() % 4)) % 4;
         if padding > 0 {
-            let _ = self.reader.read_exact(&mut pad);
+            let mut pad = vec![0u8; padding];
+            self.reader.read_exact(&mut pad)?;
         }
 
         // Read and verify check (based on stream flags)
@@ -600,14 +634,13 @@ impl XzWriter {
         let stream_flags = StreamFlags::new(self.check_type);
         self.write_stream_header(&mut output, stream_flags)?;
 
-        // Write block
-        let block_start = output.len();
-        self.write_block(&mut output, data)?;
-        let block_end = output.len();
+        // Write block; keep its Unpadded Size (header + compressed data +
+        // check, excluding block padding) for the index record.
+        let unpadded_size = self.write_block(&mut output, data)?;
 
         // Write index
         let index_start = output.len();
-        self.write_index(&mut output, block_end - block_start, data.len())?;
+        self.write_index(&mut output, unpadded_size, data.len())?;
         let index_end = output.len();
 
         // Write stream footer
@@ -639,7 +672,10 @@ impl XzWriter {
     }
 
     /// Write a compressed block.
-    fn write_block<W: Write>(&self, writer: &mut W, data: &[u8]) -> Result<()> {
+    ///
+    /// Returns the block's Unpadded Size (block header + compressed data +
+    /// check, excluding block padding) as required by the index record.
+    fn write_block<W: Write>(&self, writer: &mut W, data: &[u8]) -> Result<usize> {
         // Compress data with LZMA2
         let encoder = Lzma2Encoder::new(self.level);
         let compressed = encoder.encode(data)?;
@@ -688,8 +724,12 @@ impl XzWriter {
         // Add padding
         block_header.resize(block_header.len() + padding, 0x00);
 
-        // CRC32 of block header (content only, not size byte)
-        let header_crc = Crc32::compute(&block_header);
+        // CRC32 of block header (size byte + padded content, per the xz
+        // format spec section 3.1: everything except the CRC32 field itself)
+        let mut header_crc_input = Vec::with_capacity(1 + block_header.len());
+        header_crc_input.push(header_size_byte);
+        header_crc_input.extend_from_slice(&block_header);
+        let header_crc = Crc32::compute(&header_crc_input);
 
         // Write size byte
         writer.write_all(&[header_size_byte])?;
@@ -703,9 +743,9 @@ impl XzWriter {
         // Write compressed data
         writer.write_all(&compressed)?;
 
-        // Pad to 4 bytes
-        let unpadded_size = compressed.len();
-        let padding = (4 - (unpadded_size % 4)) % 4;
+        // Pad compressed data to a 4-byte boundary (block padding is NOT
+        // part of the Unpadded Size recorded in the index)
+        let padding = (4 - (compressed.len() % 4)) % 4;
         for _ in 0..padding {
             writer.write_all(&[0x00])?;
         }
@@ -727,7 +767,8 @@ impl XzWriter {
             }
         }
 
-        Ok(())
+        // Unpadded Size = block header + compressed data + check
+        Ok(total_header_size + compressed.len() + self.check_type.size())
     }
 
     /// Write a multibyte integer (static version).
@@ -745,10 +786,13 @@ impl XzWriter {
     }
 
     /// Write index.
+    ///
+    /// `unpadded_size` is the block size WITHOUT the trailing block padding
+    /// (header + compressed data + check), per the xz format spec.
     fn write_index<W: Write>(
         &self,
         writer: &mut W,
-        block_size: usize,
+        unpadded_size: usize,
         uncompressed_size: usize,
     ) -> Result<()> {
         let mut index = Vec::new();
@@ -760,7 +804,7 @@ impl XzWriter {
         index.push(0x01);
 
         // Record: unpadded size, uncompressed size
-        self.write_multibyte_int(&mut index, block_size as u64);
+        self.write_multibyte_int(&mut index, unpadded_size as u64);
         self.write_multibyte_int(&mut index, uncompressed_size as u64);
 
         // Pad to 4 bytes

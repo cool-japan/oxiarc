@@ -50,6 +50,7 @@
 pub mod decode;
 pub mod encode;
 pub mod huffman;
+pub mod lh1;
 pub mod lzss;
 pub mod methods;
 pub mod optimal;
@@ -62,6 +63,7 @@ pub mod parallel;
 pub use decode::{LzhDecoder, decode_lzh};
 pub use encode::{LzhEncoder, encode_lzh};
 pub use huffman::LzhHuffmanTree;
+pub use lh1::{decode_lh1, encode_lh1};
 pub use lzss::{LzssDecoder, LzssEncoder, LzssToken};
 pub use methods::LzhMethod;
 pub use optimal::LzssOptimalParser;
