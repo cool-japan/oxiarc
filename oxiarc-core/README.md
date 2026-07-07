@@ -3,11 +3,11 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 154 tests passing.
+**Version 0.3.6** (2026-07-07) — 154 tests passing.
 
 **What's new in 0.3.5**: Added `msb_bitstream` — `MsbBitReader`/`MsbBitWriter`, genuine most-significant-bit-first bit I/O for canonical LZH/LHA-family bitstream work (mirrors canonical LHA `getbits`/`putbits`/`fillbuf` semantics), a sibling to the existing LSB-first `BitReader`/`BitWriter` used by DEFLATE. Re-exported from the crate root and `prelude`.
 
@@ -208,14 +208,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.3.5"
+oxiarc-core = "0.3.6"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.3.5", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.3.6", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

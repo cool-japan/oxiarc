@@ -1,4 +1,4 @@
-# oxiarc-lzw - Development Status (v0.3.5, 2026-07-07)
+# oxiarc-lzw - Development Status (v0.3.6, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 

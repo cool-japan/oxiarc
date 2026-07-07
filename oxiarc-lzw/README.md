@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.5 (2026-07-07) | 76 tests passing**
+**Version: 0.3.6 (2026-07-07) | 76 tests passing**
 
 ## Overview
 

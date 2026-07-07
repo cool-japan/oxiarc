@@ -5,6 +5,8 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - Unreleased
+
 ## [0.3.5] - 2026-07-07
 
 LZH/LHA interoperability release: the `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec is rewritten from OxiArc's private, non-canonical bitstream format to genuine canonical LHA wire format, closing the interoperability gap left open by the 0.3.4 hardening pass (which covered LZMA, bzip2, 7z, ZIP, TAR, and XZ). Validated bidirectionally against a corpus of real third-party `.lzh` archives and a live `lha` (Lhasa) CLI oracle. Also fixes a Miri-flagged undefined-behavior class in the CRC fast paths, resource leaks in three archive writers' `into_inner()`, and a CLI exit-code bug on unrecognized archive formats.

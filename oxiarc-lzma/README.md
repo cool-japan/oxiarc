@@ -3,11 +3,11 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 151 tests passing.
+**Version 0.3.6** (2026-07-07) — 151 tests passing.
 
 **What's new in 0.3.1**: Custom dictionary support via `LzmaEncoder::with_dictionary(level, dict_size, dict)` / `set_dictionary` and `LzmaDecoder::with_dictionary(reader, props, dict_size, dict)` / `set_dictionary`; thread-safe memory pool `LzmaPool` with `PooledBuf<'a>` RAII wrapper and `LzmaDecoderPooled<'p, R>` for amortizing large dict buffer allocations.
 
@@ -245,10 +245,10 @@ assert_eq!(&decompressed, data.as_ref());
 ```toml
 [dependencies]
 # Default (serial only)
-oxiarc-lzma = "0.3.5"
+oxiarc-lzma = "0.3.6"
 
 # With parallel LZMA2 compression
-oxiarc-lzma = { version = "0.3.5", features = ["parallel"] }
+oxiarc-lzma = { version = "0.3.6", features = ["parallel"] }
 ```
 
 ## Usage
@@ -257,7 +257,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.3.5"
+oxiarc-lzma = "0.3.6"
 ```
 
 ## Modules

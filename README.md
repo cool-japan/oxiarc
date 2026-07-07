@@ -144,15 +144,15 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.3.5"  # For archive format support
-oxiarc-deflate = "0.3.5"  # For DEFLATE compression
-oxiarc-lzma = "0.3.5"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.3.5"    # For Bzip2 compression
-oxiarc-lz4 = "0.3.5"      # For LZ4 compression
-oxiarc-zstd = "0.3.5"     # For Zstandard compression
-oxiarc-brotli = "0.3.5"   # For Brotli compression
-oxiarc-snappy = "0.3.5"   # For Snappy compression
-oxiarc-szip = "0.3.5"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
+oxiarc-archive = "0.3.6"  # For archive format support
+oxiarc-deflate = "0.3.6"  # For DEFLATE compression
+oxiarc-lzma = "0.3.6"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.3.6"    # For Bzip2 compression
+oxiarc-lz4 = "0.3.6"      # For LZ4 compression
+oxiarc-zstd = "0.3.6"     # For Zstandard compression
+oxiarc-brotli = "0.3.6"   # For Brotli compression
+oxiarc-snappy = "0.3.6"   # For Snappy compression
+oxiarc-szip = "0.3.6"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
 ```
 
 ## Quick Start
@@ -303,7 +303,7 @@ Adaptive entropy coding for scientific data:
 | oxiarc-cli      | Stable  | 45         | 45            |
 | **Total**       |         | **1,746**  | **1,878**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.5 (2026-07-07).
+All crates are feature-complete, tested, and API-stable as of v0.3.6 (2026-07-07).
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
