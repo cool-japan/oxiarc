@@ -2,15 +2,17 @@
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.4-blue)
+![Version](https://img.shields.io/badge/version-0.3.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.4** (2026-06-06) — 99 tests passing.
+**Version 0.3.5** (2026-07-07) — 163 tests passing.
 
 **What's new in 0.3.0**: 4-byte multiplicative hash for better avalanche and fewer collisions; `LzssOptimalParser` — two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder; custom dictionary support via `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, and `LzssDecoder::preload_dictionary`.
 
 **What's new in 0.3.1**: Custom dictionary support — `LzhEncoder::with_dictionary(method, dict)` and `set_dictionary(&mut self, dict)` allow seeding the encoder with a known prefix corpus; `LzhDecoder::with_dictionary(method, size, dict)` and `set_dictionary` mirror the interface for the decoder; `LzssEncoder::preload_dictionary` and `LzssDecoder::preload_dictionary` seed hash chains and ring buffer from the dict tail, improving compression ratio when encoder and decoder share a known corpus prefix.
+
+**What's new in 0.3.5**: The `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec now speaks genuine canonical LHA wire format instead of the previous private, self-consistent-only bitstream — MSB-first bit order (via the new `oxiarc-core::msb_bitstream` module), corrected code-table length encoding, pt-tree zero-run handling, and position/offset encoding. Validated against 6 real third-party `.lzh` archives (`tests/data/`, sourced from the `fragglet/lhasa` corpus) and a live `lha` (Lhasa) CLI oracle behind the new opt-in `lha-oracle` feature. The streaming decoder was rewritten to match, and a `parallel` header-size bug that made real LHA tools report zero entries in parallel-built archives is fixed.
 
 ## Overview
 
@@ -22,6 +24,7 @@ This crate implements the core compression algorithm, separate from the archive 
 
 - **Pure Rust** - No C bindings or unsafe code
 - **Multiple methods** - lh0, lh4, lh5, lh6, lh7
+- **Real LHA interoperability** - lh4/lh5/lh6/lh7 speak genuine canonical LHA wire format (MSB-first), validated against real-world `.lzh` archives and a live `lha` CLI oracle
 - **Dual Huffman trees** - Codes + Offsets
 - **Configurable window sizes** - 4KB to 64KB
 - **Streaming and one-shot APIs**
@@ -114,10 +117,11 @@ println!("Position bits: {}", method.position_bits());
 ### Encoder
 
 ```rust
-use oxiarc_lzhuf::LzhEncoder;
+use oxiarc_lzhuf::{LzhEncoder, LzhMethod};
 
-let encoder = LzhEncoder::new(LzhMethod::Lh5);
-let compressed = encoder.encode(data)?;
+let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+let mut compressed = Vec::new();
+encoder.encode(data, &mut compressed, true)?;
 ```
 
 ### Decoder
@@ -134,8 +138,8 @@ let decompressed = decoder.decode(&compressed)?;
 ```rust
 use oxiarc_lzhuf::{LzssEncoder, LzssDecoder, LzssToken};
 
-// Low-level LZSS encoding
-let mut encoder = LzssEncoder::new(LzhMethod::Lh5);
+// Low-level LZSS encoding (window_size, min_match, max_match — lh5-equivalent)
+let mut encoder = LzssEncoder::new(8192, 3, 256);
 let tokens: Vec<LzssToken> = encoder.encode(data);
 
 for token in &tokens {
@@ -152,8 +156,14 @@ for token in &tokens {
 
 ```rust
 use oxiarc_lzhuf::LzhHuffmanTree;
+use oxiarc_core::MsbBitReader;
+use std::io::Cursor;
 
-let tree = LzhHuffmanTree::from_code_lengths(&lengths)?;
+// `code_lengths` is a per-symbol Huffman code length table; `tree_capacity`
+// bounds the internal flat tree array (2x the symbol count is sufficient).
+let tree = LzhHuffmanTree::from_code_lengths(&lengths, lengths.len() * 2)?;
+
+let mut bit_reader = MsbBitReader::new(Cursor::new(compressed_bits));
 let symbol = tree.decode(&mut bit_reader)?;
 ```
 
@@ -173,10 +183,15 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzhuf = "0.3.4"
+oxiarc-lzhuf = "0.3.5"
 ```
 
 ## Compatibility
+
+The `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec speaks genuine canonical LHA wire format — MSB-first bit order, matching the reference `LHa for UNIX` bit I/O, code-table length encoding, and position/offset encoding — not merely a self-consistent private format. This is validated two ways:
+
+- **Decode direction**: byte-exact decoding of a real-world corpus of `.lzh` archives produced by independent LHA-family tools (`LHa for UNIX 1.14i`, `LHA 2.55e` for DOS) across header levels 0/1/2, including a 1.24 MB multi-block archive (see `tests/data/README.md` for full provenance).
+- **Encode direction**: archives produced by this crate are verified readable by a live `lha` (Lhasa 0.6.0) CLI oracle (`lha t` / `lha x`), gated behind the opt-in `lha-oracle` Cargo feature.
 
 This implementation is compatible with:
 - LHA for UNIX (lha)

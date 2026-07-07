@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.3.3, 2026-06-06)
+# oxiarc-cli - Development Status (v0.3.5, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 
@@ -134,8 +134,7 @@
 
 ## Test Coverage
 
-- Integration tests needed
-- Currently relies on library tests
+- 45 tests passing (10 integration-test files under `tests/`, plus library unit tests)
 
 ## Code Statistics
 
@@ -151,7 +150,7 @@
 ## Command Reference
 
 ```
-oxiarc 0.3.3
+oxiarc 0.3.5
 The Oxidized Archiver - Pure Rust archive utility
 
 USAGE:

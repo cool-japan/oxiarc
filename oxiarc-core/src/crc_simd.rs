@@ -153,7 +153,9 @@ pub mod x86 {
             ptr = ptr.add(16);
 
             // Process 16-byte blocks using fold operation
-            while ptr.add(16) <= end {
+            // SAFETY-FIX: avoid speculative ptr.add(16) in the loop guard (same class of
+            // bug as the aarch64 crc32_pmull loop and crc32_slice8_fallback below).
+            while (end as usize) - (ptr as usize) >= 16 {
                 let next_block = _mm_loadu_si128(ptr.cast());
                 x0 = fold_128(x0, next_block, k1k2);
                 ptr = ptr.add(16);
@@ -232,7 +234,11 @@ pub mod x86 {
         let end = unsafe { ptr.add(data.len()) };
 
         // Process 8 bytes at a time
-        while unsafe { ptr.add(8) } <= end {
+        // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+        // `ptr.add(n)` is itself UB when the result would land more than one byte past
+        // the end of the allocation, even if the pointer is only compared and never
+        // dereferenced. Address subtraction avoids constructing an out-of-bounds pointer.
+        while (end as usize) - (ptr as usize) >= 8 {
             let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
             let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -344,7 +350,10 @@ pub mod arm {
 
         // Fold-by-1: process remaining 16-byte blocks using K3/K4 constants.
         // SAFETY: ptr.add(16) stays within [data.as_ptr(), end] due to the loop guard
-        while unsafe { ptr.add(16) } <= end {
+        // SAFETY-FIX: avoid speculative ptr.add(16) in the loop guard (same class of bug
+        // as crc32_slice8_fallback: computing an out-of-bounds pointer is UB even when
+        // it is only compared, never dereferenced).
+        while (end as usize) - (ptr as usize) >= 16 {
             // SAFETY: vld1q_u8 is safe when ptr is valid for 16 bytes (loop guard ensures this)
             let next_block = unsafe { vld1q_u8(ptr) };
             // SAFETY: fold_128_arm requires neon+aes features which we have (target_feature)
@@ -473,7 +482,11 @@ pub mod arm {
         let end = unsafe { ptr.add(data.len()) };
 
         // Process 8 bytes at a time
-        while unsafe { ptr.add(8) } <= end {
+        // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+        // `ptr.add(n)` is itself UB when the result would land more than one byte past
+        // the end of the allocation, even if the pointer is only compared and never
+        // dereferenced. Address subtraction avoids constructing an out-of-bounds pointer.
+        while (end as usize) - (ptr as usize) >= 8 {
             let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
             let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -627,7 +640,8 @@ pub fn software_crc32(mut crc: u32, data: &[u8]) -> u32 {
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
-    while unsafe { ptr.add(8) } <= end {
+    // SAFETY-FIX: see crc32_slice8_fallback above — avoid speculative ptr.add(8).
+    while (end as usize) - (ptr as usize) >= 8 {
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
         let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 

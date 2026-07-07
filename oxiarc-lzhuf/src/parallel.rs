@@ -34,8 +34,12 @@ use rayon::prelude::*;
 // principle, hold one.  In practice this module calls `encode_lzh` (which
 // allocates a fresh encoder on the stack) inside each closure, so no encoder
 // crosses a thread boundary, but the assertion is kept as a contract check.
-#[allow(dead_code)]
-fn _assert_lzh_encoder_send() {
+// `#[cfg(test)]`-scoped and exercised by `unit_tests::test_lzh_encoder_is_send`
+// below (rather than `#[allow(dead_code)]`-suppressed in a normal build) so it
+// participates in ordinary dead-code analysis while still failing to compile
+// if `LzhEncoder` ever stops being `Send`.
+#[cfg(test)]
+fn assert_lzh_encoder_send() {
     fn is_send<T: Send>() {}
     is_send::<crate::encode::LzhEncoder>();
 }
@@ -139,9 +143,10 @@ pub fn lzh_compress_parallel(entries: &[LzhEntryInput<'_>], method: LzhMethod) -
 /// mtime is always `0` for deterministic output.
 fn compress_one_member(entry: &LzhEntryInput<'_>, method: LzhMethod) -> Result<Vec<u8>> {
     let name_bytes = entry.name.as_bytes();
-    if name_bytes.len() > 255 {
+    // header_size_byte = 25 + fname_len must fit in a u8 (see build_level1_header).
+    if name_bytes.len() > (u8::MAX as usize) - 25 {
         return Err(OxiArcError::invalid_header(
-            "Filename too long for LZH level-1 header (max 255 bytes)",
+            "Filename too long for LZH level-1 header (max 230 bytes)",
         ));
     }
 
@@ -206,10 +211,20 @@ fn build_level1_header(
     mtime: u32,
     method: LzhMethod,
 ) -> Vec<u8> {
-    // Total header = 22 + name_len + 2 (crc) + 1 (os) + 2 (ext) = 27 + name_len
-    // header_size field = total - 2 (excludes [0] and [1])
+    // Total on-disk header = 22 + name_len + 2 (crc) + 1 (os) + 2 (ext) = 27 + name_len.
+    // header_size field = total - 2 (excludes [0] size and [1] checksum) = 25 + name_len.
+    //
+    // This mirrors `oxiarc-archive`'s `LzhWriter::write_level1_header` exactly
+    // (verified against it, and independently against a real `-lh5-` level-1
+    // fixture's on-disk bytes in `tests/data/`). A prior version of this
+    // function computed `20 + fname_len` — 5 bytes short of the CRC16(2) +
+    // os_id(1) + next_ext_size(2) fields it does write — which made every
+    // archive `lzh_compress_parallel` produced unparsable by real LHA tools
+    // (confirmed with `lha l`: 0 entries recognized) despite being internally
+    // self-consistent. The caller (`compress_one_member`) enforces
+    // `name_bytes.len() <= u8::MAX - 25` so this cast never overflows.
     let fname_len = name_bytes.len();
-    let header_size_byte = (20 + fname_len) as u8; // bytes in [2..end]
+    let header_size_byte = (25 + fname_len) as u8; // bytes in [2..end]
 
     let mut header = Vec::with_capacity(27 + fname_len);
 
@@ -252,6 +267,13 @@ mod unit_tests {
     use super::*;
 
     #[test]
+    fn test_lzh_encoder_is_send() {
+        // Calling this exercises (and thus compiles) the static assertion;
+        // it fails to compile at all if `LzhEncoder` ever stops being `Send`.
+        assert_lzh_encoder_send();
+    }
+
+    #[test]
     fn test_build_level1_header_basics() {
         let h = build_level1_header(b"test.txt", 100, 200, 0xABCD, 0, LzhMethod::Lh5);
         // Check method id at bytes [2..7]
@@ -261,6 +283,26 @@ mod unit_tests {
         // OS id
         let fname_len = b"test.txt".len();
         assert_eq!(h[24 + fname_len], b'U');
+    }
+
+    #[test]
+    fn test_build_level1_header_size_byte_matches_reference_formula() {
+        // Regression test: header_size_byte must be `25 + fname_len`
+        // (verified against `oxiarc-archive`'s `LzhWriter::write_level1_header`
+        // and against a real `-lh5-` level-1 archive's on-disk bytes). A
+        // prior version computed `20 + fname_len`, silently omitting the
+        // CRC16(2) + os_id(1) + next_ext_size(2) fields from the count, which
+        // made real LHA tools unable to recognize any entry in the resulting
+        // archive (`lha l` reported 0 files) despite round-tripping fine
+        // through OxiArc's own reader.
+        for name in ["a", "test.txt", "a_much_longer_filename_example.dat"] {
+            let h = build_level1_header(name.as_bytes(), 10, 20, 0, 0, LzhMethod::Lh5);
+            assert_eq!(
+                h[0] as usize,
+                25 + name.len(),
+                "header_size byte must equal 25 + fname_len for {name:?}"
+            );
+        }
     }
 
     #[test]

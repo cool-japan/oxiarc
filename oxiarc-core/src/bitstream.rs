@@ -6,9 +6,17 @@
 //!
 //! # Bit Ordering
 //!
-//! Both DEFLATE and LZH use LSB-first (Least Significant Bit first) ordering
-//! within bytes. This means bits are packed starting from the least significant
-//! bit of each byte.
+//! DEFLATE uses LSB-first (Least Significant Bit first) ordering within bytes:
+//! bits are packed starting from the least significant bit of each byte. The
+//! [`BitReader`] and [`BitWriter`] in this module implement that LSB-first
+//! convention.
+//!
+//! Note that canonical LZH/LHA (the classic `lha` / `LHarc` family, e.g. the
+//! `-lh5-` method) instead uses MSB-first ordering, where bits fill from the
+//! most significant bit downward. For that convention see the sibling
+//! [`crate::msb_bitstream`] module (`MsbBitReader` / `MsbBitWriter`). These
+//! LSB-first types remain correct for DEFLATE and for OxiArc's current
+//! (not-yet-spec-compliant) LZH format.
 //!
 //! # Example
 //!

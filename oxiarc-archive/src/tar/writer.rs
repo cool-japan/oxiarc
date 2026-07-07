@@ -328,15 +328,32 @@ impl<W: Write> TarWriter<W> {
     /// Consume the writer and return the inner writer.
     /// Finishes the archive first.
     pub fn into_inner(self) -> Result<W> {
-        // Use ManuallyDrop to prevent the Drop impl from running
+        // Use ManuallyDrop to prevent the Drop impl from running (it would
+        // otherwise try to finish the archive a second time).
         let mut this = std::mem::ManuallyDrop::new(self);
-        if !this.finished {
-            this.writer.write_all(&[0u8; BLOCK_SIZE])?;
-            this.writer.write_all(&[0u8; BLOCK_SIZE])?;
-            this.writer.flush()?;
+        let write_result: std::io::Result<()> = if this.finished {
+            Ok(())
+        } else {
+            this.writer
+                .write_all(&[0u8; BLOCK_SIZE])
+                .and_then(|_| this.writer.write_all(&[0u8; BLOCK_SIZE]))
+                .and_then(|_| this.writer.flush())
+        };
+
+        // SAFETY: `this` is `ManuallyDrop`, so none of its fields have been
+        // dropped yet. Read `writer` out without dropping it — it becomes
+        // either the returned value, or an ordinary local that drops
+        // normally if `write_result` turns out to be an error below — then
+        // explicitly drop `progress`, the only other field owning a
+        // resource (an `Arc` clone), so it is never leaked. `finished` and
+        // `entry_index` are `Copy` and own nothing.
+        let writer = unsafe { std::ptr::read(&this.writer) };
+        unsafe {
+            std::ptr::drop_in_place(&mut this.progress);
         }
-        // SAFETY: We're consuming self via ManuallyDrop, so we can take ownership
-        Ok(unsafe { std::ptr::read(&this.writer) })
+
+        write_result?;
+        Ok(writer)
     }
 }
 
@@ -344,5 +361,42 @@ impl<W: Write> Drop for TarWriter<W> {
     fn drop(&mut self) {
         // Attempt to finish on drop, ignore errors
         let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxiarc_core::progress::{ProgressHandle, ProgressSink};
+    use std::sync::Arc;
+
+    /// Regression test (manual code review, not Miri-flagged): `into_inner()`
+    /// used to suppress `Drop` for the *entire* struct via `ManuallyDrop`,
+    /// which silently leaked every other owned field too — most observably
+    /// the `Arc<dyn ProgressSink>` clone held in `progress`, whose refcount
+    /// was never decremented. Confirms `into_inner()` now drops `progress`
+    /// properly instead of leaking it.
+    #[test]
+    fn test_tar_writer_into_inner_does_not_leak_progress() {
+        struct NoopSink;
+        impl ProgressSink for NoopSink {
+            fn on_progress(&self, _processed: u64, _total: Option<u64>) {}
+        }
+
+        let sink = Arc::new(NoopSink);
+        let handle: ProgressHandle = sink.clone();
+
+        let mut writer = TarWriter::new(Vec::new()).with_progress(handle);
+        writer
+            .add_file("leak_check.txt", b"regression test data")
+            .expect("add_file");
+
+        let _inner = writer.into_inner().expect("into_inner");
+
+        assert_eq!(
+            Arc::strong_count(&sink),
+            1,
+            "into_inner() must drop the writer's internal Arc<ProgressSink> clone, not leak it"
+        );
     }
 }

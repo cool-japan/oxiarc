@@ -92,6 +92,43 @@ impl LzhMethod {
         }
     }
 
+    /// Width, in bits, of the offset-tree code-count field (canonical LHA
+    /// `pbit` / lhasa `OFFSET_BITS`).
+    ///
+    /// This field prefixes the position/offset Huffman table and also sizes
+    /// the single-code value in the `n == 0` degenerate case. Verified against
+    /// the lhasa `lh{5,6,7}_decoder.c` wrappers: `-lh4-`/`-lh5-` use 4 bits,
+    /// `-lh6-`/`-lh7-` use 5 bits.
+    pub(crate) fn offset_bits(&self) -> u8 {
+        match self {
+            Self::Lh4 | Self::Lh5 => 4,
+            Self::Lh6 | Self::Lh7 => 5,
+            _ => 0,
+        }
+    }
+
+    /// Number of history-buffer address bits used by the canonical decoder
+    /// (lhasa `HISTORY_BITS`); the ring buffer holds `1 << history_bits` bytes.
+    ///
+    /// Verified against lhasa: `-lh4-`/`-lh5-` = 14 (16 KiB), `-lh6-` = 16
+    /// (64 KiB), `-lh7-` = 17 (128 KiB). The decoder allocates the full ring so
+    /// that any conformant archive — whichever dictionary size its encoder
+    /// actually used — is decodable; a larger-than-needed ring is harmless.
+    pub(crate) fn history_bits(&self) -> u8 {
+        match self {
+            Self::Lh4 | Self::Lh5 => 14,
+            Self::Lh6 => 16,
+            Self::Lh7 => 17,
+            _ => 0,
+        }
+    }
+
+    /// Maximum number of offset codes the decoder will read for this method,
+    /// i.e. lhasa `MAX_OFFSET_CODES = (1 << OFFSET_BITS) - 1`.
+    pub(crate) fn max_offset_codes(&self) -> usize {
+        (1usize << self.offset_bits()).saturating_sub(1)
+    }
+
     /// Get the maximum match length.
     pub fn max_match(&self) -> usize {
         match self {
@@ -169,8 +206,10 @@ pub mod constants {
 
 /// Number of bits used to encode the P-tree code count for a given `np`.
 ///
-/// lh4/lh5 use `np = 14` (4 bits); lh6/lh7 use `np = 16`/`17`, which does
-/// not fit in 4 bits, so 5 bits are used.
+/// This is used only by the legacy `src/streaming/*` decoder (out of scope
+/// for the canonical-format rewrite; retained so that module keeps building).
+/// lh4/lh5 use `np = 14` (4 bits); lh6/lh7 use `np = 16`/`17`, which does not
+/// fit in 4 bits, so 5 bits are used.
 pub(crate) fn p_tree_count_bits(np: usize) -> u8 {
     if np <= 14 { 4 } else { 5 }
 }
@@ -214,6 +253,24 @@ mod tests {
         assert_eq!(LzhMethod::Lh5.position_bits(), 13);
         assert_eq!(LzhMethod::Lh6.position_bits(), 15);
         assert_eq!(LzhMethod::Lh7.position_bits(), 16);
+    }
+
+    #[test]
+    fn test_canonical_offset_and_history_bits() {
+        // Verified against lhasa lh{5,6,7}_decoder.c.
+        assert_eq!(LzhMethod::Lh4.offset_bits(), 4);
+        assert_eq!(LzhMethod::Lh5.offset_bits(), 4);
+        assert_eq!(LzhMethod::Lh6.offset_bits(), 5);
+        assert_eq!(LzhMethod::Lh7.offset_bits(), 5);
+
+        assert_eq!(LzhMethod::Lh4.history_bits(), 14);
+        assert_eq!(LzhMethod::Lh5.history_bits(), 14);
+        assert_eq!(LzhMethod::Lh6.history_bits(), 16);
+        assert_eq!(LzhMethod::Lh7.history_bits(), 17);
+
+        assert_eq!(LzhMethod::Lh5.max_offset_codes(), 15);
+        assert_eq!(LzhMethod::Lh6.max_offset_codes(), 31);
+        assert_eq!(LzhMethod::Lh7.max_offset_codes(), 31);
     }
 
     #[test]

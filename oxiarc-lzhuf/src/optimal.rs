@@ -28,32 +28,42 @@ const UNIFORM_MATCH_BITS: u32 = 14;
 const INF_COST: u32 = u32::MAX / 2;
 
 // ---------------------------------------------------------------------------
-// Helper: position code computation (mirrors encode.rs logic)
+// Helper: position code computation (mirrors encode::encode_offset exactly)
 // ---------------------------------------------------------------------------
 
-/// Compute the position code (= floor(log2(distance))) from a distance value.
+/// Compute the canonical offset-tree symbol (a bit-length category) for a
+/// match distance, for DP cost-estimation purposes.
 ///
-/// This mirrors the `get_position_code` function in `encode.rs`.  Position
-/// code 0 corresponds to distance 1; position code k corresponds to
-/// distances in the range `[2^k, 2^(k+1) - 1]`, encoded with k extra bits.
+/// This mirrors `encode::encode_offset` exactly (the canonical LHA
+/// convention, verified against the lhasa reference decoder): let `offset =
+/// distance - 1` (0-based). Symbol `0` for `offset == 0`, symbol `1` for
+/// `offset == 1`, otherwise the bit length of `offset` (`>= 2`). Note this is
+/// **not** `floor(log2(distance))` — that was the prior (non-canonical)
+/// convention this crate used before its LZH bitstream was corrected to match
+/// real LHA/LZH archives; see `encode` module docs for the full derivation.
+///
+/// This function only feeds the DP parser's *bit-cost estimate* (used to
+/// choose among candidate matches) — the actual emitted bits always go
+/// through `encode::encode_offset`, so a mismatch here could only ever
+/// degrade compression quality, never correctness. It is kept in sync anyway
+/// so the estimated costs the DP optimises are the true costs.
 #[inline]
 fn position_code(distance: u16) -> u8 {
-    if distance <= 1 {
-        return 0;
+    let offset = u32::from(distance).saturating_sub(1);
+    if offset <= 1 {
+        offset as u8
+    } else {
+        (32 - offset.leading_zeros()) as u8
     }
-    let mut p = 0u8;
-    let mut d = distance;
-    while d > 1 {
-        d >>= 1;
-        p += 1;
-    }
-    p
 }
 
 /// Number of extra bits emitted after the position code for a given distance.
+/// Mirrors `encode::encode_offset`: 0 extra bits for position codes 0 and 1,
+/// otherwise `position_code(distance) - 1`.
 #[inline]
 fn position_extra_bits(distance: u16) -> u32 {
-    position_code(distance) as u32
+    let code = position_code(distance);
+    if code <= 1 { 0 } else { u32::from(code - 1) }
 }
 
 /// Map a match length (3-based) to its C-tree symbol index.

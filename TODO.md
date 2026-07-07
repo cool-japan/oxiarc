@@ -1,8 +1,9 @@
 
-# OxiArc - Development Roadmap (v0.3.5, 2026-07-06)
+# OxiArc - Development Roadmap (v0.3.5, 2026-07-07)
 
 ## Version History
 
+- **v0.3.5** (2026-07-07): LZH canonical bitstream rewrite — the lh4/lh5/lh6/lh7 codec previously implemented a private, self-consistent-only format; rewritten to genuine canonical LHA format (MSB-first bit order + corrected code-table/position encoding, new `oxiarc_core::msb_bitstream` module), validated against 6 real-LHA-produced `.lzh` archives and a live `lha` (Lhasa) oracle at both the codec level (`oxiarc-lzhuf`) and archive level (`oxiarc-archive`) via a new opt-in `lha-oracle` Cargo feature in both crates. Also: fixed genuine undefined behavior (Miri-detected) in oxiarc-core's CRC SIMD code (unsound pointer arithmetic, 7 call sites); fixed a resource leak in `ZipWriter`/`TarWriter`/`LzhWriter::into_inner()` in oxiarc-archive; fixed oxiarc-cli exit codes so `test`/`list` on unrecognized archive formats correctly return non-zero instead of silently exiting 0; dependency updates (`glob`, `clap_complete` bumps, `crossbeam-epoch` security fix for RUSTSEC-2026-0204, removed an unused oxiarc-core dependency from oxiarc-szip); added regression test coverage for deflate max-length-match decoding and snappy max-size-block handling (both already-correct, closing test gaps). 1,878 tests passing (all features), zero clippy/check/rustdoc warnings.
 - **v0.3.4** (2026-07-06): Interoperability hardening release — spec-conformance defects found via downstream FVRS integration testing were root-caused and fixed across LZMA/LZMA2 (distance-slot probability layout, state mapping, LZMA2 control-byte reset field, embedded EOS markers), bzip2 (bit order, CRC-32 variant, MTF/Huffman pipeline, format minimums), 7z (substream sizes, 0-byte members, varint decoding, header/CRC handling), ZIP (Shift-JIS/EFS/CP437 name decoding, writer EFS flag), TAR (char-boundary panic, PAX long-name write support), XZ (block-header CRC, index unpadded size, self-describing chunk framing), and LZH (`-lh1-`/`-lhd-`/unknown-method listing, beyond-window LZSS/Huffman fixes, Shift_JIS filenames). All codecs validated bidirectionally against liblzma/libbz2/bsdtar/CPython; hermetic golden-vector test suites committed. 1,799 tests passing (all features), zero clippy/check/rustdoc warnings.
 - **v0.3.3** (2026-06-06): oxiarc-brotli high-entropy/incompressible round-trip fix — incompressible data now round-trips byte-for-byte across all quality levels (1–11). Fixed two underlying bugs: (1) incomplete length-limited Huffman codes (replaced the `ceil(-log2 p)` heuristic with the package-merge algorithm, which always yields a complete, length-optimal code) and (2) insert lengths above 319 were silently truncated (unified the insert-length code table between encoder and decoder, extending categories up to ~4 MiB inserts). 13 new high-entropy regression tests. 1,679 tests passing, 2 skipped, zero warnings. No other crate changed.
 - **v0.3.2** (2026-05-31): AEC/SZIP codec (oxiarc-szip) — full CCSDS-121.0-B-2 compliant encoder/decoder with `BitReader`/`BitWriter` bit manipulation primitives, `SzipParams` configuration struct, `SzipError` error enum. Round-trip tests for all sample scenarios.
@@ -213,13 +214,7 @@
 - [x] LZW streaming encoder/decoder (LzwStreamEncoder/LzwStreamDecoder with TIFF and GIF modes)
 - [x] EntryBuilder pattern with fluent API (oxiarc-core)
 - [x] Serde serialization for Entry types (optional serde feature in oxiarc-core)
-- [~] Streaming with async I/O (partial: DEFLATE streaming GzipStream/ZlibStream; full streaming pipeline pending) (planned 2026-04-20)
-  - **Goal:** Record the concrete state of play so the next /ultra run can pick up codec-by-codec async streaming coherently. Sync streaming across TAR/ZIP/LZH lands in this run via `archive-streaming-extraction`. Async DEFLATE (`oxiarc_deflate::async_deflate`) and async ZIP (`oxiarc_archive::async_zip`) already exist.
-  - **Design:** Remaining async work tracked as per-crate items: `archive-async-io-more-formats` (TAR-async, LZH-async), `brotli-async-io-support`, `lzma-async-io`, `core-async-io-support`. Snappy async I/O is now complete. This top-level item serves as the cross-crate coordination point.
-  - **Files:** `oxiarc/TODO.md` only (meta-item; per-crate tests land with per-crate work)
-  - **Prerequisites:** `archive-streaming-extraction` (this run)
-  - **Tests:** none (meta-item)
-  - **Risk:** none (tracking item only)
+- [x] Streaming with async I/O (completed 2026-07-07) — all per-crate async I/O done: core traits/wrappers (AsyncCompressor/AsyncDecompressor, StreamingAsyncCompressor/Decompressor, compress_concurrent/decompress_concurrent), brotli (BrotliAsyncCompressor/Decompressor), lzma (async_lzma), archive TAR/LZH/ZIP async readers, snappy async I/O, async DEFLATE (GzipStream/ZlibStream). True bounded-memory async streaming through codec internals is an explicit non-goal (each sub-crate's own TODO documents this); open a new item if that scope is wanted later.
 
 ### Quality / Testing
 - [x] Snappy interop integration tests (16 tests against wire-format golden vectors covering block and framed formats in oxiarc-snappy)
@@ -295,7 +290,7 @@
 - oxiarc-cli: 42 tests
 - Total: 1,799 tests (1,799 passed, 0 skipped, zero warnings, all features)
 
-## Code Statistics (v0.3.4, 2026-07-06)
+## Code Statistics (v0.3.5, 2026-07-07)
 
 | Crate | Lines of Code |
 |-------|---------------|
@@ -312,10 +307,8 @@
 | oxiarc-cli | ~4,988 |
 | oxiarc-lzma | ~7,222 (spec-conformant distance-slot table, state mapping) |
 | oxiarc-lzw | ~2,140 (gif_lzw module, bitstream_lsb module, streaming encoder/decoder) |
-| **Total** | **~75,564** (250 files) |
+| **Total** | **~76,755** (256 files) |
 
 ## Stubs to implement (added 2026-06-22 by /cooljapan-stub-check)
 
-- [x] **oxiarc** `oxiarc-archive`: `oxiarc-archive/src/xz/header.rs:913` — `TODO`: `LZH compression (lh5) encoder not compatible` (round-trip tests disabled; lh5 Huffman emission not spec-compatible)
-  - **Resolved (v0.3.4, 2026-07-06):** lh5 (and lh4/lh6/lh7) beyond-window corruption root-caused to three bugs in `oxiarc-lzhuf` — the LZSS encoder clobbering history for inputs larger than the window, a 16-bit per-block size field silently overflowing past 65535 bytes, and 4/5-bit p-tree count fields for np=16/17. Fixed with new beyond-window regression tests (8/16/64/100 KB, CRC-16 verified). The stale in-source comment at `xz/header.rs:957` (an XZ/LZMA test file, not LZH) references this same tracking note and should be revisited/removed in a follow-up cleanup pass.
-  - **Priority:** P2  **Scope:** large  **Cross-project:** none
+- [x] LZH compression (lh5) encoder now spec-compatible (completed 2026-07-07) — MSB-first canonical rewrite of the lh4/lh5/lh6/lh7 codec (new `oxiarc-core::msb_bitstream`; `oxiarc-lzhuf/src/{encode,huffman,decode,lzss,optimal,methods}.rs` + `streaming/{decoder,huffman}.rs`) producing genuine LHA-wire-format archives; `oxiarc-archive/src/lzh/{writer,header}.rs` needed **no** changes — the default level-2 writer already emits headers real `lha` reads. Validated byte-exact against 6 genuine real-LHA `.lzh` fixtures (levels 0/1/2, incl. a 1.24 MB multi-block file, cross-tool) AND a live `lha` (Lhasa 0.6.0) oracle at **both** the codec level (`oxiarc-lzhuf` `lha-oracle`: `lha t`/`x` round-trips) and the **archive** level (new `oxiarc-archive` `lha-oracle`: `lha l`/`t`/`x`/`pq` over small, ~150 KB multi-block, multi-file, Shift_JIS-named, empty and stored archives); reverse direction (real archive → `LzhReader`) added as always-run `tests/lzh_corpus_reader.rs`. Suites green (oxiarc-archive 389, oxiarc-lzhuf 163), clippy clean, oracle self-skips without `lha`. Residual (out of scope, non-blocking, pre-existing): the opt-in level-1/0 writer stores Unix time where canonical LHA uses DOS FAT time (cosmetic date only — `lha` still CRC-tests + extracts fine), and Lhasa does not read level-3 headers at all; the default level-2 path is fully clean. Prior fix (v0.3.4, 2026-07-06): an earlier, already-shipped beyond-window corruption bug (LZSS clobbering history past the window, a 16-bit per-block size field overflowing past 65535 bytes, wrong p-tree count-field width for np=16/17) was fixed under this same item with 8/16/64/100 KB CRC-16 regression tests; that fix stands independently — this canonical-format rewrite was the separate, now-closed real-tool-readability work.

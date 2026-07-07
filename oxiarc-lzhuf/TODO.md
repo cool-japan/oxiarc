@@ -1,5 +1,5 @@
 
-# oxiarc-lzhuf - Development Status (v0.3.3, 2026-06-06)
+# oxiarc-lzhuf - Development Status (v0.3.5, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 
@@ -88,13 +88,13 @@
 - [x] Custom dictionary initialization — `LzhEncoder::with_dictionary(method, dict)` / `set_dictionary`, `LzhDecoder::with_dictionary(method, size, dict)` / `set_dictionary`; delegates to `LzssEncoder/Decoder::preload_dictionary` which seeds ring buffer and hash chains (done 2026-05-16)
 
 ### Compatibility
-- [ ] Extended testing with real LZH archives
+- [x] Extended testing with real LZH archives (done 2026-07-07) — `tests/data/` corpus (6 genuine third-party `.lzh` fixtures from `fragglet/lhasa`, header levels 0/1/2) exercised by `tests/corpus_fixtures.rs` (decode direction) and `tests/lha_oracle.rs` (encode direction, live `lha`/Lhasa CLI oracle via the opt-in `lha-oracle` feature)
 - [ ] Fuzzing tests
 - [ ] Edge case handling
 
 ## Test Coverage
 
-- Total: 99 tests (34 lib + 20 streaming_integration + 3 doctests)
+- Total: 163 tests (93 lib + 42 streaming_integration + 8 window_regression + 7 corpus_fixtures + 7 parallel_lzhuf + 6 lha_oracle) + 4 doctests, all-features
 
 ## Code Statistics
 

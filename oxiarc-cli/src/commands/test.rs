@@ -333,8 +333,12 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
             }
         }
         _ => {
-            println!("Testing not supported for {}", format);
-            return Ok(());
+            return Err(format!(
+                "unsupported or unrecognized archive format for {}: {}",
+                archive.display(),
+                format
+            )
+            .into());
         }
     }
 

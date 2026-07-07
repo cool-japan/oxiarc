@@ -5,7 +5,37 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.5] - Unreleased
+## [0.3.5] - 2026-07-07
+
+LZH/LHA interoperability release: the `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec is rewritten from OxiArc's private, non-canonical bitstream format to genuine canonical LHA wire format, closing the interoperability gap left open by the 0.3.4 hardening pass (which covered LZMA, bzip2, 7z, ZIP, TAR, and XZ). Validated bidirectionally against a corpus of real third-party `.lzh` archives and a live `lha` (Lhasa) CLI oracle. Also fixes a Miri-flagged undefined-behavior class in the CRC fast paths, resource leaks in three archive writers' `into_inner()`, and a CLI exit-code bug on unrecognized archive formats.
+
+### Fixed
+- **oxiarc-lzhuf**: `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` archives produced by OxiArc were unreadable by real LHA implementations (`lha`, LHarc, and compatible tools) despite round-tripping correctly through OxiArc's own reader — the codec spoke a private, non-canonical bitstream. The encoder and decoder (`encode.rs`, `decode.rs`, `huffman.rs`, `methods.rs`, `optimal.rs`, `streaming/{decoder,huffman}.rs`) were rewritten against the reference `lhasa` decoder to genuine canonical LHA format:
+  1. **Bit order** — bits were packed LSB-first with every Huffman code bit-reversed to fake MSB semantics; canonical LHA is natively MSB-first. New `oxiarc_core::msb_bitstream::{MsbBitReader, MsbBitWriter}` module (mirroring LHA's `getbits`/`putbits`, including zero-bit padding past end-of-input) replaces the reversal hack.
+  2. **Block command-count field** — the 16-bit per-block field was treated as a byte count; canonically it counts *commands* (literals or copies), so a copy-heavy block can cover far more output bytes than its count suggests.
+  3. **Code-table length encoding** — temp-tree symbol values were mapped to code lengths as `v - 3` (with an always-unused `v == 3` slot); canonical LHA uses `v - 2`, and its zero-run skip mechanism is independent of (not layered onto) the temp table's own index-2 skip-count field.
+  4. **Offset-table field widths** — the offset (P-tree) code-count field and history-buffer size are method-dependent (4 bits / 16 KiB for `-lh4-`/`-lh5-`; 5 bits / 64 KiB for `-lh6-`; 5 bits / 128 KiB for `-lh7-`), now centralized in new `LzhMethod::offset_bits`/`history_bits`/`max_offset_codes` helpers.
+
+  Validated against 6 genuine third-party `.lzh` fixtures spanning header levels 0/1/2 (including a 1.24 MB multi-block archive) in `oxiarc-lzhuf/tests/data/`, plus a live `lha` (Lhasa) CLI oracle gated behind a new opt-in `lha-oracle` feature. `oxiarc-archive`'s `LzhWriter`/`LzhReader` needed no changes — the default level-2 header format was already spec-conformant.
+- **oxiarc-lzhuf**: `parallel::lzh_compress_parallel`'s level-1 header builder computed its header-size byte as `20 + fname_len`, five bytes short of the spec value `25 + fname_len` (it omits the CRC-16(2) + OS-ID(1) + next-extension-size(2) fields the header does write). Archives it produced were internally self-consistent but real `lha` reported **zero entries** (`lha l`) in them. Fixed to `25 + fname_len`, matching `oxiarc-archive`'s `LzhWriter` and confirmed byte-exact against a real `-lh5-` level-1 fixture.
+- **oxiarc-core**: Fixed undefined behavior, flagged by Miri, in the scalar and SIMD CRC-32/CRC-64 fast paths (`crc.rs`, `crc_simd.rs`; 7 call sites across the slice-by-8 scalar loop, the x86 PCLMULQDQ fold loop, and the aarch64 PMULL fold loop). Each loop guard computed `ptr.add(n)` speculatively to compare it against `end`, but `ptr.add` is itself UB once the result lands more than one byte past the end of the allocation — even when the pointer is only compared, never dereferenced. Replaced with address subtraction (`(end as usize) - (ptr as usize) >= n`), which never constructs an out-of-bounds pointer. No behavioral or performance change.
+- **oxiarc-archive**: Fixed a resource leak in `ZipWriter::into_inner`, `TarWriter::into_inner`, and `LzhWriter::into_inner`. Each wrapped the *entire* writer struct in `ManuallyDrop` to suppress its `Drop` impl (which would otherwise re-run `finish()`), which also silently leaked every other owned field — most notably the `Arc<dyn ProgressSink>` progress-handle clone in all three (its refcount was never decremented), plus `ZipWriter`'s `entries` Vec. `TarWriter::into_inner` additionally leaked the writer itself if an I/O error occurred while writing the two end-of-archive zero blocks. All three now read `writer` out via `ptr::read` and explicitly drop the remaining owned fields; `TarWriter` computes the finish-write result before disposing of resources so an I/O error can no longer leak the writer. Regression tests added for all three, asserting the progress `Arc`'s strong count drops to 1 after `into_inner()`.
+- **oxiarc-cli**: `oxiarc test` and `oxiarc list` (including `--json` mode) on a file with an unrecognized or corrupt archive format previously printed a message and exited `0`; both now return a non-zero exit code with a clean `unsupported or unrecognized archive format for <path>: <format>` error. (`oxiarc detect`, whose job is reporting `Format: Unknown` at exit 0, is intentionally unaffected.)
+
+### Changed
+- Dependency bumps: `glob` 0.3 → 0.3.3, `clap_complete` 4.6.6 → 4.6.7 (root `[workspace.dependencies]`).
+
+### Added
+- **oxiarc-core**: `msb_bitstream::{MsbBitReader, MsbBitWriter}` — public most-significant-bit-first bit I/O (re-exported at the crate root and in `prelude`), the canonical-LZH/LHA-oriented sibling of the existing LSB-first `bitstream` module used by DEFLATE.
+- **oxiarc-lzhuf** / **oxiarc-archive**: opt-in `lha-oracle` Cargo feature (off by default; `oxiarc-lzhuf`'s implies `parallel`) that shells out to a real `lha` (Lhasa) CLI to validate OxiArc-produced archives — codec-level `lha t`/`x` round-trips in `oxiarc-lzhuf`, archive-level `lha l`/`t`/`x`/`p` round-trips in `oxiarc-archive`; self-skips cleanly when `lha` is not on `PATH`.
+- Real-world LZH interop corpus (`oxiarc-lzhuf/tests/data/`: 6 genuine third-party `.lzh` archives across header levels 0/1/2, plus expected-plaintext goldens) and the suites exercising it: `oxiarc-lzhuf/tests/corpus_fixtures.rs`, `oxiarc-lzhuf/tests/lha_oracle.rs`, `oxiarc-archive/tests/lzh_corpus_reader.rs`, `oxiarc-archive/tests/lzh_lha_oracle.rs`, plus expanded chunked/incremental-decode coverage in `oxiarc-lzhuf/tests/streaming_integration.rs`.
+- **oxiarc-deflate**: decoder-only regression test for a hand-built fixed-Huffman, length-258 (maximum-length) back-reference — closes a coverage gap; this case was previously only exercised indirectly via encode-then-decode roundtrips.
+- **oxiarc-cli**: `tests/cli_unrecognized_format.rs` regression coverage for the exit-code fix above.
+
+### Quality
+- 1878 tests passing (all features, 0 skipped — 79 more than 0.3.4); zero clippy, check, and rustdoc warnings across the workspace.
+- **oxiarc-snappy**: re-audited max-size-block (64 KiB) chunking handling — confirmed already correct and exhaustively covered by existing tests; no code changes needed.
+- All COOLJAPAN policies compliant (no `unwrap` in production, pure Rust, workspace deps, snake_case, <2000 LoC/file).
 
 ## [0.3.4] - 2026-07-06
 
@@ -537,6 +567,7 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.3.5]: https://github.com/cool-japan/oxiarc/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cool-japan/oxiarc/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/cool-japan/oxiarc/compare/v0.3.1...v0.3.2

@@ -1,4 +1,4 @@
-# oxiarc-zstd - Development Status (v0.3.3, 2026-06-06)
+# oxiarc-zstd - Development Status (v0.3.5, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 

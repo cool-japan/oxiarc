@@ -213,7 +213,12 @@ pub fn cmd_list(
             }
         }
         _ => {
-            println!("Unsupported format: {}", format);
+            return Err(format!(
+                "unsupported or unrecognized archive format for {}: {}",
+                archive.display(),
+                format
+            )
+            .into());
         }
     }
 
@@ -336,9 +341,12 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
             }));
         }
         _ => {
-            output.metadata = Some(serde_json::json!({
-                "error": "Unsupported format"
-            }));
+            return Err(format!(
+                "unsupported or unrecognized archive format for {}: {}",
+                archive.display(),
+                format
+            )
+            .into());
         }
     }
 

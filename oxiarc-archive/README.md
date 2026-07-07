@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.4 (2026-06-06) | 332 tests passing**
+**Version: 0.3.5 (2026-07-07) | 392 tests passing**
 
 
 ## Features
@@ -21,6 +21,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 - ISO 9660 read support with PVD and Joliet UCS-2 filename handling (new in 0.2.8)
 - Raw-preserve append: `ZipWriter::add_file_raw`, `LzhReader::read_raw_method_data`, `LzhWriter::add_file_raw` (new in 0.2.8)
 - Archive repair/recovery: `repair_zip`, `repair_tar` functions; `ZipRepair`, `TarRepair`, `RepairReport` structs for recovering truncated or corrupt archives (new in 0.3.0)
+- LZH/LHA archives validated for real-world interoperability against a live `lha` (Lhasa) CLI oracle — opt-in `lha-oracle` feature (new in 0.3.5)
 
 All features are implemented and tested. API is stable.
 
@@ -103,20 +104,21 @@ Supported async compression methods: `Stored`, `Deflate`.
 |---------|---------|-------------|
 | `mmap` | no | Memory-mapped file support for efficient large file reading (via `memmap2`) |
 | `async-io` | no | Async ZIP entry reading via Tokio (`async_zip` module) |
+| `lha-oracle` | no | Opt-in interoperability tests that shell out to a real `lha` (Lhasa) CLI to validate LZH archives produced by `LzhWriter` (`lha l`/`t`/`x`/`p`); self-skips cleanly when `lha` is not on `PATH` (new in 0.3.5) |
 
 ```toml
 [dependencies]
 # Default (no optional features)
-oxiarc-archive = "0.3.4"
+oxiarc-archive = "0.3.5"
 
 # With memory-mapped I/O
-oxiarc-archive = { version = "0.3.4", features = ["mmap"] }
+oxiarc-archive = { version = "0.3.5", features = ["mmap"] }
 
 # With async ZIP support
-oxiarc-archive = { version = "0.3.4", features = ["async-io"] }
+oxiarc-archive = { version = "0.3.5", features = ["async-io"] }
 
 # With all features
-oxiarc-archive = { version = "0.3.4", features = ["mmap", "async-io"] }
+oxiarc-archive = { version = "0.3.5", features = ["mmap", "async-io"] }
 ```
 
 ## Format Detection

@@ -1,373 +1,356 @@
-//! LZH-specific Huffman coding.
+//! Canonical LZH/LHA Huffman decoding (MSB-first).
 //!
-//! LZH uses a different Huffman format than DEFLATE. It encodes:
-//! - Character/length codes (NC = 510 symbols)
-//! - Position/distance codes (varies by method)
+//! This is a clean-room re-implementation of the "new-style" LHA Huffman
+//! machinery (`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`), translated directly from the
+//! reference `lhasa` decoder (`fragglet/lhasa`, `lib/tree_decode.c` and
+//! `lib/lh_new_decoder.c`). It reads the **most-significant bit first** via
+//! [`MsbBitReader`], the opposite of DEFLATE's LSB-first packing.
+//!
+//! Three Huffman tables appear in every block, in this exact order:
+//!
+//! 1. **Temp table** (a.k.a. PT-tree): up to `MAX_TEMP_CODES` symbols. Its own
+//!    code lengths are sent raw — a 3-bit value per symbol, extended by a unary
+//!    run when the value is 7 (`read_length_value`) — with one special case:
+//!    after the length of symbol index 2, a 2-bit field says how many of the
+//!    immediately-following symbols (3, 4, 5) are unused (length 0).
+//! 2. **Code table** (C-tree): `NUM_CODES` symbols (0-255 literals, 256+ copy
+//!    lengths). Its code lengths are themselves Huffman-encoded *using the temp
+//!    table*: a decoded value `v <= 2` is a run of zero-length codes
+//!    (`read_skip_count`), and `v >= 3` means "code length = `v - 2`".
+//! 3. **Offset table** (P-tree): up to `MAX_OFFSET_CODES` symbols, code lengths
+//!    sent raw exactly like the temp table but **without** the index-2 skip.
+//!
+//! Canonical Huffman assignment: symbols are ordered by `(length, symbol
+//! index)` and codes assigned shortest-first; reading MSB-first walks the tree
+//! from the root. A table announced with a count `n == 0` is the degenerate
+//! "single code" case — every lookup yields that one symbol while consuming
+//! **zero** bits ([`LzhHuffmanTree::single`]).
+//!
+//! See `encode.rs` for the full bitstream spec and the inverse (encoder) side.
 
-use crate::methods::constants::{NC, NT};
-use oxiarc_core::BitReader;
+use crate::methods::constants::NC;
+use oxiarc_core::MsbBitReader;
 use oxiarc_core::error::{OxiArcError, Result};
 use std::io::Read;
 
-/// Maximum code length for LZH Huffman codes.
-pub const MAX_CODE_LENGTH: usize = 16;
+/// Maximum representable Huffman code length in canonical LHA.
+///
+/// Temp-table values encode code lengths as `value - 2`; the largest temp
+/// symbol (18) therefore denotes length 16.
+const MAX_CODE_LENGTH: u8 = 16;
 
-/// Entry in the Huffman lookup table.
-/// Encodes both symbol (lower 10 bits) and length (upper 6 bits).
-/// -1 indicates an invalid entry.
-#[derive(Debug, Clone, Copy)]
-struct TableEntry(i32);
+/// Number of bits in the temp-table code-count field (lhasa `TEMP_CODE_BITS`).
+const TEMP_CODE_BITS: u8 = 5;
 
-impl TableEntry {
-    const INVALID: TableEntry = TableEntry(-1);
+/// Maximum number of temp-table codes (lhasa `MAX_TEMP_CODES`).
+const MAX_TEMP_CODES: usize = (1 << TEMP_CODE_BITS) - 1; // 31
 
-    fn new(symbol: u16, length: u8) -> Self {
-        TableEntry(((length as i32) << 16) | (symbol as i32))
-    }
+/// Leaf marker set in a tree node value (lhasa `TREE_NODE_LEAF`).
+const TREE_NODE_LEAF: u32 = 1 << 31;
 
-    fn is_valid(self) -> bool {
-        self.0 >= 0
-    }
-
-    fn symbol(self) -> u16 {
-        (self.0 & 0xFFFF) as u16
-    }
-
-    fn length(self) -> u8 {
-        ((self.0 >> 16) & 0xFF) as u8
-    }
-}
-
-/// LZH Huffman tree for decoding.
+/// A canonical LHA Huffman decode tree stored as a flat binary-tree array,
+/// exactly as `lhasa`'s `build_tree` produces it.
+///
+/// Each array slot is either a **leaf** (`TREE_NODE_LEAF | symbol`) or an
+/// **internal node** holding the array index of its `0`-child (the `1`-child is
+/// the next index). Decoding walks from the root reading one bit at a time.
 #[derive(Debug, Clone)]
 pub struct LzhHuffmanTree {
-    /// Lookup table for fast decoding (stores symbol + length).
-    table: Vec<TableEntry>,
-    /// Table bits (for fast lookup).
-    table_bits: u8,
-    /// Maximum code length.
-    max_length: u8,
+    /// Flat tree array; slot 0 is the root.
+    nodes: Vec<u32>,
+    /// If `Some`, this table decodes to a single symbol consuming zero bits.
+    single: Option<u16>,
 }
 
 impl LzhHuffmanTree {
-    /// Create a Huffman tree from code lengths.
+    /// Construct the degenerate single-code table (lhasa `set_tree_single`):
+    /// every [`decode`](Self::decode) returns `symbol` and reads no bits.
+    pub fn single(symbol: u16) -> Self {
+        Self {
+            nodes: vec![symbol as u32 | TREE_NODE_LEAF],
+            single: Some(symbol),
+        }
+    }
+
+    /// Build a canonical decode tree from per-symbol code lengths.
     ///
-    /// `table_bits` is the *minimum* lookup width; if any code is longer,
-    /// the table is widened to the maximum code length so that every code
-    /// remains decodable in a single lookup.
-    pub fn from_lengths(lengths: &[u8], table_bits: u8) -> Result<Self> {
-        // Find max length
-        let max_length = *lengths.iter().max().unwrap_or(&0);
-        if max_length as usize > MAX_CODE_LENGTH {
-            return Err(OxiArcError::invalid_huffman(0));
-        }
+    /// `tree_capacity` bounds the flat array (lhasa sizes it `num_symbols * 2`).
+    /// Length-0 symbols are unused. This mirrors `lhasa`'s `build_tree`:
+    /// symbols are placed shortest-length-first, and within a length in
+    /// ascending symbol order, yielding standard canonical codes.
+    pub fn from_code_lengths(code_lengths: &[u8], tree_capacity: usize) -> Result<Self> {
+        let num = code_lengths.len();
+        // All slots start as leaves (symbol 0), matching lhasa `init_tree`, so a
+        // malformed/incomplete table never dereferences an unwritten pointer.
+        let mut nodes = vec![TREE_NODE_LEAF; tree_capacity.max(1)];
 
-        // Widen the table if any code exceeds the requested lookup width.
-        let table_bits = table_bits.max(max_length);
-        let table_size = 1 << table_bits;
-        let mut table = vec![TableEntry::INVALID; table_size];
+        let mut next_entry: usize = 0;
+        let mut tree_allocated: usize = 1;
+        let mut code_len: u8 = 0;
 
-        if lengths.is_empty() || max_length == 0 {
-            return Ok(Self {
-                table,
-                table_bits,
-                max_length: 0,
-            });
-        }
-
-        // Count codes of each length
-        let mut bl_count = [0u32; MAX_CODE_LENGTH + 1];
-        for &len in lengths {
-            if len > 0 {
-                bl_count[len as usize] += 1;
-            }
-        }
-
-        // Calculate starting codes
-        let mut next_code = [0u32; MAX_CODE_LENGTH + 1];
-        let mut code = 0u32;
-        for bits in 1..=max_length as usize {
-            code = (code + bl_count[bits - 1]) << 1;
-            next_code[bits] = code;
-        }
-
-        // Build lookup table
-        for (symbol, &len) in lengths.iter().enumerate() {
-            if len > 0 && len <= table_bits {
-                let len_usize = len as usize;
-                let code = next_code[len_usize];
-                next_code[len_usize] += 1;
-
-                // Fill table entries (reversed for LSB-first)
-                let reversed = Self::reverse_bits(code as u16, len);
-                let fill_count = 1 << (table_bits as usize - len_usize);
-
-                for i in 0..fill_count {
-                    let index = reversed as usize | (i << len_usize);
-                    if index < table_size {
-                        table[index] = TableEntry::new(symbol as u16, len);
-                    }
+        loop {
+            // expand_queue: give every queued node two children, pushing the
+            // queue one level deeper (codes one bit longer).
+            let new_nodes = (tree_allocated - next_entry) * 2;
+            if tree_allocated + new_nodes <= nodes.len() {
+                let end_offset = tree_allocated;
+                while next_entry < end_offset {
+                    nodes[next_entry] = tree_allocated as u32;
+                    tree_allocated += 2;
+                    next_entry += 1;
                 }
+            }
+
+            code_len += 1;
+
+            // add_codes_with_length: attach every symbol whose length matches
+            // the current depth to the next free queue slot.
+            let mut codes_remaining = false;
+            for (symbol, &len) in code_lengths.iter().enumerate().take(num) {
+                if len == code_len {
+                    if next_entry < tree_allocated {
+                        let node = next_entry;
+                        next_entry += 1;
+                        nodes[node] = symbol as u32 | TREE_NODE_LEAF;
+                    }
+                } else if len > code_len {
+                    codes_remaining = true;
+                }
+            }
+
+            if !codes_remaining || code_len >= MAX_CODE_LENGTH {
+                break;
             }
         }
 
         Ok(Self {
-            table,
-            table_bits,
-            max_length,
+            nodes,
+            single: None,
         })
     }
 
-    /// Reverse bits.
-    fn reverse_bits(mut value: u16, length: u8) -> u16 {
-        let mut result = 0u16;
-        for _ in 0..length {
-            result = (result << 1) | (value & 1);
-            value >>= 1;
-        }
-        result
-    }
-
-    /// Decode a symbol from the bit reader.
-    pub fn decode<R: Read>(&self, reader: &mut BitReader<R>) -> Result<u16> {
-        if self.max_length == 0 {
-            return Err(OxiArcError::invalid_huffman(reader.bit_position()));
+    /// Decode one symbol (lhasa `read_from_tree`): walk from the root taking
+    /// the MSB-first bit at each internal node until a leaf is reached.
+    pub fn decode<R: Read>(&self, reader: &mut MsbBitReader<R>) -> Result<u16> {
+        if let Some(sym) = self.single {
+            return Ok(sym);
         }
 
-        // Try to peek table_bits, but fall back to less if near end of stream
-        let bits = match reader.peek_bits(self.table_bits) {
-            Ok(b) => b,
-            Err(_) => {
-                // Try to peek whatever bits are available
-                // and pad with zeros (which is what the byte padding does)
-                let mut available = 0u8;
-                for i in 1..=self.table_bits {
-                    if reader.peek_bits(i).is_ok() {
-                        available = i;
-                    } else {
-                        break;
-                    }
-                }
-                if available == 0 {
-                    return Err(OxiArcError::unexpected_eof(1));
-                }
-                // Peek available bits
-                reader.peek_bits(available)?
+        let mut code = self.nodes[0];
+        let mut steps = 0u32;
+        while code & TREE_NODE_LEAF == 0 {
+            let bit = usize::from(reader.get_bit()?);
+            let idx = code as usize + bit;
+            if idx >= self.nodes.len() {
+                return Err(OxiArcError::invalid_huffman(reader.bits_read()));
             }
-        };
-
-        let entry = self.table[bits as usize];
-
-        if entry.is_valid() {
-            // Skip only the actual code length, not all table_bits
-            reader.skip_bits(entry.length())?;
-            Ok(entry.symbol())
-        } else {
-            // Need slow path for longer codes
-            Err(OxiArcError::invalid_huffman(reader.bit_position()))
+            code = self.nodes[idx];
+            steps += 1;
+            if steps > u32::from(MAX_CODE_LENGTH) {
+                // Guards against a malformed (cyclic) table.
+                return Err(OxiArcError::invalid_huffman(reader.bits_read()));
+            }
         }
+        Ok((code & !TREE_NODE_LEAF) as u16)
     }
 }
 
-/// Read the character/length Huffman tree from the stream.
-pub fn read_c_tree<R: Read>(reader: &mut BitReader<R>) -> Result<LzhHuffmanTree> {
-    let n = reader.read_bits(9)? as usize; // Number of codes
-    #[cfg(test)]
-    eprintln!("[read_c_tree] n={}, bit_pos={}", n, reader.bit_position());
+/// Read a length value: 3 bits, extended by a unary run of 1-bits terminated by
+/// a 0-bit when the base value is 7 (lhasa `read_length_value`).
+fn read_length_value<R: Read>(reader: &mut MsbBitReader<R>) -> Result<u8> {
+    let mut len = reader.get_bits(3)? as u8;
+    if len == 7 {
+        while reader.get_bit()? {
+            len += 1;
+            if len >= 32 {
+                // A conformant stream never approaches this; bail defensively
+                // rather than loop on zero-padded EOF.
+                break;
+            }
+        }
+    }
+    Ok(len)
+}
+
+/// Read the skip/zero-run count encoded by temp-table value `v` in the C-tree
+/// length list (lhasa `read_skip_count`): `0 -> 1`, `1 -> 4-bit + 3`,
+/// `2 -> 9-bit + 20`.
+fn read_skip_count<R: Read>(reader: &mut MsbBitReader<R>, v: u16) -> Result<usize> {
+    Ok(match v {
+        0 => 1,
+        1 => reader.get_bits(4)? as usize + 3,
+        _ => reader.get_bits(9)? as usize + 20,
+    })
+}
+
+/// Read the temp table (PT-tree) that in turn encodes the C-tree code lengths
+/// (lhasa `read_temp_table`).
+pub fn read_temp_tree<R: Read>(reader: &mut MsbBitReader<R>) -> Result<LzhHuffmanTree> {
+    let n = reader.get_bits(TEMP_CODE_BITS)? as usize;
 
     if n == 0 {
-        // Special case: single code
-        let c = reader.read_bits(9)? as usize;
-        let mut lengths = vec![0u8; NC];
-        if c < NC {
-            lengths[c] = 1;
-        }
-        return LzhHuffmanTree::from_lengths(&lengths, 12);
+        // Single code, value in a 5-bit field.
+        let code = reader.get_bits(5)? as u16;
+        return Ok(LzhHuffmanTree::single(code));
     }
 
-    // Read the temporary tree for decoding lengths
-    let pt = read_pt_tree(reader)?;
-    #[cfg(test)]
-    eprintln!(
-        "[read_c_tree] after PT tree, bit_pos={}",
-        reader.bit_position()
-    );
+    let n = n.min(MAX_TEMP_CODES);
+    let mut lengths = [0u8; MAX_TEMP_CODES];
 
-    // Read character/length code lengths
-    let mut lengths = vec![0u8; NC];
-    let mut i = 0;
+    let mut i = 0usize;
+    while i < n {
+        lengths[i] = read_length_value(reader)?;
 
-    while i < n.min(NC) {
-        #[cfg(test)]
-        let before_pos = reader.bit_position();
-        let c = pt.decode(reader)?;
-        #[cfg(test)]
-        if i < 5 || i > n - 3 {
-            eprintln!(
-                "[read_c_tree] i={}, decoded c={}, bits consumed={}",
-                i,
-                c,
-                reader.bit_position() - before_pos
-            );
-        }
-
-        if c <= 2 {
-            // Run of zeros
-            let count = match c {
-                0 => 1,
-                1 => reader.read_bits(4)? as usize + 3,
-                2 => reader.read_bits(9)? as usize + 20,
-                _ => unreachable!(),
-            };
-            #[cfg(test)]
-            if i < 5 || i > n - 3 {
-                eprintln!("[read_c_tree]   -> {} zeros", count);
-            }
-            for _ in 0..count {
+        // After the length of symbol index 2, a 2-bit field says how many of
+        // the next symbols (3, 4, 5) are skipped (length 0).
+        if i == 2 {
+            let skip = reader.get_bits(2)? as usize;
+            for _ in 0..skip {
+                i += 1;
                 if i < lengths.len() {
                     lengths[i] = 0;
-                    i += 1;
                 }
             }
-        } else if c == 3 {
-            // PT code 3 is unused (reserved for skip mechanism in PT tree)
-            // Treat as error or single zero for robustness
-            #[cfg(test)]
-            eprintln!("[read_c_tree]   -> PT code 3 (should not occur)");
-            lengths[i] = 0;
-            i += 1;
+        }
+
+        i += 1;
+    }
+
+    LzhHuffmanTree::from_code_lengths(&lengths[..n], MAX_TEMP_CODES * 2)
+}
+
+/// Read the C-tree (character/length codes), whose lengths are Huffman-encoded
+/// using `temp_tree` (lhasa `read_code_table`).
+pub fn read_code_tree<R: Read>(
+    reader: &mut MsbBitReader<R>,
+    temp_tree: &LzhHuffmanTree,
+) -> Result<LzhHuffmanTree> {
+    let n = reader.get_bits(9)? as usize;
+
+    if n == 0 {
+        let code = reader.get_bits(9)? as u16;
+        return Ok(LzhHuffmanTree::single(code));
+    }
+
+    let n = n.min(NC);
+    let mut lengths = vec![0u8; NC];
+
+    let mut i = 0usize;
+    while i < n {
+        let v = temp_tree.decode(reader)?;
+        if v <= 2 {
+            let skip = read_skip_count(reader, v)?;
+            for _ in 0..skip {
+                if i >= n {
+                    break;
+                }
+                lengths[i] = 0;
+                i += 1;
+            }
         } else {
-            // PT code >= 4: C-length = PT_code - 3
-            lengths[i] = (c - 3) as u8;
-            #[cfg(test)]
-            if i < 5 || i > n - 3 {
-                eprintln!("[read_c_tree]   -> length {}", lengths[i]);
-            }
+            // Temp value v (>= 3) denotes C-tree code length v - 2.
+            lengths[i] = (v - 2) as u8;
             i += 1;
         }
     }
 
-    #[cfg(test)]
-    eprintln!("[read_c_tree] done, bit_pos={}", reader.bit_position());
-
-    LzhHuffmanTree::from_lengths(&lengths, 12)
+    LzhHuffmanTree::from_code_lengths(&lengths[..n], NC * 2)
 }
 
-/// Read the position/distance Huffman tree from the stream.
+/// Read the offset/position tree (lhasa `read_offset_table`).
 ///
-/// The width of the code-count field depends on `np`: lh4/lh5 (`np = 14`)
-/// use 4 bits, lh6/lh7 (`np = 16`/`17`) need 5 bits.
-pub fn read_p_tree<R: Read>(reader: &mut BitReader<R>, np: usize) -> Result<LzhHuffmanTree> {
-    #[cfg(test)]
-    eprintln!("[read_p_tree] start, bit_pos={}", reader.bit_position());
-
-    let nbit = crate::methods::p_tree_count_bits(np);
-    let n = reader.read_bits(nbit)? as usize; // Number of codes
-    #[cfg(test)]
-    eprintln!("[read_p_tree] n={}", n);
+/// `offset_bits` is the method's count-field width and `max_codes` is
+/// `(1 << offset_bits) - 1`.
+pub fn read_offset_tree<R: Read>(
+    reader: &mut MsbBitReader<R>,
+    offset_bits: u8,
+    max_codes: usize,
+) -> Result<LzhHuffmanTree> {
+    let n = reader.get_bits(offset_bits)? as usize;
 
     if n == 0 {
-        // Special case: single code
-        let c = reader.read_bits(nbit)? as usize;
-        #[cfg(test)]
-        eprintln!(
-            "[read_p_tree] single code: {}, bit_pos={}",
-            c,
-            reader.bit_position()
-        );
-        let mut lengths = vec![0u8; np];
-        if c < np {
-            lengths[c] = 1;
-        }
-        return LzhHuffmanTree::from_lengths(&lengths, 8);
+        let code = reader.get_bits(offset_bits)? as u16;
+        return Ok(LzhHuffmanTree::single(code));
     }
 
-    // Read position code lengths
-    let mut lengths = vec![0u8; np];
-
-    for length in lengths.iter_mut().take(n.min(np)) {
-        let len = reader.read_bits(3)?;
-        *length = len as u8;
-
-        // Special escape for length 7
-        if len == 7 {
-            while reader.read_bit()? {
-                *length += 1;
-            }
-        }
-        #[cfg(test)]
-        eprintln!("[read_p_tree] P = {}", *length);
+    let n = n.min(max_codes);
+    let mut lengths = vec![0u8; max_codes.max(1)];
+    for length in lengths.iter_mut().take(n) {
+        *length = read_length_value(reader)?;
     }
 
-    #[cfg(test)]
-    eprintln!("[read_p_tree] done, bit_pos={}", reader.bit_position());
-
-    LzhHuffmanTree::from_lengths(&lengths, 8)
-}
-
-/// Read the temporary tree (for reading c_tree lengths).
-fn read_pt_tree<R: Read>(reader: &mut BitReader<R>) -> Result<LzhHuffmanTree> {
-    let n = reader.read_bits(5)? as usize;
-
-    if n == 0 {
-        // Single code
-        let c = reader.read_bits(5)? as usize;
-        let mut lengths = vec![0u8; NT];
-        if c < NT {
-            lengths[c] = 1;
-        }
-        return LzhHuffmanTree::from_lengths(&lengths, 5);
-    }
-
-    let mut lengths = vec![0u8; NT];
-
-    for i in 0..n.min(NT) {
-        if i == 3 {
-            // Special: skip count
-            let skip = reader.read_bits(2)? as usize;
-            for j in 0..skip {
-                if i + j < lengths.len() {
-                    lengths[i + j] = 0;
-                }
-            }
-            continue;
-        }
-
-        let len = reader.read_bits(3)?;
-        lengths[i] = len as u8;
-
-        if len == 7 {
-            while reader.read_bit()? {
-                lengths[i] += 1;
-            }
-        }
-    }
-
-    LzhHuffmanTree::from_lengths(&lengths, 5)
+    LzhHuffmanTree::from_code_lengths(&lengths[..n], max_codes.max(1) * 2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxiarc_core::MsbBitWriter;
+    use std::io::Cursor;
 
-    #[test]
-    fn test_reverse_bits() {
-        assert_eq!(LzhHuffmanTree::reverse_bits(0b101, 3), 0b101);
-        assert_eq!(LzhHuffmanTree::reverse_bits(0b1100, 4), 0b0011);
+    /// Emit a canonical Huffman code (MSB-first) matching the decoder.
+    fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
+        let max_len = *lengths.iter().max().unwrap_or(&0) as usize;
+        let mut bl_count = vec![0u32; max_len + 1];
+        for &l in lengths {
+            if l > 0 {
+                bl_count[l as usize] += 1;
+            }
+        }
+        let mut next_code = vec![0u32; max_len + 2];
+        let mut code = 0u32;
+        for bits in 1..=max_len {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+        let mut codes = vec![0u32; lengths.len()];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l > 0 {
+                codes[sym] = next_code[l as usize];
+                next_code[l as usize] += 1;
+            }
+        }
+        codes
     }
 
     #[test]
-    fn test_empty_tree() {
-        let tree = LzhHuffmanTree::from_lengths(&[], 8).expect("valid huffman table");
-        assert_eq!(tree.max_length, 0);
+    fn single_code_consumes_no_bits() {
+        let tree = LzhHuffmanTree::single(42);
+        let data = vec![0u8; 4];
+        let mut reader = MsbBitReader::new(Cursor::new(data));
+        assert_eq!(tree.decode(&mut reader).expect("decode"), 42);
+        assert_eq!(reader.bits_read(), 0, "single code must read zero bits");
     }
 
     #[test]
-    fn test_single_symbol_tree() {
-        let mut lengths = vec![0u8; 256];
-        lengths[65] = 1; // Only 'A'
+    fn canonical_tree_roundtrips_msb_first() {
+        // Symbols 0..=3 with lengths [2,1,3,3]: canonical codes are
+        // 1 -> 0, 0 -> 10, 2 -> 110, 3 -> 111.
+        let lengths = [2u8, 1, 3, 3];
+        let codes = canonical_codes(&lengths);
+        let tree = LzhHuffmanTree::from_code_lengths(&lengths, lengths.len() * 2).expect("tree");
 
-        let tree = LzhHuffmanTree::from_lengths(&lengths, 8).expect("valid huffman table");
-        assert_eq!(tree.max_length, 1);
+        let mut buf = Vec::new();
+        {
+            let mut w = MsbBitWriter::new(&mut buf);
+            for sym in [1u16, 0, 2, 3, 1, 1, 3] {
+                w.put_bits(lengths[sym as usize], codes[sym as usize])
+                    .expect("put");
+            }
+            w.flush().expect("flush");
+        }
+        let mut reader = MsbBitReader::new(Cursor::new(buf));
+        for sym in [1u16, 0, 2, 3, 1, 1, 3] {
+            assert_eq!(tree.decode(&mut reader).expect("decode"), sym);
+        }
+    }
+
+    #[test]
+    fn empty_lengths_build_ok() {
+        let tree = LzhHuffmanTree::from_code_lengths(&[], 2).expect("empty tree builds");
+        // A degenerate empty tree decodes to the leaf-initialised root (symbol 0)
+        // without panicking; real streams never invoke this.
+        let mut reader = MsbBitReader::new(Cursor::new(vec![0u8; 2]));
+        assert_eq!(tree.decode(&mut reader).expect("decode"), 0);
     }
 }

@@ -7,7 +7,7 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.4 (2026-06-06) | 37 tests passing**
+**Version: 0.3.5 (2026-07-07) | 45 tests passing**
 
 
 ## Features
@@ -237,6 +237,13 @@ oxiarc extract --memory-limit 1G large_archive.zip -o ./output/
 | 0 | Success |
 | 1 | Error (invalid archive, I/O error, etc.) |
 
+An unrecognized or corrupt archive format is treated as an error by every
+command that has to open the archive to do its job: `extract`, `test`, and
+`list` (including `list --json`, which prints nothing on stdout in that case)
+all exit `1` with a message on stderr. `detect` is exempt by design — its job
+is precisely to report unrecognized formats, so it always exits `0` and
+prints `Format: Unknown` instead.
+
 ## Error Messages
 
 ```
@@ -244,6 +251,7 @@ Error: Invalid magic number: expected [50, 4B], found [00, 00]
 Error: Unsupported compression method: LZMA
 Error: CRC mismatch: expected 0xABCD1234, computed 0x12345678
 Error: Corrupted data at offset 1234
+Error: unsupported or unrecognized archive format for mystery.bin: Unknown
 ```
 
 ## Usage with Pipes

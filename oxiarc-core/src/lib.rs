@@ -4,7 +4,8 @@
 //!
 //! This crate provides the fundamental building blocks for archive operations:
 //!
-//! - [`bitstream`]: Bit-level I/O for variable-length codes (Huffman, etc.)
+//! - [`bitstream`]: LSB-first bit-level I/O for variable-length codes (DEFLATE, etc.)
+//! - [`msb_bitstream`]: MSB-first bit-level I/O for canonical LZH/LHA codecs
 //! - [`ringbuffer`]: Sliding window buffer for LZ77/LZSS decompression
 //! - [`crc`]: CRC-32 and CRC-16 checksums
 //! - [`traits`]: Core traits for compression/decompression
@@ -61,6 +62,7 @@ pub mod crc;
 pub mod crc_simd;
 pub mod entry;
 pub mod error;
+pub mod msb_bitstream;
 pub mod progress;
 pub mod ringbuffer;
 pub mod traits;
@@ -77,6 +79,7 @@ pub use cancel::CancellationToken;
 pub use crc::{Crc16, Crc32, Crc64};
 pub use entry::{CompressionMethod, Entry, EntryBuilder, EntryType, FileAttributes};
 pub use error::{OxiArcError, Result};
+pub use msb_bitstream::{MsbBitReader, MsbBitWriter};
 pub use progress::{NoopProgress, ProgressHandle, ProgressSink, noop_progress};
 pub use ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
 pub use traits::{
@@ -108,6 +111,7 @@ pub mod prelude {
     pub use crate::error::{OxiArcError, Result};
     #[cfg(feature = "mmap")]
     pub use crate::mmap::{MappedFile, MmapOptions, MmapReader};
+    pub use crate::msb_bitstream::{MsbBitReader, MsbBitWriter};
     pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
     pub use crate::traits::{
         ArchiveReader, ArchiveWriter, CompressionLevel, Compressor, Decompressor,
