@@ -654,8 +654,19 @@ impl<W: Write> LzhWriter<W> {
     /// Consume the writer and return the inner writer.
     pub fn into_inner(mut self) -> Result<W> {
         self.finish()?;
-        let this = std::mem::ManuallyDrop::new(self);
-        Ok(unsafe { std::ptr::read(&this.writer) })
+        // SAFETY: `self` is wrapped in `ManuallyDrop` so its `Drop` impl
+        // (which would call `finish()` again) never runs. We read `writer`
+        // out without dropping it — it is the value returned to the caller
+        // — then explicitly drop `progress`, the only other field owning a
+        // resource (an `Arc` clone), so it is never leaked. `compression`,
+        // `finished`, `header_level`, and `entry_index` are `Copy` and own
+        // no resources.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let writer = unsafe { std::ptr::read(&this.writer) };
+        unsafe {
+            std::ptr::drop_in_place(&mut this.progress);
+        }
+        Ok(writer)
     }
 
     /// Get current Unix timestamp.

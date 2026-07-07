@@ -12,7 +12,6 @@ keywords = ["szip", "aec", "ccsds", "compression", "decompression"]
 categories = ["compression", "encoding", "science"]
 
 [dependencies]
-oxiarc-core = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

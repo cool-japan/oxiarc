@@ -582,8 +582,81 @@ mod tests {
         Ok(())
     }
 
-    // Note: More comprehensive tests would require generating valid
-    // compressed data with fixed/dynamic Huffman codes
+    /// Decoder-only test: hand-build a fixed-Huffman (BTYPE=01) block
+    /// containing a literal followed by a maximum-length (258) back
+    /// reference, and confirm `inflate` expands it correctly. This closes
+    /// the coverage gap where length-258 handling was only ever exercised
+    /// indirectly via encode-then-decode roundtrips (see
+    /// `tests/edge_cases.rs::test_max_match_length`) and `tables.rs` unit
+    /// tests on `length_to_code`, never via a decoder-only hand-built
+    /// bitstream.
+    #[test]
+    fn test_inflate_hand_built_length_258_match() -> Result<()> {
+        use oxiarc_core::BitWriter;
+
+        // Write `length` bits of `code`, most-significant bit first.
+        // DEFLATE Huffman codes are transmitted MSB-first (RFC 1951
+        // SS3.2.2), while `BitWriter::write_bits` packs its `value`
+        // LSB-first (bit 0 goes out first) — the same reason
+        // `Deflater::write_huffman_code` pre-reverses canonical codes
+        // before handing them to `BitWriter`. Feeding one bit at a time
+        // from the top down sidesteps needing that reversal here.
+        fn write_code_msb_first(
+            writer: &mut BitWriter<&mut Vec<u8>>,
+            code: u32,
+            length: u8,
+        ) -> Result<()> {
+            for i in (0..length).rev() {
+                writer.write_bit(((code >> i) & 1) != 0)?;
+            }
+            Ok(())
+        }
+
+        // Hand-build one fixed-Huffman block: a single literal 'A', then a
+        // length-258/distance-1 back-reference (i.e. "repeat the last byte
+        // 258 more times"), then end-of-block. Values per RFC 1951 SS3.2.6
+        // and this crate's own `tables::length_to_code`/`distance_to_code`:
+        //   - literal 'A' (0x41): symbols 0-143 use 8-bit codes 0x30-0xBF,
+        //     so code = 0x30 + 0x41 = 0x71.
+        //   - length 258 -> length code 285, 0 extra bits
+        //     (`length_to_code(258) == (285, 0, 0)`). Code 285 falls in the
+        //     280-287 range (8-bit codes 0xC0-0xC7): code = 0xC0 + 5 = 0xC5.
+        //   - distance 1 -> distance code 0, 0 extra bits
+        //     (`distance_to_code(1) == (0, 0, 0)`). Fixed distance codes
+        //     are plain 5-bit values; code 0 is all-zero bits.
+        //   - end-of-block: symbol 256 uses a 7-bit code, 0x00.
+        let mut compressed = Vec::new();
+        {
+            let mut writer = BitWriter::new(&mut compressed);
+
+            writer.write_bit(true)?; // BFINAL = 1 (only block)
+            writer.write_bits(0b01, 2)?; // BTYPE = 01 (fixed Huffman)
+
+            write_code_msb_first(&mut writer, 0x71, 8)?; // literal 'A'
+            write_code_msb_first(&mut writer, 0xC5, 8)?; // length code 285
+            write_code_msb_first(&mut writer, 0x00, 5)?; // distance code 0
+            write_code_msb_first(&mut writer, 0x00, 7)?; // end-of-block
+
+            writer.flush()?;
+        }
+
+        let result = inflate(&compressed)
+            .expect("inflate of hand-built length-258 match stream should succeed");
+
+        // One literal 'A' plus a length-258/distance-1 match: the match
+        // repeats the immediately preceding byte 258 times, so the full
+        // output is 259 copies of 'A'.
+        let expected = vec![b'A'; 259];
+        assert_eq!(result.len(), 259);
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    // Note: fixed-Huffman decoder coverage (including the length-258
+    // maximum-match case) is exercised above via a hand-built bitstream;
+    // dynamic-Huffman blocks are still only covered indirectly through
+    // encode-then-decode roundtrips elsewhere in this crate.
 
     #[test]
     fn test_try_decompress_sync_unit_roundtrip() {

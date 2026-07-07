@@ -179,20 +179,20 @@ fn test_streaming_bit_reader_multiple_reads() {
 
 #[test]
 fn test_streaming_bit_reader_peek_without_consume() {
-    let data = [0xAB];
+    let data = [0xAB]; // 0xAB == 1010_1011; MSB-first the high nibble (0xA) is first.
     let mut reader = StreamingBitReader::new();
 
-    // Peek at 4 bits
-    assert_eq!(reader.peek_bits(&data, 4), Some(0xB));
+    // Peek at 4 bits (high nibble)
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xA));
 
     // Peek again - should be the same
-    assert_eq!(reader.peek_bits(&data, 4), Some(0xB));
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xA));
 
     // Now read - should consume
-    assert_eq!(reader.read_bits(&data, 4), Some(0xB));
+    assert_eq!(reader.read_bits(&data, 4), Some(0xA));
 
-    // Peek next 4 bits
-    assert_eq!(reader.peek_bits(&data, 4), Some(0xA));
+    // Peek next 4 bits (low nibble)
+    assert_eq!(reader.peek_bits(&data, 4), Some(0xB));
 }
 
 #[test]
@@ -200,15 +200,15 @@ fn test_streaming_bit_reader_read_single_bits() {
     let data = [0b10101010]; // 0xAA
     let mut reader = StreamingBitReader::new();
 
-    // Read LSB first: 0, 1, 0, 1, 0, 1, 0, 1
-    assert_eq!(reader.read_bit(&data), Some(false)); // bit 0 = 0
-    assert_eq!(reader.read_bit(&data), Some(true)); // bit 1 = 1
-    assert_eq!(reader.read_bit(&data), Some(false)); // bit 2 = 0
-    assert_eq!(reader.read_bit(&data), Some(true)); // bit 3 = 1
-    assert_eq!(reader.read_bit(&data), Some(false)); // bit 4 = 0
-    assert_eq!(reader.read_bit(&data), Some(true)); // bit 5 = 1
-    assert_eq!(reader.read_bit(&data), Some(false)); // bit 6 = 0
+    // Read MSB first: 1, 0, 1, 0, 1, 0, 1, 0
     assert_eq!(reader.read_bit(&data), Some(true)); // bit 7 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 6 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 5 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 4 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 3 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 2 = 0
+    assert_eq!(reader.read_bit(&data), Some(true)); // bit 1 = 1
+    assert_eq!(reader.read_bit(&data), Some(false)); // bit 0 = 0
 }
 
 #[test]
@@ -685,4 +685,167 @@ fn test_streaming_lh6_edge_window_size() {
 #[test]
 fn test_streaming_lh7_edge_window_size() {
     run_edge_window_size(LzhMethod::Lh7);
+}
+
+// ============================================================================
+// Real-LHA corpus fixtures — incremental (chunked) streaming decode
+// ============================================================================
+//
+// These decode the same genuine, third-party `.lzh` archives in `tests/data/`
+// that validate the *serial* decoder (see `tests/corpus_fixtures.rs` and
+// `tests/data/README.md`), but drive the *streaming* decoder one awkward-sized
+// chunk at a time and assert byte-exactness against the paired `.expected`
+// plaintext. Passing here proves the streaming path is genuinely
+// real-LHA-compatible, not merely self-consistent with OxiArc's own encoder.
+
+/// Chase a chain of LZH extension-header chunks (`[u16 LE size][data...]`,
+/// `size` counts itself, `size == 0` terminates). Used by header levels 1/2.
+fn chase_extensions(data: &[u8], mut pos: usize) -> usize {
+    loop {
+        let size = u16::from_le_bytes(data[pos..pos + 2].try_into().expect("2 bytes")) as usize;
+        if size == 0 {
+            return pos + 2;
+        }
+        pos += size;
+    }
+}
+
+/// Parse just enough of an LZH level-0/1/2 header to locate the compressed
+/// payload. Returns `(payload_start_offset, method, uncompressed_size)`.
+fn locate_payload(data: &[u8]) -> (usize, LzhMethod, u64) {
+    let method = LzhMethod::from_id(&data[2..7]).expect("recognised method id");
+    let uncompressed_size = u32::from_le_bytes(data[11..15].try_into().expect("4 bytes")) as u64;
+    let level = data[20];
+    let start = match level {
+        0 => data[0] as usize + 2,
+        1 => {
+            let name_len = data[21] as usize;
+            let os_id_pos = 22 + name_len + 2;
+            chase_extensions(data, os_id_pos + 1)
+        }
+        2 => chase_extensions(data, 24),
+        other => panic!("unsupported LZH header level {other} in test fixture"),
+    };
+    (start, method, uncompressed_size)
+}
+
+/// Read a fixture file from `tests/data/`.
+fn read_data_file(name: &str) -> Vec<u8> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::fs::read(
+        std::path::Path::new(manifest_dir)
+            .join("tests/data")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+}
+
+/// Decode a fixture's LZH payload incrementally (feeding `input_chunk_size`
+/// bytes and draining into an `output_buf_size` scratch buffer per call) and
+/// assert byte-exactness against `expected_name`.
+fn assert_fixture_streams_exact(
+    lzh_name: &str,
+    expected_name: &str,
+    input_chunk_size: usize,
+    output_buf_size: usize,
+) {
+    let archive = read_data_file(lzh_name);
+    let expected = read_data_file(expected_name);
+    let (payload_start, method, uncompressed_size) = locate_payload(&archive);
+    let payload = &archive[payload_start..];
+
+    let got = chunk_sweep_decode(
+        payload,
+        method,
+        uncompressed_size,
+        input_chunk_size,
+        output_buf_size,
+    );
+
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "{lzh_name} (chunk={input_chunk_size}): decoded length mismatch",
+    );
+    if got != expected {
+        let first_diff = got
+            .iter()
+            .zip(expected.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(usize::MAX);
+        panic!(
+            "{lzh_name} (chunk={input_chunk_size}): streaming output diverges from \
+             {expected_name} at byte {first_diff}",
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h0_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h0_lh5.lzh",
+            "lha_unix114i_h0_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h1_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h1_lh5.lzh",
+            "lha_unix114i_h1_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h2_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h2_lh5.lzh",
+            "lha_unix114i_h2_lh5.expected",
+            chunk,
+            17,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha255e_lh5_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact("lha255e_lh5.lzh", "lha255e_lh5.expected", chunk, 17);
+    }
+}
+
+#[test]
+fn stream_corpus_lha_unix114i_h0_lh0_stored_tiny_chunks() {
+    for &chunk in &[1usize, 3, 7] {
+        assert_fixture_streams_exact(
+            "lha_unix114i_h0_lh0.lzh",
+            "lha_unix114i_h0_lh0.expected",
+            chunk,
+            13,
+        );
+    }
+}
+
+#[test]
+fn stream_corpus_lha213_lh5_long_multiblock() {
+    // 1.24 MB across many Huffman blocks (re-sent code tables). Awkward but
+    // larger chunks keep the call count reasonable while still crossing block,
+    // table, and byte boundaries mid-symbol.
+    for &(chunk, out_buf) in &[(7usize, 4096usize), (13, 8192), (1023, 512)] {
+        assert_fixture_streams_exact(
+            "lha213_lh5_long.lzh",
+            "lha213_lh5_long.expected",
+            chunk,
+            out_buf,
+        );
+    }
 }

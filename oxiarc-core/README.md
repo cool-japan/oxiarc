@@ -3,11 +3,13 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.3.4-blue)
+![Version](https://img.shields.io/badge/version-0.3.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.4** (2026-06-06) — 132 tests passing.
+**Version 0.3.5** (2026-07-07) — 154 tests passing.
+
+**What's new in 0.3.5**: Added `msb_bitstream` — `MsbBitReader`/`MsbBitWriter`, genuine most-significant-bit-first bit I/O for canonical LZH/LHA-family bitstream work (mirrors canonical LHA `getbits`/`putbits`/`fillbuf` semantics), a sibling to the existing LSB-first `BitReader`/`BitWriter` used by DEFLATE. Re-exported from the crate root and `prelude`.
 
 **What's new in 0.3.0**: Added `MappedFile` — a zero-copy memory-mapped file primitive backed by `memmap2` (enable the `mmap` feature). SIMD CRC-32 acceleration is now auto-enabled at compile time via `cfg(target_arch)` and no longer requires the `simd` feature flag; the flag is now a deprecated no-op.
 
@@ -17,6 +19,7 @@ Core primitives and traits for the OxiArc archive library.
 ## Features
 
 - **BitStream** - Bit-level I/O for variable-length codes
+- **MsbBitStream** - MSB-first bit-level I/O for canonical LZH/LHA-family codecs
 - **RingBuffer** - Sliding window buffer for LZ77/LZSS
 - **CRC** - CRC-32 and CRC-16 checksums
 - **Traits** - Core traits for compression/decompression
@@ -53,6 +56,34 @@ Key features:
 - `read_bits(count)` / `write_bits(value, count)`
 - Byte alignment with `align_to_byte()`
 - Peek ahead without consuming
+
+### msb_bitstream
+
+MSB-first bit-level I/O for canonical LZH/LHA-family bitstream work — the most-significant-bit-first sibling of `bitstream`, for codecs (the classic `lha`/`LHarc` family, including this crate's `-lh5-` support) that pack bits opposite to DEFLATE's LSB-first order.
+
+```rust
+use oxiarc_core::msb_bitstream::{MsbBitReader, MsbBitWriter};
+use std::io::Cursor;
+
+// Write bits, MSB-first (canonical LZH/LHA bit order)
+let mut output = Vec::new();
+let mut writer = MsbBitWriter::new(&mut output);
+writer.put_bits(3, 0b101)?; // emits 1, 0, 1
+writer.put_bits(1, 0b1)?;   // emits 1
+writer.flush()?;           // zero-pads the final byte
+
+// Read them back
+let mut reader = MsbBitReader::new(Cursor::new(&output));
+let a = reader.get_bits(3)?; // 0b101
+let b = reader.get_bits(1)?; // 0b1
+```
+
+Key features:
+- Mirrors canonical LHA `getbits`/`putbits`/`fillbuf` bit semantics exactly
+- `get_bits(count)` / `put_bits(count, value)`, plus single-bit `get_bit()` / `put_bit()`
+- `peek_bits(count)` without consuming, paired with `skip_bits(count)` — the canonical Huffman-decode idiom (peek a max-width code, look it up, skip the matched length)
+- Zero-pads past end-of-input instead of erroring, matching LHA's `fillbuf`; `padding_bits()` reports how much was synthesized so callers can detect a truncated stream
+- `bits_read()` / `bits_written()` logical bit counters
 
 ### ringbuffer
 
@@ -177,14 +208,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.3.4"
+oxiarc-core = "0.3.5"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.3.4", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.3.5", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary
@@ -192,6 +223,7 @@ oxiarc-core = { version = "0.3.4", features = ["async-io", "mmap"] }
 | Module | Key Types |
 |--------|-----------|
 | `bitstream` | `BitReader<R>`, `BitWriter<W>` |
+| `msb_bitstream` | `MsbBitReader<R>`, `MsbBitWriter<W>` |
 | `ringbuffer` | `RingBuffer`, `OutputRingBuffer` |
 | `crc` | `Crc32`, `Crc16` |
 | `traits` | `Compressor`, `Decompressor`, `ArchiveReader`, `ArchiveWriter` |

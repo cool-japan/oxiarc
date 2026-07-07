@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.3.3, 2026-06-06)
+# oxiarc-deflate - Development Status (v0.3.5, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 
@@ -157,7 +157,7 @@
 ### Compliance
 - [x] Round-trip testing (zlib/gzip format compliance, 2026-05-17)
 - [ ] Fuzzing tests
-- [ ] Edge case handling (empty input, max length matches)
+- [x] Edge case handling (empty input, max length matches) (completed 2026-07-07) — both cases already correct (empty-input special case in write_stored_blocks; length 258→code 285 in length_to_code); added decoder-only hand-built length-258 vector to close the coverage gap.
 
 ## Test Coverage
 

@@ -353,7 +353,10 @@ fn crc32_slice8(crc: &mut u32, data: &[u8]) {
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
-    while unsafe { ptr.add(8) } <= end {
+    // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+    // `ptr.add(n)` is UB when the result would land more than one byte past the end
+    // of the allocation, even if the pointer is only compared and never dereferenced.
+    while (end as usize) - (ptr as usize) >= 8 {
         // Read 8 bytes
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
 
@@ -539,7 +542,10 @@ fn crc64_slice8(crc: &mut u64, data: &[u8]) {
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
-    while unsafe { ptr.add(8) } <= end {
+    // SAFETY-FIX: compare addresses instead of calling `ptr.add(8)` speculatively.
+    // `ptr.add(n)` is UB when the result would land more than one byte past the end
+    // of the allocation, even if the pointer is only compared and never dereferenced.
+    while (end as usize) - (ptr as usize) >= 8 {
         // Read 8 bytes
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
 

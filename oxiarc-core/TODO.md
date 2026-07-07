@@ -1,5 +1,5 @@
 
-# oxiarc-core - Development Status (v0.3.3, 2026-06-06)
+# oxiarc-core - Development Status (v0.3.5, 2026-07-07)
 
 ## Completed Features (COMPLETE)
 
@@ -121,7 +121,7 @@
 
 ## Test Coverage
 
-- Total: 132 tests (CRC-32/64 slicing-by-8, DualCrc optimization, size boundary, bitstream, ringbuffer, entry, traits)
+- Total: 154 tests (CRC-32/64 slicing-by-8, DualCrc optimization, size boundary, bitstream, msb_bitstream, ringbuffer, entry, traits)
 
 ## Code Statistics
 

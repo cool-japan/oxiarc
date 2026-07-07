@@ -17,6 +17,15 @@ default = []
 mmap = ["oxiarc-core/mmap"]
 # Async I/O support via Tokio
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
+# Archive-level oracle tests (tests/lzh_lha_oracle.rs) that shell out to the
+# real `lha` CLI (Lhasa, decompress-only) to prove that LZH archives produced
+# by `LzhWriter` are readable by an independent LHA implementation: `lha l`
+# (list), `lha t` (CRC-16 test) and `lha x`/`lha p` (extract + byte-diff).
+# Mirrors the `lha-oracle` feature in `oxiarc-lzhuf` (which validates the codec
+# stream); this one validates the surrounding archive headers. Self-skips (with
+# a printed note, no failure) when `lha` is not on PATH. Never enabled by
+# default; not needed for normal library use.
+lha-oracle = []
 
 [dependencies]
 oxiarc-core.workspace = true

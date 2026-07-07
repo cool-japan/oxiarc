@@ -13,6 +13,12 @@ categories = ["compression", "encoding"]
 
 [features]
 parallel = ["dep:rayon"]
+# Encode-direction oracle tests (tests/lha_oracle.rs) that shell out to the
+# real `lha` CLI (Lhasa) to validate OxiArc-produced archives. Implies
+# `parallel`, whose `lzh_compress_parallel` builds the minimal single-entry
+# test archives. Self-skips (does not fail) at runtime if `lha` is not on
+# PATH. Never enabled by default; not needed for normal library use.
+lha-oracle = ["parallel"]
 
 [dependencies]
 oxiarc-core.workspace = true
