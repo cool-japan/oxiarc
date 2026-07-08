@@ -33,6 +33,45 @@ const MAX_REASONABLE_COUNT: u64 = 16 * 1024 * 1024;
 /// Maximum accepted size of the next header block.
 const MAX_HEADER_SIZE: u64 = 1 << 31;
 
+/// Read exactly `declared_len` bytes starting at the reader's current
+/// position, bounding the allocation against the number of bytes actually
+/// remaining in the underlying stream.
+///
+/// Both the 7z "next header" size and per-folder "pack size" fields are
+/// untrusted values taken directly from the archive header/metadata. A
+/// crafted archive can declare an implausible size for what is really a
+/// small or truncated file; blindly turning that into `vec![0u8; declared]`
+/// would allocate (and zero-fill) up to a couple of GiB before a single
+/// byte is even read, and a sufficiently adversarial `declared_len` could
+/// overflow the allocator entirely and abort the process.
+///
+/// Here the declared length is first checked against the number of bytes
+/// actually remaining from the current stream position to EOF, and the
+/// allocation itself goes through `try_reserve_exact` so an
+/// oversized-but-still-"remaining" declaration surfaces as a normal `Err`.
+fn read_bounded_by_remaining<R: Read + Seek>(reader: &mut R, declared_len: u64) -> Result<Vec<u8>> {
+    let current = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(current))?;
+    let remaining = end.saturating_sub(current);
+
+    if declared_len > remaining {
+        return Err(OxiArcError::invalid_header(format!(
+            "7z declares a block of {declared_len} bytes but only {remaining} bytes remain in the stream"
+        )));
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(declared_len as usize).map_err(|_| {
+        OxiArcError::invalid_header(format!(
+            "unable to allocate {declared_len} bytes while reading 7z stream data"
+        ))
+    })?;
+    data.resize(declared_len as usize, 0);
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
 /// Property IDs for 7z format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -499,8 +538,7 @@ impl<R: Read + Seek> SevenZReader<R> {
         reader.seek(SeekFrom::Start(32 + next_header_offset))?;
 
         // Read next header
-        let mut header_data = vec![0u8; next_header_size as usize];
-        reader.read_exact(&mut header_data)?;
+        let header_data = read_bounded_by_remaining(&mut reader, next_header_size)?;
 
         // Verify header CRC
         let computed_header_crc = Crc32::compute(&header_data);
@@ -1235,8 +1273,7 @@ fn decode_folder_data<R: Read + Seek>(
         .ok_or_else(|| OxiArcError::invalid_header("7z packed stream index out of range"))?;
 
     reader.seek(SeekFrom::Start(pack_offset))?;
-    let mut packed = vec![0u8; pack_size as usize];
-    reader.read_exact(&mut packed)?;
+    let packed = read_bounded_by_remaining(reader, pack_size)?;
 
     // Walk the linear coder chain via bind pairs. With 1-in/1-out coders,
     // input stream i and output stream i both belong to coder i.
@@ -1514,5 +1551,58 @@ mod tests {
         let mut pos = 0;
         let result = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos);
         assert!(result.is_err());
+    }
+
+    /// `read_bounded_by_remaining` must reject a declared length larger
+    /// than the bytes actually remaining in the stream, rather than
+    /// attempting a `vec![0u8; declared_len]`-style allocation up front.
+    #[test]
+    fn test_read_bounded_by_remaining_rejects_oversized_declaration() {
+        let mut cursor = std::io::Cursor::new(vec![1u8, 2, 3, 4]);
+        // Declare a size far beyond both the 4 bytes present here and any
+        // reasonable archive size.
+        let result = read_bounded_by_remaining(&mut cursor, u32::MAX as u64 * 4);
+        assert!(result.is_err());
+    }
+
+    /// A declared length that is in range must still be read correctly.
+    #[test]
+    fn test_read_bounded_by_remaining_reads_valid_declaration() {
+        let mut cursor = std::io::Cursor::new(vec![10u8, 20, 30, 40, 50]);
+        let data = read_bounded_by_remaining(&mut cursor, 3).expect("read within bounds");
+        assert_eq!(data, vec![10, 20, 30]);
+    }
+
+    /// A `SevenZReader::new` call over a signature header that declares an
+    /// implausible `next_header_size` (larger than the bytes actually
+    /// remaining after the signature header) must fail cleanly instead of
+    /// attempting to allocate/zero-fill that many bytes.
+    #[test]
+    fn test_sevenz_reader_new_rejects_oversized_next_header_size() {
+        // 32-byte signature header: 6-byte magic, 2-byte version, 4-byte
+        // start-header CRC, 8-byte next_header_offset, 8-byte
+        // next_header_size, 4-byte next_header_crc.
+        let mut sig = vec![0u8; 32];
+        sig[0..6].copy_from_slice(&SEVENZ_MAGIC);
+        sig[6] = 0; // major version
+        sig[7] = 4; // minor version
+
+        let next_header_offset: u64 = 0;
+        let next_header_size: u64 = 1 << 20; // declared, but no bytes follow
+
+        sig[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
+        sig[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+
+        let start_header_crc = Crc32::compute(&sig[12..32]);
+        sig[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+
+        // No bytes follow the 32-byte signature header at all, so the
+        // declared 1 MiB next-header size vastly exceeds what remains.
+        let cursor = std::io::Cursor::new(sig);
+        let result = SevenZReader::new(cursor);
+        assert!(
+            result.is_err(),
+            "oversized next_header_size with no remaining bytes must error"
+        );
     }
 }

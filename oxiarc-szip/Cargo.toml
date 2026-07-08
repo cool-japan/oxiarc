@@ -11,11 +11,15 @@ readme = "README.md"
 keywords = ["szip", "aec", "ccsds", "compression", "decompression"]
 categories = ["compression", "encoding", "science"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "szip_bench"

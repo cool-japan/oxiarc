@@ -42,6 +42,8 @@
 //! assert_eq!(output, b"Hello, streaming Snappy!");
 //! ```
 
+#![warn(missing_docs)]
+
 #[cfg(feature = "async-io")]
 pub mod async_snappy;
 pub mod compress;

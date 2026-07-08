@@ -62,6 +62,7 @@ memmap2 = "0.9.11"
 criterion = "0.8.2"
 weezl = "0.2.1"
 glob = "0.3.3"
+proptest = "1.11.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

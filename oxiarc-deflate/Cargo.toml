@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Pure Rust DEFLATE compression algorithm (RFC 1951) for OxiArc"
 keywords = ["deflate", "compression", "huffman", "lz77", "zlib"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
@@ -25,6 +29,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "lz77_bench"

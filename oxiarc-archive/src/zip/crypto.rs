@@ -250,10 +250,15 @@ impl ZipCrypto {
         header
     }
 
-    /// Generate an encryption header using a simple random source.
+    /// Generate an encryption header using a caller-provided deterministic seed.
     ///
-    /// This generates pseudo-random bytes based on the provided seed values.
-    /// For production use, consider using a cryptographically secure RNG.
+    /// This derives the 11 random header bytes from an LCG seeded with the
+    /// supplied values, so the output is fully reproducible. It is intended for
+    /// tests and for callers that already own a high-quality seed; it is **not**
+    /// a cryptographically secure source. For production encryption, prefer
+    /// [`ZipCrypto::generate_header_random`] (or
+    /// [`ZipCryptoWriter::write_header_secure`]), which pulls the random bytes
+    /// from the operating system CSPRNG.
     ///
     /// # Arguments
     ///
@@ -279,6 +284,28 @@ impl ZipCrypto {
             *byte = (state >> 56) as u8;
         }
 
+        self.generate_header(crc32, &random)
+    }
+
+    /// Generate an encryption header using the operating system CSPRNG.
+    ///
+    /// The 11 random header bytes are drawn from the same OS CSPRNG used for AES
+    /// salts (`/dev/urandom` on Unix-like systems, with a runtime-entropy
+    /// fallback). This is the recommended way to build a traditional-encryption
+    /// header for real archives, since it does not rely on a predictable,
+    /// caller-supplied seed the way [`ZipCrypto::generate_header_seeded`] does.
+    ///
+    /// # Arguments
+    ///
+    /// * `crc32` - The CRC-32 of the uncompressed file data.
+    ///
+    /// # Returns
+    ///
+    /// A 12-byte encrypted header.
+    pub fn generate_header_random(&mut self, crc32: u32) -> [u8; ENCRYPTION_HEADER_SIZE] {
+        let random_bytes = super::encryption::generate_salt(11);
+        let mut random = [0u8; 11];
+        random.copy_from_slice(&random_bytes);
         self.generate_header(crc32, &random)
     }
 
@@ -425,6 +452,26 @@ impl<W: Write> ZipCryptoWriter<W> {
     /// The number of bytes written (always 12).
     pub fn write_header(&mut self, crc32: u32, seed1: u64, seed2: u64) -> Result<usize> {
         let header = self.cipher.generate_header_seeded(crc32, seed1, seed2);
+        self.inner.write_all(&header)?;
+        Ok(ENCRYPTION_HEADER_SIZE)
+    }
+
+    /// Write the encryption header using the operating system CSPRNG.
+    ///
+    /// Unlike [`ZipCryptoWriter::write_header`], the 11 random header bytes are
+    /// drawn from the OS CSPRNG rather than a caller-supplied seed, so the
+    /// header is unpredictable. This is the recommended entry point for real
+    /// archives.
+    ///
+    /// # Arguments
+    ///
+    /// * `crc32` - The CRC-32 of the uncompressed data.
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes written (always 12).
+    pub fn write_header_secure(&mut self, crc32: u32) -> Result<usize> {
+        let header = self.cipher.generate_header_random(crc32);
         self.inner.write_all(&header)?;
         Ok(ENCRYPTION_HEADER_SIZE)
     }
@@ -684,6 +731,55 @@ mod tests {
         let mut decrypted = vec![0u8; plaintext.len()];
         reader.read_exact(&mut decrypted).expect("read failed");
 
+        assert_eq!(&decrypted[..], &plaintext[..]);
+    }
+
+    #[test]
+    fn test_header_random_roundtrip() {
+        // A CSPRNG-sourced header must still verify against the correct password
+        // and CRC, and (with overwhelming probability) differ between calls.
+        let crc32: u32 = 0xDEADBEEF;
+        let password = b"testpassword";
+
+        let mut cipher = ZipCrypto::new(password);
+        let header1 = cipher.generate_header_random(crc32);
+        let mut cipher = ZipCrypto::new(password);
+        let header2 = cipher.generate_header_random(crc32);
+
+        // The encrypted random portion should differ between headers.
+        assert_ne!(header1[..11], header2[..11]);
+
+        // And the header must still pass verification.
+        let mut cipher = ZipCrypto::new(password);
+        let mut cursor = Cursor::new(header1);
+        assert!(cipher.verify_header(&mut cursor, crc32).is_ok());
+    }
+
+    #[test]
+    fn test_writer_secure_header_roundtrip() {
+        let password = b"secret";
+        let crc32: u32 = 0x12345678;
+        let plaintext = b"Data to encrypt via secure header writer";
+
+        let mut output = Vec::new();
+        {
+            let mut writer = ZipCryptoWriter::new(&mut output, password);
+            writer
+                .write_header_secure(crc32)
+                .expect("write secure header failed");
+            writer.write_all(plaintext).expect("write failed");
+        }
+
+        assert_eq!(output.len(), ENCRYPTION_HEADER_SIZE + plaintext.len());
+
+        let mut cursor = Cursor::new(&output);
+        let mut reader = ZipCryptoReader::new(&mut cursor, password);
+        reader
+            .verify_header(crc32)
+            .expect("header verification failed");
+
+        let mut decrypted = vec![0u8; plaintext.len()];
+        reader.read_exact(&mut decrypted).expect("read failed");
         assert_eq!(&decrypted[..], &plaintext[..]);
     }
 

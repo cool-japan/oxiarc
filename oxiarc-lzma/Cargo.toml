@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Pure Rust LZMA/LZMA2 compression with custom dictionaries, memory pool, parallel and streaming support for OxiArc"
 keywords = ["lzma", "lzma2", "compression", "7z", "xz"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
@@ -24,6 +28,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]

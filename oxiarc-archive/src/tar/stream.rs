@@ -1,12 +1,25 @@
 //! Streaming TAR reader — no `Seek` required.
 
 use oxiarc_core::cancel::CancellationToken;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
 use std::collections::HashMap;
 use std::io::Read;
 
 use super::{BLOCK_SIZE, TarHeader};
+
+/// Upper bound on the size of a single PAX extended-header or GNU
+/// long-name/long-link record read via [`TarStreamReader::read_extension_data`].
+///
+/// `header.size` for these records comes straight from an untrusted TAR
+/// header field. Because `TarStreamReader` only requires `Read` (no
+/// `Seek`), it cannot cheaply learn how many bytes actually remain in the
+/// underlying stream the way the seekable [`super::reader::TarReader`]
+/// can, so a fixed sanity cap is used instead: real-world PAX headers and
+/// long names/links are at most a few KiB, so 64 MiB is generous headroom
+/// while still preventing a crafted archive from forcing an
+/// arbitrarily large allocation before any data is validated.
+const MAX_EXTENSION_DATA_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Streaming TAR reader requiring only `Read` — no `Seek` needed.
 ///
@@ -180,7 +193,19 @@ impl<R: Read> TarStreamReader<R> {
 
     /// Read `size` bytes of extension-header data plus its block padding.
     fn read_extension_data(&mut self, size: u64) -> Result<Vec<u8>> {
-        let mut data = vec![0u8; size as usize];
+        if size > MAX_EXTENSION_DATA_SIZE {
+            return Err(OxiArcError::invalid_header(format!(
+                "TAR extension header declares size {size}, exceeding the {MAX_EXTENSION_DATA_SIZE}-byte sanity limit"
+            )));
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(size as usize).map_err(|_| {
+            OxiArcError::invalid_header(format!(
+                "unable to allocate {size} bytes for TAR extension header data"
+            ))
+        })?;
+        data.resize(size as usize, 0);
         self.reader.read_exact(&mut data)?;
         let padding = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
         if padding > 0 {

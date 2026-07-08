@@ -30,6 +30,35 @@ pub struct FrameHeader {
     pub header_size: usize,
 }
 
+/// Reserve capacity for the decoded output buffer without trusting the
+/// attacker-controlled `Frame_Content_Size` field.
+///
+/// The requested `content_size` is clamped to `window_size` (itself already
+/// clamped to [`MAX_WINDOW_SIZE`]) before reserving, so a frame declaring a
+/// content size near `u64::MAX` cannot force an allocation request that
+/// exceeds `isize::MAX` (which would otherwise panic with "capacity
+/// overflow") nor an unbounded/OOM-inducing allocation. Uses `try_reserve`
+/// so that even the clamped amount failing to allocate becomes a clean
+/// `Result::Err` instead of an abort.
+fn reserve_output_capacity(
+    output: &mut Vec<u8>,
+    content_size: u64,
+    window_size: usize,
+) -> Result<()> {
+    let capped = content_size
+        .min(window_size as u64)
+        .min(MAX_WINDOW_SIZE as u64) as usize;
+    output
+        .try_reserve(capped)
+        .map_err(|e| OxiArcError::CorruptedData {
+            offset: 0,
+            message: format!(
+                "failed to reserve {} bytes for declared content size {}: {}",
+                capped, content_size, e
+            ),
+        })
+}
+
 /// Parse frame header.
 pub fn parse_frame_header(data: &[u8]) -> Result<FrameHeader> {
     if data.len() < 5 {
@@ -215,9 +244,9 @@ impl ZstdDecoder {
         let header = parse_frame_header(data)?;
         self.window_size = header.window_size;
 
-        // Reserve space for output
+        // Reserve space for output (capped; see `reserve_output_capacity`).
         if let Some(size) = header.content_size {
-            self.output.reserve(size as usize);
+            reserve_output_capacity(&mut self.output, size, header.window_size)?;
         }
 
         let mut pos = header.header_size;
@@ -544,7 +573,7 @@ fn decompress_frame_with_decoder(
     decoder.window_size = header.window_size;
 
     if let Some(size) = header.content_size {
-        decoder.output.reserve(size as usize);
+        reserve_output_capacity(&mut decoder.output, size, header.window_size)?;
     }
 
     let mut pos = header.header_size;
@@ -704,6 +733,49 @@ mod tests {
     fn test_decoder_creation() {
         let decoder = ZstdDecoder::new();
         assert_eq!(decoder.window_size, MAX_WINDOW_SIZE);
+    }
+
+    /// Regression test: a crafted frame declaring a `Frame_Content_Size`
+    /// near `u64::MAX` must not panic (capacity overflow) or abort (OOM) —
+    /// it must simply return `Err`. See `reserve_output_capacity`.
+    #[test]
+    fn test_decode_frame_huge_content_size_no_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&ZSTD_MAGIC);
+        // Single-segment frame with an 8-byte content size field.
+        data.push(0x20 | 0xC0); // FHD_SINGLE_SEGMENT | 8-byte content size flag
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        // No block data follows, so decoding must fail cleanly with a
+        // corrupted-data error rather than panicking on the huge reserve.
+
+        let result = std::panic::catch_unwind(|| {
+            let mut decoder = ZstdDecoder::new();
+            decoder.decode_frame(&data)
+        });
+
+        let decode_result = result.expect("decode_frame must not panic on huge content_size");
+        assert!(decode_result.is_err());
+    }
+
+    /// Same regression, exercised through `reserve_output_capacity` directly
+    /// to confirm the capped amount is well within `MAX_WINDOW_SIZE` and
+    /// that `try_reserve` on an implausibly large request returns `Err`
+    /// instead of aborting.
+    #[test]
+    fn test_reserve_output_capacity_caps_and_never_panics() {
+        let mut output: Vec<u8> = Vec::new();
+        // A content size near u64::MAX, with a window_size at the maximum
+        // allowed, must be capped down to MAX_WINDOW_SIZE and succeed.
+        let result = reserve_output_capacity(&mut output, u64::MAX, MAX_WINDOW_SIZE);
+        assert!(result.is_ok());
+        assert!(output.capacity() <= MAX_WINDOW_SIZE);
+
+        // A merely large but "sane" content size should reserve exactly
+        // that much when it is below the window size cap.
+        let mut output2: Vec<u8> = Vec::new();
+        let result2 = reserve_output_capacity(&mut output2, 1024, MAX_WINDOW_SIZE);
+        assert!(result2.is_ok());
+        assert!(output2.capacity() >= 1024);
     }
 
     #[test]

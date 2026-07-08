@@ -58,11 +58,19 @@ pub struct Lzma2Decoder {
 
 impl Lzma2Decoder {
     /// Create a new LZMA2 decoder with the given dictionary size.
+    ///
+    /// `dict_size` is clamped to [`crate::decoder::DICT_SIZE_ALLOC_CAP`] to
+    /// guard against a maliciously (or accidentally) huge header-declared
+    /// dictionary forcing an outsized allocation — the LZMA2 properties byte
+    /// can legitimately encode dictionary sizes up to ~4 GiB. The backing
+    /// buffer itself is grown lazily as data is decoded (via the internal
+    /// `update_dictionary` path) rather than eagerly zero-filled at
+    /// `dict_size`.
     pub fn new(dict_size: u32) -> Self {
-        let dict_size = dict_size.max(4096);
+        let dict_size = dict_size.clamp(4096, crate::decoder::DICT_SIZE_ALLOC_CAP);
         Self {
             dict_size,
-            dictionary: vec![0u8; dict_size as usize],
+            dictionary: Vec::new(),
             dict_pos: 0,
             dict_len: 0,
             props: None,
@@ -610,11 +618,24 @@ impl Lzma2Decoder {
     }
 
     /// Update the dictionary with new data.
+    ///
+    /// The backing `dictionary` buffer grows lazily: a byte is appended
+    /// (extending physical storage) only when `dict_pos` has reached the
+    /// current end of the buffer; otherwise it overwrites an already-grown
+    /// slot in place. This means the buffer only ever grows up to
+    /// `dict_size` bytes as data is actually decoded — even across
+    /// mid-stream dictionary resets (which rewind the logical `dict_pos`/
+    /// `dict_len` counters to 0 without shrinking the physical buffer) — and
+    /// never eagerly allocates the full header-declared size up front.
     fn update_dictionary(&mut self, data: &[u8]) {
         let dict_capacity = self.dict_size as usize;
 
         for &byte in data {
-            self.dictionary[self.dict_pos] = byte;
+            if self.dict_pos < self.dictionary.len() {
+                self.dictionary[self.dict_pos] = byte;
+            } else {
+                self.dictionary.push(byte);
+            }
             self.dict_pos = (self.dict_pos + 1) % dict_capacity;
             if self.dict_len < dict_capacity {
                 self.dict_len += 1;

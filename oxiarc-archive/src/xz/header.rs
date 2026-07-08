@@ -129,6 +129,11 @@ pub struct XzReader<R: Read> {
     cancel: Option<CancellationToken>,
     /// Cumulative decompressed bytes produced so far.
     bytes_processed: u64,
+    /// Size in bytes of the Index field (Index Indicator + Number of
+    /// Records + List of Records + Index Padding + CRC32), populated by
+    /// [`Self::skip_index`] and cross-checked against the stream footer's
+    /// Backward Size field in [`Self::read_footer`].
+    index_size: usize,
 }
 
 impl<R: Read> XzReader<R> {
@@ -165,6 +170,7 @@ impl<R: Read> XzReader<R> {
             progress: None,
             cancel: None,
             bytes_processed: 0,
+            index_size: 0,
         })
     }
 
@@ -240,6 +246,16 @@ impl<R: Read> XzReader<R> {
                     if props_size >= 1 {
                         let dict_props = header[offset];
                         dict_size = dict_size_from_props(dict_props);
+                        if dict_size > oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP {
+                            return Err(OxiArcError::corrupted(
+                                0,
+                                format!(
+                                    "XZ block declares LZMA2 dictionary size {dict_size} bytes, \
+                                     exceeding the maximum allowed allocation of {} bytes",
+                                    oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP
+                                ),
+                            ));
+                        }
                         offset += props_size as usize;
                     }
                 } else {
@@ -266,7 +282,7 @@ impl<R: Read> XzReader<R> {
             output.extend_from_slice(&block_data);
         }
 
-        // Read and skip index (for now)
+        // Parse the index, validating its trailing CRC-32.
         self.skip_index()?;
 
         // Read stream footer
@@ -496,7 +512,7 @@ impl<R: Read> XzReader<R> {
         Ok(data)
     }
 
-    /// Skip the index.
+    /// Parse the index and validate its trailing CRC-32.
     fn skip_index(&mut self) -> Result<()> {
         // The index indicator (0x00) was already read when we detected end of blocks
         // Now we need to read the number of records and skip the index
@@ -552,9 +568,21 @@ impl<R: Read> XzReader<R> {
             index_data.push(byte[0]);
         }
 
-        // Read CRC32 (4 bytes) - already included in alignment calculation above
+        // Read and verify the trailing CRC32, which covers everything parsed
+        // above (Index Indicator + Number of Records + List of Records +
+        // Index Padding) but not the CRC32 field itself.
         let mut crc = [0u8; 4];
         self.reader.read_exact(&mut crc)?;
+        let expected_crc = u32::from_le_bytes(crc);
+        let computed_crc = Crc32::compute(&index_data);
+        if expected_crc != computed_crc {
+            return Err(OxiArcError::crc_mismatch(expected_crc, computed_crc));
+        }
+
+        // Remember the total on-disk size of the Index field (everything
+        // just parsed, plus the 4-byte CRC32) so it can be cross-checked
+        // against the stream footer's Backward Size field.
+        self.index_size = index_data.len() + 4;
 
         Ok(())
     }
@@ -575,6 +603,31 @@ impl<R: Read> XzReader<R> {
         if footer_flags.check_type != self.stream_flags.check_type {
             return Err(OxiArcError::invalid_header(
                 "Stream flags in footer don't match header",
+            ));
+        }
+
+        // Backward Size is stored as `(real_index_size / 4) - 1`, and the
+        // real Index field size must always be a multiple of 4 bytes
+        // (it is explicitly padded to that alignment). Cross-check it
+        // against the Index field we actually parsed in `skip_index`.
+        let backward_size_field = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+        if self.index_size % 4 != 0 {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ index size {} is not a multiple of 4 bytes",
+                    self.index_size
+                ),
+            ));
+        }
+        let expected_backward_size = (self.index_size / 4).saturating_sub(1) as u32;
+        if backward_size_field != expected_backward_size {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ footer Backward Size ({backward_size_field}) does not match \
+                     the parsed index size (expected {expected_backward_size})"
+                ),
             ));
         }
 
@@ -949,13 +1002,102 @@ mod tests {
         assert_eq!(decompressed, original);
     }
 
-    // Note: Some of the more complex roundtrip tests are disabled because
-    // the LZMA encoder has known issues with certain data patterns.
-    // The XZ container format itself is correct, but the underlying
-    // LZMA codec needs more work for full compatibility.
-    //
-    // Tracked in TODO.md: "LZH compression (lh5) encoder not compatible"
-    // Similar issue exists with LZMA for complex data.
+    /// Small deterministic xorshift PRNG so tests can generate reproducible,
+    /// incompressible-looking data without depending on an external `rand`
+    /// crate (SciRS2-Core is for numeric/array workloads, not needed here).
+    fn xorshift_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn test_xz_roundtrip_incompressible_random() {
+        // Pseudo-random, effectively incompressible payload well above the
+        // "Hello, World!" / 1000x'A' sizes used by the other roundtrip tests.
+        let original = xorshift_bytes(0xDEAD_BEEF_C0FF_EE01, 64 * 1024);
+        let compressed = compress(&original, 6).expect("compress random data");
+        assert_eq!(&compressed[0..6], XZ_MAGIC);
+
+        let decompressed = decompress_slice(&compressed).expect("decompress random data");
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_xz_roundtrip_large_multi_block() {
+        // Hand-assemble a two-block XZ stream (our own `XzWriter::compress`
+        // only ever emits a single block) to exercise the reader's
+        // multi-block loop together with the new index CRC-32 and footer
+        // Backward Size validation against a genuine, format-compliant
+        // multi-record index.
+        let writer = XzWriter::new(LzmaLevel::new(6));
+        let stream_flags = StreamFlags::new(writer.check_type);
+
+        let block_a = xorshift_bytes(0x1234_5678_9ABC_DEF0, 48 * 1024);
+        let block_b: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+
+        let mut output = Vec::new();
+        writer
+            .write_stream_header(&mut output, stream_flags)
+            .expect("write stream header");
+        let unpadded_a = writer
+            .write_block(&mut output, &block_a)
+            .expect("write block a");
+        let unpadded_b = writer
+            .write_block(&mut output, &block_b)
+            .expect("write block b");
+
+        // Build a genuine 2-record index (Index Indicator + Number of
+        // Records + records + padding + CRC32), matching the on-disk layout
+        // `write_index` produces for a single record.
+        let mut index = vec![0x00u8];
+        index.push(0x02); // number of records
+        writer.write_multibyte_int(&mut index, unpadded_a as u64);
+        writer.write_multibyte_int(&mut index, block_a.len() as u64);
+        writer.write_multibyte_int(&mut index, unpadded_b as u64);
+        writer.write_multibyte_int(&mut index, block_b.len() as u64);
+        while (index.len() + 4) % 4 != 0 {
+            index.push(0x00);
+        }
+        let index_crc = Crc32::compute(&index);
+        index.extend_from_slice(&index_crc.to_le_bytes());
+        output.extend_from_slice(&index);
+
+        writer
+            .write_stream_footer(&mut output, stream_flags, index.len())
+            .expect("write stream footer");
+
+        let mut expected = block_a.clone();
+        expected.extend_from_slice(&block_b);
+
+        let decompressed =
+            decompress_slice(&output).expect("decompress hand-assembled multi-block stream");
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_xz_index_crc_mismatch_detected() {
+        let original = b"index CRC mismatch should be detected".to_vec();
+        let mut compressed = compress(&original, 3).expect("compress");
+
+        // Corrupt a byte inside the index's CRC32 trailer (the last 4 bytes
+        // before the 12-byte stream footer).
+        let crc_offset = compressed.len() - 12 - 1;
+        compressed[crc_offset] ^= 0xFF;
+
+        let err = decompress_slice(&compressed).expect_err("corrupted index CRC must be rejected");
+        assert!(
+            matches!(err, OxiArcError::CrcMismatch { .. }),
+            "expected CrcMismatch, got {err:?}"
+        );
+    }
 
     #[test]
     fn test_xz_progress_forwarding() {

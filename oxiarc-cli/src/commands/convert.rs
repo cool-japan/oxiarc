@@ -1,25 +1,38 @@
 //! Convert command implementation.
 
 use crate::commands::create::{CompressionLevel, OutputFormat};
-use crate::utils::ExtractedEntry;
+use crate::style::Styler;
+use crate::utils::{ExtractedEntry, create_file, open_file, write_file};
 use oxiarc_archive::{
     ArchiveFormat, BrotliReader, BrotliWriter, Bzip2Reader, Bzip2Writer, CabReader, Lz4Reader,
     Lz4Writer, LzhCompressionLevel, LzhWriter, SevenZReader, SnappyReader, SnappyWriter, TarWriter,
     XzWriter, ZipCompressionLevel, ZipReader, ZipWriter, ZstdReader, ZstdWriter,
 };
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn cmd_convert(
-    input: &PathBuf,
-    output: &PathBuf,
+    input: &Path,
+    output: &Path,
     format: Option<OutputFormat>,
     compression: CompressionLevel,
     verbose: bool,
+    quiet: bool,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse to clobber an existing output. `convert` used to silently truncate
+    // whatever the destination already held; failing loudly avoids destroying
+    // an unrelated file when the output path is mistyped or already populated.
+    if output.exists() {
+        return Err(format!(
+            "output already exists: {} (remove it first to convert)",
+            output.display()
+        )
+        .into());
+    }
+
     // Detect input format
-    let file = File::open(input)?;
+    let file = open_file(input)?;
     let mut reader = BufReader::new(file);
     let (input_format, _) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
@@ -32,25 +45,27 @@ pub fn cmd_convert(
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     };
 
-    println!(
-        "Converting {} ({}) to {} ({:?})",
-        input.display(),
-        input_format,
-        output.display(),
-        output_format
-    );
+    if !quiet {
+        println!(
+            "Converting {} ({}) to {} ({:?})",
+            input.display(),
+            input_format,
+            output.display(),
+            output_format
+        );
+    }
 
     // Extract all entries from input archive
     let entries = extract_all_entries(&mut reader, input_format, input)?;
 
-    if verbose {
+    if verbose && !quiet {
         println!("  Found {} entries", entries.len());
     }
 
     // Write to output archive
     match output_format {
         OutputFormat::Zip => {
-            let file = File::create(output)?;
+            let file = create_file(output)?;
             let writer = BufWriter::new(file);
             let mut zip = ZipWriter::new(writer);
 
@@ -65,12 +80,12 @@ pub fn cmd_convert(
             for (name, is_dir, data) in &entries {
                 if *is_dir {
                     zip.add_directory(name)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {}/", name);
                     }
                 } else {
                     zip.add_file(name, data)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {} ({} bytes)", name, data.len());
                     }
                 }
@@ -79,19 +94,19 @@ pub fn cmd_convert(
             zip.finish()?;
         }
         OutputFormat::Tar => {
-            let file = File::create(output)?;
+            let file = create_file(output)?;
             let writer = BufWriter::new(file);
             let mut tar = TarWriter::new(writer);
 
             for (name, is_dir, data) in &entries {
                 if *is_dir {
                     tar.add_directory(name)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {}/", name);
                     }
                 } else {
                     tar.add_file(name, data)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {} ({} bytes)", name, data.len());
                     }
                 }
@@ -100,7 +115,7 @@ pub fn cmd_convert(
             tar.finish()?;
         }
         OutputFormat::Lzh => {
-            let file = File::create(output)?;
+            let file = create_file(output)?;
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
@@ -113,12 +128,12 @@ pub fn cmd_convert(
             for (name, is_dir, data) in &entries {
                 if *is_dir {
                     lzh.add_directory(name)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {}/", name);
                     }
                 } else {
                     lzh.add_file(name, data)?;
-                    if verbose {
+                    if verbose && !quiet {
                         println!("  Added: {} ({} bytes)", name, data.len());
                     }
                 }
@@ -148,9 +163,9 @@ pub fn cmd_convert(
             };
 
             let compressed = oxiarc_archive::gzip::compress_with_filename(data, name, level)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -177,9 +192,9 @@ pub fn cmd_convert(
 
             let xz_writer = XzWriter::new(oxiarc_lzma::LzmaLevel::new(level));
             let compressed = xz_writer.compress(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -200,9 +215,9 @@ pub fn cmd_convert(
             let mut compressed = Vec::new();
             let mut lz4_writer = Lz4Writer::new(&mut compressed);
             lz4_writer.write_compressed(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -229,9 +244,9 @@ pub fn cmd_convert(
 
             let bzip2_writer = Bzip2Writer::with_level(level);
             let compressed = bzip2_writer.compress(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -251,9 +266,9 @@ pub fn cmd_convert(
 
             let zstd_writer = ZstdWriter::new();
             let compressed = zstd_writer.compress(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -280,9 +295,9 @@ pub fn cmd_convert(
 
             let brotli_writer = BrotliWriter::with_quality(quality);
             let compressed = brotli_writer.compress(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -302,15 +317,17 @@ pub fn cmd_convert(
 
             let snappy_writer = SnappyWriter::new();
             let compressed = snappy_writer.compress(data)?;
-            std::fs::write(output, compressed)?;
+            write_file(output, &compressed)?;
 
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
     }
 
-    println!("Conversion complete");
+    if !quiet {
+        println!("{}", styler.success("Conversion complete"));
+    }
     Ok(())
 }
 

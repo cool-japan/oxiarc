@@ -869,14 +869,20 @@ mod tests {
     ///
     /// Compiled on x86_64; skipped at runtime if PCLMULQDQ is unavailable.
     ///
-    /// Currently `#[ignore]` — the fold constants / Barrett reduction shape in
-    /// `x86::crc32_pclmulqdq` do not match the bit-reflected ISO 3309
-    /// convention used by the scalar path (verified on aarch64 — PMULL path
-    /// has the same structural issue; see `test_pmull_matches_scalar_vectors`
-    /// below). The SIMD path is left intact but NOT wired into dispatch.
-    /// Un-ignore this test once `x86::crc32_pclmulqdq` (and `arm::crc32_pmull`)
-    /// use validated reflected-mode constants (typically pre-shifted by x^1,
-    /// i.e. 33-bit values) per Intel's "Fast CRC Computation Using PCLMULQDQ".
+    /// Currently `#[ignore]` and NOT wired into dispatch: the fold constants /
+    /// Barrett-reduction shape in `x86::crc32_pclmulqdq` have not been verified
+    /// against the bit-reflected ISO 3309 scalar path on an x86_64 host, so
+    /// `init_crc32_dispatch`/`SimdCrc32Dispatcher` deliberately fall back to
+    /// slicing-by-8 on x86_64. Un-ignore this test once `x86::crc32_pclmulqdq`
+    /// is validated on a PCLMULQDQ-capable CI runner with reflected-mode
+    /// constants (typically pre-shifted by x^1, i.e. 33-bit values) per Intel's
+    /// "Fast CRC Computation Using PCLMULQDQ".
+    ///
+    /// NOTE: this is a per-architecture, x86-only caveat. The aarch64 PMULL path
+    /// (`arm::crc32_pmull`) uses independently validated reflected-mode 33-bit
+    /// constants and IS enabled in dispatch; its equality with the scalar
+    /// reference is asserted by `test_pmull_matches_scalar_vectors`,
+    /// `test_pmull_length_sweep`, and `test_pmull_random_inputs` below.
     #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "SIMD fold constants pending verification — see comment"]

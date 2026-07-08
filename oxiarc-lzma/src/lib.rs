@@ -21,40 +21,49 @@
 //!
 //! ### Decompression
 //!
-//! ```ignore
-//! use oxiarc_lzma::decompress;
+//! ```rust
+//! use oxiarc_lzma::{compress, decompress_bytes, LzmaLevel};
 //!
-//! let compressed = include_bytes!("data.lzma");
-//! let decompressed = decompress(&compressed[..])?;
+//! // Produce a compressed buffer with the crate's own encoder, then decode it.
+//! let data = b"Hello, World!";
+//! let compressed = compress(data, LzmaLevel::DEFAULT)?;
+//! let decompressed = decompress_bytes(&compressed)?;
+//! assert_eq!(decompressed, data);
+//! # Ok::<(), oxiarc_lzma::Error>(())
 //! ```
 //!
 //! ### Compression
 //!
-//! ```ignore
+//! ```rust
 //! use oxiarc_lzma::{compress, LzmaLevel};
 //!
 //! let data = b"Hello, World!";
 //! let compressed = compress(data, LzmaLevel::DEFAULT)?;
+//! # Ok::<(), oxiarc_lzma::Error>(())
 //! ```
 //!
 //! ### LZMA2 Chunked Encoding (XZ compatible)
 //!
-//! ```ignore
+//! ```rust
 //! use oxiarc_lzma::{encode_lzma2_chunked, decode_lzma2_chunked, LzmaLevel};
 //!
 //! let data = b"Hello, LZMA2 chunked world!";
 //! let encoded = encode_lzma2_chunked(data, LzmaLevel::DEFAULT)?;
 //! let decoded = decode_lzma2_chunked(&encoded, 1 << 20)?;
+//! assert_eq!(decoded, data);
+//! # Ok::<(), oxiarc_lzma::Error>(())
 //! ```
 //!
 //! For custom chunk sizes, use `Lzma2ChunkedEncoder`:
 //!
-//! ```ignore
+//! ```rust
 //! use oxiarc_lzma::{Lzma2ChunkedEncoder, Lzma2Config, LzmaLevel};
 //!
+//! let data = b"Hello, custom chunk size world!";
 //! let config = Lzma2Config::with_level(LzmaLevel::DEFAULT).chunk_size(64 * 1024);
 //! let mut encoder = Lzma2ChunkedEncoder::with_config(config);
 //! let encoded = encoder.encode(data)?;
+//! # Ok::<(), oxiarc_lzma::Error>(())
 //! ```
 //!
 //! ## LZMA Format
@@ -80,12 +89,43 @@ pub mod encoder;
 pub mod lzma2;
 pub mod lzma2_chunk;
 pub mod lzma2_stream;
-pub mod match_finder;
+// The following modules hold internal entropy-coder/state-machine/allocator
+// machinery. They are kept `pub(crate)` so their module paths are not part of
+// the public API surface (avoiding a semver freeze on internal details); the
+// select public-facing types are re-exported below via `pub use`.
+//
+// NOTE: this crate does not currently define an `unstable-internals` Cargo
+// feature (this file does not own `Cargo.toml`); if callers need direct
+// access to these internals for advanced/debugging use, add such a feature
+// in `Cargo.toml` and gate these declarations on it (`pub` when enabled,
+// `pub(crate)` otherwise) rather than widening default visibility here.
+// `MatchFinder::reset` was previously exempt from the `dead_code` lint
+// because the trait was part of the public API surface (any trait method
+// reachable from a crate's public API is assumed used by downstream
+// crates). Narrowing this module to `pub(crate)` makes the lint fire for
+// real, since nothing inside this crate currently calls `reset` (each
+// finder is re-constructed rather than reset in place). The method is
+// meaningful abstraction surface for the trait (documented, kept for
+// forward compatibility / potential future reuse-instead-of-reallocate
+// optimization) so it is allowed here rather than deleted from a file this
+// item does not own.
+#[allow(dead_code)]
+pub(crate) mod match_finder;
+// `memory_pool` stays `pub` (unlike its siblings above) because its own
+// public doctests (outside this file's ownership) reference the full
+// `oxiarc_lzma::memory_pool::...` path directly; narrowing its visibility
+// here would break those doctests without being able to fix them in place.
+// It is still dropped from the crate-root `pub use` re-export below so it is
+// no longer front-and-center in the default public surface.
 pub mod memory_pool;
-pub mod model;
+pub(crate) mod model;
 pub mod optimal;
 #[cfg(feature = "parallel")]
 pub mod parallel;
+// `range_coder` stays `pub` (unlike `match_finder`/`model` above) because
+// `lzma2.rs` (outside this file's ownership) imports `RangeDecoder` via the
+// crate-root re-export (`use crate::{LzmaLevel, RangeDecoder};`); narrowing
+// visibility here without updating that import would break the build.
 pub mod range_coder;
 pub mod streaming;
 
@@ -102,9 +142,16 @@ pub use lzma2_chunk::{
     encode_lzma2_chunked, encode_lzma2_with_config,
 };
 pub use lzma2_stream::{Lzma2StreamDecoder, Lzma2StreamEncoder};
-pub use match_finder::{Bt4MatchFinder, HashChainMatchFinder, MatchFinder};
-pub use memory_pool::{LzmaDecoderPooled, LzmaPool, PooledBuf, bucket_for};
-pub use model::{LzmaModel, LzmaProperties, State};
+// NOTE: `LzmaProperties` is part of the public, documented dictionary/stream API
+// (see `LzmaEncoder::with_dictionary`, `LzmaDecoder::with_dictionary`), so it stays
+// public even though its home module (`model`) is `pub(crate)`. The remaining
+// entropy-coder/state-machine internals (`LzmaModel`, `State`, the match
+// finders, and the memory pool allocator types) are implementation details and
+// are intentionally NOT re-exported here so they stay out of the crate's
+// semver-frozen public surface. `RangeDecoder`/`RangeEncoder` remain
+// re-exported because internal code outside this file's ownership
+// (`lzma2.rs`) still imports `RangeDecoder` via this root path.
+pub use model::LzmaProperties;
 #[cfg(feature = "parallel")]
 pub use parallel::{
     PARALLEL_DEFAULT_CHUNK_SIZE, PARALLEL_MIN_CHUNK_SIZE, ParallelLzma2Encoder,

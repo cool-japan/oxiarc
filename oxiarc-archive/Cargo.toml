@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Archive container format support for OxiArc (ZIP, TAR, GZIP, LZH, XZ)"
 keywords = ["archive", "zip", "tar", "gzip", "xz"]
 categories = ["compression", "encoding", "filesystem"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []

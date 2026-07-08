@@ -7,10 +7,12 @@
 //!
 //! ## Features
 //!
-//! - Full LZ77 + Huffman + FSE compression (levels 1-22)
+//! - LZ77 match-finding with entropy-coded sequences (levels 1-22)
 //! - Complete Zstandard frame parsing and decompression
-//! - FSE (Finite State Entropy) encoding and decoding
-//! - Huffman encoding and decoding for literals
+//! - FSE (Finite State Entropy) sequence coding using the RFC 8878 predefined
+//!   tables (and RLE tables for constant symbol categories) plus full decoding
+//! - Raw and RLE literals on the encode path; Huffman literal decoding on the
+//!   decode path
 //! - Dictionary-based compression for small data
 //! - Streaming Write/Read API
 //! - XXH64 checksum verification
@@ -18,7 +20,7 @@
 //!
 //! ## Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use oxiarc_zstd::{compress_with_level, decompress, encode_all, decode_all};
 //!
 //! // Buffer-based compression with level
@@ -77,11 +79,20 @@ pub type ZstdWriter<W> = ZstdStreamEncoder<W>;
 // Dictionary API
 pub use dict::{ZstdDict, train_dictionary};
 
-// Advanced: LZ77 types (for users who want fine-grained control)
-pub use lz77::{LevelConfig, Lz77Sequence, MatchFinder};
-
-// Advanced: Bitstream writers (for custom encoding)
+// API freeze (0.3.x): the LZ77 building blocks
+// (`lz77::{LevelConfig, Lz77Sequence, MatchFinder}`) and the low-level bitstream
+// writers (`bitwriter::{ForwardBitWriter, BackwardBitWriter}`) are NOT part of the
+// stable public API. They are crate-internal implementation details whose shape
+// may change without notice, so they are hidden from the documentation and are
+// not covered by the crate's SemVer guarantees. They are re-exported as
+// `#[doc(hidden)]` (rather than removed outright) only because some of their
+// helper methods currently have no in-crate call sites; making them fully private
+// would require crate-internal `#[allow(dead_code)]` annotations that live outside
+// this module.
+#[doc(hidden)]
 pub use bitwriter::{BackwardBitWriter, ForwardBitWriter};
+#[doc(hidden)]
+pub use lz77::{LevelConfig, Lz77Sequence, MatchFinder};
 
 #[cfg(feature = "parallel")]
 pub use encode::compress_parallel;
@@ -105,6 +116,7 @@ pub const MAX_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Block types in Zstandard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockType {
     /// Raw uncompressed block.
     Raw,
@@ -134,6 +146,7 @@ impl BlockType {
 
 /// Literals block type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LiteralsBlockType {
     /// Raw literals (uncompressed).
     Raw,

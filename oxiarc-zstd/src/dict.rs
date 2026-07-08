@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use oxiarc_zstd::dict::{ZstdDict, train_dictionary};
 //!
 //! let samples: Vec<&[u8]> = vec![
@@ -24,7 +24,7 @@
 //!     b"common prefix data C",
 //! ];
 //! let dict = train_dictionary(&samples, 4096).expect("dictionary training failed");
-//! assert!(dict.len() > 0);
+//! assert!(!dict.is_empty());
 //! ```
 
 use crate::xxhash::xxhash64_with_seed;

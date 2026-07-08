@@ -11,8 +11,8 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! #[cfg(feature = "parallel")]
+//! ```rust,no_run
+//! # #[cfg(feature = "parallel")] {
 //! use oxiarc_lzhuf::{lzh_compress_parallel, LzhEntryInput, LzhMethod};
 //!
 //! let entries = vec![
@@ -20,6 +20,7 @@
 //!     LzhEntryInput { name: "foo.txt",   data: b"foo bar baz" },
 //! ];
 //! let archive = lzh_compress_parallel(&entries, LzhMethod::Lh5).unwrap();
+//! # }
 //! ```
 
 use crate::encode::encode_lzh;
@@ -77,6 +78,7 @@ impl ParallelLzhBuilder {
     /// Override the number of rayon worker threads.
     ///
     /// When `None` (the default), rayon uses its global thread pool.
+    #[must_use]
     pub fn with_num_threads(mut self, n: usize) -> Self {
         self.num_threads = Some(n);
         self

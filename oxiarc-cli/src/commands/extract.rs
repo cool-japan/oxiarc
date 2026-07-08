@@ -10,7 +10,7 @@ use oxiarc_archive::{
     ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, IsoReader, LenientWarning, Lz4Reader,
     SevenZReader, SnappyReader, ZipReader, ZstdReader,
 };
-use oxiarc_core::Entry;
+use oxiarc_core::{Entry, EntryType};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -64,6 +64,8 @@ pub struct ExtractArgs<'a> {
     /// size exceeds this limit cause an immediate error rather than
     /// an out-of-memory allocation.
     pub memory_limit: Option<u64>,
+    /// Suppress the progress bar and per-file chatter (errors still print).
+    pub quiet: bool,
 }
 
 /// Print accumulated lenient-mode warnings to stderr. No-op for empty
@@ -208,7 +210,11 @@ pub fn cmd_extract(
         strict_names,
         lenient,
         memory_limit,
+        quiet,
     } = args;
+
+    // Quiet mode forces off both the progress bar and per-file verbose chatter.
+    let verbose = verbose && !quiet;
 
     // Determine overwrite mode from flags
     let overwrite_mode = if prompt {
@@ -229,7 +235,7 @@ pub fn cmd_extract(
     let to_stdout = output == "-";
 
     // Disable progress bar for stdin/stdout
-    let progress = progress && !from_stdin && !to_stdout;
+    let progress = progress && !from_stdin && !to_stdout && !quiet;
 
     if from_stdin && format_hint.is_none() {
         return Err("--format is required when reading from stdin".into());
@@ -335,7 +341,7 @@ pub fn cmd_extract(
     if to_stdout {
         let stdout = io::stdout();
         let mut writer = BufWriter::new(stdout.lock());
-        extract_single_file_to_writer(&data, format, &mut writer, verbose)?;
+        extract_single_file_to_writer(&data, format, &mut writer, verbose, memory_limit)?;
         return Ok(());
     }
 
@@ -346,7 +352,7 @@ pub fn cmd_extract(
         let out_name = "output"; // Default name for stdin
         let out_path = output_path.join(out_name);
 
-        let decompressed = decompress_single_file(&data, format)?;
+        let decompressed = decompress_single_file(&data, format, memory_limit)?;
 
         if should_write_file(&out_path, overwrite_mode, verbose)? {
             std::fs::write(&out_path, &decompressed)?;
@@ -357,11 +363,32 @@ pub fn cmd_extract(
         return Ok(());
     }
 
-    unreachable!("Should have been handled above");
+    // The only paths that fall through the `(format, data)` block above without
+    // returning are `to_stdout` (handled above) and `from_stdin` (handled just
+    // above). Any other case returned early inside that block, so this point is
+    // logically unreachable — but we return a defensive error instead of
+    // panicking to satisfy the no-panic policy.
+    Err("internal error: extract reached an unhandled code path".into())
+}
+
+/// Resolve `output_root` to an absolute, symlink-free form when it exists,
+/// falling back to a purely lexical absolute path when it does not yet exist
+/// on disk (the common case for the first entry of an archive).
+fn canonicalize_or_absolute(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Helper that resolves the output filesystem path for an archive entry,
 /// applying Windows reserved-name sanitization and long-path prefixing.
+///
+/// Security: `sanitize_relative_path` already strips `..`/root/drive
+/// components (first line of defense against Zip-Slip). As defense in depth,
+/// the joined path is verified to remain within the (absolute) output root;
+/// any escape is rejected with an error rather than written outside the
+/// target directory.
 fn resolve_output_path(
     output_root: &Path,
     entry_name: &str,
@@ -369,8 +396,131 @@ fn resolve_output_path(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let sanitized = sanitize_relative_path(entry_name, strict_names)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let joined = output_root.join(&sanitized);
+    // Build the candidate path from the absolute root so the containment check
+    // below compares like-for-like prefixes.
+    let root_abs = canonicalize_or_absolute(output_root);
+    let joined = root_abs.join(&sanitized);
+    if !joined.starts_with(&root_abs) {
+        return Err(format!(
+            "refusing to extract '{}': resolved path '{}' escapes output directory '{}'",
+            entry_name,
+            joined.display(),
+            output_root.display()
+        )
+        .into());
+    }
     Ok(long_path_prefix(&joined))
+}
+
+/// Determine the symlink target for a core [`Entry`], if it represents a
+/// symbolic link. Returns `None` for regular files and directories.
+fn core_symlink_target(entry: &Entry) -> Option<PathBuf> {
+    if entry.entry_type == EntryType::Symlink || entry.link_target.is_some() {
+        entry.link_target.clone()
+    } else {
+        None
+    }
+}
+
+/// Create a symbolic link at `link_path` pointing at `target`, honoring the
+/// overwrite mode. Returns `Ok(Some(msg))` with a verbose success description
+/// when the link was created, or `Ok(None)` when nothing quotable happened
+/// (skipped, or a warning already printed to stderr).
+///
+/// The `link_path` has already passed the containment check in
+/// [`resolve_output_path`], so the *location* of the link cannot escape the
+/// output directory (the link target itself is written verbatim, matching the
+/// behavior of standard extraction tools).
+fn write_symlink_entry(
+    link_path: &Path,
+    target: &Path,
+    overwrite_mode: OverwriteMode,
+    verbose: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(parent) = link_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // A symlink cannot be created over an existing path; consult the overwrite
+    // policy, then remove the existing entry before recreating it.
+    let exists = link_path.symlink_metadata().is_ok();
+    if exists {
+        match overwrite_mode {
+            OverwriteMode::Never => {
+                if verbose {
+                    eprintln!("  Skipped: {} (already exists)", link_path.display());
+                }
+                return Ok(None);
+            }
+            OverwriteMode::Prompt => {
+                let prompt = format!("Overwrite {}?", link_path.display());
+                let ok = Confirm::new()
+                    .with_prompt(&prompt)
+                    .default(false)
+                    .interact()?;
+                if !ok {
+                    return Ok(None);
+                }
+            }
+            OverwriteMode::Always => {}
+        }
+        std::fs::remove_file(link_path)?;
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link_path)?;
+        Ok(Some(format!(
+            "  Symlink: {} -> {}",
+            link_path.display(),
+            target.display()
+        )))
+    }
+    #[cfg(windows)]
+    {
+        // Prefer a directory symlink when the target resolves to an existing
+        // directory relative to the link's parent; otherwise a file symlink.
+        let resolved = link_path
+            .parent()
+            .map(|p| p.join(target))
+            .unwrap_or_else(|| target.to_path_buf());
+        let result = if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link_path)
+        } else {
+            std::os::windows::fs::symlink_file(target, link_path)
+        };
+        match result {
+            Ok(()) => Ok(Some(format!(
+                "  Symlink: {} -> {}",
+                link_path.display(),
+                target.display()
+            ))),
+            Err(e) => {
+                // ERROR_PRIVILEGE_NOT_HELD (1314): creating symlinks requires
+                // either Developer Mode or the SeCreateSymbolicLink privilege.
+                // Degrade gracefully with a warning rather than aborting.
+                const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+                if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+                    eprintln!(
+                        "  warning: skipped symlink {} (insufficient privilege; enable Developer Mode)",
+                        link_path.display()
+                    );
+                    Ok(None)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target;
+        eprintln!(
+            "  warning: skipped symlink {} (symlinks unsupported on this platform)",
+            link_path.display()
+        );
+        Ok(None)
+    }
 }
 
 /// Resolve a password either from the CLI flag or interactive prompt.
@@ -421,25 +571,49 @@ struct ExtractArchiveArgs<'a, R: Read + Seek> {
 }
 
 /// Decompress a single-file format from a byte slice.
+///
+/// `memory_limit` is enforced up front for formats that carry a cheaply
+/// available declared output size in their frame header/trailer (gzip ISIZE,
+/// lz4/zstd frame content size). For the remaining formats (xz, bzip2, brotli,
+/// snappy) the size is not known without decompressing, so the limit is
+/// best-effort there.
 fn decompress_single_file(
     data: &[u8],
     format: ArchiveFormat,
+    memory_limit: Option<u64>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut cursor = io::Cursor::new(data);
     let mut reader = BufReader::new(&mut cursor);
 
     match format {
         ArchiveFormat::Gzip => {
+            // gzip stores the uncompressed size (mod 2^32) as the trailing
+            // ISIZE field; use it as a lower-bound guard before allocating.
+            if data.len() >= 4 {
+                let declared_size = u32::from_le_bytes([
+                    data[data.len() - 4],
+                    data[data.len() - 3],
+                    data[data.len() - 2],
+                    data[data.len() - 1],
+                ]) as u64;
+                check_memory_limit("gzip stream", declared_size, memory_limit)?;
+            }
             let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
             Ok(gzip.decompress()?)
         }
         ArchiveFormat::Xz => Ok(oxiarc_archive::xz::decompress(&mut reader)?),
         ArchiveFormat::Lz4 => {
             let mut lz4 = Lz4Reader::new(reader)?;
+            if let Some(declared) = lz4.original_size() {
+                check_memory_limit("lz4 stream", declared, memory_limit)?;
+            }
             Ok(lz4.decompress()?)
         }
         ArchiveFormat::Zstd => {
             let mut zstd = ZstdReader::new(reader)?;
+            if let Some(declared) = zstd.content_size() {
+                check_memory_limit("zstd stream", declared, memory_limit)?;
+            }
             Ok(zstd.decompress()?)
         }
         ArchiveFormat::Bzip2 => {
@@ -464,8 +638,9 @@ fn extract_single_file_to_writer<W: Write>(
     format: ArchiveFormat,
     writer: &mut W,
     _verbose: bool,
+    memory_limit: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let decompressed = decompress_single_file(data, format)?;
+    let decompressed = decompress_single_file(data, format, memory_limit)?;
     writer.write_all(&decompressed)?;
     writer.flush()?;
     Ok(())
@@ -537,6 +712,19 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("files");
 
             for entry in to_extract {
+                if let Some(target) = core_symlink_target(entry) {
+                    let link_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
+                    if let Some(msg) =
+                        write_symlink_entry(&link_path, &target, overwrite_mode, verbose)?
+                    {
+                        if verbose {
+                            pb.println(msg);
+                        }
+                    }
+                    pb.inc(1);
+                    continue;
+                }
                 if entry.is_dir() {
                     let dir_path =
                         resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
@@ -595,6 +783,10 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("Decompressing");
 
             let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
+            // Note: the gzip ISIZE trailer would allow a pre-decompress
+            // memory-limit guard, but it lives at the end of the stream and is
+            // not cheaply reachable through this streaming reader; the limit is
+            // therefore best-effort for the file-based gzip path.
             let data = gzip.decompress()?;
 
             // Use original filename if available, otherwise strip .gz
@@ -638,6 +830,19 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("files");
 
             for entry in to_extract {
+                if let Some(target) = core_symlink_target(entry) {
+                    let link_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
+                    if let Some(msg) =
+                        write_symlink_entry(&link_path, &target, overwrite_mode, verbose)?
+                    {
+                        if verbose {
+                            pb.println(msg);
+                        }
+                    }
+                    pb.inc(1);
+                    continue;
+                }
                 if entry.is_dir() {
                     let dir_path =
                         resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
@@ -686,6 +891,19 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("files");
 
             for entry in to_extract {
+                if let Some(target) = core_symlink_target(entry) {
+                    let link_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
+                    if let Some(msg) =
+                        write_symlink_entry(&link_path, &target, overwrite_mode, verbose)?
+                    {
+                        if verbose {
+                            pb.println(msg);
+                        }
+                    }
+                    pb.inc(1);
+                    continue;
+                }
                 if entry.is_dir() {
                     let dir_path =
                         resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
@@ -756,6 +974,10 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("Decompressing");
 
             let mut lz4 = Lz4Reader::new(reader)?;
+            if let Some(declared) = lz4.original_size() {
+                let label = archive_path.display().to_string();
+                check_memory_limit(&label, declared, memory_limit)?;
+            }
             let data = lz4.decompress()?;
 
             // Use input filename without .lz4 extension
@@ -785,6 +1007,10 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("Decompressing");
 
             let mut zstd = ZstdReader::new(reader)?;
+            if let Some(declared) = zstd.content_size() {
+                let label = archive_path.display().to_string();
+                check_memory_limit(&label, declared, memory_limit)?;
+            }
             let data = zstd.decompress()?;
 
             // Use input filename without .zst extension
@@ -909,14 +1135,30 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("files");
 
             for (i, entry) in to_extract {
+                let core_entry = entry.to_entry();
+                if let Some(target) = core_symlink_target(&core_entry) {
+                    let link_path =
+                        resolve_output_path(output, &core_entry.sanitized_name(), strict_names)?;
+                    if let Some(msg) =
+                        write_symlink_entry(&link_path, &target, overwrite_mode, verbose)?
+                    {
+                        if verbose {
+                            pb.println(msg);
+                        }
+                    }
+                    pb.inc(1);
+                    continue;
+                }
                 if entry.is_dir {
-                    let dir_path = resolve_output_path(output, &entry.name, strict_names)?;
+                    let dir_path =
+                        resolve_output_path(output, &core_entry.sanitized_name(), strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = resolve_output_path(output, &entry.name, strict_names)?;
+                    let file_path =
+                        resolve_output_path(output, &core_entry.sanitized_name(), strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -924,7 +1166,6 @@ fn extract_archive_format<R: Read + Seek>(
                         check_memory_limit(&entry.name, entry.size, memory_limit)?;
                         let data = sevenz.extract(i)?;
                         std::fs::write(&file_path, &data)?;
-                        let core_entry = entry.to_entry();
                         apply_metadata(
                             &file_path,
                             &core_entry,
@@ -955,14 +1196,29 @@ fn extract_archive_format<R: Read + Seek>(
             pb.set_message("files");
 
             for entry in to_extract {
+                if let Some(target) = core_symlink_target(entry) {
+                    let link_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
+                    if let Some(msg) =
+                        write_symlink_entry(&link_path, &target, overwrite_mode, verbose)?
+                    {
+                        if verbose {
+                            pb.println(msg);
+                        }
+                    }
+                    pb.inc(1);
+                    continue;
+                }
                 if entry.is_dir() {
-                    let dir_path = resolve_output_path(output, &entry.name, strict_names)?;
+                    let dir_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     std::fs::create_dir_all(&dir_path)?;
                     if verbose {
                         pb.println(format!("  Created: {}", entry.name));
                     }
                 } else {
-                    let file_path = resolve_output_path(output, &entry.name, strict_names)?;
+                    let file_path =
+                        resolve_output_path(output, &entry.sanitized_name(), strict_names)?;
                     if let Some(parent) = file_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1276,5 +1532,97 @@ mod tests {
             msg.contains("zip"),
             "error message should list supported formats, got: {msg}"
         );
+    }
+
+    /// Zip-Slip regression: crafted traversal entry names (as used by 7z/CAB/ISO
+    /// which historically passed raw `entry.name`) must resolve *inside* the
+    /// output root, never above it.
+    #[test]
+    fn test_resolve_output_path_blocks_traversal() {
+        let tmp =
+            std::env::temp_dir().join(format!("oxiarc_resolve_traversal_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let root_abs = tmp.canonicalize().expect("canonicalize root");
+
+        let malicious = [
+            "../../../etc/evil",
+            r"..\..\etc\evil",
+            "/etc/passwd",
+            r"C:\Windows\system32\evil",
+            "a/../../b/escape",
+        ];
+        for name in malicious {
+            let resolved = resolve_output_path(&tmp, name, false)
+                .unwrap_or_else(|e| panic!("resolve {name:?} failed: {e}"));
+            assert!(
+                resolved.starts_with(&root_abs),
+                "entry {name:?} escaped output root: {resolved:?}"
+            );
+            assert!(
+                !resolved.to_string_lossy().contains(".."),
+                "entry {name:?} left `..` in path: {resolved:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_core_symlink_target_detection() {
+        let file = Entry::file("plain.txt", 0);
+        assert!(core_symlink_target(&file).is_none());
+
+        let mut link = Entry::file("link", 0);
+        link.entry_type = EntryType::Symlink;
+        link.link_target = Some(PathBuf::from("../elsewhere/target"));
+        assert_eq!(
+            core_symlink_target(&link),
+            Some(PathBuf::from("../elsewhere/target"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_symlink_entry_creates_real_symlink() {
+        let tmp = std::env::temp_dir().join(format!("oxiarc_symlink_entry_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let link_path = tmp.join("mylink");
+        let _ = std::fs::remove_file(&link_path);
+
+        let msg = write_symlink_entry(
+            &link_path,
+            Path::new("target.txt"),
+            OverwriteMode::Always,
+            false,
+        )
+        .expect("write symlink");
+        assert!(
+            msg.is_some(),
+            "expected a verbose message for created symlink"
+        );
+
+        let meta = std::fs::symlink_metadata(&link_path).expect("symlink metadata");
+        assert!(
+            meta.file_type().is_symlink(),
+            "expected a real symlink, got {:?}",
+            meta.file_type()
+        );
+        let target = std::fs::read_link(&link_path).expect("read_link");
+        assert_eq!(target, Path::new("target.txt"));
+
+        // Overwriting an existing symlink with Always must succeed.
+        write_symlink_entry(
+            &link_path,
+            Path::new("other.txt"),
+            OverwriteMode::Always,
+            false,
+        )
+        .expect("overwrite symlink");
+        assert_eq!(
+            std::fs::read_link(&link_path).expect("read_link 2"),
+            Path::new("other.txt")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

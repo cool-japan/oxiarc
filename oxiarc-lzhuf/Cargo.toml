@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Pure Rust LZH (LZSS + Huffman) compression for OxiArc"
 keywords = ["lzh", "lha", "lzss", "compression", "huffman"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md", "tests/data/*.expected", "tests/data/lha213_lh5_long.lzh"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 parallel = ["dep:rayon"]
@@ -26,6 +30,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "lzhuf_bench"

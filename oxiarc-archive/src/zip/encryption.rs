@@ -1,9 +1,11 @@
-//! ZIP AES-256 encryption support following WinZip AE-2 specification.
+//! ZIP AES encryption support following the WinZip AE-2 specification.
 //!
 //! This module implements the WinZip AES encryption scheme (AE-2) which provides:
-//! - AES-256 encryption in CTR mode
+//! - AES-128 / AES-192 / AES-256 encryption in CTR mode (genuine 10/12/14-round
+//!   key schedules per FIPS 197, wire-compatible with WinZip/7-Zip/WinRAR)
 //! - PBKDF2-SHA1 key derivation
-//! - HMAC-SHA1 authentication
+//! - HMAC-SHA1 authentication, verified in constant time
+//! - Salts sourced from the operating system CSPRNG
 //!
 //! All implementations are pure Rust with no external dependencies.
 
@@ -263,32 +265,56 @@ const RCON: [u32; 10] = [
     0x1b000000, 0x36000000,
 ];
 
-/// AES-256 cipher state.
-pub struct Aes256 {
-    /// Expanded round keys (15 * 4 = 60 words for AES-256).
-    round_keys: [[u8; 16]; 15],
+/// AES block cipher supporting 128, 192 and 256-bit keys (FIPS 197).
+///
+/// The number of rounds is derived from the key length: 10 rounds for a
+/// 16-byte key (AES-128, `Nk = 4`), 12 rounds for a 24-byte key (AES-192,
+/// `Nk = 6`) and 14 rounds for a 32-byte key (AES-256, `Nk = 8`). Because the
+/// round count and key schedule follow the standard exactly for every strength,
+/// the resulting ciphertext is wire-compatible with WinZip / 7-Zip / WinRAR for
+/// AES-128, AES-192 and AES-256 alike.
+pub struct Aes {
+    /// Expanded round keys (`nr + 1` blocks of 16 bytes each).
+    round_keys: Vec<[u8; 16]>,
+    /// Number of rounds (10 for AES-128, 12 for AES-192, 14 for AES-256).
+    nr: usize,
 }
 
-impl Aes256 {
-    /// Create a new AES-256 cipher with the given 32-byte key.
-    pub fn new(key: &[u8; 32]) -> Self {
-        let round_keys = Self::key_expansion(key);
-        Self { round_keys }
+impl Aes {
+    /// Create a new AES cipher from a 16, 24 or 32-byte key.
+    ///
+    /// Returns an error for any other key length.
+    pub fn new(key: &[u8]) -> Result<Self> {
+        let (nk, nr) = match key.len() {
+            16 => (4usize, 10usize),
+            24 => (6usize, 12usize),
+            32 => (8usize, 14usize),
+            other => {
+                return Err(OxiArcError::unsupported_method(format!(
+                    "AES key must be 16, 24 or 32 bytes, got {other}"
+                )));
+            }
+        };
+        Ok(Self {
+            round_keys: Self::key_expansion(key, nk, nr),
+            nr,
+        })
     }
 
-    /// Expand the 256-bit key into round keys.
-    fn key_expansion(key: &[u8; 32]) -> [[u8; 16]; 15] {
-        let nk = 8; // Key length in 32-bit words (256/32)
-        let nr = 14; // Number of rounds for AES-256
+    /// Expand the cipher key into `nr + 1` round keys.
+    ///
+    /// `key.len()` is guaranteed to equal `4 * nk` by the callers.
+    fn key_expansion(key: &[u8], nk: usize, nr: usize) -> Vec<[u8; 16]> {
+        let total_words = 4 * (nr + 1);
+        let mut w = vec![[0u8; 4]; total_words];
 
-        // Initialize with key
-        let mut w = [[0u8; 4]; 60];
+        // Initialize with the cipher key.
         for i in 0..nk {
             w[i] = [key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]];
         }
 
-        // Key expansion
-        for i in nk..4 * (nr + 1) {
+        // Key expansion.
+        for i in nk..total_words {
             let mut temp = w[i - 1];
             if i % nk == 0 {
                 // RotWord + SubWord + Rcon
@@ -299,7 +325,7 @@ impl Aes256 {
                     SBOX[temp[0] as usize],
                 ];
             } else if nk > 6 && i % nk == 4 {
-                // Additional SubWord for AES-256
+                // Additional SubWord, applied only for 256-bit keys (Nk = 8).
                 temp = [
                     SBOX[temp[0] as usize],
                     SBOX[temp[1] as usize],
@@ -315,15 +341,12 @@ impl Aes256 {
             ];
         }
 
-        // Convert to round keys
-        let mut round_keys = [[0u8; 16]; 15];
+        // Convert the word schedule into 16-byte round keys.
+        let mut round_keys = vec![[0u8; 16]; nr + 1];
         for (r, round_key) in round_keys.iter_mut().enumerate() {
             for c in 0..4 {
                 let w_idx = r * 4 + c;
-                round_key[c * 4] = w[w_idx][0];
-                round_key[c * 4 + 1] = w[w_idx][1];
-                round_key[c * 4 + 2] = w[w_idx][2];
-                round_key[c * 4 + 3] = w[w_idx][3];
+                round_key[c * 4..c * 4 + 4].copy_from_slice(&w[w_idx]);
             }
         }
 
@@ -334,21 +357,21 @@ impl Aes256 {
     pub fn encrypt_block(&self, input: &[u8; 16]) -> [u8; 16] {
         let mut state = *input;
 
-        // Initial round key addition
+        // Initial round key addition.
         Self::add_round_key(&mut state, &self.round_keys[0]);
 
-        // Main rounds
-        for round in 1..14 {
+        // Main rounds.
+        for round in 1..self.nr {
             Self::sub_bytes(&mut state);
             Self::shift_rows(&mut state);
             Self::mix_columns(&mut state);
             Self::add_round_key(&mut state, &self.round_keys[round]);
         }
 
-        // Final round (no MixColumns)
+        // Final round (no MixColumns).
         Self::sub_bytes(&mut state);
         Self::shift_rows(&mut state);
-        Self::add_round_key(&mut state, &self.round_keys[14]);
+        Self::add_round_key(&mut state, &self.round_keys[self.nr]);
 
         state
     }
@@ -419,33 +442,65 @@ impl Aes256 {
     }
 }
 
+/// AES-256 cipher.
+///
+/// Retained as a convenience wrapper over the generic [`Aes`] cipher for a
+/// fixed 32-byte key. The infallible constructor is safe because a 32-byte key
+/// is always a valid AES-256 key.
+pub struct Aes256 {
+    inner: Aes,
+}
+
+impl Aes256 {
+    /// Create a new AES-256 cipher with the given 32-byte key.
+    pub fn new(key: &[u8; 32]) -> Self {
+        // A 32-byte key always yields a valid AES-256 (Nk = 8, Nr = 14) schedule,
+        // so this cannot fail — build the schedule directly to avoid `Result`.
+        Self {
+            inner: Aes {
+                round_keys: Aes::key_expansion(key, 8, 14),
+                nr: 14,
+            },
+        }
+    }
+
+    /// Encrypt a single 16-byte block.
+    pub fn encrypt_block(&self, input: &[u8; 16]) -> [u8; 16] {
+        self.inner.encrypt_block(input)
+    }
+}
+
 // ===========================================================================
 // AES-CTR Mode Implementation
 // ===========================================================================
 
-/// AES-256-CTR mode cipher for WinZip encryption.
+/// AES-CTR mode cipher for WinZip encryption.
+///
+/// Supports AES-128, AES-192 and AES-256 depending on the key length passed to
+/// [`AesCtr::new`].
 pub struct AesCtr {
-    cipher: Aes256,
+    cipher: Aes,
     counter: [u8; 16],
     keystream: [u8; 16],
     keystream_pos: usize,
 }
 
 impl AesCtr {
-    /// Create a new AES-CTR cipher.
+    /// Create a new AES-CTR cipher from a 16, 24 or 32-byte key.
     ///
-    /// WinZip uses little-endian counter starting at 1 (not 0).
-    pub fn new(key: &[u8; 32]) -> Self {
-        let cipher = Aes256::new(key);
+    /// WinZip uses a little-endian counter starting at 1 (not 0). Returns an
+    /// error if the key length is not a valid AES key size.
+    pub fn new(key: &[u8]) -> Result<Self> {
+        let cipher = Aes::new(key)?;
         let mut counter = [0u8; 16];
         counter[0] = 1; // WinZip starts counter at 1
 
-        Self {
+        Ok(Self {
             cipher,
             counter,
             keystream: [0u8; 16],
             keystream_pos: 16, // Force keystream generation on first use
-        }
+        })
     }
 
     /// Process data (encrypt or decrypt - CTR mode is symmetric).
@@ -656,18 +711,11 @@ impl ZipAesEncryptor {
         let hmac_key = derived[key_len..key_len * 2].to_vec();
         let password_verification: [u8; 2] = [derived[key_len * 2], derived[key_len * 2 + 1]];
 
-        // For AES-256, we need a 32-byte key
-        let cipher = if strength == AesStrength::Aes256 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(encryption_key);
-            AesCtr::new(&key)
-        } else {
-            // For AES-128/192, we still use AES-256 internally but with zero-padded key
-            // Note: Proper implementation would use AES-128/192 variants
-            let mut key = [0u8; 32];
-            key[..key_len].copy_from_slice(encryption_key);
-            AesCtr::new(&key)
-        };
+        // Use a genuine AES cipher sized to the requested strength: AES-128
+        // (10 rounds), AES-192 (12 rounds) or AES-256 (14 rounds). The key
+        // length is exactly `strength.key_len()`, which is always a valid AES
+        // key size, so this never errors.
+        let cipher = AesCtr::new(encryption_key)?;
 
         Ok((
             Self {
@@ -725,16 +773,9 @@ impl ZipAesDecryptor {
         let hmac_key = derived[key_len..key_len * 2].to_vec();
         let password_verification: [u8; 2] = [derived[key_len * 2], derived[key_len * 2 + 1]];
 
-        // For AES-256, we need a 32-byte key
-        let cipher = if strength == AesStrength::Aes256 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(encryption_key);
-            AesCtr::new(&key)
-        } else {
-            let mut key = [0u8; 32];
-            key[..key_len].copy_from_slice(encryption_key);
-            AesCtr::new(&key)
-        };
+        // Use a genuine AES cipher sized to the requested strength (see the
+        // matching comment in `ZipAesEncryptor::new`).
+        let cipher = AesCtr::new(encryption_key)?;
 
         Ok((
             Self {
@@ -757,38 +798,131 @@ impl ZipAesDecryptor {
     }
 
     /// Verify the authentication code.
+    ///
+    /// The comparison between the computed HMAC and the stored authentication
+    /// code is performed in constant time (see `ct_eq`) so that a mismatch
+    /// does not leak, through timing, how many leading bytes were correct. The
+    /// length check short-circuits, but the length of the code is public
+    /// (always [`WINZIP_AUTH_CODE_LEN`]), so this leaks nothing secret.
     pub fn verify(&self, auth_code: &[u8]) -> bool {
         if auth_code.len() != WINZIP_AUTH_CODE_LEN {
             return false;
         }
         let full_hmac = hmac_sha1(&self.hmac_key, &self.hmac_data);
-        &full_hmac[..WINZIP_AUTH_CODE_LEN] == auth_code
+        ct_eq(&full_hmac[..WINZIP_AUTH_CODE_LEN], auth_code)
     }
 }
 
-/// Generate a random salt using a simple PRNG.
+/// Constant-time equality check for two byte slices.
 ///
-/// Note: This uses a simple time-based seed for portability.
-/// For production use, consider using a proper CSPRNG.
-pub fn generate_salt(len: usize) -> Vec<u8> {
+/// Returns `true` iff `a` and `b` have the same length and identical contents.
+/// The per-byte comparison folds every byte difference into an accumulator with
+/// no data-dependent branch or early exit, so the running time depends only on
+/// the (public) slice length and not on where — or whether — the first mismatch
+/// occurs. This is used to compare authentication tags without opening a timing
+/// side channel.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Fill `buf` with bytes from the operating system's CSPRNG.
+///
+/// On Unix-like systems this reads from `/dev/urandom`, which is a
+/// cryptographically secure, non-blocking source seeded by the kernel entropy
+/// pool. Returns `true` on success and `false` if the source could not be
+/// opened or fully read (in which case the caller falls back to
+/// `fill_from_entropy_fallback`).
+fn fill_from_os_csprng(buf: &mut [u8]) -> bool {
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        use std::io::Read;
+
+        if let Ok(mut file) = File::open("/dev/urandom") {
+            return file.read_exact(buf).is_ok();
+        }
+        false
+    }
+
+    #[cfg(not(unix))]
+    {
+        // No dependency-free OS CSPRNG binding is available on this platform;
+        // the caller falls back to the runtime-entropy path below.
+        let _ = buf;
+        false
+    }
+}
+
+/// Best-effort entropy fallback used only when the OS CSPRNG is unavailable.
+///
+/// This mixes several runtime entropy sources (high-resolution wall clock, the
+/// process id, a monotonically increasing per-process counter, a stack address,
+/// a heap address and the current thread id) and expands them into the output
+/// buffer with SHA-1 in counter mode. It is deliberately not relied upon as the
+/// primary path — [`fill_from_os_csprng`] is tried first — but it guarantees
+/// non-deterministic, non-repeating salts even if `/dev/urandom` cannot be
+/// opened, which the previous clock-only xorshift generator did not.
+fn fill_from_entropy_fallback(out: &mut [u8]) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let seed = SystemTime::now()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut seed: Vec<u8> = Vec::with_capacity(64);
+
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    seed.extend_from_slice(&nanos.to_le_bytes());
+    seed.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
+    seed.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
 
-    let mut state = seed as u64;
-    let mut salt = Vec::with_capacity(len);
+    let stack_marker = 0u8;
+    seed.extend_from_slice(&(&stack_marker as *const u8 as usize as u64).to_le_bytes());
 
-    for _ in 0..len {
-        // Simple xorshift64 PRNG
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        salt.push((state >> 32) as u8);
+    let heap_marker = Box::new(0u8);
+    seed.extend_from_slice(&(heap_marker.as_ref() as *const u8 as usize as u64).to_le_bytes());
+
+    let mut hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    seed.extend_from_slice(&hasher.finish().to_le_bytes());
+
+    // Expand the seed material into the output using SHA-1 in counter mode.
+    let mut offset = 0;
+    let mut block_index: u64 = 0;
+    while offset < out.len() {
+        let mut block_hasher = Sha1::new();
+        block_hasher.update(&seed);
+        block_hasher.update(&block_index.to_le_bytes());
+        let digest = block_hasher.finalize();
+        let take = (out.len() - offset).min(digest.len());
+        out[offset..offset + take].copy_from_slice(&digest[..take]);
+        offset += take;
+        block_index += 1;
     }
+}
 
+/// Generate a cryptographically random salt of `len` bytes.
+///
+/// The salt is drawn from the operating system CSPRNG (`/dev/urandom` on
+/// Unix-like systems). If that source is unavailable, a best-effort
+/// runtime-entropy fallback is used (see `fill_from_entropy_fallback`); the
+/// salt is never derived from a fixed or clock-only seed.
+pub fn generate_salt(len: usize) -> Vec<u8> {
+    let mut salt = vec![0u8; len];
+    if !fill_from_os_csprng(&mut salt) {
+        fill_from_entropy_fallback(&mut salt);
+    }
     salt
 }
 
@@ -924,6 +1058,118 @@ mod tests {
     }
 
     #[test]
+    fn test_aes128_encrypt() {
+        // NIST FIPS 197 Appendix C.1 known-answer vector for AES-128.
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let plaintext: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let expected: [u8; 16] = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+
+        let cipher = Aes::new(&key).expect("valid 16-byte key");
+        let result = cipher.encrypt_block(&plaintext);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_aes192_encrypt() {
+        // NIST FIPS 197 Appendix C.2 known-answer vector for AES-192.
+        let key: [u8; 24] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        ];
+        let plaintext: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let expected: [u8; 16] = [
+            0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d,
+            0x71, 0x91,
+        ];
+
+        let cipher = Aes::new(&key).expect("valid 24-byte key");
+        let result = cipher.encrypt_block(&plaintext);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_aes_rejects_invalid_key_length() {
+        // Only 16, 24 and 32-byte keys are valid AES key sizes.
+        assert!(Aes::new(&[0u8; 20]).is_err());
+        assert!(Aes::new(&[0u8; 0]).is_err());
+        assert!(Aes::new(&[0u8; 33]).is_err());
+        assert!(AesCtr::new(&[0u8; 20]).is_err());
+    }
+
+    #[test]
+    fn test_aes256_wrapper_matches_generic() {
+        // The convenience `Aes256` wrapper must agree with the generic cipher.
+        let key: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let plaintext: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let generic = Aes::new(&key).expect("valid 32-byte key");
+        let wrapper = Aes256::new(&key);
+        assert_eq!(
+            generic.encrypt_block(&plaintext),
+            wrapper.encrypt_block(&plaintext)
+        );
+    }
+
+    #[test]
+    fn test_zip_aes_roundtrip_all_strengths() {
+        // Genuine AES-128/192/256 AE-2 round-trips: encrypt, authenticate, then
+        // decrypt with a fresh context and verify the tag and plaintext.
+        for strength in [
+            AesStrength::Aes128,
+            AesStrength::Aes192,
+            AesStrength::Aes256,
+        ] {
+            let password = b"correct horse battery staple";
+            let salt = generate_salt(strength.salt_len());
+            let plaintext = b"WinZip AE-2 genuine AES round-trip payload \x00\x01\x02\xff";
+
+            let (mut encryptor, pw_enc) =
+                ZipAesEncryptor::new(password, &salt, strength).expect("encryptor");
+            let mut buffer = plaintext.to_vec();
+            encryptor.encrypt(&mut buffer);
+            let auth_code = encryptor.finalize();
+
+            // Ciphertext must differ from plaintext.
+            assert_ne!(buffer.as_slice(), plaintext.as_slice());
+
+            let (mut decryptor, pw_dec) =
+                ZipAesDecryptor::new(password, &salt, strength).expect("decryptor");
+            assert_eq!(pw_enc, pw_dec);
+            decryptor.update_hmac(&buffer);
+            assert!(decryptor.verify(&auth_code), "auth tag must verify");
+
+            decryptor.decrypt(&mut buffer);
+            assert_eq!(buffer.as_slice(), plaintext.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_ct_eq() {
+        assert!(ct_eq(b"abcdef", b"abcdef"));
+        assert!(!ct_eq(b"abcdef", b"abcdeg"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
     fn test_aes_ctr_encrypt_decrypt() {
         let key: [u8; 32] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -934,7 +1180,7 @@ mod tests {
 
         // Encrypt
         let mut encrypted = plaintext.to_vec();
-        let mut cipher = AesCtr::new(&key);
+        let mut cipher = AesCtr::new(&key).expect("valid 32-byte key");
         cipher.process(&mut encrypted);
 
         // Verify it's different from plaintext
@@ -942,7 +1188,7 @@ mod tests {
 
         // Decrypt
         let mut decrypted = encrypted.clone();
-        let mut cipher = AesCtr::new(&key);
+        let mut cipher = AesCtr::new(&key).expect("valid 32-byte key");
         cipher.process(&mut decrypted);
 
         // Verify decryption matches original

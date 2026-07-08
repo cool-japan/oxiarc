@@ -803,6 +803,9 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
                     // next iteration refills from the reader (or hits EOF).
                 }
                 DecompressStatus::BlockEnd => {}
+                // `DecompressStatus` is `#[non_exhaustive]`; treat any future
+                // status like a block boundary (continue driving the loop).
+                _ => {}
             }
         }
     }

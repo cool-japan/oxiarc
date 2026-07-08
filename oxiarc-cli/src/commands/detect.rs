@@ -1,16 +1,23 @@
 use crate::style::Styler;
+use crate::utils::{input_display_name, open_input};
 use oxiarc_archive::ArchiveFormat;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
 
-pub fn cmd_detect(file: &PathBuf, styler: &Styler) -> Result<(), Box<dyn std::error::Error>> {
-    let f = File::open(file)?;
-    let mut reader = BufReader::new(f);
+pub fn cmd_detect(
+    file: &str,
+    quiet: bool,
+    styler: &Styler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = open_input(file)?;
 
     let (format, magic) = ArchiveFormat::detect(&mut reader)?;
 
-    println!("File: {}", styler.path(&file.display().to_string()));
+    // Detection still runs under --quiet (so an unreadable input errors), but
+    // its informational report is suppressed.
+    if quiet {
+        return Ok(());
+    }
+
+    println!("File: {}", styler.path(&input_display_name(file)));
     println!("Format: {}", styler.success(&format.to_string()));
     println!("Extension: .{}", format.extension());
     println!("MIME type: {}", format.mime_type());

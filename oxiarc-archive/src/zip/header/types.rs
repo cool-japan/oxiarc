@@ -268,8 +268,12 @@ impl LocalFileHeader {
         let seconds = (self.mtime & 0x1F) as u64 * 2;
         let minutes = ((self.mtime >> 5) & 0x3F) as u64;
         let hours = ((self.mtime >> 11) & 0x1F) as u64;
-        let day = (self.mdate & 0x1F) as u64;
-        let month = ((self.mdate >> 5) & 0x0F) as u64;
+        // DOS date fields are 1-based; a crafted header can encode day/month 0,
+        // which would underflow the `month - 1` term below. Clamp to the minimum
+        // valid value so a malformed date yields an approximate time instead of
+        // panicking (debug) or wrapping to a ~2^64-second offset (release).
+        let day = ((self.mdate & 0x1F) as u64).max(1);
+        let month = (((self.mdate >> 5) & 0x0F) as u64).max(1);
         let year = ((self.mdate >> 9) & 0x7F) as u64 + 1980;
 
         // Approximate: Days since Unix epoch
@@ -613,5 +617,49 @@ impl CentralDirEntry {
     pub fn written_size(&self) -> usize {
         let zip64_extra = self.build_zip64_extra();
         46 + self.filename.len() + self.extra.len() + zip64_extra.len() + self.comment.len()
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    fn header_with_date(mdate: u16, mtime: u16) -> LocalFileHeader {
+        LocalFileHeader {
+            version_needed: 20,
+            flags: 0,
+            method: CompressionMethod::Stored,
+            mtime,
+            mdate,
+            crc32: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            filename: "f".to_string(),
+            filename_raw: b"f".to_vec(),
+            extra: Vec::new(),
+            data_offset: 0,
+            uncompressed_size_64: None,
+            compressed_size_64: None,
+        }
+    }
+
+    #[test]
+    fn modified_time_does_not_panic_on_zero_dos_date() {
+        // A crafted local-file header with a zero DOS date encodes month 0 and
+        // day 0, which used to underflow `month - 1` and panic (debug) / wrap
+        // (release). It must now yield a valid SystemTime and a usable Entry.
+        let header = header_with_date(0, 0);
+        let _ = header.modified_time();
+        let _ = header.to_entry();
+    }
+
+    #[test]
+    fn modified_time_matches_known_date() {
+        // 2021-06-15 (year 41 since 1980, month 6, day 15).
+        let mdate = ((2021 - 1980) << 9) | (6 << 5) | 15;
+        let header = header_with_date(mdate, 0);
+        // Same-formula sanity check: no panic and a strictly positive offset.
+        let t = header.modified_time();
+        assert!(t > UNIX_EPOCH);
     }
 }

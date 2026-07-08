@@ -1,24 +1,34 @@
 use crate::style::Styler;
+use crate::utils::{input_display_name, open_input};
 use oxiarc_archive::{ArchiveFormat, CabReader, IsoReader, SevenZReader, ZipReader};
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{Seek, SeekFrom};
 
-pub fn cmd_info(archive: &PathBuf, styler: &Styler) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(archive)?;
-    let mut reader = BufReader::new(file);
+pub fn cmd_info(
+    archive: &str,
+    quiet: bool,
+    styler: &Styler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = open_input(archive)?;
+
+    // Determine the stream length by seeking to the end, then rewind. This
+    // works uniformly for a file-backed reader and the in-memory stdin buffer,
+    // avoiding a separate `fs::metadata` call (which cannot describe stdin).
+    let size = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
 
     let (format, _) = ArchiveFormat::detect(&mut reader)?;
-    let metadata = std::fs::metadata(archive)?;
+
+    // --quiet suppresses the informational report but detection above still
+    // runs, so an unreadable/unrecognized input is still reported as an error.
+    if quiet {
+        return Ok(());
+    }
 
     println!("{}", styler.header("Archive Information"));
     println!("{}", styler.header("==================="));
-    println!("File: {}", styler.path(&archive.display().to_string()));
+    println!("File: {}", styler.path(&input_display_name(archive)));
     println!("Format: {}", format);
-    println!(
-        "Size: {}",
-        styler.size(&format!("{} bytes", metadata.len()))
-    );
+    println!("Size: {}", styler.size(&format!("{} bytes", size)));
     println!("MIME type: {}", format.mime_type());
 
     reader.seek(SeekFrom::Start(0))?;

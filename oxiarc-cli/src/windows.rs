@@ -28,63 +28,144 @@ pub fn is_reserved_name(basename: &str) -> bool {
     RESERVED_EXACT.iter().any(|r| upper == *r) || RESERVED_PREFIX.iter().any(|r| upper == *r)
 }
 
-/// Sanitize a filename by appending `_` to the stem if it collides with a
-/// Windows reserved name.
+/// If `part` begins with a Windows drive designator (`C:`, `d:foo`, …), return
+/// the portion after the `X:` prefix; otherwise return `part` unchanged.
 ///
-/// In `strict` mode, returns an error instead of sanitizing. The underscore is
-/// inserted before the extension so the original extension is preserved:
-/// `CON.txt` -> `CON_.txt`, `CON` -> `CON_`.
-pub fn sanitize_reserved_name(name: &str, strict: bool) -> Result<String, String> {
-    if !is_reserved_name(name) {
-        return Ok(name.to_string());
-    }
-    if strict {
-        return Err(format!("reserved filename: {}", name));
-    }
-    match name.find('.') {
-        Some(dot) => {
-            let (stem, rest) = name.split_at(dot);
-            Ok(format!("{}_{}", stem, rest))
-        }
-        None => Ok(format!("{}_", name)),
+/// This strips `Component::Prefix`-style drive markers that would otherwise
+/// survive naive `/`-splitting on non-Windows hosts.
+fn strip_drive_prefix(part: &str) -> &str {
+    let bytes = part.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        &part[2..]
+    } else {
+        part
     }
 }
 
-/// Apply `sanitize_reserved_name` only to the final component of a relative
-/// path, preserving the directory components unchanged.
+/// Trailing `.` and space characters are stripped by Windows when creating a
+/// file, so `foo.` and `foo ` silently become `foo`, colliding with a sibling
+/// named `foo`. Suffix such components with `_` to keep them distinct and
+/// creatable. Returns the component unchanged when it has no trailing `.`/` `.
+fn sanitize_trailing(name: &str) -> String {
+    if name.ends_with('.') || name.ends_with(' ') {
+        format!("{}_", name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Sanitize a single path component so it is safe to create on a Windows
+/// filesystem.
 ///
-/// Used by extraction to rewrite output paths before they are created on disk.
+/// Handles two independent hazards:
+///   * Reserved device names (`CON`, `NUL`, `COM1`, …): the stem gets a `_`
+///     suffix inserted before the extension (`CON.txt` -> `CON_.txt`).
+///   * Trailing `.`/space: suffixed with `_` (`foo.` -> `foo._`).
+///
+/// In `strict` mode, returns an error instead of rewriting.
+pub fn sanitize_reserved_name(name: &str, strict: bool) -> Result<String, String> {
+    if is_reserved_name(name) {
+        if strict {
+            return Err(format!("reserved filename: {}", name));
+        }
+        let renamed = match name.find('.') {
+            Some(dot) => {
+                let (stem, rest) = name.split_at(dot);
+                format!("{}_{}", stem, rest)
+            }
+            None => format!("{}_", name),
+        };
+        return Ok(sanitize_trailing(&renamed));
+    }
+
+    if name.ends_with('.') || name.ends_with(' ') {
+        if strict {
+            return Err(format!(
+                "invalid trailing '.' or space in filename: {}",
+                name
+            ));
+        }
+        return Ok(sanitize_trailing(name));
+    }
+
+    Ok(name.to_string())
+}
+
+/// Sanitize a relative extraction path so it cannot escape the output
+/// directory and is safe on a Windows filesystem.
+///
+/// This is the first line of defense against Zip-Slip: it treats both `/` and
+/// `\` as separators (so `..\..\` traversal is caught on non-Windows hosts
+/// too), drops `.`/`..`/root/drive-prefix components, and applies
+/// [`sanitize_reserved_name`] to each surviving component. A trailing `/`
+/// (directory marker in ZIP/TAR) is preserved when the result is non-empty.
+///
+/// The returned string is always a clean relative path with no traversal
+/// components; callers still apply a defense-in-depth containment check after
+/// joining it to the output root.
 pub fn sanitize_relative_path(rel: &str, strict: bool) -> Result<String, String> {
     if rel.is_empty() {
         return Ok(String::new());
     }
-    // Preserve a trailing `/` (directory markers in ZIP/TAR).
-    let (body, trailing_slash) = if let Some(stripped) = rel.strip_suffix('/') {
-        (stripped, true)
-    } else {
-        (rel, false)
-    };
+    // Treat backslashes as separators so Windows-style traversal (`..\..\`) is
+    // normalized on every host, not just Windows.
+    let normalized = rel.replace('\\', "/");
+    let trailing_slash = normalized.ends_with('/');
 
     let mut parts: Vec<String> = Vec::new();
-    for part in body.split('/') {
-        parts.push(sanitize_reserved_name(part, strict)?);
+    for raw in normalized.split('/') {
+        // Collapse empty components (leading/duplicate/trailing separators).
+        if raw.is_empty() {
+            continue;
+        }
+        // Drop current-dir and parent-dir traversal markers.
+        if raw == "." || raw == ".." {
+            continue;
+        }
+        // Drop drive designators (`C:`), keeping any tail (`C:foo` -> `foo`).
+        let cleaned = strip_drive_prefix(raw);
+        if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+            continue;
+        }
+        parts.push(sanitize_reserved_name(cleaned, strict)?);
     }
+
     let mut out = parts.join("/");
-    if trailing_slash {
+    if trailing_slash && !out.is_empty() {
         out.push('/');
     }
     Ok(out)
 }
 
-/// On Windows, prefix paths longer than 255 chars with `\\?\` for long-path
-/// support. On non-Windows, return the path unchanged.
+/// On Windows, prefix paths longer than 255 chars with the `\\?\` extended-length
+/// marker. On non-Windows, return the path unchanged.
+///
+/// The marker is only valid for *absolute* paths, and the exact spelling differs
+/// between drive-absolute and UNC paths:
+///   * `C:\very\long\path`      -> `\\?\C:\very\long\path`
+///   * `\\server\share\long`    -> `\\?\UNC\server\share\long`
+///
+/// Relative paths are first resolved to absolute (via [`std::path::absolute`]);
+/// already-prefixed and short paths are returned unchanged.
 #[cfg(windows)]
 pub fn long_path_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.len() > 255 && !s.starts_with(r"\\?\") {
-        PathBuf::from(format!(r"\\?\{}", s))
+    if s.starts_with(r"\\?\") || s.len() <= 255 {
+        return path.to_path_buf();
+    }
+
+    // The extended-length prefix requires an absolute path.
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let abs_str = absolute.to_string_lossy();
+
+    if abs_str.starts_with(r"\\?\") {
+        absolute.to_path_buf()
+    } else if let Some(unc) = abs_str.strip_prefix(r"\\") {
+        // UNC: \\server\share\... -> \\?\UNC\server\share\...
+        PathBuf::from(format!(r"\\?\UNC\{}", unc))
     } else {
-        path.to_path_buf()
+        // Drive-absolute: C:\... -> \\?\C:\...
+        PathBuf::from(format!(r"\\?\{}", abs_str))
     }
 }
 
@@ -152,6 +233,64 @@ mod tests {
             sanitize_relative_path("some/dir/", false).expect("path"),
             "some/dir/"
         );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_strips_parent_dir() {
+        // Unix-style traversal.
+        assert_eq!(
+            sanitize_relative_path("../../../etc/evil", false).expect("path"),
+            "etc/evil"
+        );
+        // Bare traversal collapses to empty (join keeps it inside the root).
+        assert_eq!(sanitize_relative_path("../../..", false).expect("path"), "");
+        // Interior `..` is dropped too.
+        assert_eq!(
+            sanitize_relative_path("a/../../b", false).expect("path"),
+            "a/b"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_handles_backslashes() {
+        // Windows-style traversal must be caught even on non-Windows hosts.
+        assert_eq!(
+            sanitize_relative_path(r"..\..\etc\evil", false).expect("path"),
+            "etc/evil"
+        );
+        assert_eq!(
+            sanitize_relative_path(r"dir\sub\file.txt", false).expect("path"),
+            "dir/sub/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_relative_path_strips_root_and_drive() {
+        assert_eq!(
+            sanitize_relative_path("/etc/passwd", false).expect("path"),
+            "etc/passwd"
+        );
+        assert_eq!(
+            sanitize_relative_path(r"C:\Windows\system32", false).expect("path"),
+            "Windows/system32"
+        );
+        assert_eq!(
+            sanitize_relative_path("C:relative/file", false).expect("path"),
+            "relative/file"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_reserved_name_trailing_dot_space() {
+        assert_eq!(
+            sanitize_reserved_name("foo.", false).expect("trailing dot"),
+            "foo._"
+        );
+        assert_eq!(
+            sanitize_reserved_name("bar ", false).expect("trailing space"),
+            "bar _"
+        );
+        assert!(sanitize_reserved_name("foo.", true).is_err());
     }
 
     #[cfg(not(windows))]

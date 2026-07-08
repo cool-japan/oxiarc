@@ -236,6 +236,7 @@ oxiarc extract --memory-limit 1G large_archive.zip -o ./output/
 |------|---------|
 | 0 | Success |
 | 1 | Error (invalid archive, I/O error, etc.) |
+| 2 | `test` found bad/corrupted entries; a wrong or missing decryption password (`extract`); or `add` targeting a non-appendable archive format |
 
 An unrecognized or corrupt archive format is treated as an error by every
 command that has to open the archive to do its job: `extract`, `test`, and
@@ -243,6 +244,16 @@ command that has to open the archive to do its job: `extract`, `test`, and
 all exit `1` with a message on stderr. `detect` is exempt by design — its job
 is precisely to report unrecognized formats, so it always exits `0` and
 prints `Format: Unknown` instead.
+
+Exit code `2` is used more specifically: `oxiarc test` exits `2` when one or
+more entries fail their integrity check; `oxiarc extract` exits `2` if a
+password prompt fails (no TTY available) or if decryption fails (wrong
+password); `oxiarc add` exits `2` when the target archive's format does not
+support in-place appending (only ZIP, TAR, and LZH are appendable).
+
+If interrupted with Ctrl-C mid-operation, `oxiarc` does not currently perform
+any special cleanup of partially-written output files — a partially
+extracted/created file may be left on disk.
 
 ## Error Messages
 

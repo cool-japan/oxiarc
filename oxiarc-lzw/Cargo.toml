@@ -10,12 +10,17 @@ keywords = ["compression", "lzw", "tiff", "pure-rust", "archive"]
 categories = ["compression", "encoding"]
 description = "Pure Rust LZW compression for TIFF and GIF formats"
 readme = "README.md"
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 weezl.workspace = true
 
 [[bench]]
@@ -24,7 +29,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[features]
-default = ["std"]
-std = []

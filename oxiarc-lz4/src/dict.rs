@@ -252,24 +252,28 @@ impl DictBuilder {
     /// Set the maximum dictionary size.
     ///
     /// The default is 64KB (maximum allowed by LZ4).
+    #[must_use]
     pub fn max_size(mut self, size: usize) -> Self {
         self.max_size = size.min(MAX_DICT_SIZE);
         self
     }
 
     /// Add a single sample to the builder.
+    #[must_use]
     pub fn add_sample(mut self, sample: &[u8]) -> Self {
         self.samples.push(sample.to_vec());
         self
     }
 
     /// Add multiple samples to the builder.
+    #[must_use]
     pub fn add_samples(mut self, samples: &[Vec<u8>]) -> Self {
         self.samples.extend(samples.iter().cloned());
         self
     }
 
     /// Add samples from an iterator.
+    #[must_use]
     pub fn add_samples_iter<I, T>(mut self, samples: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -1021,6 +1025,7 @@ impl Lz4DictBlockEncoder {
     }
 
     /// Set the acceleration factor, consuming and returning `self`.
+    #[must_use]
     pub fn acceleration(mut self, acceleration: i32) -> Self {
         self.accel = acceleration.max(1);
         self
@@ -1121,30 +1126,35 @@ impl DictFrameDescriptor {
     }
 
     /// Set the dictionary ID.
+    #[must_use]
     pub fn with_dict_id(mut self, id: u32) -> Self {
         self.dict_id = Some(id);
         self
     }
 
     /// Set the dictionary from a dictionary object.
+    #[must_use]
     pub fn with_dict(mut self, dict: &Lz4Dict) -> Self {
         self.dict_id = Some(dict.id());
         self
     }
 
     /// Set the content size.
+    #[must_use]
     pub fn with_content_size(mut self, size: u64) -> Self {
         self.content_size = Some(size);
         self
     }
 
     /// Set the content checksum flag.
+    #[must_use]
     pub fn with_content_checksum(mut self, enabled: bool) -> Self {
         self.content_checksum = enabled;
         self
     }
 
     /// Set the block checksum flag.
+    #[must_use]
     pub fn with_block_checksum(mut self, enabled: bool) -> Self {
         self.block_checksum = enabled;
         self

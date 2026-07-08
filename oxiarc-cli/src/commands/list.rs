@@ -1,15 +1,15 @@
 use super::SortBy;
 use crate::style::Styler;
-use crate::utils::{filter_entries, print_entries, print_tree, sort_entries};
+use crate::utils::{
+    filter_entries, input_display_name, open_input, print_entries, print_tree, sort_entries,
+};
 use oxiarc_archive::{
     ArchiveFormat, Bzip2Reader, CabReader, IsoReader, LenientWarning, Lz4Reader, SevenZReader,
     ZipReader, ZstdReader,
 };
 use oxiarc_core::Entry;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{Seek, SeekFrom};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EntryJson {
@@ -72,6 +72,9 @@ pub struct ListOptions<'a> {
     /// size exceeds this limit cause an immediate error rather than an
     /// out-of-memory allocation.
     pub memory_limit: Option<u64>,
+    /// Suppress the decorative `Archive: <name> (<format>)` banner. The entry
+    /// listing itself (the requested data) is always emitted.
+    pub quiet: bool,
 }
 
 /// Print accumulated lenient-mode warnings to stderr. No-op for empty
@@ -84,12 +87,11 @@ fn print_warnings(warnings: &[LenientWarning], styler: &Styler) {
 }
 
 pub fn cmd_list(
-    archive: &PathBuf,
+    archive: &str,
     options: &ListOptions<'_>,
     styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(archive)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_input(archive)?;
 
     let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
@@ -98,12 +100,14 @@ pub fn cmd_list(
         return cmd_list_json(archive, format, reader, options, styler);
     }
 
-    println!(
-        "Archive: {} ({})",
-        styler.path(&archive.display().to_string()),
-        format
-    );
-    println!();
+    if !options.quiet {
+        println!(
+            "Archive: {} ({})",
+            styler.path(&input_display_name(archive)),
+            format
+        );
+        println!();
+    }
 
     match format {
         ArchiveFormat::Zip => {
@@ -215,7 +219,7 @@ pub fn cmd_list(
         _ => {
             return Err(format!(
                 "unsupported or unrecognized archive format for {}: {}",
-                archive.display(),
+                input_display_name(archive),
                 format
             )
             .into());
@@ -234,14 +238,14 @@ fn display_entries(entries: &[Entry], verbose: bool, tree: bool, styler: &Styler
 }
 
 fn cmd_list_json<R: std::io::Read + std::io::Seek>(
-    archive: &std::path::Path,
+    archive: &str,
     format: ArchiveFormat,
     reader: R,
     options: &ListOptions<'_>,
     styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = ArchiveListJson {
-        archive: archive.display().to_string(),
+        archive: input_display_name(archive),
         format: format!("{}", format),
         entries: None,
         metadata: None,
@@ -343,7 +347,7 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
         _ => {
             return Err(format!(
                 "unsupported or unrecognized archive format for {}: {}",
-                archive.display(),
+                input_display_name(archive),
                 format
             )
             .into());

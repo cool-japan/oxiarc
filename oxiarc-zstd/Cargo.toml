@@ -10,6 +10,10 @@ description = "Pure Rust Zstandard (zstd) compression implementation for OxiArc"
 readme = "README.md"
 keywords = ["compression", "zstd", "zstandard", "fse", "huffman"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
@@ -17,6 +21,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "zstd_bench"

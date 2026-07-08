@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Command-line interface for OxiArc archive operations"
 keywords = ["cli", "archive", "compression", "zip", "lzh"]
 categories = ["command-line-utilities", "compression"]
+exclude = ["*.bak", "*.backup", "TODO.md", "tests/**"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bin]]
 name = "oxiarc"

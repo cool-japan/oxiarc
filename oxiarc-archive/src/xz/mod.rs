@@ -11,12 +11,16 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use oxiarc_archive::xz;
 //!
-//! // Decompress data
-//! let compressed = include_bytes!("data.xz");
-//! let data = xz::decompress(&mut &compressed[..]).unwrap();
+//! // Round-trip through the crate's own compressor rather than depending
+//! // on an external fixture file.
+//! let original = b"Hello, XZ!";
+//! let compressed = xz::compress(original, 6)?;
+//! let data = xz::decompress(&mut &compressed[..])?;
+//! assert_eq!(data, original);
+//! # Ok::<(), oxiarc_core::error::OxiArcError>(())
 //! ```
 
 mod header;

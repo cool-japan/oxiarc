@@ -9,13 +9,16 @@
 //! cases a clear error is printed and the process exits with status 2.
 
 use crate::commands::CompressionLevel;
+use crate::style::Styler;
+use crate::utils::{open_file, read_dir_for, read_file, read_link_for, symlink_metadata_for};
 use oxiarc_archive::zip::{CompressionMethod as ZipMethod, is_entry_encrypted};
 use oxiarc_archive::{
     ArchiveFormat, LzhCompressionLevel, LzhMethod, LzhReader, LzhWriter, TarHeader, TarReader,
     TarWriter, ZipCompressionLevel, ZipReader, ZipWriter,
 };
 use oxiarc_core::EntryType;
-use std::fs::{File, OpenOptions};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -61,27 +64,32 @@ pub fn cmd_add(
     files: &[PathBuf],
     compression: CompressionLevel,
     verbose: bool,
+    quiet: bool,
     dry_run: bool,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !archive.exists() {
         return Err(format!("archive not found: {}", archive.display()).into());
     }
 
     // Detect format.
-    let file = File::open(archive)?;
+    let file = open_file(archive)?;
     let mut reader = BufReader::new(file);
     let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
     drop(reader);
 
     match format {
-        ArchiveFormat::Zip => add_to_zip(archive, files, compression, verbose, dry_run),
-        ArchiveFormat::Tar => add_to_tar(archive, files, verbose, dry_run),
-        ArchiveFormat::Lzh => add_to_lzh(archive, files, verbose, dry_run),
+        ArchiveFormat::Zip => add_to_zip(archive, files, compression, verbose, quiet, dry_run),
+        ArchiveFormat::Tar => add_to_tar(archive, files, verbose, quiet, dry_run),
+        ArchiveFormat::Lzh => add_to_lzh(archive, files, verbose, quiet, dry_run),
         other => {
             eprintln!(
-                "error: `oxiarc add` does not support the {} format (only ZIP, TAR, and LZH are appendable).",
-                other
+                "{}",
+                styler.error(&format!(
+                    "error: `oxiarc add` does not support the {} format (only ZIP, TAR, and LZH are appendable).",
+                    other
+                ))
             );
             std::process::exit(2);
         }
@@ -94,11 +102,14 @@ pub fn cmd_add(
 /// `create.rs`).
 fn collect_input_entries(files: &[PathBuf]) -> Result<Vec<NewEntry>, Box<dyn std::error::Error>> {
     let mut out: Vec<NewEntry> = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
     for path in files {
-        if !path.exists() {
+        // `symlink_metadata` succeeds for a dangling symlink where `exists()`
+        // (which follows the link) would report `false`, so probe with it.
+        if symlink_metadata_for(path).is_err() {
             return Err(format!("input not found: {}", path.display()).into());
         }
-        collect_one(path, path, &mut out)?;
+        collect_one(path, path, &mut out, &mut visited)?;
     }
     Ok(out)
 }
@@ -107,6 +118,7 @@ fn collect_one(
     path: &Path,
     base: &Path,
     out: &mut Vec<NewEntry>,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rel = path
         .strip_prefix(base.parent().unwrap_or(base))
@@ -114,14 +126,32 @@ fn collect_one(
         .to_string_lossy()
         .replace('\\', "/");
 
-    if path.is_dir() {
+    // `symlink_metadata` does NOT follow symlinks, so a symlink is recorded as
+    // a leaf (its target text as content) rather than being dereferenced — and
+    // a circular symlink can never drive unbounded recursion.
+    let meta = symlink_metadata_for(path)?;
+    let ftype = meta.file_type();
+
+    if ftype.is_symlink() {
+        let target = read_link_for(path)?;
+        out.push((
+            rel,
+            false,
+            target.to_string_lossy().into_owned().into_bytes(),
+        ));
+    } else if ftype.is_dir() {
+        // Guard against directory cycles (bind mounts / hardlinked dirs).
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !visited.insert(canon) {
+            return Ok(());
+        }
         out.push((rel.clone(), true, Vec::new()));
-        for child in std::fs::read_dir(path)? {
-            let child = child?;
-            collect_one(&child.path(), base, out)?;
+        for child in read_dir_for(path)? {
+            let child = child.map_err(|e| format!("{}: {}", path.display(), e))?;
+            collect_one(&child.path(), base, out, visited)?;
         }
     } else {
-        let data = std::fs::read(path)?;
+        let data = read_file(path)?;
         out.push((rel, false, data));
     }
     Ok(())
@@ -146,10 +176,11 @@ fn add_to_zip(
     files: &[PathBuf],
     compression: CompressionLevel,
     verbose: bool,
+    quiet: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read all existing entries into memory, preserving raw compressed bytes.
-    let file = File::open(archive)?;
+    let file = open_file(archive)?;
     let reader = BufReader::new(file);
     let mut zip = ZipReader::new(reader)?;
     let existing: Vec<_> = zip.entries().to_vec();
@@ -247,12 +278,12 @@ fn add_to_zip(
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 zw.add_directory(name)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {}/", name);
                 }
             } else {
                 zw.add_file(name, data)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {} ({} bytes)", name, data.len());
                 }
             }
@@ -261,7 +292,7 @@ fn add_to_zip(
     }
 
     std::fs::rename(&tmp, archive)?;
-    if verbose {
+    if verbose && !quiet {
         eprintln!("Updated {}", archive.display());
     }
     Ok(())
@@ -273,9 +304,10 @@ fn add_to_tar(
     archive: &Path,
     files: &[PathBuf],
     verbose: bool,
+    quiet: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(archive)?;
+    let file = open_file(archive)?;
     let reader = BufReader::new(file);
     let mut tar = TarReader::new(reader)?;
     let existing: Vec<_> = tar.entries().to_vec();
@@ -343,12 +375,12 @@ fn add_to_tar(
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 tw.add_directory(name)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {}/", name);
                 }
             } else {
                 tw.add_file(name, data)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {} ({} bytes)", name, data.len());
                 }
             }
@@ -357,7 +389,7 @@ fn add_to_tar(
     }
 
     std::fs::rename(&tmp, archive)?;
-    if verbose {
+    if verbose && !quiet {
         eprintln!("Updated {}", archive.display());
     }
     Ok(())
@@ -373,9 +405,10 @@ fn add_to_lzh(
     archive: &Path,
     files: &[PathBuf],
     verbose: bool,
+    quiet: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(archive)?;
+    let file = open_file(archive)?;
     let reader = BufReader::new(file);
     let mut lzh = LzhReader::new(reader)?;
     let existing: Vec<_> = lzh.entries();
@@ -465,12 +498,12 @@ fn add_to_lzh(
         for (name, is_dir, data) in &new_entries {
             if *is_dir {
                 lw.add_directory(name)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {}/", name);
                 }
             } else {
                 lw.add_file(name, data)?;
-                if verbose {
+                if verbose && !quiet {
                     println!("  Added: {} ({} bytes)", name, data.len());
                 }
             }
@@ -479,7 +512,7 @@ fn add_to_lzh(
     }
 
     std::fs::rename(&tmp, archive)?;
-    if verbose {
+    if verbose && !quiet {
         eprintln!("Updated {}", archive.display());
     }
     Ok(())

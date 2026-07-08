@@ -1,10 +1,12 @@
+//! Encoding/decoding parameters for the AEC/SZIP codec.
+
 use crate::SzipError;
 
 /// Parameters governing AEC/SZIP encoding and decoding.
 ///
 /// These correspond closely to the parameters exposed by libaec and the
 /// CCSDS-121.0-B-2 standard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SzipParams {
     /// Bits encoded per sample (1–32). Common values: 8, 16, 32.
     pub bits_per_pixel: u8,
@@ -35,6 +37,29 @@ pub struct SzipParams {
     /// szip filter when the `AEC_DATA_SIGNED` / `AEC_CHIP_OPTION` flags are
     /// set. Defaults to `false` for pure software streams.
     pub rsi_byte_align: bool,
+}
+
+impl Default for SzipParams {
+    /// Common 8-bit, pure-software AEC/SZIP stream settings.
+    ///
+    /// - `bits_per_pixel`: 8
+    /// - `pixels_per_block`: 8
+    /// - `samples`: 0 (caller must set this to the actual sample count)
+    /// - `reference_sample_interval`: 8 (one reference sample per block)
+    /// - `msb`: `true` (MSB-first bit ordering)
+    /// - `nn_preprocess`: `false`
+    /// - `rsi_byte_align`: `false`
+    fn default() -> Self {
+        SzipParams {
+            bits_per_pixel: 8,
+            pixels_per_block: 8,
+            samples: 0,
+            reference_sample_interval: 8,
+            msb: true,
+            nn_preprocess: false,
+            rsi_byte_align: false,
+        }
+    }
 }
 
 impl SzipParams {

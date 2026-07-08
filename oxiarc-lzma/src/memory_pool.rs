@@ -74,7 +74,16 @@ impl LzmaPool {
     /// before handing the buffer to the decoder.
     pub fn acquire(&self, size: usize) -> PooledBuf<'_> {
         let bucket = bucket_for(size);
-        let mut guard = self.inner.lock().expect("LzmaPool lock poisoned");
+        // The mutex only ever guards a `HashMap<usize, Vec<Vec<u8>>>` of
+        // reusable scratch buffers, mutated only via `Vec::push`/`pop`
+        // (exception-safe, no invariant can be left broken by a panic
+        // mid-lock). So it is safe to recover the poisoned guard rather than
+        // propagate the poison and permanently disable the pool for every
+        // other thread over one unrelated panic.
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let buf = guard
             .entry(bucket)
             .or_default()
@@ -89,7 +98,11 @@ impl LzmaPool {
     /// at capacity the buffer is dropped (freed) instead.
     fn release(&self, buf: Vec<u8>) {
         let bucket = bucket_for(buf.len());
-        let mut guard = self.inner.lock().expect("LzmaPool lock poisoned");
+        // See `acquire` for why recovering from poison is safe here.
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = guard.entry(bucket).or_default();
         if slot.len() < self.max_buffers_per_bucket {
             slot.push(buf);

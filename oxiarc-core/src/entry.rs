@@ -134,12 +134,14 @@ impl FileAttributes {
     }
 
     /// Set Unix mode.
+    #[must_use]
     pub fn with_mode(mut self, mode: u32) -> Self {
         self.unix_mode = Some(mode);
         self
     }
 
     /// Set DOS attributes.
+    #[must_use]
     pub fn with_dos(mut self, attrs: u8) -> Self {
         self.dos_attributes = Some(attrs);
         self
@@ -274,36 +276,42 @@ impl Entry {
     }
 
     /// Builder method to set compression method.
+    #[must_use]
     pub fn with_method(mut self, method: CompressionMethod) -> Self {
         self.method = method;
         self
     }
 
     /// Builder method to set compressed size.
+    #[must_use]
     pub fn with_compressed_size(mut self, size: u64) -> Self {
         self.compressed_size = size;
         self
     }
 
     /// Builder method to set modification time.
+    #[must_use]
     pub fn with_modified(mut self, time: SystemTime) -> Self {
         self.modified = Some(time);
         self
     }
 
     /// Builder method to set CRC-32.
+    #[must_use]
     pub fn with_crc32(mut self, crc: u32) -> Self {
         self.crc32 = Some(crc);
         self
     }
 
     /// Builder method to set attributes.
+    #[must_use]
     pub fn with_attributes(mut self, attrs: FileAttributes) -> Self {
         self.attributes = attrs;
         self
     }
 
     /// Builder method to set comment.
+    #[must_use]
     pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
         self.comment = Some(comment.into());
         self
@@ -461,72 +469,84 @@ impl EntryBuilder {
     }
 
     /// Set the uncompressed size.
+    #[must_use]
     pub fn size(mut self, size: u64) -> Self {
         self.size = size;
         self
     }
 
     /// Set the compressed size.
+    #[must_use]
     pub fn compressed_size(mut self, size: u64) -> Self {
         self.compressed_size = size;
         self
     }
 
     /// Set the compression method.
+    #[must_use]
     pub fn method(mut self, method: CompressionMethod) -> Self {
         self.method = method;
         self
     }
 
     /// Set the last modification time.
+    #[must_use]
     pub fn modified(mut self, time: SystemTime) -> Self {
         self.modified = Some(time);
         self
     }
 
     /// Set the creation time.
+    #[must_use]
     pub fn created(mut self, time: SystemTime) -> Self {
         self.created = Some(time);
         self
     }
 
     /// Set the last access time.
+    #[must_use]
     pub fn accessed(mut self, time: SystemTime) -> Self {
         self.accessed = Some(time);
         self
     }
 
     /// Set the file attributes.
+    #[must_use]
     pub fn attributes(mut self, attributes: FileAttributes) -> Self {
         self.attributes = attributes;
         self
     }
 
     /// Set the CRC-32 checksum.
+    #[must_use]
     pub fn crc32(mut self, crc: u32) -> Self {
         self.crc32 = Some(crc);
         self
     }
 
     /// Set the comment.
+    #[must_use]
     pub fn comment(mut self, comment: impl Into<String>) -> Self {
         self.comment = Some(comment.into());
         self
     }
 
     /// Set the link target (for symlinks and hardlinks).
+    #[must_use]
     pub fn link_target(mut self, target: impl Into<PathBuf>) -> Self {
         self.link_target = Some(target.into());
         self
     }
 
     /// Set the offset in the archive.
+    #[must_use]
     pub fn offset(mut self, offset: u64) -> Self {
         self.offset = offset;
         self
     }
 
     /// Set extra data.
+    #[must_use]
     pub fn extra(mut self, extra: Vec<u8>) -> Self {
         self.extra = extra;
         self

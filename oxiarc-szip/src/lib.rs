@@ -16,13 +16,8 @@
 //! use oxiarc_szip::{SzipParams, decode, encode};
 //!
 //! let params = SzipParams {
-//!     bits_per_pixel: 8,
-//!     pixels_per_block: 8,
 //!     samples: 16,
-//!     reference_sample_interval: 8,
-//!     msb: true,
-//!     nn_preprocess: false,
-//!     rsi_byte_align: false,
+//!     ..SzipParams::default()
 //! };
 //!
 //! let samples: Vec<u64> = (0..16u64).collect();
@@ -33,6 +28,8 @@
 //! let decoded: Vec<u64> = raw_bytes.iter().map(|&b| b as u64).collect();
 //! assert_eq!(decoded, samples);
 //! ```
+
+#![warn(missing_docs)]
 
 pub mod error;
 pub mod params;

@@ -20,7 +20,7 @@ use crate::lz77::{Lz77Command, Lz77Params, lz77_compress_pooled};
 use crate::pool::BrotliPool;
 
 /// Brotli compression parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrotliParams {
     /// Quality level (0-11). Higher = better compression, slower.
     pub quality: u32,
@@ -85,6 +85,14 @@ impl BrotliParams {
 }
 
 /// Compress data using Brotli with the given quality level.
+///
+/// This is the crate's primary entry point and follows the workspace-wide
+/// `compress(data, level)` convention shared by the other codec crates
+/// (e.g. `oxiarc_deflate::deflate`, `oxiarc_lz4::compress`). `quality` is a
+/// `u32` (not `u8`) for consistency with [`BrotliParams::quality`] and the
+/// reference Brotli encoder API; valid values are `0..=11`, see
+/// [`BrotliParams::validate`]. Use [`compress_with_params`] for full control
+/// over `lgwin`/`lgblock`.
 pub fn compress(data: &[u8], quality: u32) -> BrotliResult<Vec<u8>> {
     let params = BrotliParams {
         quality,

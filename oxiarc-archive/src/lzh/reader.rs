@@ -8,6 +8,47 @@ use oxiarc_core::{Crc16, Entry};
 use oxiarc_lzhuf::{LzhMethod, decode_lzh};
 use std::io::{Read, Seek, SeekFrom, Write};
 
+/// Read exactly `declared_len` bytes of the compressed payload starting at
+/// the reader's current position.
+///
+/// `declared_len` originates from an untrusted LZH header field
+/// (`compressed_size`), so it must never drive an unconditional
+/// `vec![0u8; declared_len]` allocation directly — a crafted archive could
+/// declare an implausible size (e.g. several GiB) for what is actually a
+/// tiny or truncated file, aborting the process on allocation before a
+/// single byte is read. Instead the declared length is first bounded
+/// against the number of bytes actually remaining in the underlying
+/// stream, and the allocation itself goes through `try_reserve_exact` so
+/// an oversized-but-still-"remaining" declaration yields a proper `Err`
+/// rather than an allocator panic.
+fn read_compressed_bounded<R: Read + Seek>(reader: &mut R, declared_len: u32) -> Result<Vec<u8>> {
+    let declared_len = declared_len as u64;
+    let current = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(current))?;
+    let remaining = end.saturating_sub(current);
+
+    if declared_len > remaining {
+        return Err(OxiArcError::corrupted(
+            current,
+            format!(
+                "LZH entry declares compressed size {declared_len} but only {remaining} bytes remain in the stream"
+            ),
+        ));
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(declared_len as usize).map_err(|_| {
+        OxiArcError::corrupted(
+            current,
+            format!("unable to allocate {declared_len} bytes for LZH entry data"),
+        )
+    })?;
+    data.resize(declared_len as usize, 0);
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
 /// Internal entry info for extraction.
 #[derive(Debug, Clone)]
 pub(crate) struct LzhEntryInfo {
@@ -165,8 +206,7 @@ impl<R: Read + Seek> LzhReader<R> {
         self.reader.seek(SeekFrom::Start(entry.offset))?;
 
         // Read compressed data
-        let mut compressed = vec![0u8; info.compressed_size as usize];
-        self.reader.read_exact(&mut compressed)?;
+        let compressed = read_compressed_bounded(&mut self.reader, info.compressed_size)?;
 
         // Decompress
         let decompressed = if info.method == LzhMethod::Lh0 {
@@ -215,8 +255,15 @@ impl<R: Read + Seek> LzhReader<R> {
     }
 
     /// Extract an entry to a Vec.
+    ///
+    /// `entry.size` (the declared *uncompressed* size) is untrusted header
+    /// data, so it is never used to pre-size the output buffer directly —
+    /// a crafted header could declare an implausible uncompressed size for
+    /// a tiny compressed payload. The buffer instead starts empty and is
+    /// grown incrementally by `extract`'s `write_all` calls as bytes are
+    /// actually produced.
     pub fn extract_to_vec(&mut self, entry: &Entry) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(entry.size as usize);
+        let mut data = Vec::new();
         self.extract(entry, &mut data)?;
         Ok(data)
     }
@@ -247,8 +294,7 @@ impl<R: Read + Seek> LzhReader<R> {
             .clone();
 
         self.reader.seek(SeekFrom::Start(entry.offset))?;
-        let mut compressed = vec![0u8; info.compressed_size as usize];
-        self.reader.read_exact(&mut compressed)?;
+        let compressed = read_compressed_bounded(&mut self.reader, info.compressed_size)?;
 
         Ok((info.method, compressed, info.crc16))
     }
@@ -280,4 +326,81 @@ pub fn open_lzh_mmap<P: AsRef<std::path::Path>>(
 ) -> Result<LzhReader<oxiarc_core::mmap::MmapReader>> {
     let reader = oxiarc_core::mmap::MmapReader::open(path)?;
     LzhReader::new(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lzh::writer::LzhWriter;
+    use std::io::Cursor;
+
+    fn build_lzh(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut writer = LzhWriter::new(&mut archive);
+            writer.add_file(name, data).expect("add_file");
+            writer.finish().expect("finish");
+        }
+        archive
+    }
+
+    /// A header field declaring a `compressed_size` far larger than what
+    /// is actually present in the stream must be rejected with a proper
+    /// `Err` from `read_compressed_bounded`, not turned into a multi-GiB
+    /// `vec![0u8; ...]` allocation.
+    #[test]
+    fn test_extract_oversized_compressed_size_errors() {
+        let archive = build_lzh("small.txt", b"hello world");
+        let mut reader = LzhReader::new(Cursor::new(archive)).expect("open archive");
+
+        // Directly corrupt the internally recorded compressed size to an
+        // implausible value — simulating a crafted header field.
+        reader.entries[0].compressed_size = u32::MAX;
+
+        let entry = reader.entries()[0].clone();
+        let result = reader.extract_to_vec(&entry);
+        assert!(
+            result.is_err(),
+            "oversized declared compressed_size must not succeed"
+        );
+    }
+
+    /// A stream truncated well before the declared `compressed_size` is
+    /// reached must yield a clean `Err`, not a panic or an attempt to
+    /// zero-fill a buffer sized from the untrusted declaration.
+    #[test]
+    fn test_extract_truncated_stream_errors() {
+        let mut archive = build_lzh("small.txt", b"hello world, this is a test payload");
+
+        // Truncate the archive well past the header but before the full
+        // declared compressed payload, so `remaining < declared_len`.
+        let truncated_len = archive.len().saturating_sub(5).max(1);
+        archive.truncate(truncated_len);
+
+        let mut reader = LzhReader::new(Cursor::new(archive)).expect("open truncated archive");
+        let entry = reader.entries()[0].clone();
+        let result = reader.extract_to_vec(&entry);
+        assert!(
+            result.is_err(),
+            "truncated stream must error rather than panic"
+        );
+    }
+
+    /// `read_compressed_bounded` itself: a declared length larger than the
+    /// remaining bytes must error without attempting the allocation.
+    #[test]
+    fn test_read_compressed_bounded_rejects_oversized_declaration() {
+        let mut cursor = Cursor::new(vec![1u8, 2, 3, 4]);
+        let result = read_compressed_bounded(&mut cursor, u32::MAX);
+        assert!(result.is_err());
+    }
+
+    /// Sanity check that the bounded reader still works correctly for a
+    /// plausible, in-range declaration.
+    #[test]
+    fn test_read_compressed_bounded_reads_valid_declaration() {
+        let mut cursor = Cursor::new(vec![10u8, 20, 30, 40, 50]);
+        let data = read_compressed_bounded(&mut cursor, 3).expect("read within bounds");
+        assert_eq!(data, vec![10, 20, 30]);
+    }
 }

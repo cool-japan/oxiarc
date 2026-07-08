@@ -319,6 +319,17 @@ impl<R: Read> BzDecoder<R> {
 }
 
 /// Decompress BZip2 data.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_bzip2::{compress, decompress, CompressionLevel};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = compress(data, CompressionLevel::new(9)).expect("compress");
+/// let decompressed = decompress(&compressed[..]).expect("decompress");
+/// assert_eq!(decompressed, data);
+/// ```
 pub fn decompress<R: Read>(reader: R) -> Result<Vec<u8>> {
     let mut decoder = BzDecoder::new(reader)?;
     let mut output = Vec::new();

@@ -9,17 +9,21 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-archive = { version = "0.2.7", features = ["async-io"] }
+//! oxiarc-archive = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_archive::async_tar::read_tar_entries_async;
 //!
-//! let entries = read_tar_entries_async("archive.tar").await?;
-//! for entry in entries {
-//!     println!("{}: {} bytes", entry.name, entry.size);
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> oxiarc_core::Result<()> {
+//!     let entries = read_tar_entries_async("archive.tar").await?;
+//!     for entry in entries {
+//!         println!("{}: {} bytes", entry.name, entry.size);
+//!     }
+//!     Ok(())
 //! }
 //! ```
 

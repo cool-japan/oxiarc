@@ -274,6 +274,17 @@ impl<W: Write> BzEncoder<W> {
 }
 
 /// Compress data using BZip2.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_bzip2::{compress, decompress, CompressionLevel};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = compress(data, CompressionLevel::new(9)).expect("compress");
+/// let decompressed = decompress(&compressed[..]).expect("decompress");
+/// assert_eq!(decompressed, data);
+/// ```
 pub fn compress(data: &[u8], level: CompressionLevel) -> Result<Vec<u8>> {
     let output = Vec::new();
     let mut encoder = BzEncoder::new(output, level)?;

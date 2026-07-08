@@ -8,6 +8,17 @@
 //! 3. Move-to-Front Transform (MTF) - Locality transformation
 //! 4. Zero-Run Length Encoding - Special encoding for zeros
 //! 5. Huffman Coding - Final entropy coding
+//!
+//! # Example
+//!
+//! ```rust
+//! use oxiarc_bzip2::{compress, decompress, CompressionLevel};
+//!
+//! let data = b"Hello, World! Hello, World!";
+//! let compressed = compress(data, CompressionLevel::new(9)).expect("compress");
+//! let decompressed = decompress(&compressed[..]).expect("decompress");
+//! assert_eq!(decompressed, data);
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]

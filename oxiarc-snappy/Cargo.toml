@@ -10,9 +10,14 @@ description = "Pure Rust Snappy compression implementation with block and framed
 readme = "README.md"
 keywords = ["snappy", "compression", "decompression", "framing", "crc32c"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
@@ -23,6 +28,7 @@ parallel = ["dep:rayon"]
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 rayon.workspace = true
 
 [[bench]]

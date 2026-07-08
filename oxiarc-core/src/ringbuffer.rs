@@ -75,6 +75,39 @@ impl RingBuffer {
         }
     }
 
+    /// Create a new ring buffer with the specified capacity, without panicking.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - Must be a power of 2 (e.g., 4096, 8192, 32768, 65536)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError`] if `capacity` is zero or not a power of two.
+    /// This is the non-panicking counterpart to [`RingBuffer::new`]; prefer
+    /// it whenever `capacity` originates from untrusted or externally
+    /// supplied input.
+    pub fn try_new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(OxiArcError::InvalidHeader {
+                message: "RingBuffer capacity must be greater than 0".to_string(),
+            });
+        }
+        if !capacity.is_power_of_two() {
+            return Err(OxiArcError::InvalidHeader {
+                message: format!("RingBuffer capacity must be a power of 2, got {capacity}"),
+            });
+        }
+
+        Ok(Self {
+            buffer: vec![0; capacity],
+            position: 0,
+            size: 0,
+            capacity,
+            mask: capacity - 1,
+        })
+    }
+
     /// Create a new ring buffer for DEFLATE decompression (32 KB).
     pub fn deflate() -> Self {
         Self::new(sizes::DEFLATE)
@@ -295,6 +328,13 @@ pub struct OutputRingBuffer {
 
 impl OutputRingBuffer {
     /// Create a new output ring buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `window_size` is zero or not a power of two (see
+    /// [`RingBuffer::new`]). Use [`OutputRingBuffer::try_new`] to construct
+    /// from an untrusted or externally supplied `window_size` without
+    /// panicking.
     pub fn new(window_size: usize) -> Self {
         Self {
             ring: RingBuffer::new(window_size),
@@ -302,7 +342,24 @@ impl OutputRingBuffer {
         }
     }
 
+    /// Create a new output ring buffer, without panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `window_size` is zero or not a power of two.
+    pub fn try_new(window_size: usize) -> Result<Self> {
+        Ok(Self {
+            ring: RingBuffer::try_new(window_size)?,
+            output: Vec::new(),
+        })
+    }
+
     /// Create with an initial output capacity hint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `window_size` is zero or not a power of two (see
+    /// [`RingBuffer::new`]).
     pub fn with_capacity(window_size: usize, output_capacity: usize) -> Self {
         Self {
             ring: RingBuffer::new(window_size),
@@ -525,6 +582,20 @@ mod tests {
 
         assert!(ring.read_at_distance(0).is_err());
         assert!(ring.read_at_distance(1).is_err()); // Empty buffer
+    }
+
+    #[test]
+    fn test_try_new_rejects_zero_and_non_power_of_two() {
+        assert!(RingBuffer::try_new(0).is_err());
+        assert!(RingBuffer::try_new(100).is_err());
+        assert!(RingBuffer::try_new(4096).is_ok());
+    }
+
+    #[test]
+    fn test_output_ringbuffer_try_new() {
+        assert!(OutputRingBuffer::try_new(0).is_err());
+        assert!(OutputRingBuffer::try_new(100).is_err());
+        assert!(OutputRingBuffer::try_new(64).is_ok());
     }
 
     #[test]

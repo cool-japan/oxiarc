@@ -79,6 +79,56 @@ impl<R: Read + Seek> ZipReader<R> {
         &self.warnings
     }
 
+    /// Read exactly `len` bytes from `reader` at its current position, after
+    /// validating `len` against the number of bytes physically remaining in
+    /// the stream.
+    ///
+    /// ZIP header fields such as `compressed_size` are attacker-controlled.
+    /// Allocating `vec![0u8; header_field]` eagerly lets a tiny malicious
+    /// archive request a multi-GiB buffer. This helper rejects any request
+    /// larger than the bytes actually left in the stream (so the buffer can
+    /// never exceed the real file size) and uses `try_reserve_exact` so an
+    /// allocation failure surfaces as a recoverable error rather than an
+    /// abort.
+    fn read_bounded(reader: &mut R, len: usize) -> Result<Vec<u8>> {
+        let cur = reader.stream_position()?;
+        let end = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(cur))?;
+        let remaining = end.saturating_sub(cur);
+
+        if len as u64 > remaining {
+            return Err(OxiArcError::corrupted(
+                cur,
+                format!("declared size {len} exceeds {remaining} bytes remaining in archive"),
+            ));
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(len)
+            .map_err(|_| OxiArcError::corrupted(cur, format!("failed to allocate {len} bytes")))?;
+        buf.resize(len, 0);
+        reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Constant-time equality for two byte slices.
+    ///
+    /// Used for password-verification comparisons so that a timing side
+    /// channel cannot reveal how many leading bytes of an attacker-supplied
+    /// verifier matched the expected value. Runs in time proportional to the
+    /// input length regardless of where (or whether) the slices differ.
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        // Prevent the optimizer from short-circuiting the accumulation.
+        core::hint::black_box(diff) == 0
+    }
+
     /// Read all entries from the archive, together with the raw
     /// (undecoded) name bytes of each entry.
     /// Uses the central directory for accurate metadata (handles data descriptors).
@@ -127,6 +177,22 @@ impl<R: Read + Seek> ZipReader<R> {
             ]);
 
             if locator_sig == ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG {
+                // The Zip64 EOCD locator records the total number of disks
+                // (bytes 16-19). A single-file archive has exactly one disk;
+                // anything else is a spanned/multi-volume set this reader
+                // cannot reassemble.
+                let total_disks = u32::from_le_bytes([
+                    locator_buf[16],
+                    locator_buf[17],
+                    locator_buf[18],
+                    locator_buf[19],
+                ]);
+                if total_disks > 1 {
+                    return Err(OxiArcError::unsupported_method(
+                        "multi-volume/spanned ZIP archives",
+                    ));
+                }
+
                 // Zip64 EOCD locator found
                 let zip64_eocd_offset = u64::from_le_bytes([
                     locator_buf[8],
@@ -143,6 +209,27 @@ impl<R: Read + Seek> ZipReader<R> {
                 reader.seek(SeekFrom::Start(zip64_eocd_offset))?;
                 let mut zip64_eocd = [0u8; 56];
                 reader.read_exact(&mut zip64_eocd)?;
+
+                // Reject spanned archives: "number of this disk" (bytes 16-19)
+                // and "disk with the start of the central directory"
+                // (bytes 20-23) must both be zero for a single-file archive.
+                let zip64_this_disk = u32::from_le_bytes([
+                    zip64_eocd[16],
+                    zip64_eocd[17],
+                    zip64_eocd[18],
+                    zip64_eocd[19],
+                ]);
+                let zip64_disk_with_cd = u32::from_le_bytes([
+                    zip64_eocd[20],
+                    zip64_eocd[21],
+                    zip64_eocd[22],
+                    zip64_eocd[23],
+                ]);
+                if zip64_this_disk != 0 || zip64_disk_with_cd != 0 {
+                    return Err(OxiArcError::unsupported_method(
+                        "multi-volume/spanned ZIP archives",
+                    ));
+                }
 
                 let entries_count = u64::from_le_bytes([
                     zip64_eocd[32],
@@ -186,10 +273,40 @@ impl<R: Read + Seek> ZipReader<R> {
             Self::parse_standard_eocd(&buf[eocd_offset..])?
         };
 
+        // Bound the declared entry count against the physical archive size
+        // before allocating. Each central-directory record is at least 46
+        // bytes, so a `file_size`-byte archive can hold at most
+        // `file_size / 46` entries. A malicious or corrupt (Zip64) EOCD can
+        // otherwise claim up to `u64::MAX` entries and drive a multi-GiB
+        // capacity allocation at open time.
+        let max_plausible_entries = file_size / 46 + 1;
+        if total_entries > max_plausible_entries {
+            return Err(OxiArcError::corrupted(
+                cd_offset,
+                format!(
+                    "central directory declares {total_entries} entries but a \
+                     {file_size}-byte archive can hold at most {max_plausible_entries}"
+                ),
+            ));
+        }
+
         // Read central directory entries
         reader.seek(SeekFrom::Start(cd_offset))?;
-        let mut entries = Vec::with_capacity(total_entries as usize);
-        let mut raw_names = Vec::with_capacity(total_entries as usize);
+        let capacity = total_entries as usize;
+        let mut entries: Vec<Entry> = Vec::new();
+        entries.try_reserve(capacity).map_err(|_| {
+            OxiArcError::corrupted(
+                cd_offset,
+                format!("failed to reserve capacity for {capacity} central-directory entries"),
+            )
+        })?;
+        let mut raw_names: Vec<Vec<u8>> = Vec::new();
+        raw_names.try_reserve(capacity).map_err(|_| {
+            OxiArcError::corrupted(
+                cd_offset,
+                format!("failed to reserve capacity for {capacity} central-directory names"),
+            )
+        })?;
 
         for _ in 0..total_entries {
             let (entry, raw_name) = Self::read_central_dir_entry(reader)?;
@@ -207,6 +324,19 @@ impl<R: Read + Seek> ZipReader<R> {
     fn parse_standard_eocd(buf: &[u8]) -> Result<(u64, u64, u64)> {
         if buf.len() < 22 {
             return Err(OxiArcError::invalid_header("EOCD too short"));
+        }
+
+        // Reject multi-volume / spanned archives. In a single-file archive the
+        // "number of this disk" (bytes 4-5) and "disk where the central
+        // directory starts" (bytes 6-7) are both zero. Any nonzero value means
+        // the archive is split across several volumes (e.g. `.z01` + `.zip`),
+        // which this reader cannot reassemble.
+        let number_of_this_disk = u16::from_le_bytes([buf[4], buf[5]]);
+        let disk_with_cd_start = u16::from_le_bytes([buf[6], buf[7]]);
+        if number_of_this_disk != 0 || disk_with_cd_start != 0 {
+            return Err(OxiArcError::unsupported_method(
+                "multi-volume/spanned ZIP archives",
+            ));
         }
 
         let total_entries = u16::from_le_bytes([buf[10], buf[11]]) as u64;
@@ -499,9 +629,9 @@ impl<R: Read + Seek> ZipReader<R> {
         // Seek to data
         self.reader.seek(SeekFrom::Start(entry.offset))?;
 
-        // Read compressed data
-        let mut compressed = vec![0u8; entry.compressed_size as usize];
-        self.reader.read_exact(&mut compressed)?;
+        // Read compressed data (bounded against the real stream length so a
+        // spoofed `compressed_size` cannot force a huge allocation).
+        let compressed = Self::read_bounded(&mut self.reader, entry.compressed_size as usize)?;
 
         // Decompress based on method
         let decompressed = match entry.method {
@@ -612,8 +742,7 @@ impl<R: Read + Seek> ZipReader<R> {
     /// The raw compressed bytes (exactly `entry.compressed_size` bytes).
     pub fn extract_raw(&mut self, entry: &Entry) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(entry.offset))?;
-        let mut compressed = vec![0u8; entry.compressed_size as usize];
-        self.reader.read_exact(&mut compressed)?;
+        let compressed = Self::read_bounded(&mut self.reader, entry.compressed_size as usize)?;
         Ok(compressed)
     }
 
@@ -687,9 +816,10 @@ impl<R: Read + Seek> ZipReader<R> {
             ));
         }
 
-        // Read all encrypted data (including header)
-        let mut encrypted = vec![0u8; encrypted_size];
-        self.reader.read_exact(&mut encrypted)?;
+        // Read all encrypted data (including header), bounded against the
+        // real stream length so a spoofed `compressed_size` cannot force a
+        // huge allocation.
+        let encrypted = Self::read_bounded(&mut self.reader, encrypted_size)?;
 
         // Initialize the cipher with the password
         let mut cipher = ZipCrypto::new(password);
@@ -777,20 +907,35 @@ impl<R: Read + Seek> ZipReader<R> {
         let (mut decryptor, expected_pw_verification): (ZipAesDecryptor, [u8; 2]) =
             ZipAesDecryptor::new(password, &salt, aes_info.strength)?;
 
-        if pw_verification != expected_pw_verification {
+        // Constant-time comparison: never leak, via early-exit timing, how
+        // many leading bytes of the verifier matched.
+        if !Self::ct_eq(&pw_verification, &expected_pw_verification) {
             return Err(OxiArcError::invalid_header(
                 "Password verification failed - incorrect password",
             ));
         }
 
-        // Calculate encrypted data size
-        // Total = salt + pw_verification + encrypted_data + auth_code
+        // Calculate encrypted data size.
+        // Total = salt + pw_verification + encrypted_data + auth_code.
+        // `compressed_size` is attacker-controlled; a value smaller than the
+        // fixed AES overhead would underflow (panic in debug, ~usize::MAX
+        // allocation in release), so reject it with `checked_sub`.
         let overhead = salt_len + PASSWORD_VERIFICATION_LEN + WINZIP_AUTH_CODE_LEN;
-        let encrypted_data_len = entry.compressed_size as usize - overhead;
+        let encrypted_data_len = (entry.compressed_size as usize)
+            .checked_sub(overhead)
+            .ok_or_else(|| {
+                OxiArcError::corrupted(
+                    entry.offset,
+                    format!(
+                        "AES entry compressed_size {} is smaller than the {overhead}-byte \
+                         encryption overhead",
+                        entry.compressed_size
+                    ),
+                )
+            })?;
 
-        // Read encrypted data
-        let mut encrypted_data = vec![0u8; encrypted_data_len];
-        self.reader.read_exact(&mut encrypted_data)?;
+        // Read encrypted data (bounded against the real stream length).
+        let encrypted_data = Self::read_bounded(&mut self.reader, encrypted_data_len)?;
 
         // Read authentication code
         let mut auth_code = [0u8; WINZIP_AUTH_CODE_LEN];

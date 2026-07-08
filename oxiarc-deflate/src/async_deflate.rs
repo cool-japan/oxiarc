@@ -9,18 +9,26 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-deflate = { version = "0.2.2", features = ["async-io"] }
+//! oxiarc-deflate = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_core::async_io::{AsyncCompressor, AsyncCompressorWrapper};
 //! use oxiarc_deflate::Deflater;
 //!
-//! let deflater = Deflater::new(6);
-//! let mut async_compressor = AsyncCompressorWrapper::new(deflater);
-//! // use async_compressor.compress_async(&mut input, &mut output).await
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() {
+//!     let deflater = Deflater::new(6);
+//!     let mut async_compressor = AsyncCompressorWrapper::new(deflater);
+//!     let mut input = tokio::io::BufReader::new(&b"Hello, async DEFLATE!"[..]);
+//!     let mut output = Vec::new();
+//!     async_compressor
+//!         .compress_async(&mut input, &mut output)
+//!         .await
+//!         .unwrap();
+//! }
 //! ```
 
 use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};

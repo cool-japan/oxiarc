@@ -1,17 +1,21 @@
 //! Error types for Brotli operations.
 
 use oxiarc_core::error::OxiArcError;
-use std::fmt;
 use std::io;
+use thiserror::Error;
 
 /// Error type for Brotli compression/decompression operations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BrotliError {
     /// Invalid or corrupted Brotli data.
+    #[error("corrupted Brotli data: {0}")]
     CorruptedData(String),
     /// Invalid Huffman code encountered.
+    #[error("invalid Huffman code: {0}")]
     InvalidHuffmanCode(String),
     /// Invalid backward reference distance.
+    #[error("invalid backward reference distance: {distance} exceeds max {max_distance}")]
     InvalidDistance {
         /// The invalid distance value.
         distance: usize,
@@ -19,68 +23,35 @@ pub enum BrotliError {
         max_distance: usize,
     },
     /// Invalid parameter value.
+    #[error("invalid parameter: {0}")]
     InvalidParameter(String),
     /// Unexpected end of input.
+    #[error("unexpected end of Brotli stream")]
     UnexpectedEof,
     /// Output size exceeded expected limit.
+    #[error("output size {0} exceeds limit")]
     OutputTooLarge(usize),
     /// I/O error.
-    Io(io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
     /// Invalid window size.
+    #[error("invalid window size: {0}")]
     InvalidWindowSize(u32),
     /// Invalid block type.
+    #[error("invalid block type: {0}")]
     InvalidBlockType(u8),
     /// Dictionary reference error.
+    #[error("dictionary error: {0}")]
     DictionaryError(String),
     /// Invalid context map.
+    #[error("invalid context map: {0}")]
     InvalidContextMap(String),
     /// Invalid prefix code.
+    #[error("invalid prefix code: {0}")]
     InvalidPrefixCode(String),
     /// Operation cancelled by the caller.
+    #[error("operation cancelled")]
     Cancelled,
-}
-
-impl fmt::Display for BrotliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BrotliError::CorruptedData(msg) => write!(f, "corrupted Brotli data: {msg}"),
-            BrotliError::InvalidHuffmanCode(msg) => write!(f, "invalid Huffman code: {msg}"),
-            BrotliError::InvalidDistance {
-                distance,
-                max_distance,
-            } => write!(
-                f,
-                "invalid backward reference distance: {distance} exceeds max {max_distance}"
-            ),
-            BrotliError::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
-            BrotliError::UnexpectedEof => write!(f, "unexpected end of Brotli stream"),
-            BrotliError::OutputTooLarge(size) => {
-                write!(f, "output size {size} exceeds limit")
-            }
-            BrotliError::Io(err) => write!(f, "I/O error: {err}"),
-            BrotliError::InvalidWindowSize(size) => write!(f, "invalid window size: {size}"),
-            BrotliError::InvalidBlockType(bt) => write!(f, "invalid block type: {bt}"),
-            BrotliError::DictionaryError(msg) => write!(f, "dictionary error: {msg}"),
-            BrotliError::InvalidContextMap(msg) => write!(f, "invalid context map: {msg}"),
-            BrotliError::InvalidPrefixCode(msg) => write!(f, "invalid prefix code: {msg}"),
-            BrotliError::Cancelled => write!(f, "operation cancelled"),
-        }
-    }
-}
-
-impl std::error::Error for BrotliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            BrotliError::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for BrotliError {
-    fn from(err: io::Error) -> Self {
-        BrotliError::Io(err)
-    }
 }
 
 impl From<BrotliError> for io::Error {

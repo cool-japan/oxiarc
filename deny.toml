@@ -1,0 +1,27 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+]
+
+[bans]
+# windows-sys currently appears at both 0.59.0 (via rpassword -> rtoolbox) and
+# 0.61.2 (via rpassword, rustix, etc.). rtoolbox 0.0.5 is the latest release
+# and pins 0.59.0 itself, so this cannot be resolved from our side without
+# dropping rpassword; warn instead of denying until upstream aligns.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

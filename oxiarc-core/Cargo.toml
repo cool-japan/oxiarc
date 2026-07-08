@@ -10,6 +10,10 @@ readme = "README.md"
 description = "Core components for OxiArc - BitReader/Writer, CRC, traits, and error types"
 keywords = ["archive", "compression", "bitstream", "crc"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []

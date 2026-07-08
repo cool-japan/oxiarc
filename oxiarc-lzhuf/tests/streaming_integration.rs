@@ -89,6 +89,9 @@ fn test_streaming_decoder_stored_small_output_buffer() {
                 // Continue with more output space
             }
             DecompressStatus::BlockEnd => {}
+            // `DecompressStatus` is `#[non_exhaustive]`; a future variant is
+            // treated as a no-op continuation of the decode loop.
+            _ => {}
         }
     }
 

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 /// The main error type for OxiArc operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OxiArcError {
     /// I/O error from underlying reader/writer.
     #[error("I/O error: {0}")]

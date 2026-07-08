@@ -15,8 +15,21 @@ use std::io::Read;
 /// Granularity for progress reporting and cancellation checks (bytes).
 const PROGRESS_GRANULARITY: u64 = 4096;
 
-/// Maximum dictionary size (4 GB).
+/// Maximum dictionary size representable in the LZMA/LZMA2 header formats
+/// (`0xFFFF_FFFF` is used by real encoders as an "unbounded" sentinel).
 pub const DICT_SIZE_MAX: u32 = 0xFFFF_FFFF;
+
+/// Hard cap on the dictionary size we are willing to *allocate*, regardless
+/// of what a stream header declares.
+///
+/// A malicious or corrupted `.lzma`/`.xz` file can declare a dictionary size
+/// up to [`DICT_SIZE_MAX`] (~4 GiB). Without a cap, a tiny input file could
+/// force a multi-gigabyte zero-filled allocation (a denial-of-service via
+/// memory exhaustion). 1.5 GiB comfortably covers every dictionary size used
+/// by real-world encoders (xz's own maximum preset dictionary is 64 MiB, and
+/// even hand-tuned custom encodes rarely exceed a few hundred MiB) while
+/// still rejecting adversarial inputs before they can exhaust memory.
+pub const DICT_SIZE_ALLOC_CAP: u32 = 1536 * 1024 * 1024;
 
 /// Decode a bit tree.
 fn decode_bit_tree<R: Read>(
@@ -85,13 +98,29 @@ pub struct LzmaDecoder<R: Read> {
 
 impl<R: Read> LzmaDecoder<R> {
     /// Create a new LZMA decoder.
+    ///
+    /// Returns an error if `dict_size` exceeds [`DICT_SIZE_ALLOC_CAP`] — this
+    /// rejects streams that would otherwise force an unbounded allocation
+    /// before a single byte has been decoded. The dictionary buffer itself
+    /// is grown lazily (one byte at a time as output is produced) up to `dict_size` as
+    /// data is actually decoded, rather than eagerly zero-filled at the
+    /// declared maximum.
     pub fn new(reader: R, props: LzmaProperties, dict_size: u32) -> Result<Self> {
-        let dict_size = dict_size.max(4096) as usize;
+        let dict_size = dict_size.max(4096);
+        if dict_size > DICT_SIZE_ALLOC_CAP {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "LZMA dictionary size {dict_size} exceeds the maximum allowed allocation of {DICT_SIZE_ALLOC_CAP} bytes"
+                ),
+            ));
+        }
+        let dict_size = dict_size as usize;
 
         Ok(Self {
             rc: RangeDecoder::new(reader)?,
             model: LzmaModel::new(props),
-            dict: vec![0u8; dict_size],
+            dict: Vec::new(),
             dict_pos: 0,
             dict_size,
             state: State::new(),
@@ -133,8 +162,7 @@ impl<R: Read> LzmaDecoder<R> {
         let tail_start = dict.len().saturating_sub(self.dict_size);
         let tail = &dict[tail_start..];
         for &byte in tail {
-            self.dict[self.dict_pos] = byte;
-            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+            self.push_dict_byte(byte);
         }
         // bytes_decoded advances so that literal contexts and distance checks work
         self.bytes_decoded = tail.len() as u64;
@@ -337,6 +365,26 @@ impl<R: Read> LzmaDecoder<R> {
         self.dict[pos]
     }
 
+    /// Write a decoded byte into the (lazily-grown) circular dictionary
+    /// buffer.
+    ///
+    /// The backing `Vec` starts empty and grows one push at a time until it
+    /// reaches `dict_size` bytes, at which point it behaves as a fixed-size
+    /// ring buffer (in place overwrite + modulo wraparound). This avoids
+    /// eagerly zero-filling a buffer sized at the header-declared maximum
+    /// (which may be adversarially large) while preserving the exact same
+    /// addressing scheme [`Self::get_byte`] relies on once the buffer is
+    /// full.
+    fn push_dict_byte(&mut self, byte: u8) {
+        if self.dict.len() < self.dict_size {
+            self.dict.push(byte);
+            self.dict_pos = self.dict.len() % self.dict_size;
+        } else {
+            self.dict[self.dict_pos] = byte;
+            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+        }
+    }
+
     /// Decompress all data.
     pub fn decompress(mut self) -> Result<Vec<u8>> {
         let mut output = Vec::new();
@@ -379,8 +427,7 @@ impl<R: Read> LzmaDecoder<R> {
 
                 let byte = self.decode_literal(prev_byte, match_byte)?;
 
-                self.dict[self.dict_pos] = byte;
-                self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                self.push_dict_byte(byte);
                 output.push(byte);
                 self.bytes_decoded += 1;
                 self.state.update_literal();
@@ -436,8 +483,7 @@ impl<R: Read> LzmaDecoder<R> {
                             }
 
                             let byte = self.get_byte(dist as usize);
-                            self.dict[self.dict_pos] = byte;
-                            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                            self.push_dict_byte(byte);
                             output.push(byte);
                             self.bytes_decoded += 1;
                             self.state.update_short_rep();
@@ -494,8 +540,7 @@ impl<R: Read> LzmaDecoder<R> {
                 let len = len as usize;
                 for _ in 0..len {
                     let byte = self.get_byte(dist as usize);
-                    self.dict[self.dict_pos] = byte;
-                    self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                    self.push_dict_byte(byte);
                     output.push(byte);
                     self.bytes_decoded += 1;
                 }

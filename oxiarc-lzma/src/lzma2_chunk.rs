@@ -96,6 +96,22 @@ pub struct Lzma2Config {
     pub dict_size: u32,
 }
 
+// `LzmaProperties` (defined in the internal `model` module) does not derive
+// `PartialEq`/`Eq`, so a plain `#[derive(PartialEq, Eq)]` on `Lzma2Config`
+// would not compile. Compare `props` structurally via its encoded byte
+// (`lc`/`lp`/`pb` round-trip losslessly through `to_byte`/`from_byte`) so
+// config values can still be compared in tests without touching `model.rs`.
+impl PartialEq for Lzma2Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.chunk_size == other.chunk_size
+            && self.props.to_byte() == other.props.to_byte()
+            && self.level == other.level
+            && self.dict_size == other.dict_size
+    }
+}
+
+impl Eq for Lzma2Config {}
+
 impl Default for Lzma2Config {
     fn default() -> Self {
         Self {
@@ -339,10 +355,19 @@ impl Lzma2ChunkedEncoder {
             return Ok(());
         }
 
-        let reset_dict = self.encoder_state.first_chunk;
-        // Always reset state because we create a fresh LzmaEncoder for each chunk.
-        // The encoder's probability tables are always initialized, so the decoder
-        // must also reset its state to match.
+        // Every chunk is compressed with a fresh `LzmaEncoder` that carries no
+        // history from prior chunks, so each chunk must reset BOTH the decoder's
+        // state AND its dictionary. Resetting only the state (leaving the
+        // dictionary intact for chunks after the first) makes the decoder seed
+        // the literal-coder context (`prev_byte` / `match_byte`) from the tail of
+        // the previous chunk, while the encoder used an empty history — the two
+        // sides then update different literal-probability entries and the range
+        // coder desynchronizes on the first colliding literal. Repeated-byte
+        // payloads happen to survive because their single per-chunk literal is
+        // always decoded from a still-pristine (0.5) probability table, so which
+        // table index is touched is immaterial; varied data crossing a chunk
+        // boundary corrupts as soon as two literals collide.
+        let reset_dict = true;
         let reset_state = true;
 
         // Try to compress with LZMA (chunk payload: no end-of-stream marker,
@@ -416,7 +441,7 @@ impl Lzma2ChunkedEncoder {
     ) -> Result<()> {
         // Check if we need to split into multiple chunks
         if compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {
-            return self.write_lzma_chunks_split(output, uncompressed, reset_dict);
+            return self.write_lzma_chunks_split(output, uncompressed);
         }
 
         self.write_single_lzma_chunk(
@@ -464,12 +489,15 @@ impl Lzma2ChunkedEncoder {
     }
 
     /// Split data and write multiple LZMA chunks.
-    fn write_lzma_chunks_split(
-        &mut self,
-        output: &mut Vec<u8>,
-        data: &[u8],
-        mut reset_dict: bool,
-    ) -> Result<()> {
+    ///
+    /// Each sub-chunk is compressed with its own fresh [`LzmaEncoder`] (empty
+    /// history), so — exactly like [`Self::encode_chunk`] — every sub-chunk must
+    /// reset the decoder's dictionary as well as its state. The one exception is
+    /// when a single incompressible sub-chunk is itself split across several
+    /// 64 KiB uncompressed chunks: only the first of those pieces resets the
+    /// dictionary, because the later pieces continue the same verbatim run and
+    /// must not wipe the bytes just written.
+    fn write_lzma_chunks_split(&mut self, output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
         // Use a conservative sub-chunk size that will compress under 64KB
         let sub_chunk_size = 16 * 1024;
         let mut offset = 0;
@@ -485,8 +513,11 @@ impl Lzma2ChunkedEncoder {
 
             // Check if compression is worthwhile
             if compressed.len() >= chunk.len() || compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {
-                // Write as uncompressed (may need to split further)
+                // Write as uncompressed (may need to split further). Reset the
+                // dictionary on the first piece only; subsequent pieces continue
+                // the same verbatim run.
                 let mut unc_offset = 0;
+                let mut reset_dict = true;
                 while unc_offset < chunk.len() {
                     let unc_remaining = chunk.len() - unc_offset;
                     let unc_size = unc_remaining.min(UNCOMPRESSED_CHUNK_MAX);
@@ -505,17 +536,9 @@ impl Lzma2ChunkedEncoder {
                     unc_offset += unc_size;
                 }
             } else {
-                // Write as LZMA chunk
-                // Always reset state since we create a fresh encoder for each sub-chunk
-                let reset_state = true;
-                self.write_single_lzma_chunk(
-                    output,
-                    chunk.len(),
-                    &compressed,
-                    reset_dict,
-                    reset_state,
-                )?;
-                reset_dict = false;
+                // Write as LZMA chunk. The sub-chunk was compressed with a fresh
+                // encoder, so reset both dictionary and state.
+                self.write_single_lzma_chunk(output, chunk.len(), &compressed, true, true)?;
             }
 
             offset += chunk_size;
@@ -718,6 +741,58 @@ mod tests {
         let encoded = encode_lzma2_with_config(&original, config).expect("encode failed");
         let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
         assert_eq!(decoded, original);
+    }
+
+    /// Deterministic pseudo-varied bytes via a byte LCG (no `rand`).
+    ///
+    /// Produces non-repetitive, literal-heavy data so the LZMA2 chunk stream
+    /// actually exercises the per-chunk literal-coder context. Repeated-byte
+    /// payloads (`vec![b; n]`) cannot reproduce the cross-chunk desync this
+    /// guards against — see the note on [`Lzma2ChunkedEncoder::encode_chunk`].
+    fn varied_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..len {
+            // Numerical Recipes LCG constants.
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(0x20u8.wrapping_add(((state >> 16) as u8) % 0x5f));
+        }
+        out
+    }
+
+    #[test]
+    fn test_varied_data_across_multiple_small_chunks() {
+        // Regression: varied (non-repetitive) data crossing several small chunk
+        // boundaries must round-trip byte-for-byte. Before the dictionary-reset
+        // fix this failed with "Invalid LZMA data" once two literals collided.
+        let data = varied_bytes(300 * 1024);
+        let config = Lzma2Config::with_level(LzmaLevel::DEFAULT).chunk_size(4 * 1024);
+        let encoded = encode_lzma2_with_config(&data, config).expect("encode failed");
+        let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
+        assert_eq!(decoded, data, "varied multi-chunk round-trip mismatch");
+    }
+
+    #[test]
+    fn test_varied_data_multiple_chunk_sizes() {
+        // Exercise a range of small chunk sizes so the boundary is crossed a
+        // varying number of times, including many crossings.
+        let data = varied_bytes(64 * 1024);
+        for chunk in [512usize, 1024, 3000, 7000, 20_000] {
+            let config = Lzma2Config::with_level(LzmaLevel::FAST).chunk_size(chunk);
+            let encoded = encode_lzma2_with_config(&data, config).expect("encode failed");
+            let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
+            assert_eq!(decoded, data, "mismatch at chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn test_varied_data_default_chunk_over_2mb() {
+        // Regression: a >2 MiB varied input routed through the DEFAULT chunk
+        // path (crate::lzma2::encode_lzma2 -> encode_chunked) must round-trip.
+        let data = varied_bytes(3 * 1024 * 1024 + 777);
+        let encoded = crate::lzma2::encode_lzma2(&data, LzmaLevel::DEFAULT).expect("encode failed");
+        let decoded = crate::lzma2::decode_lzma2(&encoded, 1 << 24).expect("decode failed");
+        assert_eq!(decoded, data, "varied default-chunk round-trip mismatch");
     }
 
     #[test]

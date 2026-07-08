@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use std::io::{Read, Write};
 //! use oxiarc_zstd::streaming::{ZstdStreamEncoder, ZstdStreamDecoder};
 //!

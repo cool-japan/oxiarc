@@ -5,7 +5,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};
 //! use tokio::io::{AsyncRead, AsyncWrite};
 //!
@@ -16,8 +16,8 @@
 //! ) -> oxiarc_core::Result<usize>
 //! where
 //!     C: AsyncCompressor,
-//!     R: AsyncRead + Unpin,
-//!     W: AsyncWrite + Unpin,
+//!     R: AsyncRead + Unpin + Send,
+//!     W: AsyncWrite + Unpin + Send,
 //! {
 //!     compressor.compress_async(input, output).await
 //! }
@@ -29,7 +29,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-core = { version = "0.2.0", features = ["async-io"] }
+//! oxiarc-core = { version = "0.3.6", features = ["async-io"] }
 //! ```
 
 use crate::error::{OxiArcError, Result};
@@ -148,11 +148,40 @@ pub trait AsyncDecompressor: Send {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use oxiarc_core::async_io::AsyncCompressorWrapper;
-/// use oxiarc_deflate::DeflateCompressor;
+/// use oxiarc_core::traits::{CompressStatus, Compressor, FlushMode};
+/// use oxiarc_core::Result;
 ///
-/// let compressor = DeflateCompressor::new();
+/// /// A trivial pass-through compressor, standing in for a real one
+/// /// (e.g. `oxiarc_deflate::DeflateCompressor`) for illustration.
+/// struct PassThroughCompressor;
+///
+/// impl Compressor for PassThroughCompressor {
+///     fn compress(
+///         &mut self,
+///         input: &[u8],
+///         output: &mut [u8],
+///         flush: FlushMode,
+///     ) -> Result<(usize, usize, CompressStatus)> {
+///         let n = input.len().min(output.len());
+///         output[..n].copy_from_slice(&input[..n]);
+///         let status = if flush == FlushMode::Finish && n == input.len() {
+///             CompressStatus::Done
+///         } else {
+///             CompressStatus::NeedsInput
+///         };
+///         Ok((n, n, status))
+///     }
+///
+///     fn reset(&mut self) {}
+///
+///     fn is_finished(&self) -> bool {
+///         true
+///     }
+/// }
+///
+/// let compressor = PassThroughCompressor;
 /// let mut async_compressor = AsyncCompressorWrapper::new(compressor);
 /// ```
 pub struct AsyncCompressorWrapper<C> {
@@ -307,11 +336,34 @@ impl<C: Compressor + Send> AsyncCompressor for AsyncCompressorWrapper<C> {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use oxiarc_core::async_io::AsyncDecompressorWrapper;
-/// use oxiarc_deflate::DeflateDecompressor;
+/// use oxiarc_core::traits::{DecompressStatus, Decompressor};
+/// use oxiarc_core::Result;
 ///
-/// let decompressor = DeflateDecompressor::new();
+/// /// A trivial pass-through decompressor, standing in for a real one
+/// /// (e.g. `oxiarc_deflate::DeflateDecompressor`) for illustration.
+/// struct PassThroughDecompressor;
+///
+/// impl Decompressor for PassThroughDecompressor {
+///     fn decompress(
+///         &mut self,
+///         input: &[u8],
+///         output: &mut [u8],
+///     ) -> Result<(usize, usize, DecompressStatus)> {
+///         let n = input.len().min(output.len());
+///         output[..n].copy_from_slice(&input[..n]);
+///         Ok((n, n, DecompressStatus::Done))
+///     }
+///
+///     fn reset(&mut self) {}
+///
+///     fn is_finished(&self) -> bool {
+///         true
+///     }
+/// }
+///
+/// let decompressor = PassThroughDecompressor;
 /// let mut async_decompressor = AsyncDecompressorWrapper::new(decompressor);
 /// ```
 pub struct AsyncDecompressorWrapper<D> {

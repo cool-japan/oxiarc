@@ -1,6 +1,9 @@
 //! LZW configuration for different formats (TIFF, GIF).
 
 /// LZW configuration parameters.
+///
+/// The [`Default`] impl returns the standard TIFF configuration (9-12 bit
+/// codes, no clear code, early code change), matching [`LzwConfig::TIFF`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LzwConfig {
     /// Minimum code size in bits (typically 9).
@@ -73,6 +76,17 @@ impl LzwConfig {
     }
 }
 
+impl Default for LzwConfig {
+    /// Defaults to the standard TIFF configuration (9-12 bit codes, no clear
+    /// code, early code change). A derived all-zero `Default` would be an
+    /// invalid configuration (`min_bits: 0` makes `clear_code()` shift-panic
+    /// on `1 << (0 - 1)`), so this is a hand-written impl that returns a
+    /// sensible, usable default rather than a bitwise-zero one.
+    fn default() -> Self {
+        Self::TIFF
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +102,11 @@ mod tests {
         assert_eq!(config.max_code(), 4095);
         assert!(!config.use_clear_code);
         assert!(config.early_change);
+    }
+
+    #[test]
+    fn test_default_config_is_tiff() {
+        assert_eq!(LzwConfig::default(), LzwConfig::TIFF);
     }
 
     #[test]

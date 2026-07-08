@@ -1,0 +1,167 @@
+[package]
+name = "oxiarc-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.4.2", features = ["derive"] }
+
+oxiarc-core = { path = "../oxiarc-core" }
+oxiarc-deflate = { path = "../oxiarc-deflate" }
+oxiarc-bzip2 = { path = "../oxiarc-bzip2" }
+oxiarc-lzma = { path = "../oxiarc-lzma" }
+oxiarc-zstd = { path = "../oxiarc-zstd" }
+oxiarc-lz4 = { path = "../oxiarc-lz4" }
+oxiarc-brotli = { path = "../oxiarc-brotli" }
+oxiarc-snappy = { path = "../oxiarc-snappy" }
+oxiarc-lzhuf = { path = "../oxiarc-lzhuf" }
+oxiarc-lzw = { path = "../oxiarc-lzw" }
+oxiarc-szip = { path = "../oxiarc-szip" }
+oxiarc-archive = { path = "../oxiarc-archive" }
+
+# Prevent this from interfering with workspace resolution: this crate is
+# intentionally excluded from the root `[workspace]` (see /notebooks/oxiarc/Cargo.toml)
+# and manages its own lockfile, per standard cargo-fuzz conventions.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_inflate"
+path = "fuzz_targets/fuzz_inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gzip_header"
+path = "fuzz_targets/fuzz_gzip_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zlib_header"
+path = "fuzz_targets/fuzz_zlib_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bzip2_decompress"
+path = "fuzz_targets/fuzz_bzip2_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lzma_decompress"
+path = "fuzz_targets/fuzz_lzma_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zstd_frame"
+path = "fuzz_targets/fuzz_zstd_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lz4_decompress"
+path = "fuzz_targets/fuzz_lz4_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_brotli_decompress"
+path = "fuzz_targets/fuzz_brotli_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snappy_decompress"
+path = "fuzz_targets/fuzz_snappy_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snappy_crc32c"
+path = "fuzz_targets/fuzz_snappy_crc32c.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lzh_decode"
+path = "fuzz_targets/fuzz_lzh_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lzw_decompress"
+path = "fuzz_targets/fuzz_lzw_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_szip_decode"
+path = "fuzz_targets/fuzz_szip_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zip_read"
+path = "fuzz_targets/fuzz_zip_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tar_read"
+path = "fuzz_targets/fuzz_tar_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cab_read"
+path = "fuzz_targets/fuzz_cab_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_iso9660_read"
+path = "fuzz_targets/fuzz_iso9660_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sevenz_header"
+path = "fuzz_targets/fuzz_sevenz_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_archive_detect"
+path = "fuzz_targets/fuzz_archive_detect.rs"
+test = false
+doc = false
+bench = false

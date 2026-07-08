@@ -10,14 +10,20 @@ description = "Pure Rust Brotli compression/decompression implementation (RFC 79
 readme = "README.md"
 keywords = ["compression", "brotli", "decompression", "rfc7932", "lz77"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]

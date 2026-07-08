@@ -964,6 +964,11 @@ impl Compressor for Deflater {
             FlushMode::None => {
                 self.deflate(input, &mut buffer, false)?;
             }
+            // `FlushMode` is `#[non_exhaustive]`; treat any future mode as the
+            // conservative buffered (no-flush) path rather than panicking.
+            _ => {
+                self.deflate(input, &mut buffer, false)?;
+            }
         }
 
         let finish = matches!(flush, FlushMode::Finish);

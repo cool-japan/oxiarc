@@ -20,10 +20,9 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};
 //! use oxiarc_brotli::async_brotli::{BrotliAsyncCompressor, BrotliAsyncDecompressor};
-//! use tokio::io::Cursor;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,14 +71,17 @@ const BROTLI_ASYNC_BUFFER_SIZE: usize = 64 * 1024;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use oxiarc_core::async_io::AsyncCompressor;
 /// use oxiarc_brotli::async_brotli::BrotliAsyncCompressor;
 ///
-/// let mut enc = BrotliAsyncCompressor::new(6);
-/// let mut input = tokio::io::BufReader::new(&b"Hello!"[..]);
-/// let mut output = Vec::new();
-/// enc.compress_async(&mut input, &mut output).await.unwrap();
+/// #[tokio::main]
+/// async fn main() {
+///     let mut enc = BrotliAsyncCompressor::new(6);
+///     let mut input = tokio::io::BufReader::new(&b"Hello!"[..]);
+///     let mut output = Vec::new();
+///     enc.compress_async(&mut input, &mut output).await.unwrap();
+/// }
 /// ```
 pub struct BrotliAsyncCompressor {
     params: BrotliParams,
@@ -181,14 +183,22 @@ impl AsyncCompressor for BrotliAsyncCompressor {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use oxiarc_core::async_io::AsyncDecompressor;
-/// use oxiarc_brotli::async_brotli::BrotliAsyncDecompressor;
+/// ```rust,no_run
+/// use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};
+/// use oxiarc_brotli::async_brotli::{BrotliAsyncCompressor, BrotliAsyncDecompressor};
 ///
-/// let mut dec = BrotliAsyncDecompressor::new();
-/// let mut input = tokio::io::BufReader::new(&compressed[..]);
-/// let mut output = Vec::new();
-/// dec.decompress_async(&mut input, &mut output).await.unwrap();
+/// #[tokio::main]
+/// async fn main() {
+///     let mut enc = BrotliAsyncCompressor::new(6);
+///     let mut enc_input = tokio::io::BufReader::new(&b"Hello!"[..]);
+///     let mut compressed = Vec::new();
+///     enc.compress_async(&mut enc_input, &mut compressed).await.unwrap();
+///
+///     let mut dec = BrotliAsyncDecompressor::new();
+///     let mut input = tokio::io::BufReader::new(&compressed[..]);
+///     let mut output = Vec::new();
+///     dec.decompress_async(&mut input, &mut output).await.unwrap();
+/// }
 /// ```
 pub struct BrotliAsyncDecompressor;
 

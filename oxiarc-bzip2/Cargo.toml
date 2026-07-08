@@ -10,6 +10,10 @@ repository.workspace = true
 authors.workspace = true
 keywords = ["bzip2", "compression", "bwt", "huffman", "mtf"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
@@ -17,6 +21,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "bwt_bench"
