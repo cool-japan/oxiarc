@@ -1,6 +1,7 @@
 # Rust
 /target/
 target
+Cargo.lock
 
 # Backup
 **/*.bak
