@@ -795,10 +795,10 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
                     return Ok(!self.output_buf.is_empty());
                 }
                 DecompressStatus::NeedsOutput => continue,
+                DecompressStatus::NeedsInput if !self.output_buf.is_empty() => {
+                    return Ok(true);
+                }
                 DecompressStatus::NeedsInput => {
-                    if !self.output_buf.is_empty() {
-                        return Ok(true);
-                    }
                     // Loop: staging was fully consumed into the decoder, so the
                     // next iteration refills from the reader (or hits EOF).
                 }

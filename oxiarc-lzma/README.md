@@ -7,7 +7,17 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.6** (2026-07-07) — 151 tests passing.
+**Version 0.3.6** (2026-07-08) — 156 tests passing.
+
+**What's new in 0.3.6**:
+
+- **Fixed a genuine LZMA2 multi-chunk encoder/decoder desync** that corrupted varied (non-repeated-byte) data spanning more than one chunk in the default `encode_lzma2`/`decode_lzma2` path above the 2 MiB chunk-size threshold. Every chunk (and sub-chunk) now resets the decoder's dictionary to match the fresh, history-less `LzmaEncoder` used for each chunk (previously only the first chunk reset the dictionary).
+- **Dictionary allocation hardening**: dictionary size is now capped at 1.5 GiB (`DICT_SIZE_ALLOC_CAP`) and the backing buffer is grown lazily/incrementally as data is decoded, instead of eagerly zero-filled at the header-declared size — closing a memory-exhaustion risk from a crafted `.lzma`/`.xz` header.
+- **XZ container validation**: the XZ index CRC-32 and footer Backward-Size field are now validated (previously unchecked), and any LZMA2 filter whose declared dictionary size exceeds the 1.5 GiB cap is rejected before a decoder is constructed.
+- **`LzmaPool` poison recovery**: `acquire`/`release` now recover from a poisoned mutex (`unwrap_or_else` instead of `.lock().expect(...)`) instead of permanently disabling the pool for every other thread after one unrelated panic.
+- New `lzma2_chunked` and `xz_compress` examples (`cargo run -p oxiarc-lzma --example lzma2_chunked`).
+- **API surface narrowed** (pre-1.0): the `match_finder` and `model` modules are now private (`pub(crate)`). `Bt4MatchFinder`, `HashChainMatchFinder`, `MatchFinder`, `LzmaModel`, and `State` are no longer part of the public API — only `LzmaProperties` remains re-exported from `model`. `LzmaPool`/`PooledBuf`/`LzmaDecoderPooled` are still public but only via `oxiarc_lzma::memory_pool::*`; they are no longer re-exported at the crate root.
+- Previously `ignore`-fenced doctests now compile and run as part of `cargo test`.
 
 **What's new in 0.3.1**: Custom dictionary support via `LzmaEncoder::with_dictionary(level, dict_size, dict)` / `set_dictionary` and `LzmaDecoder::with_dictionary(reader, props, dict_size, dict)` / `set_dictionary`; thread-safe memory pool `LzmaPool` with `PooledBuf<'a>` RAII wrapper and `LzmaDecoderPooled<'p, R>` for amortizing large dict buffer allocations.
 
@@ -40,10 +50,9 @@ It's used in:
 - **Range Coder** - Precise 11-bit probability model
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on LZMA2 codecs
 - **Cooperative cancellation** - `with_cancel(CancellationToken)` builder on LZMA2 codecs
-- **BT4 match finder** - `Bt4MatchFinder` with 3-table hash (h2/h3/h4); level 9 uses BT4 for superior compression
-- **Match finder trait** - `MatchFinder` abstracting `HashChainMatchFinder` (levels 0–8) and `Bt4MatchFinder` (level 9)
+- **Advanced match finding (internal)** - level 9 uses a binary-tree match finder (3-table hash: h2/h3/h4) for superior compression; levels 0–8 use hash-chain matching. As of 0.3.6 these match-finder types are private implementation details, not part of the public API.
 - **Custom dictionary** - `LzmaEncoder::with_dictionary` and `LzmaDecoder::with_dictionary`
-- **Memory pool** - `LzmaPool`, `PooledBuf`, `LzmaDecoderPooled` for allocation-efficient workloads
+- **Memory pool** - `oxiarc_lzma::memory_pool::{LzmaPool, PooledBuf, LzmaDecoderPooled}` for allocation-efficient workloads (not re-exported at the crate root)
 - **Parallel LZMA2** - `lzma2_compress_parallel` free function and `ParallelLzma2Encoder` builder for multi-threaded LZMA2 compression; output is a valid LZMA2 stream decodable by `Lzma2Decoder` (requires `features = ["parallel"]`)
 
 All features are implemented and tested. API is stable.
@@ -266,9 +275,10 @@ oxiarc-lzma = "0.3.6"
 |--------|-------------|
 | `encoder` | LZMA compression |
 | `decoder` | LZMA decompression |
-| `model` | Context-dependent probability models |
 | `optimal` | Optimal parsing for improved compression decisions |
 | `range_coder` | Range encoder/decoder |
+
+Internal modules (`match_finder`, `model`, and others) are `pub(crate)` as of 0.3.6 and are not part of the public API surface.
 
 ## Comparison with Other Codecs
 

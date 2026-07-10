@@ -1,4 +1,4 @@
-# oxiarc-zstd - Development Status (v0.3.6, 2026-07-07)
+# oxiarc-zstd - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -10,7 +10,9 @@
 - [x] Dictionary support
 - [x] Checksum support (XXH64)
 - [x] Streaming API
-- [x] All features tested (179 tests passing)
+- [x] Hardened frame-header handling: `try_reserve`-bounded output allocation against untrusted `Frame_Content_Size`, and a bounded `Window_Descriptor` for large one-shot frames (new in 0.3.6)
+- [x] `BlockType`/`LiteralsBlockType` marked `#[non_exhaustive]`; `lz77`/`bitwriter` advanced re-exports demoted to `#[doc(hidden)]` (API freeze, new in 0.3.6)
+- [x] All features tested (186 tests passing)
 
 ## Milestone: COMPLETE
 

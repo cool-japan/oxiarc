@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.3.6, 2026-07-07)
+# oxiarc-deflate - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -156,41 +156,55 @@
 
 ### Compliance
 - [x] Round-trip testing (zlib/gzip format compliance, 2026-05-17)
-- [ ] Fuzzing tests
+- [x] `proptest`-based round-trip test suite (`tests/proptest_roundtrip.rs`: `roundtrip`, `inflate_never_panics`) (done 2026-07-08)
+- [ ] Fuzzing tests (cargo-fuzz style; proptest round-trip suite above is a related but distinct property-based check)
 - [x] Edge case handling (empty input, max length matches) (completed 2026-07-07) — both cases already correct (empty-input special case in write_stored_blocks; length 258→code 285 in length_to_code); added decoder-only hand-built length-258 vector to close the coverage gap.
 
 ## Test Coverage
 
-- inflate: 8 tests
-- deflate: 7 tests
-- huffman: 4 tests
-- lz77: 7 tests
-- tables: 7 tests
+Per-module/binary test counts (`cargo nextest list -p oxiarc-deflate --all-features`):
+
+- streaming: 40 tests
 - zlib: 27 tests
-- streaming: ~15 tests (gzip stream, zlib stream)
-- async_deflate: ~12 tests
-- gzip: ~7 tests
+- parallel: 19 tests
+- lz77: 18 tests
+- deflate: 15 tests
+- optimal: 10 tests
+- huffman: 9 tests
+- inflate: 7 tests
+- tables: 7 tests
+- gzip: 6 tests
+- pool: 6 tests
+- async_deflate: 4 tests
+- raw_stream: 4 tests
+- compliance: 32 tests (integration test)
 - edge_cases: 14 tests (integration test)
-- Total: 212 tests
+- proptest_roundtrip: 2 tests (integration test)
+- **Total: 220 tests** (`cargo nextest run -p oxiarc-deflate --all-features`, verified 2026-07-08)
 
 ## Code Statistics
 
-| File | Lines |
-|------|-------|
-| optimal.rs | ~534 (NEW in v0.3.0) |
-| streaming.rs | 1,047 (NEW) |
-| zlib.rs | 931 |
-| huffman.rs | 438 |
-| lz77.rs | 371 |
-| inflate.rs | 349 |
-| deflate.rs | 347 |
-| tables.rs | 311 |
-| async_deflate.rs | ~300 |
-| gzip.rs | ~250 |
-| lib.rs | ~135 |
-| **Total** | **~3,479** |
+Code lines per file (`tokei oxiarc-deflate/src`, code lines only, verified 2026-07-08):
+
+| File | Code Lines |
+|------|-----------|
+| streaming.rs | 1,106 |
+| deflate.rs | 890 |
+| lz77.rs | 848 |
+| zlib.rs | 586 |
+| huffman.rs | 503 |
+| inflate.rs | 481 |
+| optimal.rs | 391 |
+| pool.rs | 343 |
+| parallel.rs | 334 |
+| tables.rs | 228 |
+| raw_stream.rs | 221 |
+| gzip.rs | 196 |
+| async_deflate.rs | 172 |
+| lib.rs | 38 |
+| **Total** | **6,337** |
 
 ## Known Limitations
 
-1. Single-threaded only
+1. Single-threaded only for the plain `Deflater`/`Inflater` batch path; the `parallel` feature enables multi-threaded GZIP/DEFLATE via `gzip_compress_parallel`/`compress_deflate_parallel`/`ParallelGzipEncoder`
 

@@ -1,4 +1,4 @@
-# oxiarc-lzw - Development Status (v0.3.6, 2026-07-07)
+# oxiarc-lzw - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -9,7 +9,9 @@
 - [x] Configurable code width (9-12 bits)
 - [x] Early change (code width increases before table full)
 - [x] Streaming encoder/decoder
-- [x] All features tested (76 tests passing)
+- [x] `LzwConfig: Default` (TIFF preset) and `#[non_exhaustive] LzwError` (new in 0.3.6)
+- [x] Property-based round-trip testing (proptest) (new in 0.3.6)
+- [x] All features tested (79 tests passing)
 
 ## Milestone: COMPLETE
 

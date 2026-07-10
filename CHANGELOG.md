@@ -5,7 +5,7 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.6] - 2026-07-07
+## [0.3.6] - 2026-07-08
 
 Security-hardening and API-stabilization release: a broad pass across every
 codec/container crate closing memory-safety, path-traversal, and panic
@@ -38,6 +38,12 @@ flags, APIs, and docs).
   unconditional `Vec::with_capacity`/`vec![0; n]`, turning malicious
   oversized-length headers into a clean error instead of an allocator
   abort/OOM.
+- **oxiarc-archive** (ZIP reader): fixed a second, unrelated integer-underflow
+  panic in `LocalFileHeader::modified_time` — a crafted local-file header
+  encoding a zero DOS month field underflowed the `month - 1` term of the
+  epoch-offset calculation (panicking in debug, wrapping to a huge day count
+  in release); DOS date fields are 1-based, so a zero month or day is now
+  clamped to the minimum valid value (1) instead.
 - **oxiarc-archive** (ZIP reader): classic and Zip64 end-of-central-directory
   records that declare more than one disk are now rejected — spanned/
   multi-volume ZIP archives are explicitly unsupported rather than silently
@@ -81,6 +87,13 @@ flags, APIs, and docs).
   back to software). Verified the aarch64 PMULL constants against the
   scalar reference over thousands of inputs/lengths — the implementation was
   already correct; only the diagnostics were wrong.
+- **oxiarc-lzhuf** (`-lh1-` decode): a malformed or truncated `-lh1-`
+  compressed stream paired with a large declared uncompressed size could
+  loop indefinitely, manufacturing zero-padding output until memory was
+  exhausted (decompression-bomb DoS); the bit reader now flags end-of-input
+  exhaustion and `decode_lh1` returns an error as soon as decoding would
+  read past the real compressed data instead of continuing to fabricate
+  output.
 - **oxiarc-lzhuf / oxiarc-core**: fixed `LzssDecoder::new`/`RingBuffer::new`
   panicking on a non-power-of-two or zero window size; added non-panicking
   `RingBuffer::try_new`/`OutputRingBuffer::try_new` alternatives and
@@ -106,15 +119,35 @@ flags, APIs, and docs).
   the offending path instead of a bare I/O error.
 - **oxiarc-cli**: replaced an `unreachable!()` at the end of `cmd_extract`
   with a proper `Err(...)` return, per the no-panic policy.
+- **oxiarc-lzma**: fixed an LZMA2 multi-chunk encoder/decoder desync that
+  corrupted varied (non-repeated-byte) data spanning more than one chunk.
+  `Lzma2ChunkedEncoder` only reset the decoder's dictionary on the first
+  chunk even though every chunk is compressed with a fresh, history-less
+  `LzmaEncoder`; the decoder then seeded its literal-coder context from the
+  previous chunk's dictionary tail while the encoder assumed empty history,
+  desyncing the range coder on the first colliding literal. Every chunk (and
+  sub-chunk) now resets the dictionary to match, fixing the default
+  `encode_lzma2`/`decode_lzma2` path for inputs above the 2 MiB chunk-size
+  threshold.
+- **oxiarc-zstd**: one-shot compression always framed its output as
+  `Single_Segment`, so the frame's implicit window size equaled the full
+  content size; reference decoders enforce a default `windowLogMax` (128 MiB
+  for libzstd's simple decompression API) and could reject an
+  oxiarc-produced frame larger than that. Content above the internal 8 MiB
+  window cap now instead gets an explicit, bounded 8 MiB `Window_Descriptor`
+  — always sufficient since every block is compressed independently and
+  match offsets never cross a block boundary — so the implicit window never
+  approaches the reference-decoder limit regardless of input size.
 
 ### Changed
 
 - **Breaking (pre-1.0) API freeze**: `oxiarc-core::FlushMode`,
   `oxiarc-core::CompressStatus`/`DecompressStatus`, `oxiarc-zstd::BlockType`/
-  `LiteralsBlockType`, and the `OxiArcError`/`BrotliError`/`SnappyError`/
-  `LzwError` error enums are now `#[non_exhaustive]` for SemVer stability
-  ahead of 1.0. Downstream code matching on these must include a wildcard
-  arm (existing in-workspace call sites already did).
+  `LiteralsBlockType`, `oxiarc-lz4::Lz4Level`, and the `OxiArcError`/
+  `BrotliError`/`SnappyError`/`LzwError`/`SzipError` error enums are now
+  `#[non_exhaustive]` for SemVer stability ahead of 1.0. Downstream code
+  matching on these must include a wildcard arm (existing in-workspace call
+  sites already did).
 - **oxiarc-core**: removed the unused `CompressionLevel(u8)` newtype (dead
   code — every codec crate already has its own, differently-ranged
   `CompressionLevel` type); `Compressor`/`Decompressor` trait docs now
@@ -124,12 +157,21 @@ flags, APIs, and docs).
   Lz77Sequence, MatchFinder}`, `bitwriter::{ForwardBitWriter,
   BackwardBitWriter}`) are demoted to `#[doc(hidden)]` — no longer part of
   the crate's documented/SemVer-covered public API surface.
+- **oxiarc-lzma**: the `match_finder` and `model` modules are demoted from
+  `pub mod` to `pub(crate) mod`, and their crate-root re-exports —
+  `match_finder::{Bt4MatchFinder, HashChainMatchFinder, MatchFinder}` and
+  `model::{LzmaModel, State}` — are removed entirely. Breaking (pre-1.0)
+  change: `Bt4MatchFinder`, `HashChainMatchFinder`, `MatchFinder`,
+  `LzmaModel`, and `State` are no longer publicly reachable from
+  `oxiarc_lzma` (`LzmaProperties`, previously re-exported alongside
+  `LzmaModel`/`State`, remains public via its own
+  `pub use model::LzmaProperties;`).
 - **oxiarc-cli**: added a global `--quiet`/`-q` flag; `list`/`test`/`info`/
   `detect`'s `archive` argument now accepts `-` for stdin.
 - Numerous `#[must_use]` additions on by-value builder setters across
-  `oxiarc-core`, `oxiarc-deflate`, `oxiarc-lz4`, `oxiarc-lzhuf`,
-  `oxiarc-lzw`, and `oxiarc-szip` (setters that consume and return `self`
-  now warn if the return value is discarded).
+  `oxiarc-core`, `oxiarc-deflate`, `oxiarc-lz4`, and `oxiarc-lzhuf`
+  (setters that consume and return `self` now warn if the return value is
+  discarded).
 
 ### Added
 
@@ -750,6 +792,7 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/cool-japan/oxiarc/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cool-japan/oxiarc/compare/v0.3.2...v0.3.3

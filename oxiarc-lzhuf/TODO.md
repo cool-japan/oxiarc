@@ -1,5 +1,5 @@
 
-# oxiarc-lzhuf - Development Status (v0.3.6, 2026-07-07)
+# oxiarc-lzhuf - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -89,25 +89,50 @@
 
 ### Compatibility
 - [x] Extended testing with real LZH archives (done 2026-07-07) — `tests/data/` corpus (6 genuine third-party `.lzh` fixtures from `fragglet/lhasa`, header levels 0/1/2) exercised by `tests/corpus_fixtures.rs` (decode direction) and `tests/lha_oracle.rs` (encode direction, live `lha`/Lhasa CLI oracle via the opt-in `lha-oracle` feature)
-- [ ] Fuzzing tests
-- [ ] Edge case handling
+- [x] Fuzzing tests (done 2026-07-08) — `tests/corrupt_input.rs` (`decode_lzh_bit_flip_fuzz_never_panics_or_silently_succeeds`, `decode_lzh_heavy_multi_byte_corruption_can_return_err`: bit-flip and heavy multi-byte corruption of real fixtures, asserting the decoder never panics and either errors cleanly or round-trips) and `tests/proptest_roundtrip.rs` (proptest-based property fuzzing)
+- [x] Edge case handling (done 2026-07-08) — `LzssDecoder::new` no longer panics on a zero/non-power-of-two window size (now rounds up via `next_power_of_two().max(16)`, matching `LzssEncoder::new`'s normalization); a malformed/truncated `-lh1-` stream paired with an oversized declared output size no longer loops fabricating output to OOM — the bit reader now signals exhaustion and `decode_lh1` returns an error instead
 
 ## Test Coverage
 
-- Total: 163 tests (93 lib + 42 streaming_integration + 8 window_regression + 7 corpus_fixtures + 7 parallel_lzhuf + 6 lha_oracle) + 4 doctests, all-features
+Per-module/binary test counts (`cargo nextest list -p oxiarc-lzhuf --all-features`):
+
+- encode: 24 tests
+- streaming (decoder + huffman submodules): 22 tests
+- lzss: 16 tests
+- lh1: 11 tests
+- methods: 7 tests
+- optimal: 6 tests
+- parallel: 4 tests
+- decode: 3 tests
+- huffman: 3 tests
+- streaming_integration: 42 tests (integration test)
+- window_regression: 8 tests (integration test)
+- corpus_fixtures: 7 tests (integration test)
+- corrupt_input: 7 tests (integration test)
+- parallel_lzhuf: 7 tests (integration test)
+- lha_oracle: 6 tests (integration test)
+- proptest_roundtrip: 2 tests (integration test)
+- **Total: 175 tests** (`cargo nextest run -p oxiarc-lzhuf --all-features`) + 5 doctests (`cargo test --doc -p oxiarc-lzhuf --all-features`), verified 2026-07-08
 
 ## Code Statistics
 
-| File | Lines |
-|------|-------|
-| lzss.rs | ~500 |
-| huffman.rs | ~500 |
-| encode.rs | ~400 |
-| decode.rs | ~400 |
-| streaming.rs | ~600 |
-| methods.rs | ~200 |
-| lib.rs | ~146 |
-| **Total** | **~2,746** |
+Code lines per file (`tokei oxiarc-lzhuf/src`, code lines only, verified 2026-07-08):
+
+| File | Code Lines |
+|------|-----------|
+| encode.rs | 957 |
+| streaming/decoder.rs | 876 |
+| lzss.rs | 571 |
+| lh1.rs | 507 |
+| streaming/huffman.rs | 402 |
+| optimal.rs | 314 |
+| decode.rs | 233 |
+| huffman.rs | 231 |
+| methods.rs | 203 |
+| parallel.rs | 159 |
+| lib.rs | 26 |
+| streaming.rs | 7 |
+| **Total** | **4,486** |
 
 ## Method Comparison
 
@@ -121,5 +146,5 @@
 
 ## Known Limitations
 
-1. Legacy methods (lh1-lh3) not implemented
+1. Legacy methods lh2/lh3 not implemented (lh1 implemented since 0.3.4)
 2. Single-threaded only (batch path; parallel feature available for multi-entry archives)

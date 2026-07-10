@@ -7,7 +7,7 @@ Pure Rust implementation of BZip2 compression/decompression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.6** (2026-07-07) — 68 tests passing.
+**Version 0.3.6** (2026-07-08) — 70 tests passing.
 
 ## Overview
 
@@ -21,6 +21,7 @@ BZip2 is a high-compression algorithm based on the Burrows-Wheeler Transform (BW
 - **Compression levels 1-9** - Adjustable block sizes (100KB-900KB)
 - **Streaming API** - Process data in chunks
 - **One-shot API** - Convenient functions for simple cases
+- **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs and every compression level
 
 All features are implemented and tested. API is stable.
 
@@ -33,8 +34,8 @@ use oxiarc_bzip2::{compress, decompress, CompressionLevel};
 let original = b"Hello, World! ".repeat(100);
 let compressed = compress(&original, CompressionLevel::new(9))?;
 
-// Decompress data
-let decompressed = decompress(&compressed)?;
+// Decompress data (`decompress` takes any `Read`, so slice the `Vec<u8>`)
+let decompressed = decompress(&compressed[..])?;
 assert_eq!(decompressed, original);
 ```
 
@@ -69,6 +70,14 @@ BZip2 uses a multi-stage pipeline:
 |---------|---------|-------------|
 | `default` | yes | Core BZip2 compression/decompression |
 | `parallel` | no | Multi-threaded block compression via Rayon |
+
+## Examples
+
+```sh
+cargo run -p oxiarc-bzip2 --example roundtrip
+```
+
+Round-trips data through every compression level (1-9) via `compress`/`decompress`.
 
 ## Part of OxiArc
 

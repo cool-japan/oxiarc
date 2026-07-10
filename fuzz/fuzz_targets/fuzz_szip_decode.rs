@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
     // Cap sample count so a bogus header can't force an unbounded
     // allocation attempt in the decoder's output buffer.
     let samples = (samples_raw as usize) % 65_536;
-    let reference_sample_interval = u32::from(rsi_tag) * u32::from(pixels_per_block);
+    let reference_sample_interval = u32::from(rsi_tag) * pixels_per_block;
 
     let params = SzipParams {
         bits_per_pixel,

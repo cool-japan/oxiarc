@@ -21,11 +21,18 @@
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
-//!     // Build a small ZIP archive in memory.
+//!     // Build a small ZIP archive in memory. The writer is scoped to an
+//!     // inner block: `ZipWriter` implements `Drop` (to auto-finish an
+//!     // unfinished archive), so its mutable borrow of `zip_bytes` stays
+//!     // alive until the writer goes out of scope, even after `finish()`
+//!     // has already run. Ending the block here lets `zip_bytes` be read
+//!     // afterward.
 //!     let mut zip_bytes = Vec::new();
-//!     let mut writer = ZipWriter::new(&mut zip_bytes);
-//!     writer.add_file("hello.txt", b"Hello, async ZIP!").unwrap();
-//!     writer.finish().unwrap();
+//!     {
+//!         let mut writer = ZipWriter::new(&mut zip_bytes);
+//!         writer.add_file("hello.txt", b"Hello, async ZIP!").unwrap();
+//!         writer.finish().unwrap();
+//!     }
 //!
 //!     // Build a ZipReader synchronously to inspect entries, then read
 //!     // the entry's data asynchronously via an async-capable reader.

@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-07) | 392 tests passing**
+**Version: 0.3.6 (2026-07-08) | 444 tests passing**
 
 
 ## Features
@@ -22,6 +22,8 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 - Raw-preserve append: `ZipWriter::add_file_raw`, `LzhReader::read_raw_method_data`, `LzhWriter::add_file_raw` (new in 0.2.8)
 - Archive repair/recovery: `repair_zip`, `repair_tar` functions; `ZipRepair`, `TarRepair`, `RepairReport` structs for recovering truncated or corrupt archives (new in 0.3.0)
 - LZH/LHA archives validated for real-world interoperability against a live `lha` (Lhasa) CLI oracle — opt-in `lha-oracle` feature (new in 0.3.5)
+- ZIP encryption: traditional ZipCrypto and genuine AES-128/192/256 (FIPS-197 cipher with key-length-derived rounds/schedule, constant-time AE-2/HMAC-SHA1 tag comparison, CSPRNG-sourced salts) (new in 0.3.6)
+- Hardened against malicious/corrupt input (new in 0.3.6): bounded (`try_reserve`/`try_reserve_exact`) allocation for header-driven buffer sizes across ZIP, TAR, LZH, 7z, and ISO 9660; ISO 9660 cyclic-directory and oversized-directory-extent guards; spanned/multi-volume ZIP archives are explicitly rejected rather than silently misread
 
 All features are implemented and tested. API is stable.
 
@@ -244,6 +246,7 @@ for entry in lzh.entries() {
 | 0 | Basic DOS format (obsolete) |
 | 1 | Extended with extension headers |
 | 2 | Modern with 2-byte header size |
+| 3 | Word-size-prefixed extension headers; write support via `LzhWriter::with_header_level(3)` |
 
 ## Modules
 
@@ -272,6 +275,39 @@ let entry = zip.entries()[0];
 // - Backslashes (converted to forward slashes)
 let safe_path = entry.sanitized_name();
 ```
+
+Beyond path sanitization, every reader in this crate defends against malicious
+or corrupt input (new in 0.3.6):
+
+- **Bounded allocation**: header-declared lengths (ZIP central directory/local
+  headers and AES fields, TAR PAX/GNU long-name records, LZH extension
+  headers, 7z headers, ISO 9660 directory extents) are validated against the
+  bytes actually remaining in the stream and allocated via
+  `try_reserve`/`try_reserve_exact`, so an oversized declared length returns a
+  clean error instead of an allocator abort/OOM.
+- **ISO 9660**: directory traversal tracks visited LBAs in a `HashSet<u32>`
+  and enforces a maximum recursion depth (`MAX_DIR_DEPTH`) and a maximum
+  directory-extent size (`MAX_DIR_EXTENT_SIZE`), closing a crafted-image
+  cyclic-directory/unbounded-allocation denial of service.
+- **ZIP**: spanned/multi-volume archives (classic and Zip64 end-of-central-
+  directory records declaring more than one disk) are rejected outright
+  rather than silently misread; AES decryption uses a genuine FIPS-197 cipher
+  (real AES-128/192/256 depending on key length) with constant-time
+  authentication-tag comparison and CSPRNG-sourced salts.
+
+## Examples
+
+Runnable examples live under [`examples/`](examples/):
+
+| Example | Demonstrates |
+|---------|--------------|
+| `format_autodetect.rs` | Detecting archive format from magic bytes |
+| `zip_roundtrip.rs` | Writing and reading back a ZIP archive |
+| `tar_roundtrip.rs` | Writing and reading back a TAR archive |
+| `iso_extract.rs` | Listing and extracting from an ISO 9660 image |
+| `repair_corrupted_zip.rs` | Recovering entries from a truncated/corrupt ZIP |
+
+Run any of them with `cargo run -p oxiarc-archive --example <name>`.
 
 ## Magic Bytes Reference
 

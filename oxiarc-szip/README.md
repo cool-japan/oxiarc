@@ -7,7 +7,14 @@ Pure Rust implementation of CCSDS-121.0-B-2 / libaec-compatible AEC (Adaptive En
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.6** (2026-07-07) — 19 tests passing.
+**Version 0.3.6** (2026-07-08) — 27 tests passing.
+
+**What's new in 0.3.6**:
+
+- **`SzipError` is now `#[non_exhaustive]`** (pre-1.0 API-stability freeze), and every struct-variant field gained a doc comment (satisfying a newly-enabled `#![warn(missing_docs)]` lint).
+- **`SzipParams` gained a `Default` impl** (`bits_per_pixel: 8, pixels_per_block: 8, samples: 0, reference_sample_interval: 8, msb: true, nn_preprocess: false, rsi_byte_align: false`) and now derives `PartialEq`/`Eq`.
+- New `sample_decode` example.
+- New `proptest`-based round-trip suite (`tests/proptest_roundtrip.rs`) and a corrupt-input regression suite (`tests/corrupt_input.rs`) covering truncated/empty/bit-flipped streams — malformed input now reliably returns `Err` instead of panicking.
 
 **What's new in 0.3.2**: Initial release of `oxiarc-szip`. Implements the full AEC/SZIP encode/decode pipeline as specified in CCSDS-121.0-B-2 and compatible with the `libaec` reference library. Supports configurable `bits_per_pixel` (1–32), `pixels_per_block` (8/16/32), `reference_sample_interval`, MSB/LSB bit ordering, NN preprocessing (unit-delay predictor), and RSI byte alignment. Exposed via `encode`, `encode_bytes`, and `decode` free functions together with `SzipParams` and `SzipError` public types.
 
@@ -37,6 +44,7 @@ It is used in:
 - **`encode_bytes`** — Convenience wrapper: converts raw `&[u8]` input to samples and calls `encode`
 - **`decode`** — Decompress an AEC/SZIP byte stream back to raw sample bytes
 - **`SzipParams`** — Strongly-typed parameter struct covering all knobs required by the standard
+- **`SzipParams::default()`** — common 8-bit settings (`bits_per_pixel: 8, pixels_per_block: 8, reference_sample_interval: 8, msb: true`); combine with struct-update syntax (`SzipParams { samples: N, ..SzipParams::default() }`) to only override what differs
 - **Configurable `bits_per_pixel`** — Supports 1–32 bits per sample; common values are 8, 16, and 32
 - **Configurable `pixels_per_block`** — Supports block sizes of 8, 16, or 32 samples (J parameter)
 - **Configurable `reference_sample_interval`** — Controls restart-point frequency in the bit stream
@@ -53,13 +61,8 @@ All features are implemented and tested. API is stable.
 use oxiarc_szip::{SzipParams, decode, encode};
 
 let params = SzipParams {
-    bits_per_pixel: 8,
-    pixels_per_block: 8,
     samples: 16,
-    reference_sample_interval: 8,
-    msb: true,
-    nn_preprocess: false,
-    rsi_byte_align: false,
+    ..SzipParams::default()
 };
 
 let samples: Vec<u64> = (0..16u64).collect();
@@ -155,6 +158,7 @@ Notable methods on `SzipParams`:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SzipError {
     InputTooShort    { need: usize, have: usize },
     InvalidBlockOption { id: u32, bpp: u8 },
@@ -165,7 +169,7 @@ pub enum SzipError {
 }
 ```
 
-All variants carry structured fields so that error messages are machine-readable. The `Display` impl is derived from `thiserror`.
+All variants carry structured fields so that error messages are machine-readable. The `Display` impl is derived from `thiserror`. As of 0.3.6 the enum is `#[non_exhaustive]` (pre-1.0 API-stability freeze): `match` expressions on `SzipError` must include a wildcard arm, since new variants may be added in a semver-compatible release.
 
 ## Use in OxiArc
 

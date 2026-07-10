@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-07) | 163 tests passing**
+**Version: 0.3.6 (2026-07-08) | 165 tests passing**
 
 ## Features
 
@@ -108,6 +108,7 @@ decompressor.read_to_end(&mut output)?;
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `parallel` | no | Rayon-based parallel compression for throughput-sensitive workloads |
+| `async-io` | no | `BrotliAsyncCompressor`/`BrotliAsyncDecompressor` (`oxiarc_core::async_io` traits) for `tokio`-based async I/O; reads the input fully before compressing/decompressing synchronously (not bounded-memory streaming) |
 
 All other functionality — one-shot API, streaming API, Huffman coding, LZ77 engine, static dictionary — is enabled by default with no feature flags required.
 
@@ -136,6 +137,14 @@ Quality levels map to LZ77 search depth and the number of candidate matches cons
 | 1–4 | Fast | Comparable to gzip |
 | 5–9 | Balanced | Better than gzip |
 | 10–11 | Slow | Best (web-asset target) |
+
+## What's new in 0.3.6
+
+- **`BrotliError` is now `#[non_exhaustive]`** (pre-1.0 API-stability freeze); its `Display`/`Error`/`From<io::Error>` impls are now generated via `thiserror` instead of hand-written (messages are unchanged). Downstream `match` expressions on `BrotliError` must include a wildcard arm.
+- **`BrotliParams` now derives `PartialEq`/`Eq`** for easier comparison in tests and application code.
+- New `proptest`-based round-trip regression suite (`tests/proptest_roundtrip.rs`): decompression never panics on arbitrary input, and compress→decompress round-trips across quality levels.
+- New `quality_levels` example comparing compression ratio across quality 0–11 plus a custom `BrotliParams` (window/block-size) configuration.
+- Previously `ignore`-fenced doctests (including the `async-io` examples) now compile and run as part of `cargo test`.
 
 ## What's new in 0.3.3
 
