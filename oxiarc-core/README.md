@@ -3,11 +3,11 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.3.6-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.6** (2026-07-13) — 187 tests passing.
+**Version 0.4.0** (2026-07-13) — 187 tests passing.
 
 **What's new in 0.3.6**: Non-panicking `RingBuffer::try_new`/`OutputRingBuffer::try_new` constructors alongside the existing panicking `new` methods (now with documented `# Panics` contracts) — prefer the fallible form when a window/capacity size originates from untrusted input. Fixed `Crc32::is_simd_available()`/`Crc32::implementation_name()` to report the CRC-32 code path actually dispatched at runtime (previously x86_64 could misreport PCLMULQDQ while dispatch had silently fallen back to software). `FlushMode`, `CompressStatus`, `DecompressStatus`, and `OxiArcError` are now `#[non_exhaustive]` as part of a pre-1.0 API freeze — downstream `match` expressions need a wildcard arm. Removed the unused `CompressionLevel(u8)` newtype (dead code; every codec crate already defines its own, differently-ranged level type). `Compressor`/`Decompressor` trait docs now correctly describe them as optional, DEFLATE-family-only traits rather than a universal contract. New `mmap_read` example.
 
@@ -219,14 +219,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.3.6"
+oxiarc-core = "0.4.0"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.3.6", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.4.0", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

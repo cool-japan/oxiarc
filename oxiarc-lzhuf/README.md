@@ -2,11 +2,11 @@
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.6-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.6** (2026-07-13) — 188 tests passing.
+**Version 0.4.0** (2026-07-13) — 188 tests passing.
 
 **What's new in 0.3.0**: 4-byte multiplicative hash for better avalanche and fewer collisions; `LzssOptimalParser` — two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder; custom dictionary support via `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, and `LzssDecoder::preload_dictionary`.
 
@@ -189,7 +189,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzhuf = "0.3.6"
+oxiarc-lzhuf = "0.4.0"
 ```
 
 ## Compatibility

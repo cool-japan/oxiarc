@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-13) | 100 tests passing (incl. libtiff/Pillow differential oracle)**
+**Version: 0.4.0 (2026-07-13) | 100 tests passing (incl. libtiff/Pillow differential oracle)**
 
 ## Overview
 
@@ -186,7 +186,7 @@ LZW builds a dictionary dynamically:
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.3.6"
+oxiarc-lzw = "0.4.0"
 ```
 
 ## Use Cases

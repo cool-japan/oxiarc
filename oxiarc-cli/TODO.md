@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.3.6, 2026-07-08)
+# oxiarc-cli - Development Status (v0.4.0, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -195,7 +195,7 @@
 ## Command Reference
 
 ```
-oxiarc 0.3.6
+oxiarc 0.4.0
 OxiArc is a Pure Rust implementation of common archive formats.
 
 Usage: oxiarc [OPTIONS] <COMMAND>

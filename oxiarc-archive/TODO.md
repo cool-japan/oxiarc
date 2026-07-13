@@ -1,5 +1,5 @@
 
-# oxiarc-archive - Development Status (v0.3.6, 2026-07-08)
+# oxiarc-archive - Development Status (v0.4.0, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
