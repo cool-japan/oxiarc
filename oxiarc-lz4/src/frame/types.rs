@@ -11,6 +11,7 @@ pub(super) const LZ4_LEGACY_MAGIC: u32 = 0x184C2102;
 /// Block maximum sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BlockMaxSize {
     /// 64 KB maximum block size.
     Size64KB = 4,
@@ -82,30 +83,49 @@ impl FrameDescriptor {
     }
 
     /// Create with content size.
+    #[must_use]
     pub fn with_content_size(mut self, size: u64) -> Self {
         self.content_size = Some(size);
         self
     }
 
     /// Set block checksum flag.
+    #[must_use]
     pub fn with_block_checksum(mut self, enabled: bool) -> Self {
         self.block_checksum = enabled;
         self
     }
 
     /// Set content checksum flag.
+    #[must_use]
     pub fn with_content_checksum(mut self, enabled: bool) -> Self {
         self.content_checksum = enabled;
         self
     }
 
     /// Set block max size.
+    #[must_use]
     pub fn with_block_max_size(mut self, size: BlockMaxSize) -> Self {
         self.block_max_size = size;
         self
     }
 
+    /// Set the block-independence flag.
+    ///
+    /// When `true` (the default) each block is compressed and decoded
+    /// independently. When `false` the frame uses *linked* blocks: each block
+    /// may reference the previous block's last 64 KiB of output as a prefix
+    /// dictionary, matching the reference `lz4 -BD` frames. Linked-block
+    /// frames compress slightly better on data with cross-block redundancy but
+    /// cannot be decoded block-by-block out of order.
+    #[must_use]
+    pub fn with_block_independence(mut self, independent: bool) -> Self {
+        self.block_independence = independent;
+        self
+    }
+
     /// Set dictionary ID for dictionary-based compression.
+    #[must_use]
     pub fn with_dict_id(mut self, id: u32) -> Self {
         self.dict_id = Some(id);
         self

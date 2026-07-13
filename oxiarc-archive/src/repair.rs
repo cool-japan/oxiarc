@@ -59,6 +59,7 @@ pub struct RecoveredEntry {
 
 /// Recovery quality of a [`RecoveredEntry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecoveryStatus {
     /// Payload was successfully decompressed and the CRC-32 matched the
     /// value stored in the archive header.

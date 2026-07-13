@@ -12,8 +12,7 @@
 //!   `weight -> code_length = max_bits + 1 - weight`
 //! Weights are stored as direct 4-bit values packed 2 per byte (high nibble first).
 
-/// Maximum Huffman code length (from spec).
-pub const MAX_CODE_LENGTH: u8 = 11;
+pub use crate::huffman::MAX_CODE_LENGTH;
 
 /// Maximum number of symbols (byte alphabet).
 const MAX_SYMBOLS: usize = 256;
@@ -132,134 +131,73 @@ impl HuffmanEncoder {
             }
         }
 
-        // Assign canonical Huffman codes
-        // 1. Count lengths
-        let mut bl_count = vec![0u32; (max_len as usize) + 1];
-        for &len in &code_lengths {
-            if len > 0 {
-                bl_count[len as usize] += 1;
+        // The lengths must form a *complete* prefix code: sum(2^-len) == 1,
+        // i.e. in integer units sum(2^(max_len - len)) == 2^max_len. A raw
+        // Huffman tree satisfies this; the limiter aims for it but bail out
+        // (caller falls back to Raw literals) if anything is off, because an
+        // incomplete weight set is rejected by RFC 8878 decoders.
+        {
+            let target = 1u64 << max_len;
+            let sum: u64 = code_lengths
+                .iter()
+                .filter(|&&len| len > 0)
+                .map(|&len| 1u64 << (max_len - len))
+                .sum();
+            if sum != target {
+                return None;
             }
         }
 
-        // 2. Compute next_code for each length
-        let mut next_code = vec![0u32; (max_len as usize) + 1];
-        let mut code_val = 0u32;
-        for bits in 1..=max_len as usize {
-            code_val = (code_val + bl_count[bits - 1]) << 1;
-            next_code[bits] = code_val;
-        }
-
-        // 3. Assign codes
-        let mut codes = vec![0u32; MAX_SYMBOLS];
-        let mut lengths = vec![0u8; MAX_SYMBOLS];
+        // Zstandard weights: weight = max_len + 1 - length. The table log the
+        // decoder derives is exactly `max_len`, and the longest codes carry
+        // weight 1 (of which a complete tree always has an even count >= 2).
+        let max_bits = max_len;
         let mut num_symbols = 0usize;
-
-        // Find the highest symbol with nonzero frequency for weight serialization
         let mut max_symbol = 0usize;
         for (i, &len) in code_lengths.iter().enumerate() {
             if len > 0 {
-                codes[i] = next_code[len as usize];
-                next_code[len as usize] += 1;
-                lengths[i] = len;
                 num_symbols += 1;
                 max_symbol = i;
             }
         }
 
-        // Compute weights compatible with the decoder's `HuffmanTable::from_weights`.
-        //
-        // The decoder computes:
-        //   total_weight = sum(2^(w-1)) for all w > 0
-        //   max_bits = bit_width(total_weight)     [= 32 - total_weight.leading_zeros()]
-        //   code_length[s] = max_bits + 1 - weight[s]
-        //
-        // We need to find a `max_bits` value such that:
-        //   weight[s] = max_bits + 1 - code_length[s]
-        //   decoder's computed max_bits == our max_bits
-        //
-        // Since this relationship is self-referential (max_bits depends on weights
-        // which depend on max_bits), we solve iteratively: start with a candidate
-        // max_bits, compute resulting total_weight, check if the decoder's
-        // bit_width(total_weight) matches our candidate, and adjust until stable.
-
-        let max_bits = {
-            let mut candidate = max_len;
-            for _ in 0..20 {
-                // Compute weights with this candidate
-                let mut total = 0u64;
-                for &len in &code_lengths {
-                    if len > 0 && candidate + 1 > len {
-                        let w = candidate + 1 - len;
-                        total += 1u64 << (w - 1);
-                    }
-                }
-                let decoder_max = if total == 0 {
-                    candidate
-                } else {
-                    (64 - total.leading_zeros()) as u8
-                };
-                let decoder_max = decoder_max.min(MAX_CODE_LENGTH);
-                if decoder_max == candidate {
-                    break;
-                }
-                candidate = decoder_max;
-            }
-            candidate
-        };
-
         let mut weights = vec![0u8; max_symbol + 1];
+        let mut rank_count = [0u32; (MAX_CODE_LENGTH as usize) + 2];
         for i in 0..=max_symbol {
-            if code_lengths[i] > 0 && max_bits + 1 > code_lengths[i] {
-                weights[i] = max_bits + 1 - code_lengths[i];
+            if code_lengths[i] > 0 {
+                let w = max_bits + 1 - code_lengths[i];
+                weights[i] = w;
+                rank_count[w as usize] += 1;
             }
         }
 
-        // Recompute codes using the decoder's max_bits and the weights
-        // to ensure exact compatibility
-        let mut actual_code_lengths = vec![0u8; MAX_SYMBOLS];
+        // Canonical code assignment mirroring the reference decode table
+        // (`HUF_readDTableX1`): weight-1 symbols occupy the lowest prefix
+        // ranges, ascending by weight, natural symbol order within a weight.
+        // A symbol of weight `w` covers 2^(w-1) table cells; its code is the
+        // cell range start shifted down by (w-1).
+        let mut rank_start = [0u64; (MAX_CODE_LENGTH as usize) + 2];
+        let mut next_start = 0u64;
+        for w in 1..=(max_bits as usize) {
+            rank_start[w] = next_start;
+            next_start += (rank_count[w] as u64) << (w - 1);
+        }
+
+        let mut codes = vec![0u32; MAX_SYMBOLS];
+        let mut lengths = vec![0u8; MAX_SYMBOLS];
         for i in 0..=max_symbol {
-            if weights[i] > 0 {
-                actual_code_lengths[i] = max_bits + 1 - weights[i];
+            let w = weights[i];
+            if w == 0 {
+                continue;
             }
-        }
-
-        // Recompute actual max_len from the adjusted code lengths
-        let mut actual_max_len = 0u8;
-        for &len in &actual_code_lengths {
-            if len > actual_max_len {
-                actual_max_len = len;
-            }
-        }
-
-        // Re-assign canonical codes with actual lengths
-        let mut bl_count2 = vec![0u32; (actual_max_len as usize) + 1];
-        for &len in &actual_code_lengths {
-            if len > 0 {
-                bl_count2[len as usize] += 1;
-            }
-        }
-
-        let mut next_code2 = vec![0u32; (actual_max_len as usize) + 1];
-        let mut code_val2 = 0u32;
-        for bits in 1..=actual_max_len as usize {
-            code_val2 = (code_val2 + bl_count2[bits - 1]) << 1;
-            next_code2[bits] = code_val2;
-        }
-
-        let mut final_codes = vec![0u32; MAX_SYMBOLS];
-        let mut final_lengths = vec![0u8; MAX_SYMBOLS];
-        for i in 0..MAX_SYMBOLS {
-            if actual_code_lengths[i] > 0 {
-                let len = actual_code_lengths[i] as usize;
-                final_codes[i] = next_code2[len];
-                next_code2[len] += 1;
-                final_lengths[i] = actual_code_lengths[i];
-            }
+            codes[i] = (rank_start[w as usize] >> (w - 1)) as u32;
+            lengths[i] = max_bits + 1 - w;
+            rank_start[w as usize] += 1u64 << (w - 1);
         }
 
         Some(Self {
-            codes: final_codes,
-            lengths: final_lengths,
+            codes,
+            lengths,
             max_bits,
             num_symbols,
             weights,
@@ -355,7 +293,12 @@ impl HuffmanEncoder {
     /// Format: header byte = 127 + num_weight_symbols, then 4-bit weights
     /// packed 2 per byte (high nibble first).
     pub fn serialize_table(&self) -> Vec<u8> {
-        let num_weight_symbols = self.weights.len();
+        // RFC 8878 §4.2.1.1: the *last* present symbol's weight is not
+        // stored — the decoder deduces it from the Kraft remainder. So only
+        // weights for symbols `0..last_symbol` are written and
+        // `Number_of_Weights = last_symbol`.
+        let last_symbol = self.weights.iter().rposition(|&w| w > 0).unwrap_or(0);
+        let num_weight_symbols = last_symbol;
         let header_byte = (127 + num_weight_symbols) as u8;
 
         let bytes_needed = num_weight_symbols.div_ceil(2);
@@ -378,102 +321,29 @@ impl HuffmanEncoder {
         output
     }
 
-    /// Encode literals using this Huffman table.
+    /// Encode literals into one RFC 8878 backward Huffman bitstream.
     ///
-    /// Returns the Huffman-encoded bitstream compatible with the Zstandard
-    /// Huffman stream format. The stream is read backwards by the decoder:
-    /// - The last byte contains a sentinel bit (highest set `1` bit) followed
-    ///   by the first bits of the stream
-    /// - The decoder reads from the last byte backwards through the buffer
-    /// - Codes are written MSB-first from the perspective of the backward reader
-    ///
-    /// Encoding proceeds from the first literal to the last, accumulating bits
-    /// in a buffer. The sentinel bit is placed at the end to mark where the
-    /// data starts for the backward reader.
+    /// The decoder consumes the stream starting at the sentinel bit in the
+    /// last byte and reads codes in **reverse write order**, so — exactly
+    /// like the reference `HUF_compress1X` — the *last* literal's code is
+    /// written first and the first literal's code last. Symbols with weight
+    /// zero (never counted in the frequency table) must not appear.
     pub fn encode_literals(&self, literals: &[u8]) -> Vec<u8> {
-        if literals.is_empty() {
-            return vec![0x01]; // Just sentinel bit
+        let mut writer = crate::bitwriter::BackwardBitWriter::with_capacity(literals.len());
+        for &lit in literals.iter().rev() {
+            writer.write_bits(self.codes[lit as usize] as u64, self.lengths[lit as usize]);
         }
-
-        // We need to produce a byte stream that the HuffmanBitReader can decode.
-        // The reader:
-        //  1. Finds sentinel bit in last byte
-        //  2. Reads codes MSB-first starting from just below the sentinel, going backward
-        //  3. Each code is peeked as max_bits from current position backward
-        //
-        // The encoding builds bits from the end of the buffer backward:
-        //  - Start after sentinel in last byte
-        //  - Write first literal code, then second, etc.
-        //  - Each code is MSB-first
-
-        // Calculate total data bits
-        let mut total_data_bits: usize = 0;
-        for &lit in literals {
-            total_data_bits += self.lengths[lit as usize] as usize;
-        }
-
-        // Total bits = data bits + sentinel (1 bit) + padding to byte boundary
-        // sentinel goes in last byte, with possible zero-padding above it
-        let total_bits_with_sentinel = total_data_bits + 1; // +1 for sentinel
-        let total_bytes = total_bits_with_sentinel.div_ceil(8);
-        let padding_bits = total_bytes * 8 - total_bits_with_sentinel;
-
-        // Build the bitstream from MSB of last byte going backward
-        // Layout in the last byte (MSB to LSB):
-        //   [padding zeros][sentinel 1][first code bits...]
-        // Then continuing into previous bytes...
-
-        let mut buffer = vec![0u8; total_bytes];
-
-        // Bit position counter: starts at bit 0 of last byte MSB side
-        // We track from the MSB end of the entire buffer
-        // Position 0 = MSB of first byte (byte 0, bit 7)
-        // Position (total_bytes*8 - 1) = LSB of last byte
-
-        // Current write position (MSB-first global bit index)
-        let mut pos = padding_bits; // skip padding zeros
-
-        // Write sentinel bit
-        Self::set_bit_msb_first(&mut buffer, pos);
-        pos += 1;
-
-        // Write literal codes in forward order (first literal first)
-        // Each code is written MSB-first
-        for &lit in literals {
-            let code = self.codes[lit as usize];
-            let len = self.lengths[lit as usize] as usize;
-
-            for b in 0..len {
-                if (code >> (len - 1 - b)) & 1 == 1 {
-                    Self::set_bit_msb_first(&mut buffer, pos + b);
-                }
-            }
-            pos += len;
-        }
-
-        buffer
-    }
-
-    /// Set a single bit in a byte buffer using MSB-first global indexing.
-    ///
-    /// Bit index 0 = MSB of byte 0, bit index 7 = LSB of byte 0,
-    /// bit index 8 = MSB of byte 1, etc.
-    #[inline]
-    fn set_bit_msb_first(buffer: &mut [u8], global_bit_index: usize) {
-        let byte_idx = global_bit_index / 8;
-        let bit_within_byte = 7 - (global_bit_index % 8);
-        if byte_idx < buffer.len() {
-            buffer[byte_idx] |= 1 << bit_within_byte;
-        }
+        writer.finish()
     }
 
     /// Get the code and length for a symbol.
+    #[cfg(test)]
     #[inline]
     pub fn get_code(&self, symbol: u8) -> (u32, u8) {
         (self.codes[symbol as usize], self.lengths[symbol as usize])
     }
 
-    /// Get the maximum code length (max_bits).
+    /// Get the maximum code length (the decoder's table log).
     pub fn max_bits(&self) -> u8 {
         self.max_bits
     }
@@ -484,6 +354,7 @@ impl HuffmanEncoder {
     }
 
     /// Get a reference to the weights array.
+    #[cfg(test)]
     pub fn weights(&self) -> &[u8] {
         &self.weights
     }
@@ -566,8 +437,9 @@ mod tests {
         assert!(encoder.is_some());
         let enc = encoder.as_ref().expect("encoder should exist");
         let serialized = enc.serialize_table();
-        // First byte should be 127 + number_of_weight_symbols
-        let num_w = enc.weights().len();
+        // First byte is 127 + Number_of_Weights, where the *last* present
+        // symbol's weight is implied (not stored) per RFC 8878 §4.2.1.1.
+        let num_w = enc.weights().len() - 1;
         assert_eq!(serialized[0], (127 + num_w) as u8);
         // Remaining bytes should be ceil(num_w / 2)
         let expected_data_bytes = num_w.div_ceil(2);
@@ -656,7 +528,9 @@ mod tests {
             assert!(len <= MAX_CODE_LENGTH);
             // Verify the decoder can decode this code back to the same symbol
             let padded_code = code << (decoder_table.max_bits() - len);
-            let entry = decoder_table.decode(padded_code);
+            let entry = decoder_table
+                .entry(padded_code as usize)
+                .expect("prefix within table");
             assert_eq!(
                 entry.symbol, sym,
                 "decoder should map code back to symbol {:?}",

@@ -56,8 +56,18 @@ pub struct Deflater {
     finished: bool,
     /// Dictionary Adler-32 checksum (if dictionary is set).
     dictionary_checksum: Option<u32>,
-    /// Pending bits from a partial flush (value, count).
+    /// Pending bits from a previous non-final `deflate`/`deflate_partial`
+    /// call (value, count). DEFLATE blocks abut at the bit level, so the
+    /// trailing partial byte of a non-final block must be carried into the
+    /// next call instead of being zero-padded to a byte boundary.
     pending_bits: (u8, u8),
+    /// Compressed bytes awaiting delivery via the streaming [`Compressor`]
+    /// trait (`compress`). Retained so a caller-supplied output buffer
+    /// smaller than the produced bytes drains across calls instead of
+    /// silently truncating the stream.
+    out_pending: Vec<u8>,
+    /// Cursor into `out_pending`: bytes before it have been delivered.
+    out_pending_pos: usize,
     /// Whether to use the graph-based optimal parser instead of greedy.
     optimal_parsing: bool,
     /// Optional pool used to recycle the LZ77 window and hash buffers.
@@ -91,6 +101,8 @@ impl Deflater {
             finished: false,
             dictionary_checksum: None,
             pending_bits: (0, 0),
+            out_pending: Vec::new(),
+            out_pending_pos: 0,
             optimal_parsing: false,
             pool: None,
         }
@@ -118,6 +130,7 @@ impl Deflater {
     /// drop(d);
     /// assert!(pool.stats().window_hits == 0); // first call always allocates
     /// ```
+    #[must_use]
     pub fn with_pool(mut self, pool: &DeflatePool) -> Self {
         // Acquire pooled buffers.
         let window_guard = pool.get_window();
@@ -165,6 +178,8 @@ impl Deflater {
             finished: false,
             dictionary_checksum: None,
             pending_bits: (0, 0),
+            out_pending: Vec::new(),
+            out_pending_pos: 0,
             optimal_parsing: true,
             pool: None,
         }
@@ -187,6 +202,7 @@ impl Deflater {
     /// let mut deflater = Deflater::new(6)
     ///     .with_lz77_params(Lz77Params { nice_length: 32, max_chain: 64, good_length: 259 });
     /// ```
+    #[must_use]
     pub fn with_lz77_params(mut self, params: Lz77Params) -> Self {
         // Preserve window/hash/dictionary state by applying params in-place.
         let lz77 = std::mem::take(&mut self.lz77);
@@ -205,6 +221,7 @@ impl Deflater {
     ///
     /// let mut deflater = Deflater::new(6).with_lz77_preset(Lz77Preset::Best);
     /// ```
+    #[must_use]
     pub fn with_lz77_preset(mut self, preset: Lz77Preset) -> Self {
         let params = preset.params();
         let lz77 = std::mem::take(&mut self.lz77);
@@ -265,6 +282,8 @@ impl Deflater {
         self.finished = false;
         self.dictionary_checksum = None;
         self.pending_bits = (0, 0);
+        self.out_pending = Vec::new();
+        self.out_pending_pos = 0;
     }
 
     /// Reset only the LZ77 state (used by full flush).
@@ -280,28 +299,71 @@ impl Deflater {
         self.finished = false;
         self.dictionary_checksum = checksum;
         self.pending_bits = (0, 0);
+        self.out_pending = Vec::new();
+        self.out_pending_pos = 0;
     }
 
     /// Compress data.
+    ///
+    /// With `finish == false` the block is written as a non-final DEFLATE
+    /// block and any trailing partial-byte bits are retained in the
+    /// compressor (not zero-padded), so a later call continues the stream
+    /// at the exact bit position — repeated `deflate(_, false)` calls
+    /// followed by a final `deflate(_, true)` produce one continuous
+    /// DEFLATE stream. Only `finish == true` byte-pads the output.
     pub fn deflate<W: Write>(&mut self, data: &[u8], writer: &mut W, finish: bool) -> Result<()> {
-        let mut bit_writer = BitWriter::new(writer);
+        self.deflate_with_pending(data, writer, finish)
+    }
 
-        // Re-inject any pending bits from a previous partial flush.
-        self.prepend_pending(&mut bit_writer)?;
+    /// Core bit-continuous writer shared by [`deflate`](Self::deflate) and
+    /// [`deflate_partial`](Self::deflate_partial).
+    ///
+    /// Re-injects pending bits from the previous call, writes the block(s),
+    /// then either byte-pads (final) or withholds the trailing partial byte
+    /// as `pending_bits` for the next call (non-final). DEFLATE blocks must
+    /// abut at the bit level, so padding between non-final blocks would
+    /// corrupt the stream.
+    fn deflate_with_pending<W: Write>(
+        &mut self,
+        data: &[u8],
+        writer: &mut W,
+        finish: bool,
+    ) -> Result<()> {
+        // Write to an intermediate buffer so the trailing partial byte can be
+        // withheld on non-final calls.
+        let mut buf = Vec::new();
+        let remainder = {
+            let mut bit_writer = BitWriter::new(&mut buf);
 
-        if self.level == 0 {
-            // Store only
-            self.write_stored_blocks(data, &mut bit_writer, finish)?;
-        } else {
-            // Compress with LZ77 and fixed Huffman codes
-            self.write_compressed_block(data, &mut bit_writer, finish)?;
-        }
+            // Re-inject any pending bits from a previous non-final call.
+            self.prepend_pending(&mut bit_writer)?;
+
+            if self.level == 0 {
+                // Store only
+                self.write_stored_blocks(data, &mut bit_writer, finish)?;
+            } else {
+                // Compress with LZ77 and Huffman codes
+                self.write_compressed_block(data, &mut bit_writer, finish)?;
+            }
+
+            let remainder = (bit_writer.bits_written() % 8) as u8;
+            // Flush pads the trailing partial byte with zeros; on non-final
+            // calls that byte is popped below and its valid bits carried over.
+            bit_writer.flush()?;
+            remainder
+        };
 
         if finish {
-            bit_writer.flush()?;
             self.finished = true;
+        } else if remainder != 0 {
+            if let Some(&last_byte) = buf.last() {
+                let mask = (1u8 << remainder).wrapping_sub(1);
+                self.pending_bits = (last_byte & mask, remainder);
+                buf.pop();
+            }
         }
 
+        writer.write_all(&buf)?;
         Ok(())
     }
 
@@ -851,52 +913,7 @@ impl Deflater {
     /// partial flush are prepended, and any trailing partial bits are saved
     /// for the next call.
     pub fn deflate_partial<W: Write>(&mut self, data: &[u8], writer: &mut W) -> Result<()> {
-        // Write to an intermediate buffer so we can manage bit-level state.
-        let mut buf = Vec::new();
-        {
-            let mut bit_writer = BitWriter::new(&mut buf);
-
-            // Re-inject pending bits from a previous partial flush.
-            if self.pending_bits.1 > 0 {
-                bit_writer.write_bits(self.pending_bits.0 as u32, self.pending_bits.1)?;
-            }
-
-            // Write the compressed (non-final) block.
-            if self.level == 0 {
-                self.write_stored_blocks(data, &mut bit_writer, false)?;
-            } else {
-                self.write_compressed_block(data, &mut bit_writer, false)?;
-            }
-
-            // Determine how many bits are in the last partial byte.
-            let total_bits = bit_writer.bits_written();
-            let remainder = (total_bits % 8) as u8;
-
-            if remainder == 0 {
-                // Exactly byte-aligned; no pending bits.
-                bit_writer.flush()?;
-                self.pending_bits = (0, 0);
-            } else {
-                // Flush complete bytes only (align pads with zeros then flushes).
-                bit_writer.flush()?;
-                self.pending_bits = (0, 0); // reset first
-            }
-            // Drop bit_writer to release the mutable borrow on buf
-            drop(bit_writer);
-
-            // If there were remainder bits, save the partial byte and remove it.
-            if remainder != 0 {
-                if let Some(&last_byte) = buf.last() {
-                    // The valid bits are in the lower `remainder` bits.
-                    let mask = (1u8 << remainder).wrapping_sub(1);
-                    self.pending_bits = (last_byte & mask, remainder);
-                    buf.pop();
-                }
-            }
-        }
-
-        writer.write_all(&buf)?;
-        Ok(())
+        self.deflate_with_pending(data, writer, false)
     }
 
     /// Re-inject any pending partial-byte bits into a fresh BitWriter,
@@ -924,12 +941,43 @@ impl Default for Deflater {
 }
 
 impl Compressor for Deflater {
+    /// Streaming compression: produced bytes that do not fit in `output`
+    /// are buffered internally and drained across subsequent calls.
+    ///
+    /// Returns [`CompressStatus::NeedsOutput`] while produced bytes remain
+    /// undelivered (with `consumed == 0` on pure drain calls, so the caller
+    /// re-offers unconsumed input) and [`CompressStatus::Done`] only after
+    /// a `Finish` stream has been fully delivered — a bounded output buffer
+    /// never receives a silently truncated stream.
     fn compress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         flush: FlushMode,
     ) -> Result<(usize, usize, CompressStatus)> {
+        // Drain compressed bytes buffered by a previous call first.
+        if self.out_pending_pos < self.out_pending.len() {
+            let remaining = self.out_pending.len() - self.out_pending_pos;
+            let to_copy = remaining.min(output.len());
+            output[..to_copy].copy_from_slice(
+                &self.out_pending[self.out_pending_pos..self.out_pending_pos + to_copy],
+            );
+            self.out_pending_pos += to_copy;
+
+            let status = if self.out_pending_pos < self.out_pending.len() {
+                CompressStatus::NeedsOutput
+            } else {
+                self.out_pending = Vec::new();
+                self.out_pending_pos = 0;
+                if self.finished {
+                    CompressStatus::Done
+                } else {
+                    CompressStatus::NeedsInput
+                }
+            };
+            return Ok((0, to_copy, status));
+        }
+
         if self.finished {
             return Ok((0, 0, CompressStatus::Done));
         }
@@ -964,16 +1012,24 @@ impl Compressor for Deflater {
             FlushMode::None => {
                 self.deflate(input, &mut buffer, false)?;
             }
+            // `FlushMode` is `#[non_exhaustive]`; treat any future mode as the
+            // conservative buffered (no-flush) path rather than panicking.
+            _ => {
+                self.deflate(input, &mut buffer, false)?;
+            }
         }
 
         let finish = matches!(flush, FlushMode::Finish);
         let to_copy = buffer.len().min(output.len());
         output[..to_copy].copy_from_slice(&buffer[..to_copy]);
 
-        let status = if finish {
-            CompressStatus::Done
-        } else if to_copy < buffer.len() {
+        let status = if to_copy < buffer.len() {
+            // Stash the undelivered remainder for later drain calls.
+            self.out_pending = buffer;
+            self.out_pending_pos = to_copy;
             CompressStatus::NeedsOutput
+        } else if finish {
+            CompressStatus::Done
         } else {
             CompressStatus::NeedsInput
         };

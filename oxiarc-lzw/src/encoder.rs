@@ -3,7 +3,7 @@
 use crate::bitstream_msb::MsbBitWriter;
 use crate::config::LzwConfig;
 use crate::dictionary::LzwDictionary;
-use crate::error::Result;
+use crate::error::{LzwError, Result};
 
 /// LZW encoder for compression.
 #[derive(Debug)]
@@ -23,14 +23,18 @@ impl LzwEncoder {
     ///
     /// # Algorithm
     ///
-    /// The LZW encoding algorithm:
+    /// The LZW encoding algorithm (TIFF 6.0 §13 / libtiff-compatible):
     /// 1. Initialize dictionary with single-byte codes (0-255)
-    /// 2. Read input byte by byte
-    /// 3. Build longest matching string in dictionary
-    /// 4. Output code for that string
-    /// 5. Add string + next byte to dictionary
-    /// 6. Repeat until all input processed
-    /// 7. Output EOI (End of Information) code
+    /// 2. Emit a ClearCode (256) as the very first code (when clear codes
+    ///    are enabled — TIFF 6.0 mandates this for every strip)
+    /// 3. Read input byte by byte, building the longest matching string
+    /// 4. Output the code for that string and add string + next byte to
+    ///    the dictionary
+    /// 5. When the table reaches entry 4093 (`next_code` == 4094), emit a
+    ///    ClearCode and reset the table (early-change/TIFF mode), matching
+    ///    libtiff's `CODE_MAX - 1` reset
+    /// 6. Output the code for the final string, account for the decoder's
+    ///    phantom final table entry, and output EOI (257)
     ///
     /// # Parameters
     ///
@@ -40,10 +44,15 @@ impl LzwEncoder {
     ///
     /// LZW-compressed byte sequence.
     pub fn encode(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut writer = MsbBitWriter::new();
+        // Always start from a clean dictionary so a reused encoder produces
+        // an independently decodable stream.
+        self.dict.reset();
 
-        // Write clear code at start (if enabled)
-        if self.dict.config().use_clear_code {
+        let mut writer = MsbBitWriter::new();
+        let use_clear_code = self.dict.config().use_clear_code;
+
+        // TIFF 6.0: every LZW strip must begin with a ClearCode.
+        if use_clear_code {
             writer.write_bits(self.dict.clear_code(), self.dict.current_bits())?;
         }
 
@@ -62,21 +71,27 @@ impl LzwEncoder {
             let mut candidate = current.clone();
             candidate.push(byte);
 
-            if let Some(_code) = self.dict.find_code(&candidate) {
+            if self.dict.find_code(&candidate).is_some() {
                 // String exists in dictionary - continue building
                 current = candidate;
             } else {
                 // String not in dictionary
                 // Output code for current string
-                let code = self.dict.find_code(&current)
-                    .expect("BUG: Current string should always exist in dictionary - it was either initialized or found in previous iteration");
+                let code = self
+                    .dict
+                    .find_code(&current)
+                    .ok_or(LzwError::InvalidCode(0))?;
                 writer.write_bits(code, self.dict.current_bits())?;
 
                 // Add new string to dictionary (if not full)
                 if !self.dict.is_full() {
                     let _ = self.dict.add_string(candidate);
-                } else if self.dict.config().use_clear_code {
-                    // Table full - write clear code and reset (GIF-style)
+                }
+
+                // Table-reset handling (only meaningful with clear codes).
+                if use_clear_code && self.dict.next_code() >= self.reset_trigger() {
+                    // Emit a ClearCode at the current width, then reset the
+                    // table and drop back to the minimum code width.
                     writer.write_bits(self.dict.clear_code(), self.dict.current_bits())?;
                     self.dict.reset();
                 }
@@ -88,10 +103,22 @@ impl LzwEncoder {
         }
 
         // Output code for final string
-        if !current.is_empty() {
-            let code = self.dict.find_code(&current)
-                .expect("BUG: Final string should always exist in dictionary - it was built from valid dictionary entries");
-            writer.write_bits(code, self.dict.current_bits())?;
+        let code = self
+            .dict
+            .find_code(&current)
+            .ok_or(LzwError::InvalidCode(0))?;
+        writer.write_bits(code, self.dict.current_bits())?;
+
+        // The decoder creates one more table entry while processing that
+        // final code; mirror it (libtiff `LZWPostEncode` does the same) so
+        // the EOI code below is written at the width the decoder will use
+        // to read it. At exact boundary sizes this also means the phantom
+        // entry can hit the reset trigger, in which case libtiff emits a
+        // ClearCode before EOI — mirror that too.
+        self.dict.note_final_code();
+        if use_clear_code && self.dict.next_code() >= self.reset_trigger() {
+            writer.write_bits(self.dict.clear_code(), self.dict.current_bits())?;
+            self.dict.reset();
         }
 
         // Write EOI code
@@ -99,6 +126,23 @@ impl LzwEncoder {
 
         // Flush remaining bits
         writer.into_vec()
+    }
+
+    /// The `next_code` value at which the encoder emits a ClearCode and
+    /// resets the table.
+    ///
+    /// - Early-change (TIFF): `max_code - 1` (4094), matching libtiff's
+    ///   `free_ent == CODE_MAX - 1` reset — entries 4094/4095 are never used.
+    /// - Standard change: only once the table is completely full
+    ///   (`max_code + 1`), preserving the previous GIF-style behaviour of
+    ///   this generic encoder (the real GIF path lives in `gif_lzw`).
+    fn reset_trigger(&self) -> u16 {
+        let config = self.dict.config();
+        if config.early_change {
+            config.max_code().saturating_sub(1)
+        } else {
+            config.max_code().saturating_add(1)
+        }
     }
 
     /// Reset the encoder to initial state.

@@ -1,21 +1,42 @@
 //! Test command implementation.
 
+use crate::style::Styler;
+use crate::utils::{input_display_name, open_input};
 use oxiarc_archive::{
     ArchiveFormat, BrotliReader, Bzip2Reader, CabReader, Lz4Reader, SevenZReader, SnappyReader,
     ZipReader, ZstdReader,
 };
-use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{Seek, SeekFrom};
 
-pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::open(archive)?;
-    let mut reader = BufReader::new(file);
+pub fn cmd_test(
+    archive: &str,
+    verbose: bool,
+    quiet: bool,
+    styler: &Styler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = open_input(archive)?;
 
-    let (format, _) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`); `-` (stdin) has no
+    // extension, so it degrades to plain content detection.
+    let (format, _) = ArchiveFormat::detect_with_path(&mut reader, archive)?;
     reader.seek(SeekFrom::Start(0))?;
 
-    println!("Testing {} ({})", archive.display(), format);
+    // Name used for single-stream (non-archive) formats that carry no internal
+    // entry name. `<stdin>`'s stem is meaningless, so fall back to "stdin".
+    let stem = if archive == "-" {
+        "stdin".to_string()
+    } else {
+        std::path::Path::new(archive)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    if !quiet {
+        println!("Testing {} ({})", input_display_name(archive), format);
+    }
 
     let mut total_files = 0usize;
     let mut ok_count = 0usize;
@@ -131,11 +152,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Xz => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             match oxiarc_archive::xz::decompress(&mut reader) {
                 Ok(_) => {
@@ -155,11 +172,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Lz4 => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             let mut lz4 = Lz4Reader::new(reader)?;
             match lz4.decompress() {
@@ -180,11 +193,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Zstd => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             let mut zstd = ZstdReader::new(reader)?;
             match zstd.decompress() {
@@ -205,11 +214,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Bzip2 => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             let mut bzip2 = Bzip2Reader::new(reader)?;
             match bzip2.decompress() {
@@ -230,11 +235,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Brotli => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             let mut brotli = BrotliReader::new(reader)?;
             match brotli.decompress() {
@@ -255,11 +256,7 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         }
         ArchiveFormat::Snappy => {
             total_files = 1;
-            let name = archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let name = stem.clone();
 
             let mut snappy = SnappyReader::new(reader)?;
             match snappy.decompress() {
@@ -335,24 +332,29 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         _ => {
             return Err(format!(
                 "unsupported or unrecognized archive format for {}: {}",
-                archive.display(),
+                input_display_name(archive),
                 format
             )
             .into());
         }
     }
 
-    println!();
-    println!("Test results:");
-    println!("  Total files: {}", total_files);
-    println!("  OK: {}", ok_count);
-    println!("  Failed: {}", error_count);
+    if !quiet {
+        println!();
+        println!("Test results:");
+        println!("  Total files: {}", total_files);
+        println!("  OK: {}", ok_count);
+        println!("  Failed: {}", error_count);
+    }
 
+    // Surface the concrete failures whenever they were not already shown
+    // inline (verbose mode prints each FAILED line as it happens). These are
+    // genuine errors, so they are emitted even under --quiet.
     if !errors.is_empty() && !verbose {
         println!();
-        println!("Errors:");
+        println!("{}", styler.error("Errors:"));
         for (name, err) in &errors {
-            println!("  {}: {}", name, err);
+            println!("  {}: {}", styler.path(name), styler.error(err));
         }
     }
 
@@ -360,7 +362,9 @@ pub fn cmd_test(archive: &PathBuf, verbose: bool) -> Result<(), Box<dyn std::err
         std::process::exit(2);
     }
 
-    println!();
-    println!("All files OK");
+    if !quiet {
+        println!();
+        println!("{}", styler.success("All files OK"));
+    }
     Ok(())
 }

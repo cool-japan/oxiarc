@@ -15,8 +15,21 @@ use std::io::Read;
 /// Granularity for progress reporting and cancellation checks (bytes).
 const PROGRESS_GRANULARITY: u64 = 4096;
 
-/// Maximum dictionary size (4 GB).
+/// Maximum dictionary size representable in the LZMA/LZMA2 header formats
+/// (`0xFFFF_FFFF` is used by real encoders as an "unbounded" sentinel).
 pub const DICT_SIZE_MAX: u32 = 0xFFFF_FFFF;
+
+/// Hard cap on the dictionary size we are willing to *allocate*, regardless
+/// of what a stream header declares.
+///
+/// A malicious or corrupted `.lzma`/`.xz` file can declare a dictionary size
+/// up to [`DICT_SIZE_MAX`] (~4 GiB). Without a cap, a tiny input file could
+/// force a multi-gigabyte zero-filled allocation (a denial-of-service via
+/// memory exhaustion). 1.5 GiB comfortably covers every dictionary size used
+/// by real-world encoders (xz's own maximum preset dictionary is 64 MiB, and
+/// even hand-tuned custom encodes rarely exceed a few hundred MiB) while
+/// still rejecting adversarial inputs before they can exhaust memory.
+pub const DICT_SIZE_ALLOC_CAP: u32 = 1536 * 1024 * 1024;
 
 /// Decode a bit tree.
 fn decode_bit_tree<R: Read>(
@@ -85,13 +98,41 @@ pub struct LzmaDecoder<R: Read> {
 
 impl<R: Read> LzmaDecoder<R> {
     /// Create a new LZMA decoder.
+    ///
+    /// Returns an error if `dict_size` exceeds [`DICT_SIZE_ALLOC_CAP`] — this
+    /// rejects streams that would otherwise force an unbounded allocation
+    /// before a single byte has been decoded. The dictionary buffer itself
+    /// is grown lazily (one byte at a time as output is produced) up to `dict_size` as
+    /// data is actually decoded, rather than eagerly zero-filled at the
+    /// declared maximum.
+    ///
+    /// Also returns an error if `props` is outside the LZMA format limits
+    /// (`lc <= 8`, `lp <= 4`, `pb <= 4`). Properties from
+    /// [`LzmaProperties::new`] / [`LzmaProperties::from_byte`] are always in
+    /// range; a struct-literal-built value may not be, and decoding with such
+    /// a value would previously attempt an unbounded model allocation.
     pub fn new(reader: R, props: LzmaProperties, dict_size: u32) -> Result<Self> {
-        let dict_size = dict_size.max(4096) as usize;
+        if !props.is_valid() {
+            return Err(OxiArcError::invalid_header(format!(
+                "Invalid LZMA properties: lc={} lp={} pb={} (limits: lc<=8, lp<=4, pb<=4)",
+                props.lc, props.lp, props.pb
+            )));
+        }
+        let dict_size = dict_size.max(4096);
+        if dict_size > DICT_SIZE_ALLOC_CAP {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "LZMA dictionary size {dict_size} exceeds the maximum allowed allocation of {DICT_SIZE_ALLOC_CAP} bytes"
+                ),
+            ));
+        }
+        let dict_size = dict_size as usize;
 
         Ok(Self {
             rc: RangeDecoder::new(reader)?,
             model: LzmaModel::new(props),
-            dict: vec![0u8; dict_size],
+            dict: Vec::new(),
             dict_pos: 0,
             dict_size,
             state: State::new(),
@@ -133,8 +174,7 @@ impl<R: Read> LzmaDecoder<R> {
         let tail_start = dict.len().saturating_sub(self.dict_size);
         let tail = &dict[tail_start..];
         for &byte in tail {
-            self.dict[self.dict_pos] = byte;
-            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+            self.push_dict_byte(byte);
         }
         // bytes_decoded advances so that literal contexts and distance checks work
         self.bytes_decoded = tail.len() as u64;
@@ -150,6 +190,7 @@ impl<R: Read> LzmaDecoder<R> {
     /// Attach a progress sink; called for every ~4096 bytes decompressed.
     ///
     /// The `on_progress` callback receives `(bytes_produced, uncompressed_size_if_known)`.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -158,6 +199,7 @@ impl<R: Read> LzmaDecoder<R> {
     /// Attach a cancellation token; checked every ~4096 bytes decompressed.
     ///
     /// If the token is cancelled the decoder returns `Err(OxiArcError::Cancelled)`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -327,14 +369,53 @@ impl<R: Read> LzmaDecoder<R> {
         Ok(dist)
     }
 
-    /// Get byte from dictionary at distance.
-    fn get_byte(&self, dist: usize) -> u8 {
+    /// Get byte from dictionary at distance `dist` (0-based: `dist == 0` is the
+    /// most recently written byte).
+    ///
+    /// A back-reference is only valid when the referenced byte is still present
+    /// in the sliding dictionary window. That window holds
+    /// `min(bytes_decoded, dict_size)` bytes, so a valid `dist` must be strictly
+    /// less than that bound. A malformed LZMA1 stream can encode a match/rep
+    /// distance that points before the start of the produced output or beyond
+    /// the dictionary size; such a distance would underflow the ring-buffer
+    /// index computation below (`dict_size - (dist - dict_pos) - 1`) and either
+    /// panic on the subtraction or read an unrelated/overwritten byte. We reject
+    /// it here with a corrupted-data error so no out-of-range `dist` can ever
+    /// reach `self.dict[pos]`.
+    fn get_byte(&self, dist: usize) -> Result<u8> {
+        let available = self.bytes_decoded.min(self.dict_size as u64) as usize;
+        if dist >= available {
+            return Err(OxiArcError::corrupted(
+                self.bytes_decoded,
+                "LZMA match distance exceeds available dictionary history",
+            ));
+        }
         let pos = if self.dict_pos > dist {
             self.dict_pos - dist - 1
         } else {
             self.dict_size - (dist - self.dict_pos) - 1
         };
-        self.dict[pos]
+        Ok(self.dict[pos])
+    }
+
+    /// Write a decoded byte into the (lazily-grown) circular dictionary
+    /// buffer.
+    ///
+    /// The backing `Vec` starts empty and grows one push at a time until it
+    /// reaches `dict_size` bytes, at which point it behaves as a fixed-size
+    /// ring buffer (in place overwrite + modulo wraparound). This avoids
+    /// eagerly zero-filling a buffer sized at the header-declared maximum
+    /// (which may be adversarially large) while preserving the exact same
+    /// addressing scheme [`Self::get_byte`] relies on once the buffer is
+    /// full.
+    fn push_dict_byte(&mut self, byte: u8) {
+        if self.dict.len() < self.dict_size {
+            self.dict.push(byte);
+            self.dict_pos = self.dict.len() % self.dict_size;
+        } else {
+            self.dict[self.dict_pos] = byte;
+            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+        }
     }
 
     /// Decompress all data.
@@ -367,20 +448,19 @@ impl<R: Read> LzmaDecoder<R> {
                 let prev_byte = if self.bytes_decoded == 0 {
                     0
                 } else {
-                    self.get_byte(0)
+                    self.get_byte(0)?
                 };
 
                 let match_byte =
                     if !self.state.is_literal() && self.rep[0] < self.bytes_decoded as u32 {
-                        self.get_byte(self.rep[0] as usize)
+                        self.get_byte(self.rep[0] as usize)?
                     } else {
                         0
                     };
 
                 let byte = self.decode_literal(prev_byte, match_byte)?;
 
-                self.dict[self.dict_pos] = byte;
-                self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                self.push_dict_byte(byte);
                 output.push(byte);
                 self.bytes_decoded += 1;
                 self.state.update_literal();
@@ -435,9 +515,8 @@ impl<R: Read> LzmaDecoder<R> {
                                 ));
                             }
 
-                            let byte = self.get_byte(dist as usize);
-                            self.dict[self.dict_pos] = byte;
-                            self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                            let byte = self.get_byte(dist as usize)?;
+                            self.push_dict_byte(byte);
                             output.push(byte);
                             self.bytes_decoded += 1;
                             self.state.update_short_rep();
@@ -493,9 +572,8 @@ impl<R: Read> LzmaDecoder<R> {
                 // Copy from dictionary
                 let len = len as usize;
                 for _ in 0..len {
-                    let byte = self.get_byte(dist as usize);
-                    self.dict[self.dict_pos] = byte;
-                    self.dict_pos = (self.dict_pos + 1) % self.dict_size;
+                    let byte = self.get_byte(dist as usize)?;
+                    self.push_dict_byte(byte);
                     output.push(byte);
                     self.bytes_decoded += 1;
                 }
@@ -555,5 +633,20 @@ mod tests {
         assert_eq!(decoded.lc, 3);
         assert_eq!(decoded.lp, 0);
         assert_eq!(decoded.pb, 2);
+    }
+
+    /// LZMA-03 regression: out-of-range struct-literal-built properties must
+    /// be rejected with `Err` instead of aborting the process on a huge
+    /// literal-model allocation.
+    #[test]
+    fn test_decoder_rejects_invalid_struct_literal_props() {
+        let props = LzmaProperties {
+            lc: 20,
+            lp: 20,
+            pb: 4,
+        };
+        let data = vec![0u8; 16];
+        let result = LzmaDecoder::new(Cursor::new(data), props, 4096);
+        assert!(result.is_err(), "invalid props must be rejected");
     }
 }

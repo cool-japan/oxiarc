@@ -41,6 +41,18 @@
 //! decoder.read_to_end(&mut output).unwrap();
 //! assert_eq!(output, b"Hello, streaming Snappy!");
 //! ```
+//!
+//! # Untrusted Input
+//!
+//! Neither Snappy format declares a *total* uncompressed size, so untrusted
+//! input should be decoded with a memory budget:
+//! [`decompress_with_limit`] for blocks, [`decompress_frame_with_limit`] (or
+//! [`FrameDecoder::with_max_output_size`]) for frames. Both enforce the cap
+//! against the size each block/chunk *declares*, i.e. before the offending
+//! output is decoded, so a decompression bomb is rejected without its
+//! expansion ever being allocated.
+
+#![warn(missing_docs)]
 
 #[cfg(feature = "async-io")]
 pub mod async_snappy;
@@ -49,6 +61,7 @@ pub mod crc32c;
 pub mod decompress;
 pub mod error;
 pub mod frame;
+pub mod frame_bounded;
 #[cfg(feature = "parallel")]
 pub mod frame_parallel;
 pub mod pool;
@@ -64,6 +77,7 @@ pub use compress::compress_block_with_dict;
 pub use compress::max_compress_len;
 pub use decompress::decompress;
 pub use decompress::decompress_block_with_dict;
+pub use decompress::decompress_with_limit;
 pub use decompress::get_decompress_len as decompress_len;
 pub use error::SnappyError;
 pub use frame::FrameDecoder;
@@ -71,6 +85,7 @@ pub use frame::FrameEncoder;
 pub use frame::compress_frame_pooled;
 pub use frame::compress_frame_with_dict;
 pub use frame::decompress_frame_with_dict;
+pub use frame_bounded::decompress_frame_with_limit;
 #[cfg(feature = "parallel")]
 pub use frame_parallel::compress_parallel;
 pub use pool::PoolStats;

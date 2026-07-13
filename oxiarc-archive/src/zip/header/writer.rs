@@ -66,6 +66,7 @@ impl<W: Write> ZipWriter<W> {
     }
 
     /// Attach a progress handle to this writer.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -432,8 +433,13 @@ impl<W: Write> ZipWriter<W> {
         compression: ZipCompressionLevel,
         strength: AesStrength,
     ) -> Result<()> {
-        // Compute CRC-32 of original data
-        let crc32 = Crc32::compute(data);
+        // AE-2 (the scheme written here) requires the CRC-32 field to be 0
+        // in both the local and central headers: the HMAC-SHA1 code
+        // authenticates the payload instead, and storing the plaintext
+        // CRC would both violate the WinZip AES spec (the CRC presence is
+        // what distinguishes AE-1 from AE-2) and leak a checksum of the
+        // plaintext.
+        let crc32 = 0u32;
 
         // Get current time for DOS format
         let (mtime, mdate) = Self::current_dos_time();
@@ -544,7 +550,7 @@ impl<W: Write> ZipWriter<W> {
         self.writer.write_all(&mtime.to_le_bytes())?;
         // Modification date
         self.writer.write_all(&mdate.to_le_bytes())?;
-        // CRC-32 (for AE-2, this is stored in local header; for AE-1 it would be 0)
+        // CRC-32 (always 0 for AE-2; only AE-1 stores the plaintext CRC)
         self.writer.write_all(&crc32.to_le_bytes())?;
         // Compressed size (includes encryption overhead)
         self.writer.write_all(&compressed_size_32.to_le_bytes())?;
@@ -699,7 +705,10 @@ impl<W: Write> ZipWriter<W> {
             20 // ZipCrypto requires at least version 2.0
         };
 
-        // Build extra field with encryption marker and optionally Zip64
+        // Build extra field (Zip64 only when needed). Encryption is
+        // signalled solely by general-purpose bit 0, per APPNOTE — the
+        // legacy private 0xEE,0xEE marker is gone: it was invisible to
+        // every other tool and false-positived on unrelated extra data.
         let mut local_extra = Vec::new();
         if needs_zip64 {
             local_extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
@@ -707,8 +716,6 @@ impl<W: Write> ZipWriter<W> {
             local_extra.extend_from_slice(&uncompressed_size.to_le_bytes());
             local_extra.extend_from_slice(&total_encrypted_size.to_le_bytes());
         }
-        // Add encryption marker (0xEE, 0xEE)
-        local_extra.extend_from_slice(&[0xEE, 0xEE]);
 
         // Use marker values for Zip64
         let compressed_size_32 = if needs_zip64 {
@@ -766,7 +773,8 @@ impl<W: Write> ZipWriter<W> {
         self.offset +=
             30 + filename_bytes.len() as u64 + local_extra.len() as u64 + total_encrypted_size;
 
-        // Store central directory entry with encryption marker
+        // Store central directory entry (encryption is signalled by the
+        // general-purpose bit 0 in `flags`, not by any private marker)
         self.entries.push(CentralDirEntry {
             version_made_by: 0x031E,
             version_needed,
@@ -778,7 +786,7 @@ impl<W: Write> ZipWriter<W> {
             compressed_size: total_encrypted_size,
             uncompressed_size,
             filename: name.to_string(),
-            extra: vec![0xEE, 0xEE], // Encryption marker
+            extra: Vec::new(),
             comment: String::new(),
             disk_start: 0,
             internal_attr: 0,
@@ -1106,67 +1114,21 @@ impl<W: Write> ZipWriter<W> {
     }
 
     /// Convert a `SystemTime` to DOS (mtime, mdate) pair.
+    ///
+    /// Delegates to the shared civil-date helper in `types` so leap years
+    /// and real month lengths are exact (the previous 365/30-day
+    /// approximation drifted by weeks and could emit month 13).
     fn dos_time_from_systime(t: SystemTime) -> (u16, u16) {
         let secs = t
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
-
-        let days = secs / 86400;
-        let time_of_day = secs % 86400;
-
-        let hours = (time_of_day / 3600) as u16;
-        let minutes = ((time_of_day % 3600) / 60) as u16;
-        let seconds = ((time_of_day % 60) / 2) as u16;
-
-        let mtime = (hours << 11) | (minutes << 5) | seconds;
-
-        let years = days / 365;
-        let year = (1970 + years) as u16;
-        let day_of_year = days % 365;
-        let month = ((day_of_year / 30) + 1) as u16;
-        let day = ((day_of_year % 30) + 1) as u16;
-
-        let mdate = if year >= 1980 {
-            ((year - 1980) << 9) | (month << 5) | day
-        } else {
-            0
-        };
-
-        (mtime, mdate)
+        super::types::dos_date_time_from_unix_secs(secs)
     }
 
     /// Get current time in DOS format.
     fn current_dos_time() -> (u16, u16) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-
-        // Convert to DOS time (simplified)
-        let secs = now.as_secs();
-        let days = secs / 86400;
-        let time_of_day = secs % 86400;
-
-        let hours = (time_of_day / 3600) as u16;
-        let minutes = ((time_of_day % 3600) / 60) as u16;
-        let seconds = ((time_of_day % 60) / 2) as u16; // DOS stores in 2-second increments
-
-        let mtime = (hours << 11) | (minutes << 5) | seconds;
-
-        // Approximate date calculation (days since 1970-01-01)
-        let years = days / 365;
-        let year = (1970 + years) as u16;
-        let day_of_year = days % 365;
-        let month = ((day_of_year / 30) + 1) as u16;
-        let day = ((day_of_year % 30) + 1) as u16;
-
-        let mdate = if year >= 1980 {
-            ((year - 1980) << 9) | (month << 5) | day
-        } else {
-            0 // Before DOS epoch
-        };
-
-        (mtime, mdate)
+        Self::dos_time_from_systime(SystemTime::now())
     }
 }
 

@@ -5,19 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 description = "Pure Rust Brotli compression/decompression implementation (RFC 7932) for OxiArc"
 readme = "README.md"
 keywords = ["compression", "brotli", "decompression", "rfc7932", "lz77"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
@@ -29,6 +36,11 @@ default = []
 # Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for BrotliCompressor/BrotliDecompressor
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 parallel = ["dep:rayon"]
+# Differential oracle tests (tests/brotli_oracle.rs) that shell out to the
+# reference `brotli` CLI in BOTH directions: reference-compress -> OxiArc
+# decode must be byte-identical, and OxiArc-compress -> `brotli -d` must be
+# accepted and byte-identical. Tests self-skip when `brotli` is not on PATH.
+brotli-oracle = []
 
 [lints]
 workspace = true

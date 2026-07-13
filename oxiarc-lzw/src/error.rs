@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// LZW compression/decompression errors.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LzwError {
     /// Invalid LZW code encountered.
     #[error("Invalid LZW code: {0}")]
@@ -40,4 +41,11 @@ pub enum LzwError {
 }
 
 /// Result type for LZW operations.
+///
+/// Note: this is a crate-local alias distinct from `oxiarc_core::error::Result`.
+/// It intentionally shadows the core alias within this crate so that internal
+/// LZW code can use the shorter `Result<T>` spelling without repeatedly writing
+/// `std::result::Result<T, LzwError>`. Public APIs that need to surface a core
+/// `OxiArcError` should convert explicitly (e.g. via `.map_err(Into::into)`)
+/// rather than introducing another per-crate alias.
 pub type Result<T> = std::result::Result<T, LzwError>;

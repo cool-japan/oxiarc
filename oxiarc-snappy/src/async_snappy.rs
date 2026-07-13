@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-snappy = { version = "0.3.3", features = ["async-io"] }
+//! oxiarc-snappy = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Note
@@ -18,12 +18,28 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_snappy::async_snappy::{AsyncSnappyCompressor, AsyncSnappyDecompressor};
 //! use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};
 //!
-//! let mut compressor = AsyncSnappyCompressor;
-//! // use compressor.compress_async(&mut input, &mut output).await
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() {
+//!     let mut compressor = AsyncSnappyCompressor;
+//!     let mut input = tokio::io::BufReader::new(&b"Hello, async Snappy!"[..]);
+//!     let mut compressed = Vec::new();
+//!     compressor
+//!         .compress_async(&mut input, &mut compressed)
+//!         .await
+//!         .unwrap();
+//!
+//!     let mut decompressor = AsyncSnappyDecompressor;
+//!     let mut comp_input = tokio::io::BufReader::new(&compressed[..]);
+//!     let mut output = Vec::new();
+//!     decompressor
+//!         .decompress_async(&mut comp_input, &mut output)
+//!         .await
+//!         .unwrap();
+//! }
 //! ```
 
 #![cfg(feature = "async-io")]

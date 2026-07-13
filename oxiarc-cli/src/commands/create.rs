@@ -1,12 +1,17 @@
 //! Create command implementation.
 
-use oxiarc_archive::{
-    BrotliWriter, Bzip2Writer, Lz4Writer, LzhCompressionLevel, LzhWriter, SnappyWriter, TarWriter,
-    XzWriter, ZipCompressionLevel, ZipWriter, ZstdWriter,
+use crate::style::Styler;
+use crate::utils::{
+    create_file, mtime_secs, read_dir_for, read_file, read_link_for, symlink_metadata_for,
+    unix_mode, write_file,
 };
-use std::fs::File;
+use oxiarc_archive::{
+    BrotliWriter, Bzip2Writer, Lz4Writer, LzhCompressionLevel, LzhWriter, SnappyWriter, TarHeader,
+    TarWriter, XzWriter, ZipCompressionLevel, ZipWriter, ZstdWriter,
+};
+use std::collections::HashSet;
 use std::io::{self, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Compression level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +99,8 @@ pub fn cmd_create(
     compress_threshold: u64,
     verbose: bool,
     dry_run: bool,
+    quiet: bool,
+    styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let to_stdout = archive == "-";
 
@@ -161,7 +168,7 @@ pub fn cmd_create(
             )
             .into());
         }
-        let data = std::fs::read(input_path)?;
+        let data = read_file(input_path)?;
         let filename = input_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -186,7 +193,7 @@ pub fn cmd_create(
                     "ZIP format cannot be written to stdout (use single-file formats)".into(),
                 );
             }
-            let file = File::create(archive)?;
+            let file = create_file(Path::new(archive))?;
             let writer = BufWriter::new(file);
             let mut zip = ZipWriter::new(writer);
 
@@ -198,8 +205,17 @@ pub fn cmd_create(
             };
             zip.set_compression(level);
 
+            let mut visited = HashSet::new();
             for path in files {
-                add_path_to_zip(&mut zip, path, path, verbose, compress_threshold)?;
+                add_path_to_zip(
+                    &mut zip,
+                    path,
+                    path,
+                    verbose,
+                    quiet,
+                    compress_threshold,
+                    &mut visited,
+                )?;
             }
 
             zip.finish()?;
@@ -210,12 +226,13 @@ pub fn cmd_create(
                     "TAR format cannot be written to stdout (use single-file formats)".into(),
                 );
             }
-            let file = File::create(archive)?;
+            let file = create_file(Path::new(archive))?;
             let writer = BufWriter::new(file);
             let mut tar = TarWriter::new(writer);
 
+            let mut visited = HashSet::new();
             for path in files {
-                add_path_to_tar(&mut tar, path, path, verbose)?;
+                add_path_to_tar(&mut tar, path, path, verbose, quiet, &mut visited)?;
             }
 
             tar.finish()?;
@@ -237,7 +254,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -250,7 +267,7 @@ pub fn cmd_create(
                     "LZH format cannot be written to stdout (use single-file formats)".into(),
                 );
             }
-            let file = File::create(archive)?;
+            let file = create_file(Path::new(archive))?;
             let writer = BufWriter::new(file);
             let mut lzh = LzhWriter::new(writer);
 
@@ -260,8 +277,9 @@ pub fn cmd_create(
             };
             lzh.set_compression(level);
 
+            let mut visited = HashSet::new();
             for path in files {
-                add_path_to_lzh(&mut lzh, path, path, verbose)?;
+                add_path_to_lzh(&mut lzh, path, path, verbose, quiet, &mut visited)?;
             }
 
             lzh.finish()?;
@@ -283,7 +301,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -301,7 +319,7 @@ pub fn cmd_create(
                 writer.write_all(&output)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &output)?;
+                write_file(Path::new(archive), &output)?;
             }
 
             if verbose {
@@ -325,7 +343,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -342,7 +360,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -366,7 +384,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -383,7 +401,7 @@ pub fn cmd_create(
                 writer.write_all(&compressed)?;
                 writer.flush()?;
             } else {
-                std::fs::write(archive, &compressed)?;
+                write_file(Path::new(archive), &compressed)?;
             }
 
             if verbose {
@@ -392,8 +410,8 @@ pub fn cmd_create(
         }
     }
 
-    if !to_stdout && verbose {
-        eprintln!("Archive created successfully");
+    if !to_stdout && verbose && !quiet {
+        eprintln!("{}", styler.success("Archive created successfully"));
     }
     Ok(())
 }
@@ -421,8 +439,15 @@ fn cmd_create_dry_run(
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;
 
+    let mut visited = HashSet::new();
     for path in files {
-        collect_dry_run_stats(path, &mut total_size, &mut file_count, &mut dir_count)?;
+        collect_dry_run_stats(
+            path,
+            &mut total_size,
+            &mut file_count,
+            &mut dir_count,
+            &mut visited,
+        )?;
     }
 
     println!(
@@ -434,23 +459,50 @@ fn cmd_create_dry_run(
     Ok(())
 }
 
+/// Archive entry name for `path`, rooted at the top-level input's basename and
+/// always using `/` separators.
+fn entry_name(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base.parent().unwrap_or(base))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Canonicalize a directory for cycle tracking, falling back to the literal
+/// path if canonicalization fails (e.g. permission denied on a parent).
+fn canonical_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Recursively collect stats for dry run output.
+///
+/// Uses `symlink_metadata` so symlinks are counted as leaf entries and never
+/// traversed — a circular symlink therefore cannot make the dry run loop
+/// forever, matching the real archiving path.
 fn collect_dry_run_stats(
-    path: &PathBuf,
+    path: &Path,
     total_size: &mut u64,
     file_count: &mut u64,
     dir_count: &mut u64,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if path.is_dir() {
+    let meta = symlink_metadata_for(path)?;
+    let ftype = meta.file_type();
+    if ftype.is_symlink() {
+        *file_count += 1;
+        println!("[DRY RUN]   {} (symlink)", path.display());
+    } else if ftype.is_dir() {
+        if !visited.insert(canonical_key(path)) {
+            return Ok(());
+        }
         *dir_count += 1;
         println!("[DRY RUN]   {}/", path.display());
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            collect_dry_run_stats(&entry.path(), total_size, file_count, dir_count)?;
+        for entry in read_dir_for(path)? {
+            let entry = entry.map_err(|e| format!("{}: {}", path.display(), e))?;
+            collect_dry_run_stats(&entry.path(), total_size, file_count, dir_count, visited)?;
         }
     } else {
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len();
+        let size = meta.len();
         *total_size += size;
         *file_count += 1;
         println!("[DRY RUN]   {} ({} bytes)", path.display(), size);
@@ -460,43 +512,61 @@ fn collect_dry_run_stats(
 
 fn add_path_to_zip<W: std::io::Write>(
     zip: &mut ZipWriter<W>,
-    path: &PathBuf,
-    base: &PathBuf,
+    path: &Path,
+    base: &Path,
     verbose: bool,
+    quiet: bool,
     compress_threshold: u64,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if path.is_dir() {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+    let meta = symlink_metadata_for(path)?;
+    let ftype = meta.file_type();
+    let name = entry_name(path, base);
 
+    if ftype.is_symlink() {
+        // ZIP's writer has no dedicated symlink entry type, so the link target
+        // is stored as the entry's content. Crucially the link is NOT followed,
+        // so a circular symlink cannot recurse and a symlinked tree is not
+        // silently dereferenced into a full copy.
+        let target = read_link_for(path)?;
+        let target_str = target.to_string_lossy();
+        zip.add_file(&name, target_str.as_bytes())?;
+        if verbose && !quiet {
+            println!("  Added (symlink): {} -> {}", name, target_str);
+        }
+    } else if ftype.is_dir() {
+        if !visited.insert(canonical_key(path)) {
+            if verbose && !quiet {
+                println!("  Skipped (already visited): {}/", name);
+            }
+            return Ok(());
+        }
         zip.add_directory(&name)?;
-        if verbose {
+        if verbose && !quiet {
             println!("  Added: {}/", name);
         }
-
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            add_path_to_zip(zip, &entry.path(), base, verbose, compress_threshold)?;
+        for entry in read_dir_for(path)? {
+            let entry = entry.map_err(|e| format!("{}: {}", path.display(), e))?;
+            add_path_to_zip(
+                zip,
+                &entry.path(),
+                base,
+                verbose,
+                quiet,
+                compress_threshold,
+                visited,
+            )?;
         }
     } else {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let data = std::fs::read(path)?;
+        let data = read_file(path)?;
         if compress_threshold > 0 && (data.len() as u64) < compress_threshold {
             zip.add_file_stored(&name, &data)?;
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes, stored)", name, data.len());
             }
         } else {
             zip.add_file(&name, &data)?;
-            if verbose {
+            if verbose && !quiet {
                 println!("  Added: {} ({} bytes)", name, data.len());
             }
         }
@@ -506,36 +576,56 @@ fn add_path_to_zip<W: std::io::Write>(
 
 fn add_path_to_tar<W: std::io::Write>(
     tar: &mut TarWriter<W>,
-    path: &PathBuf,
-    base: &PathBuf,
+    path: &Path,
+    base: &Path,
     verbose: bool,
+    quiet: bool,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if path.is_dir() {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+    let meta = symlink_metadata_for(path)?;
+    let ftype = meta.file_type();
+    let name = entry_name(path, base);
 
-        tar.add_directory(&name)?;
-        if verbose {
+    if ftype.is_symlink() {
+        // Store a real symlink entry (typeflag '2'); the link is not followed.
+        let target = read_link_for(path)?;
+        let target_str = target.to_string_lossy();
+        let mut header = TarHeader::new_symlink(&name, &target_str);
+        header.mtime = mtime_secs(&meta);
+        tar.add_entry_from_header(&header, &[])?;
+        if verbose && !quiet {
+            println!("  Added (symlink): {} -> {}", name, target_str);
+        }
+    } else if ftype.is_dir() {
+        if !visited.insert(canonical_key(path)) {
+            if verbose && !quiet {
+                println!("  Skipped (already visited): {}/", name);
+            }
+            return Ok(());
+        }
+        // Preserve the real directory mode and mtime so `--preserve-*` can
+        // round-trip through oxiarc-produced tarballs.
+        let dir_name = if name.ends_with('/') {
+            name.clone()
+        } else {
+            format!("{}/", name)
+        };
+        let mut header = TarHeader::new_directory(&dir_name, unix_mode(&meta));
+        header.mtime = mtime_secs(&meta);
+        tar.add_entry_from_header(&header, &[])?;
+        if verbose && !quiet {
             println!("  Added: {}/", name);
         }
-
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            add_path_to_tar(tar, &entry.path(), base, verbose)?;
+        for entry in read_dir_for(path)? {
+            let entry = entry.map_err(|e| format!("{}: {}", path.display(), e))?;
+            add_path_to_tar(tar, &entry.path(), base, verbose, quiet, visited)?;
         }
     } else {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let data = std::fs::read(path)?;
-        tar.add_file(&name, &data)?;
-        if verbose {
+        let data = read_file(path)?;
+        let mut header = TarHeader::new_file(&name, data.len() as u64, unix_mode(&meta));
+        header.mtime = mtime_secs(&meta);
+        tar.add_entry_from_header(&header, &data)?;
+        if verbose && !quiet {
             println!("  Added: {} ({} bytes)", name, data.len());
         }
     }
@@ -544,36 +634,44 @@ fn add_path_to_tar<W: std::io::Write>(
 
 fn add_path_to_lzh<W: std::io::Write>(
     lzh: &mut LzhWriter<W>,
-    path: &PathBuf,
-    base: &PathBuf,
+    path: &Path,
+    base: &Path,
     verbose: bool,
+    quiet: bool,
+    visited: &mut HashSet<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if path.is_dir() {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+    let meta = symlink_metadata_for(path)?;
+    let ftype = meta.file_type();
+    let name = entry_name(path, base);
 
+    if ftype.is_symlink() {
+        // LZH's writer has no symlink entry type; store the target as content
+        // without following the link (no dereference, no recursion cycle).
+        let target = read_link_for(path)?;
+        let target_str = target.to_string_lossy();
+        lzh.add_file(&name, target_str.as_bytes())?;
+        if verbose && !quiet {
+            println!("  Added (symlink): {} -> {}", name, target_str);
+        }
+    } else if ftype.is_dir() {
+        if !visited.insert(canonical_key(path)) {
+            if verbose && !quiet {
+                println!("  Skipped (already visited): {}/", name);
+            }
+            return Ok(());
+        }
         lzh.add_directory(&name)?;
-        if verbose {
+        if verbose && !quiet {
             println!("  Added: {}/", name);
         }
-
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            add_path_to_lzh(lzh, &entry.path(), base, verbose)?;
+        for entry in read_dir_for(path)? {
+            let entry = entry.map_err(|e| format!("{}: {}", path.display(), e))?;
+            add_path_to_lzh(lzh, &entry.path(), base, verbose, quiet, visited)?;
         }
     } else {
-        let name = path
-            .strip_prefix(base.parent().unwrap_or(base))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let data = std::fs::read(path)?;
+        let data = read_file(path)?;
         lzh.add_file(&name, &data)?;
-        if verbose {
+        if verbose && !quiet {
             println!("  Added: {} ({} bytes)", name, data.len());
         }
     }

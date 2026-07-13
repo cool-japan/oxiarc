@@ -33,6 +33,61 @@ const MAX_REASONABLE_COUNT: u64 = 16 * 1024 * 1024;
 /// Maximum accepted size of the next header block.
 const MAX_HEADER_SIZE: u64 = 1 << 31;
 
+/// Maximum number of coders in a single folder.
+///
+/// The 7-Zip reference implementation caps a folder at 64 coders
+/// (`kNumCodersMax`); real archives use at most 4 (filter chains plus
+/// BCJ2). A crafted count beyond this drove a multi-GiB
+/// `Vec::with_capacity` before a single coder was even parsed.
+const MAX_CODERS_PER_FOLDER: usize = 64;
+
+/// Maximum total input/output streams across the coders of one folder.
+///
+/// Complex coders declare their stream counts as unbounded varints; a
+/// crafted value of 2^40 previously produced a capacity-overflow panic or
+/// a TiB-scale reservation for the bind-pair vector (SEVENZ-01). The
+/// reference implementation's bound is 64 (`kNumOutStreamsMax`).
+const MAX_FOLDER_STREAMS: u64 = 64;
+
+/// Read exactly `declared_len` bytes starting at the reader's current
+/// position, bounding the allocation against the number of bytes actually
+/// remaining in the underlying stream.
+///
+/// Both the 7z "next header" size and per-folder "pack size" fields are
+/// untrusted values taken directly from the archive header/metadata. A
+/// crafted archive can declare an implausible size for what is really a
+/// small or truncated file; blindly turning that into `vec![0u8; declared]`
+/// would allocate (and zero-fill) up to a couple of GiB before a single
+/// byte is even read, and a sufficiently adversarial `declared_len` could
+/// overflow the allocator entirely and abort the process.
+///
+/// Here the declared length is first checked against the number of bytes
+/// actually remaining from the current stream position to EOF, and the
+/// allocation itself goes through `try_reserve_exact` so an
+/// oversized-but-still-"remaining" declaration surfaces as a normal `Err`.
+fn read_bounded_by_remaining<R: Read + Seek>(reader: &mut R, declared_len: u64) -> Result<Vec<u8>> {
+    let current = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(current))?;
+    let remaining = end.saturating_sub(current);
+
+    if declared_len > remaining {
+        return Err(OxiArcError::invalid_header(format!(
+            "7z declares a block of {declared_len} bytes but only {remaining} bytes remain in the stream"
+        )));
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(declared_len as usize).map_err(|_| {
+        OxiArcError::invalid_header(format!(
+            "unable to allocate {declared_len} bytes while reading 7z stream data"
+        ))
+    })?;
+    data.resize(declared_len as usize, 0);
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
 /// Property IDs for 7z format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -204,6 +259,11 @@ impl<'a> ByteCursor<'a> {
         Ok(value)
     }
 
+    /// Number of unread bytes left in the cursor.
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
     /// Read a number that is used as an element count, with a sanity bound.
     fn count(&mut self) -> Result<usize> {
         let value = self.number()?;
@@ -214,6 +274,24 @@ impl<'a> ByteCursor<'a> {
             )));
         }
         Ok(value as usize)
+    }
+
+    /// Read an element count that must additionally be *payload-plausible*:
+    /// each counted element consumes at least one byte of this header, so
+    /// a count exceeding the bytes remaining in the cursor is necessarily
+    /// forged. This keeps the memory a crafted header can commit
+    /// proportional to the bytes it actually supplies (a bare `count()`
+    /// still allows a 5-byte varint to drive a 100+ MiB reservation
+    /// through `Vec::with_capacity`-style pre-allocation in callers).
+    fn count_bounded_by_remaining(&mut self) -> Result<usize> {
+        let value = self.count()?;
+        if value > self.remaining() {
+            return Err(OxiArcError::invalid_header(format!(
+                "7z header declares {value} elements but only {} bytes remain",
+                self.remaining()
+            )));
+        }
+        Ok(value)
     }
 
     /// Read an MSB-first bit vector of `count` bits.
@@ -235,18 +313,43 @@ impl<'a> ByteCursor<'a> {
     }
 
     /// Read a CRC digest list (defined bit vector + little-endian u32 values).
+    ///
+    /// The `AllAreDefined` fast path is handled here directly instead of
+    /// materializing `vec![true; count]` via [`ByteCursor::optional_bits`]:
+    /// that byte consumes *no* input, so a crafted aggregate count (e.g.
+    /// SubStreamsInfo `kCrc` summing per-folder counts) could reserve
+    /// hundreds of MiB from a ~175-byte archive. When all digests are
+    /// defined, each costs 4 bytes of header — bound the count by the
+    /// bytes actually remaining before allocating anything.
     fn digests(&mut self, count: usize) -> Result<Vec<Option<u32>>> {
-        let defined = self.optional_bits(count)?;
-        defined
-            .into_iter()
-            .map(|is_defined| {
-                if is_defined {
-                    Ok(Some(self.u32_le()?))
-                } else {
-                    Ok(None)
-                }
-            })
-            .collect()
+        let all_defined = self.u8()?;
+        if all_defined != 0 {
+            if count > self.remaining() / 4 {
+                return Err(OxiArcError::invalid_header(format!(
+                    "7z digest list declares {count} entries but only {} bytes remain",
+                    self.remaining()
+                )));
+            }
+            let mut digests = Vec::with_capacity(count);
+            for _ in 0..count {
+                digests.push(Some(self.u32_le()?));
+            }
+            Ok(digests)
+        } else {
+            // The defined bit vector consumes ceil(count / 8) bytes, so
+            // `bits` (via `take`) naturally bounds `count` by the input.
+            let defined = self.bits(count)?;
+            defined
+                .into_iter()
+                .map(|is_defined| {
+                    if is_defined {
+                        Ok(Some(self.u32_le()?))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .collect()
+        }
     }
 }
 
@@ -499,8 +602,7 @@ impl<R: Read + Seek> SevenZReader<R> {
         reader.seek(SeekFrom::Start(32 + next_header_offset))?;
 
         // Read next header
-        let mut header_data = vec![0u8; next_header_size as usize];
-        reader.read_exact(&mut header_data)?;
+        let header_data = read_bounded_by_remaining(&mut reader, next_header_size)?;
 
         // Verify header CRC
         let computed_header_crc = Crc32::compute(&header_data);
@@ -711,7 +813,8 @@ fn parse_pack_info(cursor: &mut ByteCursor<'_>, info: &mut StreamsInfo) -> Resul
     info.pack_pos = 32u64
         .checked_add(cursor.number()?)
         .ok_or_else(|| OxiArcError::invalid_header("7z pack position overflows"))?;
-    let num_pack_streams = cursor.count()?;
+    // Each pack stream must have a size varint (>= 1 byte) in this header.
+    let num_pack_streams = cursor.count_bounded_by_remaining()?;
 
     loop {
         let id = cursor.u8()?;
@@ -746,7 +849,9 @@ fn parse_unpack_info(cursor: &mut ByteCursor<'_>, info: &mut StreamsInfo) -> Res
     if cursor.u8()? != PropertyId::Folder as u8 {
         return Err(OxiArcError::invalid_header("7z UnpackInfo lacks kFolder"));
     }
-    let num_folders = cursor.count()?;
+    // Each folder definition occupies several bytes; a count beyond the
+    // remaining header bytes would only serve to pre-reserve memory.
+    let num_folders = cursor.count_bounded_by_remaining()?;
     if cursor.u8()? != 0 {
         return Err(OxiArcError::unsupported_method(
             "7z external folder definitions",
@@ -796,6 +901,12 @@ fn parse_folder(cursor: &mut ByteCursor<'_>) -> Result<Folder> {
     if num_coders == 0 {
         return Err(OxiArcError::invalid_header("7z folder has no coders"));
     }
+    if num_coders > MAX_CODERS_PER_FOLDER {
+        return Err(OxiArcError::invalid_header(format!(
+            "7z folder declares {num_coders} coders, exceeding the limit of \
+             {MAX_CODERS_PER_FOLDER}"
+        )));
+    }
 
     let mut coders = Vec::with_capacity(num_coders);
     let mut total_in_streams: u64 = 0;
@@ -809,17 +920,32 @@ fn parse_folder(cursor: &mut ByteCursor<'_>) -> Result<Folder> {
 
         let codec_id = CodecId::from_bytes(cursor.take(codec_id_size)?);
 
+        // Complex coders declare their stream counts as varints. Read them
+        // through the *bounded* `count()` helper — the raw `number()` path
+        // previously admitted values up to 2^63, which fed
+        // `total_out_streams - 1` into `Vec::with_capacity` below
+        // (capacity-overflow panic / TiB-scale reservation).
         let (num_in_streams, num_out_streams) = if is_complex {
-            (cursor.number()?, cursor.number()?)
+            (cursor.count()? as u64, cursor.count()? as u64)
         } else {
             (1, 1)
         };
+        if num_in_streams == 0 || num_out_streams == 0 {
+            return Err(OxiArcError::invalid_header(
+                "7z coder declares zero input or output streams",
+            ));
+        }
         total_in_streams = total_in_streams
             .checked_add(num_in_streams)
             .ok_or_else(|| OxiArcError::invalid_header("7z coder input count overflows"))?;
         total_out_streams = total_out_streams
             .checked_add(num_out_streams)
             .ok_or_else(|| OxiArcError::invalid_header("7z coder output count overflows"))?;
+        if total_in_streams > MAX_FOLDER_STREAMS || total_out_streams > MAX_FOLDER_STREAMS {
+            return Err(OxiArcError::invalid_header(format!(
+                "7z folder declares more than {MAX_FOLDER_STREAMS} coder streams"
+            )));
+        }
 
         let properties = if has_attributes {
             let props_size = cursor.count()?;
@@ -883,13 +1009,19 @@ fn parse_substreams_info(cursor: &mut ByteCursor<'_>, info: &mut StreamsInfo) ->
         match PropertyId::from_u8(id) {
             Some(PropertyId::End) => break,
             Some(PropertyId::NumUnpackStream) => {
+                // Bound both each per-folder count and the aggregate: the
+                // per-substream loops below (sizes, CRCs) and the entry
+                // assembly all iterate the *sum*, which a crafted header
+                // could otherwise push to folders x 16M.
+                let mut total: u64 = 0;
                 for num in nums.iter_mut() {
                     *num = cursor.number()?;
-                    if *num > MAX_REASONABLE_COUNT {
-                        return Err(OxiArcError::invalid_header(
-                            "7z substream count is implausible",
-                        ));
-                    }
+                    total = total
+                        .checked_add(*num)
+                        .filter(|&t| t <= MAX_REASONABLE_COUNT)
+                        .ok_or_else(|| {
+                            OxiArcError::invalid_header("7z substream count is implausible")
+                        })?;
                 }
             }
             Some(PropertyId::Size) => {
@@ -918,20 +1050,25 @@ fn parse_substreams_info(cursor: &mut ByteCursor<'_>, info: &mut StreamsInfo) ->
             }
             Some(PropertyId::Crc) => {
                 // Substreams whose folder CRC is already known (single
-                // substream) are excluded from the digest list.
-                let unknown_count: usize = info
-                    .folders
-                    .iter()
-                    .zip(nums.iter())
-                    .map(|(folder, &num)| {
-                        if num == 1 && folder.unpack_crc.is_some() {
-                            0
-                        } else {
-                            num as usize
-                        }
-                    })
-                    .sum();
-                let digests = cursor.digests(unknown_count)?;
+                // substream) are excluded from the digest list. Sum the
+                // aggregate with overflow/plausibility checks — per-folder
+                // counts are bounded but their sum across folders is not,
+                // and it flows into an allocation inside `digests`.
+                let mut unknown_count: u64 = 0;
+                for (folder, &num) in info.folders.iter().zip(nums.iter()) {
+                    if num == 1 && folder.unpack_crc.is_some() {
+                        continue;
+                    }
+                    unknown_count = unknown_count
+                        .checked_add(num)
+                        .filter(|&t| t <= MAX_REASONABLE_COUNT)
+                        .ok_or_else(|| {
+                            OxiArcError::invalid_header(
+                                "7z substream CRC digest count is implausible",
+                            )
+                        })?;
+                }
+                let digests = cursor.digests(unknown_count as usize)?;
                 let mut digest_iter = digests.into_iter();
                 for (folder, &num) in info.folders.iter().zip(nums.iter()) {
                     if num == 1 && folder.unpack_crc.is_some() {
@@ -982,7 +1119,11 @@ fn parse_substreams_info(cursor: &mut ByteCursor<'_>, info: &mut StreamsInfo) ->
 
 /// Parse a `kFilesInfo` block.
 fn parse_files_info(cursor: &mut ByteCursor<'_>) -> Result<FilesInfo> {
-    let num_files = cursor.count()?;
+    // Every file needs at least a 2-byte (NUL-terminated UTF-16) name in
+    // the kName block of this same header, so a file count beyond the
+    // remaining bytes is necessarily forged; rejecting it here keeps the
+    // per-file metadata vectors below proportional to the input size.
+    let num_files = cursor.count_bounded_by_remaining()?;
 
     let mut info = FilesInfo::empty();
     info.empty_stream = vec![false; num_files];
@@ -1235,8 +1376,7 @@ fn decode_folder_data<R: Read + Seek>(
         .ok_or_else(|| OxiArcError::invalid_header("7z packed stream index out of range"))?;
 
     reader.seek(SeekFrom::Start(pack_offset))?;
-    let mut packed = vec![0u8; pack_size as usize];
-    reader.read_exact(&mut packed)?;
+    let packed = read_bounded_by_remaining(reader, pack_size)?;
 
     // Walk the linear coder chain via bind pairs. With 1-in/1-out coders,
     // input stream i and output stream i both belong to coder i.
@@ -1514,5 +1654,58 @@ mod tests {
         let mut pos = 0;
         let result = SevenZReader::<std::io::Cursor<Vec<u8>>>::read_number(&data, &mut pos);
         assert!(result.is_err());
+    }
+
+    /// `read_bounded_by_remaining` must reject a declared length larger
+    /// than the bytes actually remaining in the stream, rather than
+    /// attempting a `vec![0u8; declared_len]`-style allocation up front.
+    #[test]
+    fn test_read_bounded_by_remaining_rejects_oversized_declaration() {
+        let mut cursor = std::io::Cursor::new(vec![1u8, 2, 3, 4]);
+        // Declare a size far beyond both the 4 bytes present here and any
+        // reasonable archive size.
+        let result = read_bounded_by_remaining(&mut cursor, u32::MAX as u64 * 4);
+        assert!(result.is_err());
+    }
+
+    /// A declared length that is in range must still be read correctly.
+    #[test]
+    fn test_read_bounded_by_remaining_reads_valid_declaration() {
+        let mut cursor = std::io::Cursor::new(vec![10u8, 20, 30, 40, 50]);
+        let data = read_bounded_by_remaining(&mut cursor, 3).expect("read within bounds");
+        assert_eq!(data, vec![10, 20, 30]);
+    }
+
+    /// A `SevenZReader::new` call over a signature header that declares an
+    /// implausible `next_header_size` (larger than the bytes actually
+    /// remaining after the signature header) must fail cleanly instead of
+    /// attempting to allocate/zero-fill that many bytes.
+    #[test]
+    fn test_sevenz_reader_new_rejects_oversized_next_header_size() {
+        // 32-byte signature header: 6-byte magic, 2-byte version, 4-byte
+        // start-header CRC, 8-byte next_header_offset, 8-byte
+        // next_header_size, 4-byte next_header_crc.
+        let mut sig = vec![0u8; 32];
+        sig[0..6].copy_from_slice(&SEVENZ_MAGIC);
+        sig[6] = 0; // major version
+        sig[7] = 4; // minor version
+
+        let next_header_offset: u64 = 0;
+        let next_header_size: u64 = 1 << 20; // declared, but no bytes follow
+
+        sig[12..20].copy_from_slice(&next_header_offset.to_le_bytes());
+        sig[20..28].copy_from_slice(&next_header_size.to_le_bytes());
+
+        let start_header_crc = Crc32::compute(&sig[12..32]);
+        sig[8..12].copy_from_slice(&start_header_crc.to_le_bytes());
+
+        // No bytes follow the 32-byte signature header at all, so the
+        // declared 1 MiB next-header size vastly exceeds what remains.
+        let cursor = std::io::Cursor::new(sig);
+        let result = SevenZReader::new(cursor);
+        assert!(
+            result.is_err(),
+            "oversized next_header_size with no remaining bytes must error"
+        );
     }
 }

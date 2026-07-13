@@ -147,160 +147,97 @@ impl Default for ForwardBitWriter {
     }
 }
 
-/// Backward bitstream writer for FSE sequence encoding.
+/// Backward bitstream writer for FSE/Huffman encoding (RFC 8878).
 ///
-/// Produces a byte array compatible with the `FseBitReader`:
-/// - The last byte contains a sentinel (highest set bit) and the first data bits.
-/// - Preceding bytes contain subsequent data bits, with byte at index N-2
-///   being read after the sentinel byte, N-3 after that, etc.
+/// Mirrors the reference `BIT_addBits` / `BIT_closeCStream` semantics:
+/// bit-fields are appended least-significant-bit first into a little-endian
+/// bit sequence, and `finish()` terminates the stream with a single `1`
+/// sentinel bit, zero-padding to a byte boundary.
 ///
-/// The encoder writes bits in the same order the decoder reads them
-/// (first written = first decoded).
-///
-/// Internally, bits are accumulated into a `Vec<u8>` from MSB of the highest
-/// byte down to LSB of byte 0. At `finish()`, a sentinel is added and the
-/// output is ready for the decoder.
+/// The paired `crate::fse::FseBitReader` starts at the sentinel and reads
+/// fields back in **reverse write order** (last written = first read), which
+/// is why sequence encoders emit their data back-to-front.
 pub struct BackwardBitWriter {
-    /// All data bits collected in a flat bit vector. We track them from the
-    /// "first written" end so that we can serialize in the order the reader
-    /// expects.
-    data_bits: Vec<u8>,
-    /// Total number of data bits written.
-    total_bits: usize,
+    /// Completed output bytes.
+    output: Vec<u8>,
+    /// Bit accumulator; bit 0 is the next position to fill.
+    container: u64,
+    /// Number of pending bits in `container` (0..8 after each write).
+    bits_in_container: u8,
 }
 
 impl BackwardBitWriter {
     /// Create a new backward bitstream writer.
     pub fn new() -> Self {
         Self {
-            data_bits: Vec::new(),
-            total_bits: 0,
+            output: Vec::new(),
+            container: 0,
+            bits_in_container: 0,
         }
     }
 
     /// Create a new backward bitstream writer with a capacity hint.
     pub fn with_capacity(byte_capacity: usize) -> Self {
         Self {
-            data_bits: Vec::with_capacity(byte_capacity * 8),
-            total_bits: 0,
+            output: Vec::with_capacity(byte_capacity),
+            container: 0,
+            bits_in_container: 0,
         }
     }
 
-    /// Write `num_bits` bits from `value` into the backward stream.
+    /// Write the lowest `num_bits` bits of `value` (up to 56 per call).
     ///
-    /// The lowest `num_bits` bits of `value` are appended. The first call's
-    /// bits will be the first bits the decoder reads.
+    /// The first field written ends up nearest byte 0 and is therefore the
+    /// **last** field the decoder reads.
     pub fn write_bits(&mut self, value: u64, num_bits: u8) {
+        debug_assert!(num_bits <= 56, "BackwardBitWriter supports up to 56 bits");
         if num_bits == 0 {
             return;
         }
 
-        // Store individual bits (LSB of value first).
-        for i in 0..num_bits {
-            let bit = ((value >> i) & 1) as u8;
-            self.data_bits.push(bit);
+        let mask = if num_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << num_bits) - 1
+        };
+        self.container |= (value & mask) << self.bits_in_container;
+        self.bits_in_container += num_bits;
+
+        // Flush completed bytes.
+        while self.bits_in_container >= 8 {
+            self.output.push((self.container & 0xFF) as u8);
+            self.container >>= 8;
+            self.bits_in_container -= 8;
         }
-        self.total_bits += num_bits as usize;
     }
 
     /// Write a single bit (0 or 1).
     pub fn write_bit(&mut self, bit: bool) {
-        self.data_bits.push(if bit { 1 } else { 0 });
-        self.total_bits += 1;
+        self.write_bits(u64::from(bit), 1);
     }
 
-    /// Finalize the backward bitstream.
-    ///
-    /// Produces a byte array where:
-    /// - The last byte contains the sentinel and the first data bits.
-    /// - Preceding bytes (read from index N-2 down to 0) contain later data bits.
-    ///
-    /// The `FseBitReader` loads the sentinel byte's data bits first (into the
-    /// accumulator's LSB), then loads byte N-2, N-3, ..., 0 into successively
-    /// higher accumulator positions.
-    ///
-    /// Returns the finalized byte vector. If no bits were written, returns `[0x01]`.
-    pub fn finish(self) -> Vec<u8> {
-        if self.data_bits.is_empty() {
-            return vec![0x01];
+    /// Finalize the stream: append the sentinel `1` bit and pad with zeros to
+    /// a byte boundary. An empty stream yields `[0x01]` (sentinel only).
+    pub fn finish(mut self) -> Vec<u8> {
+        // Sentinel bit marks the end of data (start of decoder reads).
+        self.container |= 1u64 << self.bits_in_container;
+        self.bits_in_container += 1;
+        while self.bits_in_container > 0 {
+            self.output.push((self.container & 0xFF) as u8);
+            self.container >>= 8;
+            self.bits_in_container = self.bits_in_container.saturating_sub(8);
         }
-
-        // The FseBitReader reads:
-        //   1. Sentinel byte (last byte): data bits below sentinel loaded first (LSB of accumulator)
-        //   2. Byte at index N-2: loaded into bits above sentinel data
-        //   3. Byte at index N-3: loaded above that
-        //   ...
-        //   N. Byte at index 0: loaded into highest positions
-        //
-        // So the first data bits go into the sentinel byte, next 8 bits into byte N-2,
-        // next 8 bits into byte N-3, etc.
-        //
-        // Build the output in reverse: start with byte 0, then byte 1, ..., then sentinel.
-
-        let n = self.data_bits.len();
-
-        // Figure out how many bits go into the sentinel byte.
-        // The sentinel byte can hold up to 7 data bits (bits 0-6, sentinel at bit 7 max).
-        // If total bits mod 8 == 0, sentinel gets 0 data bits (sentinel-only byte).
-        // If total bits mod 8 == k (1..7), sentinel gets k data bits.
-        // Actually, we need the total bits to decompose into: sentinel_bits + full_bytes * 8.
-        // sentinel_bits can be 0..7. If 0, we need an extra sentinel-only byte.
-
-        // Pack the data bits into bytes. The reader reads:
-        //   sentinel_data (first S data bits, S=0..7), then
-        //   byte N-2 (next 8 bits), byte N-3 (next 8), ..., byte 0 (last 8 bits).
-        //
-        // So byte 0 has the LAST 8 data bits, byte 1 has the second-to-last 8, etc.
-
-        let sentinel_data_bits = n % 8;
-        let full_bytes = n / 8;
-
-        // Build from byte 0 (which has the last 8 data bits) to the sentinel byte.
-        let mut output = Vec::with_capacity(full_bytes + 1);
-
-        // Byte 0 has data bits at indices [n - 8, n - 1] (the last 8 data bits).
-        // Byte 1 has data bits at indices [n - 16, n - 9].
-        // ...
-        // Byte k has data bits at indices [n - 8*(k+1), n - 8*k - 1].
-        //
-        // If sentinel_data_bits > 0, the sentinel covers indices [0, sentinel_data_bits-1].
-        // The remaining full_bytes cover indices [sentinel_data_bits, n-1].
-
-        // Build full bytes: byte 0 = last 8, byte 1 = second-to-last 8, etc.
-        for byte_idx in 0..full_bytes {
-            // This byte covers data_bits starting at offset:
-            // sentinel_data_bits + (full_bytes - 1 - byte_idx) * 8
-            let start = sentinel_data_bits + (full_bytes - 1 - byte_idx) * 8;
-            let mut byte_val = 0u8;
-            for bit in 0..8 {
-                if self.data_bits[start + bit] != 0 {
-                    byte_val |= 1 << bit;
-                }
-            }
-            output.push(byte_val);
-        }
-
-        // Build sentinel byte: first sentinel_data_bits of data_bits.
-        let mut sentinel_byte = 0u8;
-        for bit in 0..sentinel_data_bits {
-            if self.data_bits[bit] != 0 {
-                sentinel_byte |= 1 << bit;
-            }
-        }
-        sentinel_byte |= 1 << sentinel_data_bits; // Sentinel bit
-        output.push(sentinel_byte);
-
-        output
+        self.output
     }
 
     /// Number of data bits written so far (excludes sentinel).
     pub fn len(&self) -> usize {
-        self.total_bits
+        self.output.len() * 8 + self.bits_in_container as usize
     }
 
     /// Whether no bits have been written yet.
     pub fn is_empty(&self) -> bool {
-        self.total_bits == 0
+        self.len() == 0
     }
 }
 
@@ -461,14 +398,10 @@ mod tests {
         writer.write_bits(0xFF, 8);
         writer.write_bits(0xAA, 8);
         let output = writer.finish();
-        // 16 data bits, 2 full bytes, sentinel gets 0 data bits.
-        // Byte 0 = last 8 data bits (0xAA), byte 1 = first 8 data bits (0xFF),
-        // sentinel = 0x01.
-        // Wait: data_bits in write order = [0xFF bits, 0xAA bits].
-        // sentinel_data_bits = 16 % 8 = 0, full_bytes = 2.
-        // byte_idx=0: start = 0 + (2-1-0)*8 = 8, data_bits[8..15] = 0xAA bits
-        // byte_idx=1: start = 0 + (2-1-1)*8 = 0, data_bits[0..7] = 0xFF bits
-        assert_eq!(output, vec![0xAA, 0xFF, 0x01]);
+        // Little-endian bit sequence: first field written occupies byte 0,
+        // second field byte 1, sentinel-only final byte (16 % 8 == 0).
+        // The decoder reads 0xAA first, then 0xFF (reverse write order).
+        assert_eq!(output, vec![0xFF, 0xAA, 0x01]);
     }
 
     #[test]

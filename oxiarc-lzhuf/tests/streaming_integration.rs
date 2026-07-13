@@ -80,15 +80,14 @@ fn test_streaming_decoder_stored_small_output_buffer() {
 
         match status {
             DecompressStatus::Done => break,
-            DecompressStatus::NeedsInput => {
-                if input_pos >= data.len() {
-                    break;
-                }
-            }
+            DecompressStatus::NeedsInput if input_pos >= data.len() => break,
             DecompressStatus::NeedsOutput => {
                 // Continue with more output space
             }
             DecompressStatus::BlockEnd => {}
+            // `DecompressStatus` is `#[non_exhaustive]`; a future variant is
+            // treated as a no-op continuation of the decode loop.
+            _ => {}
         }
     }
 

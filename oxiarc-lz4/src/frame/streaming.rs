@@ -106,6 +106,7 @@ impl Lz4Compressor {
     /// `on_progress(bytes, None)` is called once per full block with the total
     /// number of raw (uncompressed) bytes processed so far.  `on_finish()` is
     /// called when [`FlushMode::Finish`] completes.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -115,6 +116,7 @@ impl Lz4Compressor {
     ///
     /// The token is checked at the start of each [`Compressor::compress`] call.
     /// If cancelled, the call returns [`OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -125,6 +127,7 @@ impl Lz4Compressor {
     /// If the accumulator grows beyond this limit before a full block can be
     /// emitted, [`Compressor::compress`] returns a
     /// [`OxiArcError::BufferTooSmall`]-style error.  Defaults to 16 MiB.
+    #[must_use]
     pub fn with_memory_budget(mut self, budget: usize) -> Self {
         self.memory_budget = budget;
         self
@@ -438,6 +441,7 @@ impl Lz4Decompressor {
     /// `on_progress(bytes, None)` is called after each block with the total
     /// decompressed byte count.  `on_finish()` is called when the frame is
     /// fully decompressed.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -447,6 +451,7 @@ impl Lz4Decompressor {
     ///
     /// The token is checked at the start of each [`Decompressor::decompress`]
     /// call.  If cancelled, the call returns [`OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -456,6 +461,7 @@ impl Lz4Decompressor {
     ///
     /// If the accumulator grows beyond this limit an error is returned.
     /// Defaults to 64 MiB.
+    #[must_use]
     pub fn with_memory_budget(mut self, budget: usize) -> Self {
         self.memory_budget = budget;
         self

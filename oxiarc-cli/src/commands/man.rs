@@ -9,10 +9,20 @@ pub fn cmd_man(cli_cmd: Command, out_dir: Option<PathBuf>) -> io::Result<()> {
 
     write_manpage(&cli_cmd, &out_dir)?;
 
+    // clap only auto-populates `version` on the top-level command, so it must
+    // be propagated by hand to every renamed subcommand page (otherwise the
+    // generated `.TH` line carries an empty version field).
+    let version: Option<&'static str> = cli_cmd
+        .get_version()
+        .map(|v| -> &'static str { Box::leak(v.to_owned().into_boxed_str()) });
+
     for subcmd in cli_cmd.get_subcommands() {
         let subcmd_name: &'static str =
             Box::leak(format!("oxiarc-{}", subcmd.get_name()).into_boxed_str());
-        let named = subcmd.clone().name(subcmd_name);
+        let mut named = subcmd.clone().name(subcmd_name);
+        if let Some(v) = version {
+            named = named.version(v);
+        }
         write_manpage(&named, &out_dir)?;
     }
 

@@ -1,5 +1,6 @@
 //! ZIP header types, constants, and core structures.
 
+use super::super::crypto::FLAG_ENCRYPTED;
 use super::super::encryption::AesExtraField;
 use oxiarc_core::entry::CompressionMethod as CoreMethod;
 use oxiarc_core::error::{OxiArcError, Result};
@@ -44,8 +45,156 @@ pub const FLAG_EFS: u16 = 0x0800;
 /// AES encryption method value in ZIP (compression method field).
 pub const METHOD_AES_ENCRYPTED: u16 = 99;
 
+/// Private extra-field ID used by the *reader* to persist per-entry ZIP
+/// header metadata (the general-purpose bit flags and the raw DOS mtime
+/// word) on [`Entry::extra`].
+///
+/// `Entry` (in `oxiarc-core`) has no dedicated field for the ZIP
+/// general-purpose bit flags, yet encryption detection (APPNOTE §4.4.4,
+/// bit 0) and the ZipCrypto check-byte rule for streamed entries
+/// (bit 3 → DOS mtime high byte) both need them after header parsing.
+/// The reader therefore appends one well-formed extra-field record
+/// (`id(2) size(2)=4 flags(2) dos_mtime(2)`, all little-endian) when it
+/// builds each `Entry`. The record is never written to disk.
+pub(crate) const OXIARC_ENTRY_META_ID: u16 = 0x4F58;
+
+/// Append the private per-entry metadata record (see
+/// [`OXIARC_ENTRY_META_ID`]) to an entry's extra bytes.
+pub(crate) fn append_entry_meta(extra: &mut Vec<u8>, flags: u16, dos_mtime: u16) {
+    extra.extend_from_slice(&OXIARC_ENTRY_META_ID.to_le_bytes());
+    extra.extend_from_slice(&4u16.to_le_bytes());
+    extra.extend_from_slice(&flags.to_le_bytes());
+    extra.extend_from_slice(&dos_mtime.to_le_bytes());
+}
+
+/// Find the payload of the *last* extra-field record with the given ID.
+///
+/// The last match is preferred because the reader appends its private
+/// metadata record after any on-disk extra data, so a crafted archive
+/// cannot shadow it with a forged record of the same ID.
+fn find_last_extra_record(extra: &[u8], wanted: u16) -> Option<&[u8]> {
+    let mut found = None;
+    let mut offset = 0;
+    while offset + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
+        let size = u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]) as usize;
+        offset += 4;
+        if offset + size > extra.len() {
+            break;
+        }
+        if id == wanted {
+            found = Some(&extra[offset..offset + size]);
+        }
+        offset += size;
+    }
+    found
+}
+
+/// The ZIP general-purpose bit flags persisted on an entry by the reader,
+/// if present (see [`OXIARC_ENTRY_META_ID`]).
+pub(crate) fn entry_gp_flags(entry: &Entry) -> Option<u16> {
+    find_last_extra_record(&entry.extra, OXIARC_ENTRY_META_ID)
+        .filter(|data| data.len() >= 2)
+        .map(|data| u16::from_le_bytes([data[0], data[1]]))
+}
+
+/// The raw DOS modification-time word persisted on an entry by the reader,
+/// if present (see [`OXIARC_ENTRY_META_ID`]).
+pub(crate) fn entry_dos_mtime(entry: &Entry) -> Option<u16> {
+    find_last_extra_record(&entry.extra, OXIARC_ENTRY_META_ID)
+        .filter(|data| data.len() >= 4)
+        .map(|data| u16::from_le_bytes([data[2], data[3]]))
+}
+
+// =============================================================================
+// DOS date/time conversion (single shared implementation)
+// =============================================================================
+//
+// Both directions use the proleptic-Gregorian civil-date algorithms from
+// Howard Hinnant's "chrono-compatible low-level date algorithms" so leap
+// years and real month lengths are handled exactly. Earlier versions kept
+// two divergent approximate copies (365-day years, 30-day months) which
+// drifted by weeks and could panic on a crafted month-0 DOS date (ZIP-02)
+// or emit an out-of-range month 13 (ZIP-05).
+
+/// Days from the Unix epoch (1970-01-01) to the given civil date.
+///
+/// `month` is 1-12 and `day` 1-31; the caller clamps out-of-range values.
+fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe as i64 - 719_468
+}
+
+/// Civil date (year, month 1-12, day 1-31) for a day count relative to the
+/// Unix epoch.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Convert a DOS (date, time) word pair to a `SystemTime`.
+///
+/// Malformed month/day fields (a crafted header can encode 0, or month up
+/// to 15) are clamped into the valid 1-12 / 1-31 range so a hostile
+/// archive yields an approximate timestamp instead of a panic (debug) or
+/// a wrapped ~2^64-second offset (release).
+pub(crate) fn dos_date_time_to_system_time(mdate: u16, mtime: u16) -> SystemTime {
+    let seconds = (mtime & 0x1F) as u64 * 2;
+    let minutes = ((mtime >> 5) & 0x3F) as u64;
+    let hours = ((mtime >> 11) & 0x1F) as u64;
+    let day = ((mdate & 0x1F) as u64).clamp(1, 31);
+    let month = (((mdate >> 5) & 0x0F) as u64).clamp(1, 12);
+    let year = ((mdate >> 9) & 0x7F) as i64 + 1980;
+
+    // DOS years span 1980-2107, so the day count is always positive.
+    let days = days_from_civil(year, month, day).max(0) as u64;
+    let total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
+
+    UNIX_EPOCH + Duration::from_secs(total_seconds)
+}
+
+/// Convert seconds since the Unix epoch to a DOS (mtime, mdate) word pair.
+///
+/// Times before the DOS epoch clamp to 1980-01-01 and times beyond the
+/// DOS range clamp to 2107-12-31 (the extremes representable in the
+/// 7-bit year field), so the emitted date is always well-formed.
+pub(crate) fn dos_date_time_from_unix_secs(secs: u64) -> (u16, u16) {
+    let time_of_day = secs % 86400;
+    let hours = (time_of_day / 3600) as u16;
+    let minutes = ((time_of_day % 3600) / 60) as u16;
+    let seconds = ((time_of_day % 60) / 2) as u16; // 2-second granularity
+    let mtime = (hours << 11) | (minutes << 5) | seconds;
+
+    let (year, month, day) = civil_from_days((secs / 86400) as i64);
+    let mdate = if year < 1980 {
+        // Before the DOS epoch: clamp to 1980-01-01.
+        (1 << 5) | 1
+    } else if year > 2107 {
+        // Beyond the 7-bit year field: clamp to 2107-12-31.
+        (127 << 9) | (12 << 5) | 31
+    } else {
+        (((year - 1980) as u16) << 9) | ((month as u16) << 5) | day as u16
+    };
+
+    (mtime, mdate)
+}
+
 /// ZIP compression methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompressionMethod {
     /// Stored (no compression).
     Stored,
@@ -264,19 +413,12 @@ impl LocalFileHeader {
     }
 
     /// Convert DOS date/time to SystemTime.
+    ///
+    /// Delegates to the shared `dos_date_time_to_system_time` helper so
+    /// the reader and this header type cannot drift apart (a duplicated
+    /// copy of this math previously panicked on a crafted month-0 date).
     pub fn modified_time(&self) -> SystemTime {
-        let seconds = (self.mtime & 0x1F) as u64 * 2;
-        let minutes = ((self.mtime >> 5) & 0x3F) as u64;
-        let hours = ((self.mtime >> 11) & 0x1F) as u64;
-        let day = (self.mdate & 0x1F) as u64;
-        let month = ((self.mdate >> 5) & 0x0F) as u64;
-        let year = ((self.mdate >> 9) & 0x7F) as u64 + 1980;
-
-        // Approximate: Days since Unix epoch
-        let days = (year - 1970) * 365 + (year - 1969) / 4 + (month - 1) * 30 + day;
-        let total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
-
-        UNIX_EPOCH + Duration::from_secs(total_seconds)
+        dos_date_time_to_system_time(self.mdate, self.mtime)
     }
 
     /// Convert to Entry.
@@ -295,6 +437,12 @@ impl LocalFileHeader {
             .compressed_size_64
             .unwrap_or(self.compressed_size as u64);
 
+        // Persist the general-purpose bit flags and raw DOS mtime on the
+        // entry so encryption detection can use flag bit 0 (APPNOTE) and
+        // the ZipCrypto check-byte rule can use the mtime high byte.
+        let mut extra = self.extra.clone();
+        append_entry_meta(&mut extra, self.flags, self.mtime);
+
         Entry {
             name: self.filename.clone(),
             entry_type,
@@ -309,7 +457,7 @@ impl LocalFileHeader {
             comment: None,
             link_target: None,
             offset: self.data_offset,
-            extra: self.extra.clone(),
+            extra,
         }
     }
 
@@ -401,13 +549,15 @@ impl DataDescriptor {
 
 /// Check if an entry is encrypted (any encryption type).
 ///
-/// This checks for the encryption marker in the entry's extra field
-/// or for the AES encryption method.
+/// Detection follows APPNOTE §4.4.4: general-purpose bit flag bit 0 marks
+/// an encrypted entry (any scheme), and compression method 99 marks WinZip
+/// AES. The flags are persisted on [`Entry::extra`] by the reader (see
+/// `OXIARC_ENTRY_META_ID`), so archives produced by external tools
+/// (`zip -e`, 7-Zip, WinRAR, Python `zipfile`) are detected too — not just
+/// archives oxiarc itself wrote.
 #[allow(dead_code)]
 pub fn is_entry_encrypted(entry: &Entry) -> bool {
-    // Check if the encryption marker exists in extra field
-    // OR if the compression method indicates AES encryption
-    entry.extra.windows(2).any(|w| w == [0xEE, 0xEE])
+    entry_gp_flags(entry).is_some_and(|flags| flags & FLAG_ENCRYPTED != 0)
         || entry.method == CoreMethod::Unknown(METHOD_AES_ENCRYPTED)
 }
 
@@ -426,16 +576,17 @@ pub fn get_entry_aes_encryption_info(entry: &Entry) -> Option<AesExtraField> {
 
 /// Check if an entry uses traditional PKWARE encryption.
 ///
-/// Returns `true` if the entry uses ZipCrypto (traditional) encryption.
+/// Returns `true` if the entry uses ZipCrypto (traditional) encryption:
+/// general-purpose bit 0 is set and the method is not AES (99).
 #[allow(dead_code)]
 pub fn is_entry_traditional_encrypted(entry: &Entry) -> bool {
-    // Traditional encryption uses the 0xEE marker but not AES method
-    entry.extra.windows(2).any(|w| w == [0xEE, 0xEE])
+    entry_gp_flags(entry).is_some_and(|flags| flags & FLAG_ENCRYPTED != 0)
         && entry.method != CoreMethod::Unknown(METHOD_AES_ENCRYPTED)
 }
 
 /// ZIP compression level for writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ZipCompressionLevel {
     /// Store without compression (method 0).
     Store,
@@ -613,5 +764,117 @@ impl CentralDirEntry {
     pub fn written_size(&self) -> usize {
         let zip64_extra = self.build_zip64_extra();
         46 + self.filename.len() + self.extra.len() + zip64_extra.len() + self.comment.len()
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    fn header_with_date(mdate: u16, mtime: u16) -> LocalFileHeader {
+        LocalFileHeader {
+            version_needed: 20,
+            flags: 0,
+            method: CompressionMethod::Stored,
+            mtime,
+            mdate,
+            crc32: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            filename: "f".to_string(),
+            filename_raw: b"f".to_vec(),
+            extra: Vec::new(),
+            data_offset: 0,
+            uncompressed_size_64: None,
+            compressed_size_64: None,
+        }
+    }
+
+    #[test]
+    fn modified_time_does_not_panic_on_zero_dos_date() {
+        // A crafted local-file header with a zero DOS date encodes month 0 and
+        // day 0, which used to underflow `month - 1` and panic (debug) / wrap
+        // (release). It must now yield a valid SystemTime and a usable Entry.
+        let header = header_with_date(0, 0);
+        let _ = header.modified_time();
+        let _ = header.to_entry();
+    }
+
+    #[test]
+    fn modified_time_matches_known_date() {
+        // 2021-06-15 00:00:00 UTC (year 41 since 1980, month 6, day 15)
+        // is exactly 1623715200 seconds after the Unix epoch.
+        let mdate = ((2021 - 1980) << 9) | (6 << 5) | 15;
+        let header = header_with_date(mdate, 0);
+        let t = header.modified_time();
+        let secs = t
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert_eq!(
+            secs, 1_623_715_200,
+            "civil-date DOS conversion must be exact"
+        );
+    }
+
+    #[test]
+    fn dos_conversion_round_trips_exactly() {
+        // Round-trip a spread of known instants through both shared
+        // helpers; the 2-second DOS granularity truncates the seconds.
+        for &secs in &[
+            315_532_800u64, // 1980-01-01 00:00:00 (DOS epoch)
+            951_827_696,    // 2000-02-29 12:34:56 (leap day)
+            1_783_900_800,  // 2026-07-13 00:00:00
+            4_102_444_798,  // 2099-12-31 23:59:58
+        ] {
+            let (mtime, mdate) = dos_date_time_from_unix_secs(secs);
+            let t = dos_date_time_to_system_time(mdate, mtime);
+            let round = t
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            assert_eq!(round, secs - secs % 2, "round-trip mismatch for {secs}");
+        }
+    }
+
+    #[test]
+    fn dos_conversion_never_emits_invalid_month_or_day() {
+        // The old 365/30-day approximation could emit month 13 near the
+        // end of a year. Sweep a year of daily timestamps and check the
+        // packed fields stay in range.
+        let start = 1_735_689_600u64; // 2025-01-01 00:00:00 UTC
+        for day in 0..730u64 {
+            let (_, mdate) = dos_date_time_from_unix_secs(start + day * 86400);
+            let month = (mdate >> 5) & 0x0F;
+            let dom = mdate & 0x1F;
+            assert!((1..=12).contains(&month), "invalid month {month}");
+            assert!((1..=31).contains(&dom), "invalid day {dom}");
+        }
+    }
+
+    #[test]
+    fn entry_meta_record_round_trips_flags_and_mtime() {
+        let mut header = header_with_date(0x5ACF, 0xB43D);
+        header.flags = FLAG_ENCRYPTED | FLAG_DATA_DESCRIPTOR;
+        let entry = header.to_entry();
+        assert_eq!(
+            entry_gp_flags(&entry),
+            Some(FLAG_ENCRYPTED | FLAG_DATA_DESCRIPTOR)
+        );
+        assert_eq!(entry_dos_mtime(&entry), Some(0xB43D));
+        assert!(is_entry_encrypted(&entry));
+        assert!(is_entry_traditional_encrypted(&entry));
+    }
+
+    #[test]
+    fn stray_ee_bytes_in_extra_do_not_mark_entry_encrypted() {
+        // Regression for the removed homegrown 0xEE,0xEE marker: an extra
+        // field that merely *contains* those bytes (here inside a
+        // well-formed record of another ID) must not flag encryption.
+        let mut header = header_with_date(0x21, 0);
+        header.extra = vec![0x55, 0x54, 0x02, 0x00, 0xEE, 0xEE];
+        let entry = header.to_entry();
+        assert!(!is_entry_encrypted(&entry));
+        assert!(!is_entry_traditional_encrypted(&entry));
     }
 }

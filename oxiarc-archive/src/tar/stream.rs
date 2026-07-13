@@ -1,12 +1,26 @@
 //! Streaming TAR reader — no `Seek` required.
 
 use oxiarc_core::cancel::CancellationToken;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
 use std::collections::HashMap;
 use std::io::Read;
 
+use super::sparse::SparseMap;
 use super::{BLOCK_SIZE, TarHeader};
+
+/// Upper bound on the size of a single PAX extended-header or GNU
+/// long-name/long-link record read via [`TarStreamReader::read_extension_data`].
+///
+/// `header.size` for these records comes straight from an untrusted TAR
+/// header field. Because `TarStreamReader` only requires `Read` (no
+/// `Seek`), it cannot cheaply learn how many bytes actually remain in the
+/// underlying stream the way the seekable [`super::reader::TarReader`]
+/// can, so a fixed sanity cap is used instead: real-world PAX headers and
+/// long names/links are at most a few KiB, so 64 MiB is generous headroom
+/// while still preventing a crafted archive from forcing an
+/// arbitrarily large allocation before any data is validated.
+const MAX_EXTENSION_DATA_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Streaming TAR reader requiring only `Read` — no `Seek` needed.
 ///
@@ -52,6 +66,7 @@ impl<R: Read> TarStreamReader<R> {
 
     /// Attach a progress sink that will be notified for each entry and on
     /// every chunk read from the stream.
+    #[must_use]
     pub fn with_progress(mut self, progress: ProgressHandle) -> Self {
         self.progress = Some(progress);
         self
@@ -59,6 +74,7 @@ impl<R: Read> TarStreamReader<R> {
 
     /// Attach a cancellation token. If cancelled, `next_entry` will return
     /// `Err(OxiArcError::Cancelled)`.
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
@@ -141,6 +157,22 @@ impl<R: Read> TarStreamReader<R> {
                         continue;
                     }
 
+                    // ---- GNU old-format sparse entry (typeflag 'S') ----
+                    //
+                    // The sparse map lives in the primary header's unused
+                    // bytes, optionally extended by 512-byte continuation
+                    // blocks; the payload is the concatenation of non-hole
+                    // runs padded to BLOCK_SIZE. `header.size` holds the
+                    // stored (on-disk) size, NOT the logical size, so the
+                    // generic path below would both mis-size the entry and
+                    // return raw run bytes as if they were contiguous
+                    // content. Mirrors the seekable `TarReader` handling.
+                    if header.typeflag == b'S' {
+                        let map = SparseMap::parse_gnu_old_format(&block, &mut self.reader)?;
+                        map.validate()?;
+                        return Ok(Some(self.make_sparse_entry(header, map)));
+                    }
+
                     // --- Apply accumulated metadata ---
                     if !pax_attrs.is_empty() {
                         header.apply_pax_attrs(&pax_attrs);
@@ -150,6 +182,21 @@ impl<R: Read> TarStreamReader<R> {
                     }
                     if let Some(link) = gnu_longlink.take() {
                         header.linkname = link;
+                    }
+
+                    // ---- PAX 0.1 sparse (`GNU.sparse.*` attributes) ----
+                    //
+                    // The map is carried by the preceding PAX header and the
+                    // data entry is a regular '0' record whose `size` is the
+                    // stored size; the canonical name is shadowed into
+                    // `GNU.sparse.name`. Mirrors the seekable `TarReader`.
+                    if pax_attrs.contains_key("GNU.sparse.map") {
+                        let map = SparseMap::from_pax_attrs(&pax_attrs)?;
+                        map.validate()?;
+                        if let Some(real_name) = pax_attrs.get("GNU.sparse.name") {
+                            header.name = real_name.clone();
+                        }
+                        return Ok(Some(self.make_sparse_entry(header, map)));
                     }
 
                     let data_size = header.size;
@@ -172,15 +219,70 @@ impl<R: Read> TarStreamReader<R> {
                         remaining: data_size,
                         padding,
                         bytes_read: 0,
+                        sparse: None,
                     }));
                 }
             }
         }
     }
 
+    /// Build a [`TarStreamEntry`] for a validated sparse map.
+    ///
+    /// The entry's `Read` impl serves the *logical* (realsize) view of the
+    /// file: stored runs are read from the underlying stream and the holes
+    /// between them are zero-filled on the fly, so no `realsize`-sized
+    /// buffer is materialized. `header.size` is rewritten to the logical
+    /// size to match what `read_to_end` will produce (and what the
+    /// seekable `TarReader` reports for the same entry).
+    fn make_sparse_entry(
+        &mut self,
+        mut header: TarHeader,
+        map: SparseMap,
+    ) -> TarStreamEntry<'_, R> {
+        let stored = map.stored_size();
+        let padding = map.padded_stored_size() - stored;
+        header.size = map.realsize;
+
+        // Track what the entry owns on the medium so Drop can skip it.
+        self.pending_skip = stored + padding;
+
+        let idx = self.entry_index;
+        self.entry_index += 1;
+        if let Some(ref sink) = self.progress {
+            sink.on_entry(&header.name, idx);
+        }
+
+        TarStreamEntry {
+            header,
+            stream: self,
+            remaining: stored,
+            padding,
+            bytes_read: 0,
+            sparse: Some(SparseReadState {
+                realsize: map.realsize,
+                runs: map.runs,
+                run_idx: 0,
+                run_pos: 0,
+                logical_pos: 0,
+            }),
+        }
+    }
+
     /// Read `size` bytes of extension-header data plus its block padding.
     fn read_extension_data(&mut self, size: u64) -> Result<Vec<u8>> {
-        let mut data = vec![0u8; size as usize];
+        if size > MAX_EXTENSION_DATA_SIZE {
+            return Err(OxiArcError::invalid_header(format!(
+                "TAR extension header declares size {size}, exceeding the {MAX_EXTENSION_DATA_SIZE}-byte sanity limit"
+            )));
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(size as usize).map_err(|_| {
+            OxiArcError::invalid_header(format!(
+                "unable to allocate {size} bytes for TAR extension header data"
+            ))
+        })?;
+        data.resize(size as usize, 0);
         self.reader.read_exact(&mut data)?;
         let padding = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
         if padding > 0 {
@@ -216,28 +318,125 @@ pub struct TarStreamEntry<'a, R: Read> {
     /// The parsed header for this entry.
     pub header: TarHeader,
     pub(crate) stream: &'a mut TarStreamReader<R>,
-    /// Unread data bytes remaining for this entry.
+    /// Unread *stored* data bytes remaining for this entry (for sparse
+    /// entries this counts run bytes on the medium, not logical bytes).
     pub(crate) remaining: u64,
     /// Block-alignment padding that follows the entry's data.
     pub(crate) padding: u64,
-    /// Total bytes read so far (for progress reporting).
+    /// Total bytes served to the caller so far (logical bytes; used for
+    /// progress reporting).
     bytes_read: u64,
+    /// Present for sparse entries: drives the logical realsize view with
+    /// zero-filled holes interleaved between stored runs.
+    sparse: Option<SparseReadState>,
+}
+
+/// Incremental state for serving a sparse entry's logical content.
+struct SparseReadState {
+    /// Logical file size (realsize).
+    realsize: u64,
+    /// Validated `(offset, numbytes)` runs, monotonically ordered and
+    /// non-overlapping (guaranteed by `SparseMap::validate`).
+    runs: Vec<(u64, u64)>,
+    /// Index of the run currently being (or next to be) served.
+    run_idx: usize,
+    /// Bytes of the current run already served.
+    run_pos: u64,
+    /// Current position in the logical (realsize) view.
+    logical_pos: u64,
+}
+
+impl<R: Read> TarStreamEntry<'_, R> {
+    /// Serve up to `buf.len()` logical bytes of a sparse entry.
+    ///
+    /// Holes are synthesized as zeros; stored runs are read from the
+    /// underlying stream. A stream that ends mid-run is an error — the
+    /// caller must never receive silently short or shifted content.
+    fn read_sparse(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(sp) = self.sparse.as_mut() else {
+            return Ok(0);
+        };
+
+        if sp.logical_pos >= sp.realsize {
+            return Ok(0);
+        }
+
+        if sp.run_idx < sp.runs.len() {
+            let (run_off, run_len) = sp.runs[sp.run_idx];
+
+            if sp.logical_pos < run_off {
+                // Hole before the current run: synthesize zeros.
+                let hole = (run_off - sp.logical_pos).min(buf.len() as u64) as usize;
+                buf[..hole].fill(0);
+                sp.logical_pos += hole as u64;
+                return Ok(hole);
+            }
+
+            // Inside the current run: read stored bytes from the stream.
+            let left_in_run = run_len - sp.run_pos;
+            let cap = (buf.len() as u64).min(left_in_run).min(self.remaining) as usize;
+            let n = self.stream.reader.read(&mut buf[..cap])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "TAR stream ended inside sparse run {} of '{}' ({} of {} run bytes read)",
+                        sp.run_idx, self.header.name, sp.run_pos, run_len
+                    ),
+                ));
+            }
+            sp.run_pos += n as u64;
+            sp.logical_pos += n as u64;
+            self.remaining -= n as u64;
+            if sp.run_pos == run_len {
+                sp.run_idx += 1;
+                sp.run_pos = 0;
+            }
+            // Keep pending_skip in sync so Drop skips only what is left.
+            self.stream.pending_skip = self.remaining + self.padding;
+            return Ok(n);
+        }
+
+        // Trailing hole after the final run.
+        let hole = (sp.realsize - sp.logical_pos).min(buf.len() as u64) as usize;
+        buf[..hole].fill(0);
+        sp.logical_pos += hole as u64;
+        Ok(hole)
+    }
 }
 
 impl<R: Read> std::io::Read for TarStreamEntry<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
-        let cap = buf.len().min(self.remaining as usize);
-        let n = self.stream.reader.read(&mut buf[..cap])?;
-        self.remaining -= n as u64;
+
+        let n = if self.sparse.is_some() {
+            let n = self.read_sparse(buf)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            n
+        } else {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let cap = buf.len().min(self.remaining as usize);
+            let n = self.stream.reader.read(&mut buf[..cap])?;
+            self.remaining -= n as u64;
+            // Keep pending_skip in sync so Drop skips only what is really left.
+            self.stream.pending_skip = self.remaining + self.padding;
+            n
+        };
+
         self.bytes_read += n as u64;
-        // Keep pending_skip in sync so Drop skips only what is really left.
-        self.stream.pending_skip = self.remaining + self.padding;
-        // Report progress.
+        // Report progress against the logical total.
         if let Some(ref sink) = self.stream.progress {
-            sink.on_progress(self.bytes_read, Some(self.bytes_read + self.remaining));
+            let total = match self.sparse {
+                Some(ref sp) => sp.realsize,
+                None => self.bytes_read + self.remaining,
+            };
+            sink.on_progress(self.bytes_read, Some(total));
         }
         Ok(n)
     }
@@ -539,6 +738,253 @@ mod tests {
         std::io::Read::read_to_end(&mut entry, &mut out).expect("read_to_end entry");
         drop(entry);
         assert_eq!(&out, b"x");
+    }
+
+    // ---- TAR-01 regression: GNU/PAX sparse entries in the stream reader ----
+
+    use crate::tar::sparse;
+
+    /// Materialize the expected logical content for a sparse layout.
+    fn materialize(realsize: u64, runs: &[(u64, u64)], fill: impl Fn(usize) -> u8) -> Vec<u8> {
+        let mut out = vec![0u8; realsize as usize];
+        let mut cursor = 0usize;
+        for &(off, len) in runs {
+            for i in 0..len as usize {
+                out[off as usize + i] = fill(cursor + i);
+            }
+            cursor += len as usize;
+        }
+        out
+    }
+
+    /// Build the stored payload (concatenated runs + block padding) for a
+    /// sparse layout, using `fill` for byte values.
+    fn stored_payload(runs: &[(u64, u64)], fill: impl Fn(usize) -> u8) -> Vec<u8> {
+        let stored: u64 = runs.iter().map(|&(_, n)| n).sum();
+        let mut data: Vec<u8> = (0..stored as usize).map(fill).collect();
+        let pad = (BLOCK_SIZE - (data.len() % BLOCK_SIZE)) % BLOCK_SIZE;
+        data.extend(std::iter::repeat_n(0u8, pad));
+        data
+    }
+
+    /// GNU old-format 'S' entry: the stream reader must produce the full
+    /// logical realsize content (holes zero-filled), byte-identical to the
+    /// seekable TarReader, instead of returning the raw stored runs.
+    #[test]
+    fn test_tar_stream_gnu_sparse_old_format() {
+        let realsize = 16_384u64;
+        let runs = vec![(0u64, 100u64), (500, 200), (4_000, 50), (10_000, 250)];
+        let fill = |i: usize| (i % 251) as u8;
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_gnu_sparse_primary(
+            "sp.bin", realsize, &runs, false,
+        ));
+        archive.extend_from_slice(&stored_payload(&runs, fill));
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 2]); // end-of-archive
+
+        // Stream reader.
+        let mut stream = TarStreamReader::new(Cursor::new(archive.clone()));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry sparse")
+            .expect("sparse entry present");
+        assert_eq!(entry.header.name, "sp.bin");
+        assert_eq!(
+            entry.header.size, realsize,
+            "sparse entry must report realsize, not stored size"
+        );
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read sparse content");
+        drop(entry);
+        assert!(stream.next_entry().expect("final").is_none());
+
+        let expected = materialize(realsize, &runs, fill);
+        assert_eq!(content.len(), expected.len());
+        assert_eq!(content, expected, "sparse logical content mismatch");
+
+        // Differential vs the seekable TarReader on the same bytes.
+        let mut reader = TarReader::new(Cursor::new(archive)).expect("TarReader::new");
+        let seekable_entry = reader.entries()[0].clone();
+        assert_eq!(seekable_entry.size, realsize);
+        let seekable = reader
+            .extract_by_name("sp.bin")
+            .expect("extract_by_name")
+            .expect("entry present");
+        assert_eq!(content, seekable, "stream and seekable readers must agree");
+    }
+
+    /// GNU old-format 'S' entry whose map spills into a continuation block
+    /// (`isextended`) must also decode correctly in the stream reader.
+    #[test]
+    fn test_tar_stream_gnu_sparse_with_continuation() {
+        let realsize = 100_000u64;
+        let primary_runs = vec![(0u64, 100u64), (500, 200), (4_000, 50), (10_000, 500)];
+        let cont_runs = vec![(20_000u64, 300u64), (40_000, 600), (70_000, 1000)];
+        let mut all_runs = primary_runs.clone();
+        all_runs.extend_from_slice(&cont_runs);
+        let fill = |i: usize| ((i * 7 + 3) % 253) as u8;
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_gnu_sparse_primary(
+            "big.bin",
+            realsize,
+            &primary_runs,
+            true,
+        ));
+        archive.extend_from_slice(&sparse::build_gnu_sparse_continuation(&cont_runs, false));
+        archive.extend_from_slice(&stored_payload(&all_runs, fill));
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 2]);
+
+        let mut stream = TarStreamReader::new(Cursor::new(archive));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry sparse+cont")
+            .expect("entry present");
+        assert_eq!(entry.header.size, realsize);
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read content");
+        drop(entry);
+        assert!(stream.next_entry().expect("final").is_none());
+
+        assert_eq!(content, materialize(realsize, &all_runs, fill));
+    }
+
+    /// PAX 0.1 sparse (`GNU.sparse.*` attributes on a regular '0' data
+    /// entry): the stream reader must produce logical content and shadow
+    /// the dummy `GNUSparseFile` path with `GNU.sparse.name`.
+    #[test]
+    fn test_tar_stream_pax_sparse() {
+        let realsize = 10_000u64;
+        let runs = vec![(0u64, 100u64), (5_000, 200)];
+        let fill = |i: usize| (i % 199) as u8;
+
+        let mk_record =
+            |k: &str, v: &str| -> String { TarWriter::<Vec<u8>>::format_pax_record(k, v) };
+        let mut pax_payload = String::new();
+        pax_payload.push_str(&mk_record("GNU.sparse.name", "sparse.dat"));
+        pax_payload.push_str(&mk_record("GNU.sparse.realsize", &realsize.to_string()));
+        pax_payload.push_str(&mk_record("GNU.sparse.map", "0,100,5000,200"));
+        let pax_bytes = pax_payload.as_bytes();
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_pax_header_block(
+            b'x',
+            pax_bytes.len() as u64,
+        ));
+        archive.extend_from_slice(pax_bytes);
+        let pad = (BLOCK_SIZE - (pax_bytes.len() % BLOCK_SIZE)) % BLOCK_SIZE;
+        archive.extend(std::iter::repeat_n(0u8, pad));
+
+        // Data-entry header: typeflag '0', size = stored size, dummy name.
+        let stored: u64 = runs.iter().map(|&(_, n)| n).sum();
+        let mut data_hdr = sparse::build_pax_header_block(b'0', stored);
+        // Rewrite the name field to the GNUSparseFile dummy path.
+        let dummy = b"./GNUSparseFile.42/sparse.dat";
+        data_hdr[..100].fill(0);
+        data_hdr[..dummy.len()].copy_from_slice(dummy);
+        // Re-checksum after the name rewrite.
+        data_hdr[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = data_hdr.iter().map(|&b| b as u32).sum();
+        let s = format!("{:06o}\0 ", checksum);
+        data_hdr[148..156].copy_from_slice(&s.as_bytes()[..8]);
+        archive.extend_from_slice(&data_hdr);
+        archive.extend_from_slice(&stored_payload(&runs, fill));
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 2]);
+
+        let mut stream = TarStreamReader::new(Cursor::new(archive.clone()));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry pax sparse")
+            .expect("entry present");
+        assert_eq!(
+            entry.header.name, "sparse.dat",
+            "GNU.sparse.name must shadow the dummy path"
+        );
+        assert_eq!(entry.header.size, realsize);
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read content");
+        drop(entry);
+        assert!(stream.next_entry().expect("final").is_none());
+
+        assert_eq!(content, materialize(realsize, &runs, fill));
+
+        // Differential vs the seekable TarReader.
+        let mut reader = TarReader::new(Cursor::new(archive)).expect("TarReader::new");
+        let seekable = reader
+            .extract_by_name("sparse.dat")
+            .expect("extract_by_name")
+            .expect("entry present");
+        assert_eq!(content, seekable);
+    }
+
+    /// A sparse entry dropped without reading must not desync the stream:
+    /// the following entry must still parse and extract correctly.
+    #[test]
+    fn test_tar_stream_sparse_skip_keeps_alignment() {
+        let realsize = 8_192u64;
+        let runs = vec![(0u64, 300u64), (4_096, 300)];
+        let fill = |i: usize| (i % 97) as u8;
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_gnu_sparse_primary(
+            "sp.bin", realsize, &runs, false,
+        ));
+        archive.extend_from_slice(&stored_payload(&runs, fill));
+        // A regular entry afterwards.
+        {
+            let mut w = TarWriter::new(&mut archive);
+            w.add_file("after.txt", b"after sparse").expect("add_file");
+            w.finish().expect("finish");
+        }
+
+        let mut stream = TarStreamReader::new(Cursor::new(archive));
+        // Drop the sparse entry unread.
+        let sparse_entry = stream
+            .next_entry()
+            .expect("next_entry sparse")
+            .expect("sparse present");
+        assert_eq!(sparse_entry.header.name, "sp.bin");
+        drop(sparse_entry);
+
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry after")
+            .expect("after present");
+        assert_eq!(entry.header.name, "after.txt");
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read after");
+        assert_eq!(&content, b"after sparse");
+    }
+
+    /// A truncated sparse payload must surface as an error, never as
+    /// silently short/wrong content.
+    #[test]
+    fn test_tar_stream_sparse_truncated_is_error() {
+        let realsize = 16_384u64;
+        let runs = vec![(0u64, 600u64)];
+        let fill = |i: usize| (i % 251) as u8;
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_gnu_sparse_primary(
+            "sp.bin", realsize, &runs, false,
+        ));
+        let payload = stored_payload(&runs, fill);
+        // Truncate mid-run.
+        archive.extend_from_slice(&payload[..300]);
+
+        let mut stream = TarStreamReader::new(Cursor::new(archive));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry sparse")
+            .expect("entry present");
+        let mut content = Vec::new();
+        let result = std::io::Read::read_to_end(&mut entry, &mut content);
+        assert!(
+            result.is_err(),
+            "truncated sparse run must be an error, got {} bytes",
+            content.len()
+        );
     }
 
     #[test]

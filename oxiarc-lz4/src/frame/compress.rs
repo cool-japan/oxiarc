@@ -2,6 +2,7 @@
 
 use super::types::{FrameDescriptor, LZ4_FRAME_MAGIC};
 use crate::block::compress_block;
+use crate::dict::{Lz4Dict, MAX_DICT_SIZE, compress_with_dict};
 use crate::xxhash::{XxHash32, xxhash32};
 use oxiarc_core::error::Result;
 
@@ -56,6 +57,10 @@ pub fn compress_with_options(input: &[u8], desc: FrameDescriptor) -> Result<Vec<
 
     // Compress blocks
     let block_size = desc.block_max_size.size_bytes();
+    // For linked (block-dependent) frames each block is compressed against the
+    // previous 64 KiB of *input* as a prefix dictionary, so cross-block
+    // back-references can be emitted (matching reference `lz4 -BD` frames).
+    let linked = !desc.block_independence;
     let mut pos = 0;
 
     while pos < input.len() {
@@ -68,7 +73,13 @@ pub fn compress_with_options(input: &[u8], desc: FrameDescriptor) -> Result<Vec<
         }
 
         // Compress block
-        let compressed = compress_block(chunk)?;
+        let compressed = if linked && pos > 0 {
+            let dict_start = pos.saturating_sub(MAX_DICT_SIZE);
+            let dict = Lz4Dict::new(&input[dict_start..pos]);
+            compress_with_dict(chunk, &dict)?
+        } else {
+            compress_block(chunk)?
+        };
 
         // Decide whether to store compressed or uncompressed
         if compressed.len() < chunk.len() {

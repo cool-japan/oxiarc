@@ -32,6 +32,13 @@ pub struct Inflater {
     expected_dict_checksum: Option<u32>,
     /// Set when `inflate_stored` processes a zero-length stored block (sync flush).
     last_empty_stored: bool,
+    /// Decoded bytes awaiting delivery via the streaming [`Decompressor`]
+    /// trait (`decompress`). Retained so a caller-supplied output buffer
+    /// smaller than the decoded payload drains across calls instead of
+    /// silently truncating.
+    trait_pending: Vec<u8>,
+    /// Cursor into `trait_pending`: bytes before it have been delivered.
+    trait_pending_pos: usize,
 }
 
 impl Inflater {
@@ -43,6 +50,8 @@ impl Inflater {
             finished: false,
             expected_dict_checksum: None,
             last_empty_stored: false,
+            trait_pending: Vec::new(),
+            trait_pending_pos: 0,
         }
     }
 
@@ -130,6 +139,8 @@ impl Inflater {
         self.finished = false;
         self.expected_dict_checksum = None;
         self.last_empty_stored = false;
+        self.trait_pending = Vec::new();
+        self.trait_pending_pos = 0;
     }
 
     /// Reset the decompressor but keep the dictionary.
@@ -140,6 +151,8 @@ impl Inflater {
         self.finished = false;
         self.expected_dict_checksum = checksum;
         self.last_empty_stored = false;
+        self.trait_pending = Vec::new();
+        self.trait_pending_pos = 0;
     }
 
     /// Decompress data from a reader.
@@ -460,6 +473,34 @@ impl Inflater {
         }
     }
 
+    /// Copy as many undelivered decoded bytes as fit into `output`.
+    ///
+    /// Returns the number of bytes copied and the resulting status:
+    /// [`DecompressStatus::NeedsOutput`] while bytes remain, or
+    /// [`DecompressStatus::Done`] once the decoded stream is fully drained
+    /// (`finished` is only set at that point).
+    fn drain_trait_pending(&mut self, output: &mut [u8]) -> (usize, DecompressStatus) {
+        let remaining = self.trait_pending.len() - self.trait_pending_pos;
+        let to_copy = remaining.min(output.len());
+        output[..to_copy].copy_from_slice(
+            &self.trait_pending[self.trait_pending_pos..self.trait_pending_pos + to_copy],
+        );
+        self.trait_pending_pos += to_copy;
+
+        if self.trait_pending_pos < self.trait_pending.len() {
+            // Not fully delivered yet — `inflate` may already have marked the
+            // stream finished; hold the flag back until the caller has
+            // received every decoded byte.
+            self.finished = false;
+            (to_copy, DecompressStatus::NeedsOutput)
+        } else {
+            self.trait_pending = Vec::new();
+            self.trait_pending_pos = 0;
+            self.finished = true;
+            (to_copy, DecompressStatus::Done)
+        }
+    }
+
     /// Decompress one complete sync-flushed chunk (convenience wrapper).
     ///
     /// `input` must be a complete sync-flush unit (all bytes from after the
@@ -480,26 +521,37 @@ impl Default for Inflater {
 }
 
 impl Decompressor for Inflater {
+    /// Streaming decompression: the entire DEFLATE stream in `input` is
+    /// parsed on the first call, and the decoded bytes are delivered
+    /// through `output` across as many calls as needed.
+    ///
+    /// Returns [`DecompressStatus::NeedsOutput`] while decoded bytes remain
+    /// undelivered and [`DecompressStatus::Done`] only once every byte has
+    /// been copied out — a caller-supplied buffer smaller than the payload
+    /// is never silently truncated.
     fn decompress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
-        // Simple implementation: decompress all at once
+        // Drain bytes decoded by a previous call first.
+        if self.trait_pending_pos < self.trait_pending.len() {
+            let (produced, status) = self.drain_trait_pending(output);
+            return Ok((0, produced, status));
+        }
+
         if self.finished {
             return Ok((0, 0, DecompressStatus::Done));
         }
 
         let mut cursor = std::io::Cursor::new(input);
         let result = self.inflate_reader(&mut cursor)?;
-
         let consumed = cursor.position() as usize;
-        let to_copy = result.len().min(output.len());
-        output[..to_copy].copy_from_slice(&result[..to_copy]);
 
-        self.finished = true;
-
-        Ok((consumed, to_copy, DecompressStatus::Done))
+        self.trait_pending = result;
+        self.trait_pending_pos = 0;
+        let (produced, status) = self.drain_trait_pending(output);
+        Ok((consumed, produced, status))
     }
 
     fn reset(&mut self) {

@@ -42,7 +42,7 @@
 
 use crate::deflate::Deflater;
 use crate::inflate::Inflater;
-use crate::zlib::{Adler32, zlib_decompress};
+use crate::zlib::Adler32;
 use oxiarc_core::{BitReader, Crc32};
 use std::io::{self, Cursor, Read, Write};
 
@@ -116,6 +116,7 @@ impl<W: Write> GzipStreamEncoder<W> {
     ///
     /// When the internal buffer reaches this many bytes it is automatically
     /// flushed via sync_flush.
+    #[must_use]
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size.max(1);
         self
@@ -607,6 +608,7 @@ impl<W: Write> ZlibStreamEncoder<W> {
     ///
     /// When the internal buffer reaches this many bytes it is automatically
     /// flushed via sync_flush.
+    #[must_use]
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size.max(1);
         self
@@ -763,6 +765,9 @@ pub struct ZlibStreamDecoder<R: Read> {
     output_pos: usize,
     /// Whether the compressed stream has been fully consumed.
     finished: bool,
+    /// Optional cap on the total decompressed output size, bounding
+    /// decompression-bomb amplification on untrusted input.
+    max_output: Option<usize>,
 }
 
 impl<R: Read> ZlibStreamDecoder<R> {
@@ -773,7 +778,20 @@ impl<R: Read> ZlibStreamDecoder<R> {
             output_buffer: Vec::new(),
             output_pos: 0,
             finished: false,
+            max_output: None,
         }
+    }
+
+    /// Cap the total decompressed output size.
+    ///
+    /// Decoding fails with [`io::ErrorKind::InvalidData`] once the
+    /// accumulated output would exceed `limit` bytes. Recommended when
+    /// decoding untrusted input, since a small zlib stream can legally
+    /// expand by a factor of ~1000 (decompression bomb).
+    #[must_use]
+    pub fn with_max_output(mut self, limit: usize) -> Self {
+        self.max_output = Some(limit);
+        self
     }
 
     /// Consume the decoder and return the inner reader.
@@ -783,8 +801,17 @@ impl<R: Read> ZlibStreamDecoder<R> {
 
     /// Read and decompress all compressed data from the inner reader.
     ///
-    /// Handles concatenated Zlib streams by repeatedly decoding until all
-    /// input is consumed.
+    /// Handles concatenated Zlib streams by decoding each member with a
+    /// streaming inflater that reports exactly how many compressed bytes it
+    /// consumed (mirroring [`GzipStreamDecoder`]), then validating the next
+    /// member's 2-byte header at that exact offset. Each input byte is
+    /// decoded at most once — O(n) total, with no speculative re-decoding
+    /// of candidate prefixes (which was quadratic and amplifiable by
+    /// decompression bombs).
+    ///
+    /// Non-zlib trailing bytes after at least one complete member terminate
+    /// decoding gracefully; a corrupt member (bad DEFLATE data, wrong or
+    /// truncated Adler-32) is an error.
     fn fill_buffer(&mut self) -> io::Result<()> {
         if self.finished || self.output_pos < self.output_buffer.len() {
             return Ok(());
@@ -798,72 +825,89 @@ impl<R: Read> ZlibStreamDecoder<R> {
             return Ok(());
         }
 
-        // Decompress concatenated Zlib streams. A Zlib stream starts with a
-        // CMF byte where CM=8 (lower nibble). The typical CMF value is 0x78
-        // (window size = 32KB, deflate).
         let mut all_decompressed = Vec::new();
-        let mut remaining = &compressed[..];
+        let mut pos = 0usize;
 
-        while !remaining.is_empty() {
-            // Validate minimum size (2-byte header + at least some data + 4-byte checksum)
+        while pos < compressed.len() {
+            let remaining = &compressed[pos..];
+
+            // Minimum member size: 2-byte header + 4-byte Adler-32.
             if remaining.len() < 6 {
                 break;
             }
 
-            // Check if this looks like a valid zlib header
+            // Validate the 2-byte zlib header (RFC 1950): CM=8 and the
+            // CMF·FLG check value divisible by 31.
             let cmf = remaining[0];
-            let cm = cmf & 0x0F;
-            if cm != 8 {
+            let flg = remaining[1];
+            if cmf & 0x0F != 8 || ((cmf as u16) * 256 + flg as u16) % 31 != 0 {
+                if pos == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid zlib header",
+                    ));
+                }
+                // Trailing non-zlib data after complete members — stop.
                 break;
             }
-            let flg = remaining[1];
-            let check = (cmf as u16) * 256 + (flg as u16);
-            if check % 31 != 0 {
-                break;
+            if (flg >> 5) & 1 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zlib preset dictionary (FDICT) not supported by ZlibStreamDecoder",
+                ));
             }
 
-            match zlib_decompress(remaining) {
-                Ok(decompressed) => {
-                    all_decompressed.extend_from_slice(&decompressed);
-                    // Successfully decoded. Since zlib_decompress consumes the
-                    // entire input, we are done.
-                    remaining = &[];
-                }
-                Err(_) => {
-                    // There might be concatenated streams. Try to find the
-                    // boundary by looking for the next valid zlib header.
-                    let mut decoded_one = false;
-                    // A minimal zlib stream is 6 bytes (2 header + empty deflate + 4 adler32).
-                    for split_pos in 6..remaining.len().saturating_sub(5) {
-                        let candidate_cmf = remaining[split_pos];
-                        let candidate_cm = candidate_cmf & 0x0F;
-                        if candidate_cm != 8 {
-                            continue;
-                        }
-                        if split_pos + 1 >= remaining.len() {
-                            continue;
-                        }
-                        let candidate_flg = remaining[split_pos + 1];
-                        let candidate_check = (candidate_cmf as u16) * 256 + (candidate_flg as u16);
-                        if candidate_check % 31 != 0 {
-                            continue;
-                        }
-                        // Looks like a valid header; try to decode the first part
-                        if let Ok(decompressed) = zlib_decompress(&remaining[..split_pos]) {
-                            all_decompressed.extend_from_slice(&decompressed);
-                            remaining = &remaining[split_pos..];
-                            decoded_one = true;
-                            break;
-                        }
-                    }
-                    if !decoded_one {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "failed to decompress Zlib data",
-                        ));
-                    }
+            // Inflate the member's DEFLATE payload, tracking the exact
+            // number of compressed bytes consumed.
+            let mut bit_reader = BitReader::new(Cursor::new(&remaining[2..]));
+            let mut inflater = Inflater::new();
+            let (decompressed, consumed) =
+                inflater.inflate_consumed(&mut bit_reader).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("zlib deflate error: {e}"),
+                    )
+                })?;
+
+            // Enforce the output cap before buffering the member.
+            if let Some(limit) = self.max_output {
+                let total = all_decompressed.len().saturating_add(decompressed.len());
+                if total > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decompressed output exceeds cap of {limit} bytes"),
+                    ));
                 }
             }
+
+            // Verify the 4-byte big-endian Adler-32 trailer at its exact
+            // position.
+            let adler_start =
+                2usize.saturating_add(usize::try_from(consumed).unwrap_or(usize::MAX));
+            if adler_start.saturating_add(4) > remaining.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zlib stream missing Adler-32 trailer",
+                ));
+            }
+            let stored = u32::from_be_bytes([
+                remaining[adler_start],
+                remaining[adler_start + 1],
+                remaining[adler_start + 2],
+                remaining[adler_start + 3],
+            ]);
+            let computed = Adler32::checksum(&decompressed);
+            if stored != computed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "zlib Adler-32 mismatch: stored {stored:#010x}, computed {computed:#010x}"
+                    ),
+                ));
+            }
+
+            all_decompressed.extend_from_slice(&decompressed);
+            pos += adler_start + 4;
         }
 
         self.output_buffer = all_decompressed;

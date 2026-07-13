@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-lzma = { version = "0.3.3", features = ["async-io"] }
+//! oxiarc-lzma = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Memory Model
@@ -19,12 +19,19 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use oxiarc_core::async_io::AsyncCompressor;
 //! use oxiarc_lzma::{Lzma2Encoder, LzmaLevel};
+//! use tokio::io::{AsyncRead, AsyncWrite};
 //!
+//! # async fn run<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send>(
+//! #     mut input: R,
+//! #     mut output: W,
+//! # ) -> oxiarc_core::error::Result<()> {
 //! let mut encoder = Lzma2Encoder::new(LzmaLevel::DEFAULT);
-//! // use encoder.compress_async(&mut input, &mut output).await
+//! let _bytes_written = encoder.compress_async(&mut input, &mut output).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};

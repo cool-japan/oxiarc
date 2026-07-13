@@ -16,26 +16,29 @@
 //! For smaller data (<16 bytes), a simpler single-table lookup is used to avoid
 //! the overhead of the more complex slicing algorithm.
 //!
-//! ## SIMD Acceleration (Optional)
+//! ## SIMD Acceleration (Automatic)
 //!
-//! When the `simd` feature is enabled, hardware-accelerated CRC-32 is available:
+//! Hardware-accelerated CRC-32 is selected automatically at runtime — there is
+//! **no** cargo feature to enable. The dispatch is chosen once (cached in a
+//! `OnceLock`) based on `cfg(target_arch)` plus CPU feature probing:
 //!
-//! - **x86_64**: Uses PCLMULQDQ (carryless multiplication) for 5-20x speedup
-//! - **aarch64**: Uses PMULL (polynomial multiplication) for similar speedup
+//! - **aarch64**: Uses PMULL (polynomial multiplication) when
+//!   `is_aarch64_feature_detected!("aes")` reports the crypto extensions
+//!   (AES implies PMULL). The fold/Barrett constants are verified against the
+//!   scalar slicing-by-8 reference; see `crc_simd::arm`.
+//! - **x86_64**: The PCLMULQDQ path exists in `crc_simd::x86` but is **not**
+//!   wired into dispatch pending empirical CI verification, so x86_64 currently
+//!   uses the slicing-by-8 software path.
+//! - **Other architectures**: always use the slicing-by-8 software path.
 //!
-//! The SIMD implementation uses the same ISO 3309 polynomial (0xEDB88320) as the
-//! software implementation, ensuring full compatibility with ZIP/GZIP/PNG formats.
+//! Every implementation uses the same ISO 3309 polynomial (0xEDB88320) as the
+//! software path, ensuring full compatibility with ZIP/GZIP/PNG formats.
 //!
-//! Runtime feature detection automatically selects the best available implementation.
+//! [`Crc32::implementation_name`] reports the path that was actually selected,
+//! and [`Crc32::is_simd_available`] reflects whether that path is SIMD.
 //!
-//! ### Enabling SIMD
-//!
-//! Add the `simd` feature to your `Cargo.toml`:
-//!
-//! ```toml
-//! [dependencies]
-//! oxiarc-core = { version = "0.2.0", features = ["simd"] }
-//! ```
+//! Note: a `simd` cargo feature previously gated this and is now a documented
+//! no-op kept only for backward compatibility.
 //!
 //! ## Note on Hardware CRC Instructions
 //!
@@ -133,47 +136,84 @@ pub use crate::crc_simd::{SimdCrc32Dispatcher, software_crc32 as simd_software_c
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 type Crc32Fn = fn(u32, &[u8]) -> u32;
 
-/// Runtime-selected CRC-32 function (initialized once via OnceLock).
+/// The CRC-32 implementation actually chosen by [`init_crc32_dispatch`].
+///
+/// This records *what was selected*, so [`Crc32::is_simd_available`] and
+/// [`Crc32::implementation_name`] can report the real dispatch path instead of
+/// independently re-probing CPU features (which historically caused x86_64 to
+/// advertise PCLMULQDQ while `update` was silently using the software path).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct Crc32Dispatch {
+    /// The function `Crc32::update` calls.
+    func: Crc32Fn,
+    /// Human-readable name of the selected path.
+    name: &'static str,
+    /// Whether the selected path is a hardware SIMD implementation.
+    simd: bool,
+}
+
+/// Runtime-selected CRC-32 dispatch (initialized once via OnceLock).
 ///
 /// On x86_64/aarch64, this may be a SIMD-accelerated implementation if the
-/// CPU supports PCLMULQDQ or PMULL respectively. Otherwise, falls back to
-/// the slicing-by-8 scalar path.
+/// CPU supports it and the path is verified. Otherwise, falls back to the
+/// slicing-by-8 scalar path.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-static CRC32_DISPATCH: std::sync::OnceLock<Crc32Fn> = std::sync::OnceLock::new();
+static CRC32_DISPATCH: std::sync::OnceLock<Crc32Dispatch> = std::sync::OnceLock::new();
 
 /// Select the best available CRC-32 implementation at runtime.
 ///
 /// Called once and cached in `CRC32_DISPATCH`. Checks for CPU features and
-/// returns a plain function pointer to the fastest verified implementation:
-/// - On aarch64 with AES/PMULL support: `arm::crc32_pmull` wrapper.
-/// - On x86_64: PCLMULQDQ path pending verification; slicing-by-8.
+/// returns the selected implementation together with a label describing it:
+/// - On aarch64 with AES/PMULL support: verified `arm::crc32_pmull` wrapper.
+/// - On x86_64: PCLMULQDQ dispatch is *not* enabled pending CI verification, so
+///   the slicing-by-8 software path is used.
 /// - Other architectures: slicing-by-8.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn init_crc32_dispatch() -> Crc32Fn {
+fn init_crc32_dispatch() -> Crc32Dispatch {
     #[cfg(target_arch = "aarch64")]
     {
         if crate::crc_simd::arm::is_supported() {
-            // SAFETY: is_supported() verified AES/PMULL is available.
             fn pmull_dispatch(crc: u32, data: &[u8]) -> u32 {
                 // SAFETY: this function is only selected when is_supported() is true,
                 // meaning the AES (and therefore PMULL) CPU feature is present.
                 unsafe { crate::crc_simd::arm::crc32_pmull(crc, data) }
             }
-            return pmull_dispatch;
+            return Crc32Dispatch {
+                func: pmull_dispatch,
+                name: "PMULL (aarch64 SIMD)",
+                simd: true,
+            };
         }
     }
     // Fallback: slicing-by-8 software implementation.
     fn software_dispatch(crc: u32, data: &[u8]) -> u32 {
         crate::crc_simd::software_crc32(crc, data)
     }
-    software_dispatch
+    // The label explains *why* software was chosen on each architecture.
+    #[cfg(target_arch = "aarch64")]
+    let name = "slicing-by-8 (software, PMULL not available)";
+    #[cfg(target_arch = "x86_64")]
+    let name = "slicing-by-8 (software; x86_64 PCLMULQDQ dispatch not enabled)";
+    Crc32Dispatch {
+        func: software_dispatch,
+        name,
+        simd: false,
+    }
+}
+
+/// Get the cached runtime dispatch record.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn get_crc32_dispatch() -> Crc32Dispatch {
+    *CRC32_DISPATCH.get_or_init(init_crc32_dispatch)
 }
 
 /// Get the cached runtime-dispatched CRC-32 function.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn get_crc32_fn() -> Crc32Fn {
-    *CRC32_DISPATCH.get_or_init(init_crc32_dispatch)
+    get_crc32_dispatch().func
 }
 
 /// CRC-32 calculator (ISO 3309).
@@ -188,9 +228,11 @@ fn get_crc32_fn() -> Crc32Fn {
 ///
 /// # Performance
 ///
-/// When the `simd` feature is enabled, this automatically uses hardware-accelerated
-/// SIMD instructions (PCLMULQDQ on x86_64, PMULL on aarch64) for large data blocks,
-/// providing 5-20x speedup over the software implementation.
+/// The implementation is selected automatically at runtime (no cargo feature
+/// required). On aarch64 with AES/PMULL support, `update` uses the verified
+/// hardware PMULL path for large data blocks (5-20x speedup). On x86_64 and
+/// other architectures it currently uses the slicing-by-8 software path.
+/// [`Crc32::implementation_name`] reports the path in effect.
 ///
 /// # Example
 ///
@@ -219,10 +261,10 @@ impl Crc32 {
 
     /// Update the CRC with more data.
     ///
-    /// On x86_64 and aarch64, this automatically uses hardware-accelerated
-    /// SIMD instructions (PCLMULQDQ on x86_64, PMULL on aarch64) when the CPU
-    /// supports them, via a `OnceLock`-cached runtime dispatch. On other
-    /// architectures, the slicing-by-8 scalar path is used.
+    /// On aarch64 with AES/PMULL support, this uses the hardware PMULL path via
+    /// a `OnceLock`-cached runtime dispatch. On x86_64 (PCLMULQDQ dispatch not
+    /// yet enabled) and other architectures, the slicing-by-8 scalar path is
+    /// used. Call [`Crc32::implementation_name`] to see the selected path.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -261,23 +303,24 @@ impl Crc32 {
         crc.finalize()
     }
 
-    /// Check if SIMD acceleration is available on this CPU and architecture.
+    /// Check whether the CRC-32 path actually dispatched by [`Crc32::update`] is
+    /// a hardware SIMD implementation.
     ///
-    /// Returns `true` if the current CPU supports PCLMULQDQ on x86_64 or
-    /// PMULL on aarch64. Returns `false` on other architectures or if the
-    /// required CPU features are not available.
+    /// This reflects the *real* dispatch decision made by `init_crc32_dispatch`
+    /// (cached in a `OnceLock`), not an independent CPU-feature probe. It returns
+    /// `true` only on aarch64 when the verified PMULL path was selected. On
+    /// x86_64 the PCLMULQDQ path is not yet wired into dispatch, so this returns
+    /// `false` even though the CPU may support PCLMULQDQ; other architectures
+    /// always return `false`.
     ///
     /// Note: the `simd` cargo feature is now a no-op alias kept for backward
-    /// compatibility; SIMD is auto-enabled via `cfg(target_arch)`.
+    /// compatibility; SIMD is auto-detected via `cfg(target_arch)` and CPU
+    /// feature detection.
     #[inline]
     pub fn is_simd_available() -> bool {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            crate::crc_simd::x86::is_supported()
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            crate::crc_simd::arm::is_supported()
+            get_crc32_dispatch().simd
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -285,27 +328,16 @@ impl Crc32 {
         }
     }
 
-    /// Get a description of the current implementation being used.
+    /// Get a description of the implementation actually being used.
     ///
-    /// This is useful for debugging and benchmarking to verify which
-    /// implementation path is being taken.
+    /// This reports the path selected by the runtime dispatcher (the same one
+    /// [`Crc32::update`] calls), so it never misreports the implementation. It
+    /// is useful for debugging and benchmarking to verify which path is taken.
     #[inline]
     pub fn implementation_name() -> &'static str {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            if crate::crc_simd::x86::is_supported() {
-                "PCLMULQDQ (x86_64 SIMD)"
-            } else {
-                "slicing-by-8 (software, PCLMULQDQ not available)"
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if crate::crc_simd::arm::is_supported() {
-                "PMULL (aarch64 SIMD)"
-            } else {
-                "slicing-by-8 (software, PMULL not available)"
-            }
+            get_crc32_dispatch().name
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {

@@ -190,14 +190,37 @@ impl LzhDecoder {
             if block_remaining == 0 {
                 // Start a new block: command count, then the three tables.
                 block_remaining = reader.get_bits(16)? as u64;
+                // `MsbBitReader` zero-pads past physical end-of-input, so a
+                // truncated stream reads a fabricated (zero) count here. If any
+                // padding bit was consumed to form the value the stream ended
+                // before this block began: the count — and everything after —
+                // is synthetic, so refuse rather than silently truncate. This
+                // mirrors lh1's `exhausted` guard in `lh1::decode_lh1`.
+                if reader.padding_bits() > 0 {
+                    return Err(OxiArcError::corrupted(
+                        reader.bits_read(),
+                        "lh4-7: compressed stream exhausted reading block header",
+                    ));
+                }
                 if block_remaining == 0 {
-                    // A zero-command block only occurs at true end-of-stream
-                    // (or on zero-padding past EOF); stop rather than spin.
+                    // A genuine zero-command block cannot advance toward the
+                    // declared size; stop rather than spin. The post-loop
+                    // length check below turns the resulting short output into
+                    // an error instead of returning truncated data.
                     break;
                 }
                 let temp_tree = read_temp_tree(reader)?;
                 code_tree = Some(read_code_tree(reader, &temp_tree)?);
                 offset_tree = Some(read_offset_tree(reader, offset_bits, max_offset_codes)?);
+                // The three tables may also have been read past EOF on a stream
+                // truncated mid-header, in which case the trees are built from
+                // zero padding rather than real descriptors.
+                if reader.padding_bits() > 0 {
+                    return Err(OxiArcError::corrupted(
+                        reader.bits_read(),
+                        "lh4-7: compressed stream exhausted reading block tables",
+                    ));
+                }
             }
 
             block_remaining -= 1;
@@ -206,6 +229,14 @@ impl LzhDecoder {
                 .as_ref()
                 .ok_or_else(|| OxiArcError::corrupted(reader.bits_read(), "missing code tree"))?;
             let code = ctree.decode(reader)?;
+            // A code decoded from zero padding is fabricated: reject rather than
+            // emit a byte the encoder never wrote.
+            if reader.padding_bits() > 0 {
+                return Err(OxiArcError::corrupted(
+                    reader.bits_read(),
+                    "lh4-7: compressed stream exhausted decoding symbol",
+                ));
+            }
 
             if code < 256 {
                 history.push(code as u8);
@@ -215,8 +246,26 @@ impl LzhDecoder {
                     OxiArcError::corrupted(reader.bits_read(), "missing offset tree")
                 })?;
                 let offset = Self::decode_offset(otree, reader)?;
+                // The offset (tree symbol + raw extra bits) must likewise come
+                // from real input, not past-EOF padding.
+                if reader.padding_bits() > 0 {
+                    return Err(OxiArcError::corrupted(
+                        reader.bits_read(),
+                        "lh4-7: compressed stream exhausted decoding match offset",
+                    ));
+                }
                 history.copy(offset, copy_count)?;
             }
+        }
+
+        // A valid stream produces at least `uncompressed_size` bytes (a final
+        // match may overshoot, which is trimmed below). Falling short means the
+        // stream ended early — return an error instead of the truncated output.
+        if (history.output.len() as u64) < self.uncompressed_size {
+            return Err(OxiArcError::corrupted(
+                reader.bits_read(),
+                "lh4-7: compressed stream ended before producing declared size",
+            ));
         }
 
         let mut output = std::mem::take(&mut history.output);

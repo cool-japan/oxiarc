@@ -1,124 +1,132 @@
 # Known Issues
 
-## LZW Dictionary/Bit-Width Synchronization Issues
+Last re-verified: 2026-07-13 (v0.3.6 hardening pass), against Pillow 12.1.0 /
+libtiff 4.7.1 on macOS. The full test matrix below was re-run at that date.
 
-**Status**: Known limitations, do not affect typical TIFF usage
+## Resolved Issues
 
 ### Issue 1: All 256 Byte Values (0-255)
 
-**Status**: ✅ **FIXED**
+**Status**: FIXED (bit-width synchronization)
 
-**Description**: When encoding a sequence containing all 256 possible byte values (0-255) in sequential order, bytes 254-255 were decoded incorrectly as 127-127.
+Encoding a sequence containing all 256 byte values decoded bytes 254-255
+incorrectly, caused by an encoder/decoder desync at the 9-to-10 bit width
+transition. Fixed by the decoder-side `update_bit_width_decode()` threshold
+(one below the encoder's, compensating for the decoder's one-entry lag).
+Covered by `test_lzw_all_byte_values` and the `allbytes_256` reference
+fixture (which is byte-identical to libtiff's output).
 
-**Root Cause**: Bit-stream synchronization issue at the 9-to-10 bit width transition point (code 512). The encoder and decoder were getting out of sync because they add dictionary entries at different points relative to writing/reading codes.
+### Issue 2: Large Repetitive Data ("Invalid Code: 753")
 
-**Solution**: Implemented separate `update_bit_width_decode()` function that uses a different threshold (one less than the encoder's threshold) to compensate for the one-entry lag between encoder and decoder.
+**Status**: STALE — no longer reproduces; removed from the issue list
 
-**Test Results**:
-- Size 0-254 bytes: ✅ PASS
-- Size 255-256 bytes: ✅ PASS (FIXED!)
+Older revisions reported an `Invalid LZW code: 753` decode failure on large
+(>100 KB) highly repetitive inputs. Re-running the matrix shows this does
+not reproduce at any size:
 
----
+| Input | Size | Result |
+|-------|------|--------|
+| "The quick brown fox..." x 100 | 4.5 KB | PASS (byte-identical to libtiff, `fox_4500` fixture) |
+| "The quick brown fox..." repeated | 1 MiB | PASS (both directions vs Pillow/libtiff) |
+| "The quick brown fox..." x 200,000 | 9.2 MB | PASS (`test_lzw_very_large_input`) |
+| All-same-byte | 100 KB | PASS (both directions vs Pillow/libtiff) |
 
-### Issue 2: Large Repetitive Data
+The former workarounds (use DEFLATE, split files, fall back to `weezl`) are
+no longer needed.
 
-**Description**: Large files with highly repetitive patterns (e.g., "The quick brown fox..." repeated 100+ times) fail with "Invalid Code: 753" error during decompression.
+### Issue 3: No TIFF 6.0 ClearCode support (total libtiff/Pillow interop failure)
 
-**Root Cause**: Dictionary entry synchronization issue when building many repetitive patterns. Code 753 is beyond the expected dictionary size at that point.
+**Status**: FIXED in the v0.3.6 hardening pass (LZW-01)
 
-**Impact**:
-- ✅ **NO IMPACT** on typical TIFF files (which are usually <100KB tiles)
-- ✅ **NO IMPACT** on typical image data patterns
-- ✅ Works fine for files up to moderate sizes
-- ⚠️ Only affects very large (MB+) files with highly repetitive patterns
+Until this pass, `LzwConfig::TIFF` set `use_clear_code: false`: the decoder
+rejected code 256 as `InvalidClearCode` and the encoder never emitted one.
+TIFF 6.0 **mandates** a ClearCode as the first code of every strip and again
+when the code table reaches entry 4094, so every strip written by
+libtiff/Pillow/GDAL/Photoshop failed to decode, and every oxiarc-encoded
+strip was rejected by those tools — self round-trips passed while real-world
+TIFF interop failed 100% in both directions.
 
-**Test Results**:
-- Small repetitive data (<1KB): ✅ PASS
-- Medium data (up to ~50KB): ✅ PASS
-- Large repetitive data (>100KB): ❌ FAIL with InvalidCode error
+The fix (mirroring libtiff's `tif_lzw.c` exactly):
 
----
+- `LzwConfig::TIFF` now sets `use_clear_code: true`;
+- the encoder emits a leading ClearCode, resets the table (with another
+  ClearCode) when `next_code` reaches 4094, and accounts for the decoder's
+  phantom final table entry before writing EOI so the EOI width always
+  matches (libtiff `LZWPostEncode` semantics);
+- the decoder accepts ClearCode resets anywhere in the stream (including
+  libtiff's ratio-checkpoint resets), dropping back to 9-bit codes.
 
-## What Works Perfectly ✅
+**Differential verification (2026-07-13, both directions)** — see
+`tests/tiff_lzw_oracle.rs` (feature `tiff-oracle`) and the always-run pinned
+fixtures in `tests/tiff_ref_fixtures.rs`:
 
-The following use cases work flawlessly:
+- decode: 125/125 Pillow/libtiff-produced strips decode byte-identically
+  (sizes 1 B - 1 MiB, including width-transition boundary sweeps and
+  table-fill ClearCode resets);
+- encode: 125/125 oxiarc-produced TIFF-LZW files decoded correctly by
+  Pillow and accepted by `tiffcp`;
+- bonus: oxiarc's compressed output is **byte-identical** to libtiff's for
+  all 125 corpus cases (TIFF LZW with libtiff's parameters is fully
+  deterministic), which the pinned fixtures now gate on every `cargo test`.
 
-✅ **310-byte round-trip** (the critical OxiGDAL truncation fix)
-✅ **All typical TIFF patterns**:
-   - Natural images
-   - Geographic data (DEM, satellite imagery)
-   - Small to medium tiles (most TIFF tiles are 256x256 = 64KB)
-   - Repeated small patterns
+### Issue 4: 64 MiB-per-frame allocation DoS in the streaming decoder
 
-✅ **Comprehensive testing passed**:
-   - Empty input
-   - Single byte
-   - Small patterns (up to 254 bytes)
-   - Repeating bytes (all same value)
-   - Alternating patterns
-   - Various data types (UInt8, UInt16, Float32, Float64)
-   - RGB multi-band data
+**Status**: FIXED in the v0.3.6 hardening pass (LZW-02)
 
-✅ **OxiGDAL integration**:
-   - 100 out of 104 tests PASS
-   - COG (Cloud-Optimized GeoTIFF) files work correctly
-   - Tiled and striped layouts work
-   - Overviews work
+`LzwStreamDecoder` (TIFF mode) passed a hardcoded 64 MiB sentinel as
+`expected_size` for every frame, and `LzwDecoder::decode` pre-reserved it
+verbatim — 200,000 tiny frames (~2 MB of input) forced ~12.5 TB of
+cumulative allocator traffic. Now the stream framing carries the true
+uncompressed length per frame (8-byte header: compressed + uncompressed
+u32), the decoder clamps its up-front reservation to 64 KiB and grows
+incrementally, and each frame's decoded length is validated against the
+header (mismatch = `InvalidData`, never silently short/padded data).
+Re-measured: 200,000 tiny frames decode correctly with ~7 MiB peak RSS.
+Note: this changed the (crate-private) streaming frame format; streams
+written by older versions must be rewritten.
 
----
+### Issue 5: `LzwConfig` struct-literal panics
 
-## Comparison with weezl
+**Status**: FIXED in the v0.3.6 hardening pass (LZW-03)
 
-| Feature | weezl | oxiarc-lzw |
-|---------|-------|------------|
-| **310-byte test** | ❌ FAILS (truncates to ~250) | ✅ PASSES |
-| **Typical TIFF files** | ✅ Works | ✅ Works |
-| **256-byte edge case** | ✅ Works | ✅ PASSES (FIXED!) |
-| **Large repetitive** | ✅ Works | ⚠️ See Issue 2 |
-| **Pure Rust** | ✅ Yes | ✅ Yes |
-| **COOLJAPAN compliant** | ❌ No | ✅ Yes |
-
-**Conclusion**: oxiarc-lzw fixes the critical truncation bug that weezl has, and now also handles the 256-byte edge case correctly. It is suitable for OxiGDAL's primary use case (reading/writing typical TIFF files) and most edge cases.
-
----
-
-## Future Work (Priority: LOW)
-
-1. **Investigate dictionary synchronization**:
-   - Add detailed tracing to encoder/decoder dictionary building
-   - Compare entry-by-entry with reference implementation (libtiff)
-   - Fix off-by-one errors in bit-width transitions
-
-2. **Verify TIFF spec compliance**:
-   - Review TIFF 6.0 LZW specification in detail
-   - Compare early code change implementation with libtiff
-   - Test against TIFF conformance suite
-
-3. **Add comprehensive logging**:
-   - Optional debug mode to trace all codes written/read
-   - Dictionary state tracking
-   - Bit-width transition logging
+`LzwConfig::new(0, 12).clear_code()` panicked with subtract-with-overflow in
+debug builds (and returned bogus values in release). `LzwConfig::new` now
+validates `9 <= min_bits <= max_bits <= 12` and returns `Result`;
+`clear_code`/`eoi_code`/`first_code`/`max_code` use saturating arithmetic so
+even an invalid struct-literal config cannot panic, and
+`LzwConfig::validate()` is the authoritative gate (called by
+`LzwEncoder::new`/`LzwDecoder::new` via the dictionary).
 
 ---
 
-## Workarounds
+## Current Limitations
 
-For the edge cases that fail:
-- Use DEFLATE compression instead of LZW
-- Split large files into smaller chunks
-- Use the `weezl` crate directly if you specifically need these edge cases
+- **Horizontal-differencing predictor (TIFF tag 317)**: out of scope for
+  this crate. Predictor pre/post-processing is a container-level transform
+  that callers (e.g. OxiGDAL) must apply around the raw LZW codec.
+- **Old-style LSB-first TIFF LZW**: pre-TIFF-6.0 writers that packed codes
+  LSB-first are not supported (libtiff only reads, never writes, that
+  variant).
+- **Streaming frame format**: the `LzwStreamEncoder`/`LzwStreamDecoder`
+  framing is private to this crate (it is not part of the TIFF or GIF file
+  formats) and changed in v0.3.6 (Issue 4 above).
 
----
+## Verified Test Matrix (re-run 2026-07-13)
+
+- Empty input, 1 byte, all byte values, alternating patterns: PASS
+- Boundary sizes 1-40, 240-280, 500-530 (9->10 bit + EOI phantom-entry
+  corners): PASS, byte-identical vs libtiff in both directions
+- 1 KiB - 256 KiB incompressible (table-fill ClearCode resets): PASS, both
+  directions
+- Repetitive/text data up to 9.2 MB: PASS
+- Truncated/corrupted strips: return `Err` (or detectably short data),
+  never panic, never full-length wrong bytes
+- GIF LZW round-trip suite (`gif_lzw`): PASS (unchanged by this pass)
 
 ## Production Readiness
 
-**Verdict**: ✅ **PRODUCTION READY** for OxiGDAL's use case
-
-The implementation successfully:
-- Fixes the critical 310-byte truncation bug
-- Handles all typical TIFF file patterns
-- Passes 100 out of 104 OxiGDAL tests
-- Follows COOLJAPAN policies (Pure Rust, no unwrap, workspace)
-- Provides better error messages than weezl
-
-The failing edge cases are artificial patterns that don't occur in real geospatial TIFF files.
+**Verdict**: PRODUCTION READY for TIFF LZW interop with the real-world
+toolchain (libtiff, Pillow, GDAL) — now backed by two-direction differential
+evidence rather than self round-trips alone. Regressions are gated by the
+always-run pinned-fixture tests and, where the tools are installed, the
+`tiff-oracle` differential suite.

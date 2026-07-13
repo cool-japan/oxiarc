@@ -7,9 +7,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 keywords = ["bzip2", "compression", "bwt", "huffman", "mtf"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
@@ -17,6 +22,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "bwt_bench"
@@ -29,6 +35,9 @@ harness = false
 [features]
 default = []
 parallel = ["rayon"]
+# Differential interop tests against the system `bzip2` CLI. Tests behind
+# this feature self-skip (without failing) when the binary is absent.
+bzip2-oracle = []
 
 [lints]
 workspace = true

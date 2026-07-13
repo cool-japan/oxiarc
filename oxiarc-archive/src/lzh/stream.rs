@@ -54,12 +54,14 @@ impl<R: Read> LzhStreamReader<R> {
     }
 
     /// Attach a progress sink that will be notified for each entry.
+    #[must_use]
     pub fn with_progress(mut self, progress: ProgressHandle) -> Self {
         self.progress = Some(progress);
         self
     }
 
     /// Attach a cancellation token.
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
@@ -92,9 +94,36 @@ impl<R: Read> LzhStreamReader<R> {
         // So the next offset after compressed data is data_offset + compressed_size.
         let compressed_size = header.compressed_size as usize;
 
-        // Read and decompress the entry's data.
-        let mut compressed = vec![0u8; compressed_size];
-        self.reader.read_exact(&mut compressed)?;
+        // Read the entry's compressed data. `compressed_size` is an
+        // untrusted u32 (up to ~4 GiB), so never allocate it blindly:
+        // pre-reserve a bounded amount and let `take + read_to_end` grow
+        // the buffer only as bytes actually arrive — a short/truncated
+        // stream then fails fast instead of first committing gigabytes.
+        const PREALLOC_CAP: usize = 1 << 20; // 1 MiB up-front ceiling
+        let mut compressed = Vec::new();
+        compressed
+            .try_reserve_exact(compressed_size.min(PREALLOC_CAP))
+            .map_err(|_| {
+                OxiArcError::corrupted(
+                    header.data_offset,
+                    format!(
+                        "cannot allocate buffer for compressed entry '{}' ({} bytes)",
+                        header.filename, compressed_size
+                    ),
+                )
+            })?;
+        let got = (&mut self.reader)
+            .take(compressed_size as u64)
+            .read_to_end(&mut compressed)?;
+        if got != compressed_size {
+            return Err(OxiArcError::corrupted(
+                header.data_offset,
+                format!(
+                    "compressed data for '{}' truncated: expected {} bytes, got {}",
+                    header.filename, compressed_size, got
+                ),
+            ));
+        }
 
         // Advance the running offset past the header bytes and compressed
         // data *before* decoding, so a per-entry failure below leaves the
@@ -112,7 +141,13 @@ impl<R: Read> LzhStreamReader<R> {
                 String::from_utf8_lossy(&id).into_owned(),
             ));
         } else {
-            decode_lzh(&compressed, header.method, header.original_size as u64).map_err(|e| {
+            // Resolve the true uncompressed size the same way
+            // `LzhHeader::to_entry` does: the 64-bit extension header 0x42
+            // overrides the (possibly truncated) 32-bit base field.
+            let uncompressed_size = header
+                .uncompressed_size64
+                .unwrap_or(header.original_size as u64);
+            decode_lzh(&compressed, header.method, uncompressed_size).map_err(|e| {
                 OxiArcError::corrupted(
                     0,
                     format!("LZH decompression failed for '{}': {}", header.filename, e),
@@ -321,6 +356,159 @@ mod tests {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut e, &mut out).expect("read_to_end x.txt");
         assert_eq!(&out, b"content");
+    }
+
+    // ---- LZHUF-02 / LZHUF-03 regressions ----
+
+    /// Hand-assemble a level-2 LZH header for `-lh5-` data with an
+    /// arbitrary 32-bit `original_size` field plus a 0x42 extension header
+    /// carrying the true 64-bit uncompressed size, followed by the
+    /// compressed bytes.
+    ///
+    /// Layout (level 2): `[total u16][method 5][compressed u32]
+    /// [original u32][mtime u32][attr][level=2][crc16][os_id]
+    /// [first_ext_size u16][ext chain][data...]`, where each extension
+    /// block is `[type][payload][next_size u16]` and its declared size
+    /// includes the trailing next-size field.
+    fn build_lzh_with_size64(
+        name: &str,
+        compressed: &[u8],
+        original_size32: u32,
+        size64: u64,
+        crc16: u16,
+    ) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let ext_name_len = 3 + name_bytes.len(); // type + payload + next_size
+        let ext_size64_len = 3 + 8;
+        let total_size = 21 + 2 + 1 + 2 + ext_name_len + ext_size64_len;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&(total_size as u16).to_le_bytes());
+        out.extend_from_slice(b"-lh5-");
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&original_size32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        out.push(0x20); // attributes
+        out.push(2); // level
+        out.extend_from_slice(&crc16.to_le_bytes());
+        out.push(b'U'); // os_id
+        // First extension size → 0x01 filename block
+        out.extend_from_slice(&(ext_name_len as u16).to_le_bytes());
+        out.push(0x01);
+        out.extend_from_slice(name_bytes);
+        // Next: 0x42 block
+        out.extend_from_slice(&(ext_size64_len as u16).to_le_bytes());
+        out.push(0x42);
+        out.extend_from_slice(&size64.to_le_bytes());
+        // End of chain
+        out.extend_from_slice(&0u16.to_le_bytes());
+
+        assert_eq!(out.len(), total_size, "header assembly mismatch");
+        out.extend_from_slice(compressed);
+        out.push(0); // end-of-archive marker
+        out
+    }
+
+    /// LZHUF-02: the streaming reader must honor the 64-bit uncompressed
+    /// size from extension header 0x42 instead of the raw 32-bit field.
+    /// The archive here declares a *wrong* 32-bit size (too small) and the
+    /// correct size only via 0x42 — exactly what the seekable `LzhReader`
+    /// already resolves through `to_entry()`.
+    #[test]
+    fn test_lzh_stream_honors_size64_extension() {
+        use oxiarc_core::Crc16;
+        use oxiarc_lzhuf::LzhEncoder;
+
+        let original: Vec<u8> = b"size64 override test "
+            .iter()
+            .cycle()
+            .take(3000)
+            .copied()
+            .collect();
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+        let compressed = encoder.compress_to_vec(&original).expect("lh5 encode");
+        let crc = Crc16::compute(&original);
+
+        // 32-bit field lies (100 bytes); 0x42 carries the true size.
+        let archive = build_lzh_with_size64("a.bin", &compressed, 100, original.len() as u64, crc);
+
+        let mut stream = LzhStreamReader::new(Cursor::new(archive));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry must succeed with 0x42 override")
+            .expect("entry present");
+        assert_eq!(entry.header.filename, "a.bin");
+        assert_eq!(
+            entry.header.uncompressed_size64,
+            Some(original.len() as u64)
+        );
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut out).expect("read entry");
+        assert_eq!(out, original, "content must decode at the 0x42 size");
+    }
+
+    /// LZHUF-03: a header claiming far more compressed bytes than the
+    /// stream contains must fail fast with a corruption error instead of
+    /// pre-committing the full claimed allocation.
+    #[test]
+    fn test_lzh_stream_truncated_compressed_size_claim() {
+        use oxiarc_core::Crc16;
+
+        let payload = b"tiny";
+        let crc = Crc16::compute(payload);
+        // Claim ~64 MiB of compressed data but supply only 4 bytes.
+        let mut archive = build_lzh_with_size64(
+            "bomb.bin",
+            payload,
+            payload.len() as u32,
+            payload.len() as u64,
+            crc,
+        );
+        // Patch the compressed-size field (offset 7..11) to a huge value.
+        archive[7..11].copy_from_slice(&(64u32 << 20).to_le_bytes());
+
+        let mut stream = LzhStreamReader::new(Cursor::new(archive));
+        let result = stream.next_entry();
+        assert!(
+            result.is_err(),
+            "oversized compressed_size claim on a short stream must error"
+        );
+    }
+
+    /// The streaming and seekable readers must agree on an archive whose
+    /// entry carries a 0x42 extension (LZHUF-02 parity check).
+    #[test]
+    fn test_lzh_stream_size64_matches_seekable_reader() {
+        use crate::lzh::LzhReader;
+        use oxiarc_core::Crc16;
+        use oxiarc_lzhuf::LzhEncoder;
+
+        let original: Vec<u8> = (0u16..2048).map(|i| (i % 256) as u8).collect();
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+        let compressed = encoder.compress_to_vec(&original).expect("lh5 encode");
+        let crc = Crc16::compute(&original);
+        let archive = build_lzh_with_size64("b.bin", &compressed, 7, original.len() as u64, crc);
+
+        // Seekable reader.
+        let mut reader = LzhReader::new(Cursor::new(archive.clone())).expect("LzhReader::new");
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.size, original.len() as u64);
+        let mut seekable = Vec::new();
+        reader
+            .extract(&entry, &mut seekable)
+            .expect("seekable extract");
+
+        // Streaming reader.
+        let mut stream = LzhStreamReader::new(Cursor::new(archive));
+        let mut stream_entry = stream
+            .next_entry()
+            .expect("stream next_entry")
+            .expect("entry present");
+        let mut streamed = Vec::new();
+        std::io::Read::read_to_end(&mut stream_entry, &mut streamed).expect("stream read");
+
+        assert_eq!(streamed, seekable, "stream and seekable readers must agree");
+        assert_eq!(streamed, original);
     }
 
     #[test]

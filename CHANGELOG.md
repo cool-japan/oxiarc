@@ -5,6 +5,471 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-07-13
+
+This release bundles two hardening passes from the same 0.3.6 development cycle.
+
+**2026-07-08 — security-hardening and API-stabilization pass:** a broad pass
+across every codec/container crate closing memory-safety, path-traversal, and
+panic issues found by internal audit, plus a documentation/CLI-ergonomics pass
+and a large expansion of test/example/fuzz coverage. No archive/stream wire
+format changed; all fixes are either defensive (reject malformed/hostile input
+instead of panicking or over-allocating) or additive (new opt-in flags, APIs,
+and docs).
+
+**2026-07-13 — reference-interoperability and hostile-input hardening
+campaign:** root problem — the test suites only exercised oxiarc→oxiarc
+round-trips, which masked total interoperability failure — several codecs
+were self-consistent **private dialects** that passed their own tests while
+failing ~100% against the reference implementation in both directions (zstd,
+brotli, LZMA2/.xz multi-chunk, TIFF-LZW, SZIP), and several decoders returned
+`Ok` with silently wrong or truncated data. A 22-auditor differential+audit
+investigation produced a 75-item remediation plan (P0–P3); all 75 items were
+implemented. Every codec is now validated by reference-tool differential
+testing, in both directions, with permanent regression gates. Two codec wire
+formats necessarily changed (see Changed).
+
+### Fixed — codec interoperability (private dialects eliminated)
+
+- **oxiarc-zstd** (flagship; resolves the OxiGDAL-reported FSE decoder
+  panic): the FSE backward bitstream was read FIFO/LSB-first instead of
+  RFC 8878 LIFO/MSB-first — and the writer mirrored the same wrong layout,
+  which is why self-round-trips passed while **0/64** real zstd frames
+  decoded (62 panics, 2 silent corruptions). Also fixed: the 4-stream
+  Huffman jump table was read as offsets instead of sizes; Huffman weight
+  tables lacked validation and the RFC 4.2.1.1 implied-last-weight
+  deduction; FSE tables lacked probability-sum validation and bounds-checked
+  state indexing (the reported `fse.rs` index-OOB panic site); a truncated
+  1-byte FCS corrupted `set_content_size(false)` frames ≥ 256 bytes;
+  raw-content dictionary frames carried a fabricated Dictionary_ID that
+  reference zstd could never match. Now: **64/64** corpus + **101/101** wide
+  reference frames decode byte-identical; **85/85** oxiarc frames accepted
+  by `zstd -d`; **9/9** dictionary frames; 60,000 fuzz cases, 0 panics. The
+  Huffman literals encoder is wired in (used when it beats Raw/RLE);
+  sequence sections remain predefined/RLE FSE — RFC-valid, a ratio
+  limitation only, documented honestly.
+- **oxiarc-brotli**: full RFC 7932 rewrite of decoder AND encoder —
+  window-bits tree (§9.2), the 704-symbol insert-and-copy table (§5) with
+  implicit distance-code-0, block-type switching (§9.3), the RFC
+  code-length VLC with Kraft-complete stop, context maps + the exact §7.1
+  context LUTs, distance short-code ring semantics, metadata meta-blocks,
+  two-level `O(1)` Huffman decode tables, strict trailing-garbage/padding
+  rejection, and the byte-exact **122,784-byte Appendix A static
+  dictionary** (previously an empty stub) with all 121 transforms
+  (UTF-8-aware ferment casing). Baseline: 141/172 reference-stream decode
+  failures plus 21 silently-wrong results, and `brotli -d` rejected
+  **441/441** oxiarc outputs. Now: **608/608** reference streams decode
+  byte-identical (zero silent mismatches); **588/588** oxiarc streams
+  accepted by `brotli -d`, with real compressed meta-blocks. The encoder's
+  ratio trails the reference at q10–11 and on structured binary (no
+  block-splitting/context modeling on the encode side) — ratio only, not
+  correctness.
+- **oxiarc-lzma / XZ**: the LZMA2 decoder reset the uncompressed position
+  per chunk, desyncing `pos_state`/`lit_state`, so standard multi-chunk
+  `.xz` (i.e. most real files over one chunk) was undecodable — oxiarc's
+  own encoder reset every chunk, masking it. The position is now a
+  persistent decoder field reset only on dictionary reset. A stateful
+  chunked encoder (cross-chunk matching, reset-1/2 continuation chunks) was
+  added, and `LzmaProperties` now validates lc/lp/pb (`new(20, 20, 4)`
+  previously aborted the process via a multi-TiB allocation). Verified vs
+  `xz 5.8.3`: **60/60** `.xz` decode + **8/8** encode byte-identical,
+  multi-block OK.
+- **oxiarc-bzip2**: multi-stream/concatenated `.bz2` (pbzip2, lbzip2,
+  `cat a.bz2 b.bz2`) was silently truncated to the first stream with an
+  `Ok` return — now all streams decode and trailing garbage is an error.
+  Legacy randomised blocks (bzip2 ≤ 0.9.0) are de-randomised (new
+  `src/rand.rs`). The encoder now implements libbz2's multi-Huffman-table
+  `sendMTFValues` clustering (previously 1 effective table; output up to
+  +50% larger than reference) reaching **99.9%** of the reference ratio.
+  New `decompress_with_limit(reader, max_out)` bounded API. Verified vs
+  `bzip2 1.0.8`: **324/324** both directions.
+- **oxiarc-szip**: the AEC/CCSDS-121 framing placed the RSI reference
+  sample outside the block option-ID field, breaking libaec interop in both
+  directions including silent wrong output on genuine libaec streams.
+  Rewritten per CCSDS-121.0-B-2 §5.2 (option ID precedes all
+  `pixels_per_block` samples; zero-block/ROS/second-extension options;
+  typed validation errors replace silent truncation). Verified against
+  **live libaec 1.1.4: 2450/2450 decode + 4900/4900 encode
+  byte-identical.**
+- **oxiarc-lzw**: TIFF LZW had no Clear Code support — TIFF 6.0 mandates
+  one as the first code of every strip and at table entry 4094 — making it
+  100% incompatible with real TIFF (libtiff/Pillow/GDAL) in both
+  directions. Fixed to libtiff `tif_lzw.c` semantics. Verified:
+  **125/125** both directions vs Pillow/libtiff; oxiarc's encoded output is
+  **byte-identical to libtiff's**.
+- **oxiarc-deflate**: the core codec was already bit-exact vs CPython
+  zlib/gzip and the gzip CLI — but the streaming/trait wrappers were not:
+  `Inflater::decompress`/`decompress_all` silently truncated output past
+  32 KiB and reported `Done`; `Deflater` broke DEFLATE bit-continuity
+  across `deflate(_, false)` calls (its own inflate rejected the output)
+  and discarded compressed bytes that overflowed the caller's buffer;
+  `GzipDecoder` could not decode concatenated multi-member gzip (including
+  oxiarc's own parallel-gzip output). All wrappers now stream correctly and
+  are reference-verified.
+- **oxiarc-lz4**: encoders violated the LASTLITERALS(5) end-of-block
+  invariant (reference lz4 rejected the frames for common repetitive
+  inputs), and the frame decoder ignored the block-independence flag
+  (`lz4 -BD` linked frames failed at block 2; oxiarc could not emit them
+  either — new `FrameDescriptor::with_block_independence` + rolling
+  dictionary). Verified vs `lz4 1.10.0`: **11/11** encode + **44/44**
+  decode + **3/3** linked-block frames.
+- **oxiarc-lzhuf**: lh4–lh7 decoders returned `Ok` with silently truncated
+  output on truncated streams (zero-padded reads past EOF read as
+  end-of-block); all decode paths now detect exhaustion — **4,442/4,442**
+  truncation trials return `Err` (previously 4,440 returned a silent
+  short `Ok`). The streaming decoder was hardened the same way, and
+  `LzhStreamReader` now honors the 64-bit uncompressed-size extension
+  header (0x42).
+
+### Security — 2026-07-08 pass
+
+- **oxiarc-cli** (Zip-Slip / path traversal): hardened `sanitize_relative_path`
+  to treat both `/` and `\` as separators and strip `.`/`..`/root/drive-prefix
+  components (previously a bare `..` component could pass through). All
+  archive readers (ZIP, 7z, CAB, LZH, ISO 9660) now route extracted names
+  through this sanitizer, and `resolve_output_path` independently rejects any
+  join that would resolve outside the output root.
+- **oxiarc-cli** (symlink handling): extraction now creates real symlinks for
+  archive entries that declare one (currently only TAR reads populate
+  symlink metadata) instead of silently following/overwriting through them;
+  Windows falls back to a warning when `SeCreateSymbolicLinkPrivilege` is
+  unavailable.
+- **oxiarc-cli** (Windows paths): fixed long-path (`\\?\`) and reserved
+  device-name (`CON`, `NUL`, `AUX`, ...) sanitization, including a
+  previously-unhandled trailing `.`/space on the final path component.
+- **oxiarc-archive** (ZIP reader): fixed an integer underflow in AES
+  compressed-size accounting that could panic on a crafted header; central
+  directory and per-entry reads now validate declared lengths against actual
+  remaining stream bytes and use `try_reserve`/`try_reserve_exact` instead of
+  unconditional `Vec::with_capacity`/`vec![0; n]`, turning malicious
+  oversized-length headers into a clean error instead of an allocator
+  abort/OOM.
+- **oxiarc-archive** (ZIP reader): fixed a second, unrelated integer-underflow
+  panic in `LocalFileHeader::modified_time` — a crafted local-file header
+  encoding a zero DOS month field underflowed the `month - 1` term of the
+  epoch-offset calculation (panicking in debug, wrapping to a huge day count
+  in release); DOS date fields are 1-based, so a zero month or day is now
+  clamped to the minimum valid value (1) instead.
+- **oxiarc-archive** (ZIP reader): classic and Zip64 end-of-central-directory
+  records that declare more than one disk are now rejected — spanned/
+  multi-volume ZIP archives are explicitly unsupported rather than silently
+  misread.
+- **oxiarc-archive** (TAR): fixed a slice-index panic in the PAX extended-
+  header parser on malformed short records (e.g. `b"1 X=Y\n"`); bounded the
+  untrusted declared sizes read for PAX/GNU long-name payloads and whole-
+  entry extraction against actual remaining stream/extension-data length.
+- **oxiarc-archive** (LZH, 7z, ZIP stream reader): bounded three more
+  header-driven allocation sites (`zip::stream`, `lzh::reader`,
+  `sevenz::header`) the same way — declared length checked against bytes
+  actually available, then `try_reserve`/`try_reserve_exact`.
+- **oxiarc-archive** (ISO 9660): `walk_directory` now tracks visited
+  directory LBAs (rejecting a directory record that points back at itself or
+  an ancestor), enforces a maximum recursion depth, and caps + bounds-checks
+  the declared directory-extent size before allocating — closing a crafted-
+  image cyclic-directory and unbounded-allocation DoS.
+- **oxiarc-zstd**: capped the untrusted 8-byte `Frame_Content_Size` frame-
+  header field against the window size before reserving output capacity
+  (`Vec::try_reserve` instead of `Vec::reserve`), fixing a capacity-overflow
+  panic/OOM risk on a crafted frame header (e.g. content size = `u64::MAX`).
+- **oxiarc-lzma**: capped the LZMA/LZMA2 dictionary-size allocation at 1.5 GiB
+  and switched to lazy, incrementally-grown dictionary buffers instead of
+  eagerly zero-filling a header-declared size; the XZ container reader now
+  rejects any LZMA2 filter whose declared dictionary size exceeds the cap
+  before constructing a decoder, and validates the XZ index CRC-32 (never
+  checked before) plus the footer Backward-Size field against the parsed
+  index.
+- **oxiarc-archive/zip** (encryption correctness): AES-128/192 encryption was
+  previously silently downgraded to an AES-256 code path with a zero-padded
+  key (producing output incompatible with WinZip/7-Zip/WinRAR and weaker
+  than advertised); replaced with a genuine FIPS-197 AES cipher whose key
+  schedule and round count are derived from the actual key length. The
+  AE-2 (HMAC-SHA1) authentication-tag comparison now runs in constant time, and
+  salts are drawn from the OS CSPRNG (`/dev/urandom`, with a strong
+  entropy-mixing fallback) instead of a weaker PRNG; ZipCrypto's header
+  randomization was aligned to the same CSPRNG source.
+- **oxiarc-core** (CRC SIMD): fixed `is_simd_available()`/`implementation_name()`
+  to report the actually-dispatched CRC-32 code path (previously x86_64
+  could misreport PCLMULQDQ while the runtime dispatch had silently fallen
+  back to software). Verified the aarch64 PMULL constants against the
+  scalar reference over thousands of inputs/lengths — the implementation was
+  already correct; only the diagnostics were wrong.
+- **oxiarc-lzhuf** (`-lh1-` decode): a malformed or truncated `-lh1-`
+  compressed stream paired with a large declared uncompressed size could
+  loop indefinitely, manufacturing zero-padding output until memory was
+  exhausted (decompression-bomb DoS); the bit reader now flags end-of-input
+  exhaustion and `decode_lh1` returns an error as soon as decoding would
+  read past the real compressed data instead of continuing to fabricate
+  output.
+- **oxiarc-lzhuf / oxiarc-core**: fixed `LzssDecoder::new`/`RingBuffer::new`
+  panicking on a non-power-of-two or zero window size; added non-panicking
+  `RingBuffer::try_new`/`OutputRingBuffer::try_new` alternatives and
+  documented the `# Panics` contract of the existing infallible
+  constructors.
+- **oxiarc-lzma**: replaced two `.lock().expect(...)` calls on a
+  `LzmaPool` mutex with poison-recovering `unwrap_or_else` — a panic in one
+  worker thread while holding the pool lock no longer poisons the pool for
+  every other thread.
+
+### Security — 2026-07-13 pass
+
+- **oxiarc-cli**: `--memory-limit` — the advertised decompression-bomb
+  defense — was silently unenforced for file-based gzip/xz/bzip2
+  extraction: a 50 MB bomb expanded fully under `--memory-limit 1M` and
+  exited 0. It is now enforced **during** decode for every format (gzip
+  ISIZE, xz stream-index declared size, lz4/zstd frame content sizes,
+  bzip2/brotli/snappy bounded `decompress_with_limit` decoders). Measured:
+  a brotli bomb under `--memory-limit 1M` peaks at **3.3 MB RSS vs
+  72.9 MB** unbounded and exits non-zero.
+- **oxiarc-lz4**: decompression-bomb fix — `decompress_block` only checked
+  `max_output` between sequences, never inside one, so a single crafted
+  sequence overshot the cap (measured: 64 B input → 1,020,020 B output,
+  15,937x). The projected size is now checked before every literal/match
+  copy, matching liblz4's destination-capacity discipline.
+- **oxiarc-snappy**: the 64 KiB per-chunk uncompressed cap was not
+  enforced in the frame decoder (one crafted chunk decoded to ~200 MiB,
+  21x amplification); now rejected up front, with bounded total-output
+  APIs added.
+- **oxiarc-archive (XZ)**: a 28-byte crafted `.xz` triggered an unbounded
+  allocation abort (SIGABRT) from the block-header compressed-size field;
+  an out-of-bounds index panic in LZMA2 filter-props parsing; and the
+  block-header CRC32 — written but never checked on read — is now
+  validated before any parsed field is used.
+- **oxiarc-archive (7z)**: complex-coder stream counts were read as
+  unbounded varints feeding `Vec::with_capacity` (capacity-overflow panic
+  or 16 TiB reservation from one crafted archive), and the `kCrc`
+  aggregate materialized `vec![true; count]` (a 175-byte archive reserved
+  256 MB). Both bounded.
+- **oxiarc-archive (CAB/LZH/ISO)**: CFFILE filename reads capped;
+  `LzhStreamReader` no longer eagerly allocates the untrusted u32
+  `compressed_size` (`try_reserve` + remaining-bytes check); the ISO 9660
+  directory-record parser no longer panics on a non-zero `LEN_DR` < 34
+  (index-OOB reachable from any untrusted `.iso`).
+- **oxiarc-deflate**: `ZlibStreamDecoder`'s concatenation fallback re-ran
+  full, bomb-amplifiable decompression per candidate split offset (a
+  ~22 KB adversarial stream hung > 60 s); now O(n) via exact
+  consumed-length tracking, plus a `with_max_output` cap.
+
+### Fixed — containers and CLI
+
+- **oxiarc-archive (ZIP)**: externally-encrypted archives (`zip -e`,
+  7-Zip, WinRAR, Python) were reported as **unencrypted** and silently
+  mis-extracted — detection used a homegrown 0xEE,0xEE extra-field marker
+  only oxiarc's own writer emits, instead of general-purpose bit 0; the GP
+  flags are now persisted per entry and drive detection. Also fixed: a
+  DOS-date month=0 underflow panic in `read_central_dir_entry` (a missed
+  duplicate of the 0.3.6 `modified_time` fix, now factored into one shared
+  helper); AE-2 entries now write CRC=0 per the WinZip AES spec (was the
+  plaintext CRC — a spec violation and a plaintext-checksum leak); the
+  Info-ZIP data-descriptor password-check byte (high byte of the DOS mtime
+  when GP bit 3 is set) is accepted, so `zip -e` archives decrypt with the
+  correct password; and written DOS timestamps use a proper civil-date
+  algorithm (the naive 365/30-day math drifted ~14 days and could emit
+  month=13).
+- **oxiarc-archive (CAB)**: the MSZIP LZ77 window is now carried across
+  CFDATA blocks within a folder (spec-valid multi-block cabinets from
+  cabarc/makecab/libmspack previously failed with InvalidDistance); CFDATA
+  per-block checksums — parsed but never validated — are now verified;
+  extraction caches the decoded folder instead of re-decompressing it for
+  every file (was O(files × folder size)); unknown compression-method
+  codes now return `unsupported_method` instead of being silently treated
+  as stored.
+- **oxiarc-archive (TAR)**: `TarStreamReader` silently mis-decoded GNU
+  old-format sparse ('S') entries — wrong size and content with no error
+  (a realsize=16384 entry returned 600 raw bytes with `Ok`). The streaming
+  reader now fully supports GNU old-format and PAX 0.1 sparse maps
+  (bsdtar-verified byte-identical). PAX 1.0 sparse remains unsupported
+  (documented).
+- **oxiarc-cli**: raw Brotli has no magic bytes, so `.br` files were
+  unusable via any file-path command including oxiarc's own output (only
+  the stdin `--format br` path worked); an extension-based fallback fixes
+  `detect`/`list`/`extract`/`test`/`convert` for `.br`. Extracting a
+  single-file format to a non-existent output directory now creates it
+  (previously a raw OS error, inconsistent with ZIP/TAR).
+- Fixed a pre-existing flaky test race (async_lzh/async_tar suites shared
+  a deletable temp path across parallel tests); each test now uses a
+  unique path.
+
+### Fixed — CLI and encoder correctness (2026-07-08 pass)
+
+- **oxiarc-cli**: the `--progress`/`-P` flag was inert — it defaulted to
+  `true` regardless of whether it was passed. It is now a plain opt-in
+  boolean flag, off by default.
+- **oxiarc-cli**: `oxiarc create`/`add` directory traversal could infinite-
+  loop or dereference-and-copy through a circular or malicious symlink;
+  traversal is now symlink-aware (`symlink_metadata`, never follows links)
+  with a visited-canonical-path set guarding directory cycles.
+- **oxiarc-cli**: `oxiarc convert` no longer silently clobbers an existing
+  output file.
+- **oxiarc-cli**: filesystem errors during `create`/`add`/`extract` now name
+  the offending path instead of a bare I/O error.
+- **oxiarc-cli**: replaced an `unreachable!()` at the end of `cmd_extract`
+  with a proper `Err(...)` return, per the no-panic policy.
+- **oxiarc-lzma**: fixed an LZMA2 multi-chunk encoder/decoder desync that
+  corrupted varied (non-repeated-byte) data spanning more than one chunk.
+  `Lzma2ChunkedEncoder` only reset the decoder's dictionary on the first
+  chunk even though every chunk is compressed with a fresh, history-less
+  `LzmaEncoder`; the decoder then seeded its literal-coder context from the
+  previous chunk's dictionary tail while the encoder assumed empty history,
+  desyncing the range coder on the first colliding literal. Every chunk (and
+  sub-chunk) now resets the dictionary to match, fixing the default
+  `encode_lzma2`/`decode_lzma2` path for inputs above the 2 MiB chunk-size
+  threshold.
+- **oxiarc-zstd**: one-shot compression always framed its output as
+  `Single_Segment`, so the frame's implicit window size equaled the full
+  content size; reference decoders enforce a default `windowLogMax` (128 MiB
+  for libzstd's simple decompression API) and could reject an
+  oxiarc-produced frame larger than that. Content above the internal 8 MiB
+  window cap now instead gets an explicit, bounded 8 MiB `Window_Descriptor`
+  — always sufficient since every block is compressed independently and
+  match offsets never cross a block boundary — so the implicit window never
+  approaches the reference-decoder limit regardless of input size.
+
+### Changed — 2026-07-08 pass
+
+- **Breaking (pre-1.0) API freeze**: `oxiarc-core::FlushMode`,
+  `oxiarc-core::CompressStatus`/`DecompressStatus`, `oxiarc-zstd::BlockType`/
+  `LiteralsBlockType`, `oxiarc-lz4::Lz4Level`, and the `OxiArcError`/
+  `BrotliError`/`SnappyError`/`LzwError`/`SzipError` error enums are now
+  `#[non_exhaustive]` for SemVer stability ahead of 1.0. Downstream code
+  matching on these must include a wildcard arm (existing in-workspace call
+  sites already did).
+- **oxiarc-core**: removed the unused `CompressionLevel(u8)` newtype (dead
+  code — every codec crate already has its own, differently-ranged
+  `CompressionLevel` type); `Compressor`/`Decompressor` trait docs now
+  correctly describe them as optional, DEFLATE-family-only traits rather
+  than "implemented by all algorithms".
+- **oxiarc-zstd**: advanced internal re-exports (`lz77::{LevelConfig,
+  Lz77Sequence, MatchFinder}`, `bitwriter::{ForwardBitWriter,
+  BackwardBitWriter}`) are demoted to `#[doc(hidden)]` — no longer part of
+  the crate's documented/SemVer-covered public API surface.
+- **oxiarc-lzma**: the `match_finder` and `model` modules are demoted from
+  `pub mod` to `pub(crate) mod`, and their crate-root re-exports —
+  `match_finder::{Bt4MatchFinder, HashChainMatchFinder, MatchFinder}` and
+  `model::{LzmaModel, State}` — are removed entirely. Breaking (pre-1.0)
+  change: `Bt4MatchFinder`, `HashChainMatchFinder`, `MatchFinder`,
+  `LzmaModel`, and `State` are no longer publicly reachable from
+  `oxiarc_lzma` (`LzmaProperties`, previously re-exported alongside
+  `LzmaModel`/`State`, remains public via its own
+  `pub use model::LzmaProperties;`).
+- **oxiarc-cli**: added a global `--quiet`/`-q` flag; `list`/`test`/`info`/
+  `detect`'s `archive` argument now accepts `-` for stdin.
+- Numerous `#[must_use]` additions on by-value builder setters across
+  `oxiarc-core`, `oxiarc-deflate`, `oxiarc-lz4`, and `oxiarc-lzhuf`
+  (setters that consume and return `self` now warn if the return value is
+  discarded).
+
+### Changed — 2026-07-13 pass
+
+- **Wire-format corrections (breaking for oxiarc-only streams)**:
+  oxiarc-szip and the crate-private LZW stream framing moved from private
+  dialects to the standard formats. Streams produced by earlier oxiarc
+  versions of these two codecs are not readable by the fixed code (and
+  vice versa) — intended, since the old bytes interoperated with nothing
+  else. The brotli/zstd/lzma/bzip2/lz4 fixes change emitted bytes too, but
+  all outputs old and new remain decodable — the new ones now also by the
+  reference tools.
+- **API stability (pre-1.0)**: 18 public enums marked `#[non_exhaustive]`
+  (`CompressionMethod`, `EntryType`, `ArchiveFormat`, `RecoveryStatus`,
+  `LenientWarningKind`, and the remaining format/method/status/error
+  enums); 106 `#[must_use]` attributes added on consuming builder setters;
+  internal types no longer leaked through public signatures.
+- **Fallible constructors**: `LzwConfig::new` now returns `Result`
+  (invalid bit widths previously panicked); `LzmaProperties` validates
+  lc/lp/pb. New error variants: `SampleOutOfRange`/`InputTooShort`/
+  `InvalidBlockOption` (szip), `ChunkTooLarge`/`TotalOutputExceeded`
+  (snappy).
+- **oxiarc-core**: `BitReader::fill_buffer` now loops on short reads
+  instead of failing with `UnexpectedEof` on valid streams read from
+  pipes/sockets; ring-buffer back-reference copies are length-bounded.
+
+### Added — 2026-07-08 pass
+
+- **SECURITY.md** and **CONTRIBUTING.md** at the workspace root.
+- **oxiarc-cli**: `man/` troff man pages for every subcommand, and shell
+  completions regenerated for bash/zsh/fish/PowerShell to match the new
+  flags.
+- Expanded regression-test coverage for every fix above (path sanitization,
+  bounded-allocation, cyclic-ISO-directory, AES known-answer/CSPRNG,
+  zstd/LZMA crafted-header, TAR PAX panic, symlink extraction, and more).
+- `proptest`-based round-trip tests for `oxiarc-deflate`, `oxiarc-lz4`,
+  `oxiarc-lzma`, `oxiarc-lzhuf`, `oxiarc-lzw`, `oxiarc-brotli`,
+  `oxiarc-bzip2`, `oxiarc-snappy`, and `oxiarc-zstd`.
+- `fuzz/` targets and new integration-test fixtures/corpora (CAB, ISO 9660
+  interop) under `oxiarc-archive/tests/`.
+- `examples/` directories added across most crates; new CLI integration
+  tests (`cli_flags`, `cli_convert`, `cli_completion`).
+- Compiling rustdoc doctests added/repaired throughout (previously several
+  crates had `ignore`-fenced or otherwise non-compiling examples).
+- **Packaging**: every workspace crate now has a per-crate `LICENSE` (a
+  symlink to the root `LICENSE`) so `cargo package`/crates.io/docs.rs render
+  the license file without relying on the workspace-level file alone, plus a
+  `[package.metadata.docs.rs]` section (`all-features = true`) so docs.rs
+  builds the full, feature-gated API surface.
+- **`deny.toml`** at the workspace root: `cargo-deny` configuration
+  (advisories: deny yanked crates; an explicit license allow-list covering
+  MIT/Apache-2.0/BSD-2/3-Clause/ISC/Zlib/CC0-1.0/Unicode-3.0; documented
+  `[bans]` exceptions for duplicate transitive dependency versions).
+
+### Added — 2026-07-13 pass
+
+- **Reference-differential oracle features** (opt-in, self-skipping when
+  the reference tool is absent, so CI stays hermetic): `zstd-oracle`
+  (oxiarc-zstd), `brotli-oracle` (oxiarc-brotli), `xz-oracle` (oxiarc-lzma
+  and oxiarc-archive), `bzip2-oracle` (oxiarc-bzip2), `lz4-oracle`
+  (oxiarc-lz4), `snappy-oracle` (oxiarc-snappy), `zlib-oracle`
+  (oxiarc-deflate), `tiff-oracle` (oxiarc-lzw), `libaec-oracle`
+  (oxiarc-szip), `zip-oracle` (oxiarc-archive) — joining 0.3.5's
+  `lha-oracle`. Each is paired with always-run embedded golden corpora.
+- New public APIs: `oxiarc_bzip2::decompress_with_limit`,
+  `oxiarc_lzma::Lzma2Decoder::decode_chunk`,
+  `oxiarc_lz4::FrameDescriptor::with_block_independence`,
+  `ZlibStreamDecoder::with_max_output`, bounded snappy decode APIs.
+- **oxiarc-brotli**: `src/tables.rs` (RFC 7932 tables) and
+  `src/dict_data.bin` (the 122,784-byte Appendix A dictionary,
+  CRC-verified, included in `cargo package`).
+- CLI end-to-end matrix test suite: 13 formats × 7 subcommands against
+  both oxiarc-produced and reference-tool-produced inputs (**303/303**,
+  byte-identical), plus corrupt/truncated-input sweeps (0 panics, 0
+  exit-101) and path-traversal checks.
+
+### Documentation
+
+- **README.md**: corrected the per-crate line-count table (previous figures
+  were stale by roughly 1.7-3x), the archive-formats/format-support-matrix
+  list (ISO 9660 was missing from the former, SZIP was miscategorized as an
+  archive format rather than a standalone codec), the SIMD-CRC32 claim
+  (actual gate is PCLMULQDQ + SSE4.1, not "SSE 4.2"), the LZH method list
+  (lh0, lh1, lh4, lh5, lh6, lh7, lhd are implemented; lh2/lh3 are not), the Zstandard
+  entropy-coding claim (Huffman literals are decode-only; the encoder emits
+  Raw/RLE literals with predefined-FSE sequences), and documented ZIP
+  AES/ZipCrypto encryption support, spanned-ZIP rejection, the actual
+  semantics/limits of `--memory-limit`, and the always-on `try_reserve`
+  allocation bounds that protect against malicious headers independently of
+  `--memory-limit`.
+- **oxiarc-cli/README.md**: documented exit code `2` (integrity failures,
+  password/decryption failures, non-appendable `add` targets) and current
+  Ctrl-C/partial-file behavior.
+- **CONTRIBUTING.md**: documented the existing `fuzz/` cargo-fuzz harnesses
+  and the opt-in `lha-oracle` feature (real-`lha`-CLI interop validation).
+
+### Quality
+
+- **2,426 tests passing, 0 failed, 0 ignored** (2,289 via `cargo nextest
+  run --workspace --all-features` across 100 binaries + 137 doctests; 112
+  suites) — up from 2,004 + 1 skipped.
+- Zero clippy warnings (`--all-features --all-targets`, and with
+  `--no-default-features`); `cargo build --workspace
+  --no-default-features` green (Pure Rust default preserved);
+  `cargo fmt --all --check` clean; rustdoc clean.
+- ~114,394 lines across 336 Rust files (tokei).
+- Acid test: the 64 real-world zstd frames (OxiGDAL Zarr v3 chunks) that
+  triggered this campaign decode **64/64 byte-identical** through the
+  `oxiarc` CLI with 0 panics; once this ships, OxiGDAL can bump the dep
+  and remove the `#[ignore]` on `test_compute_zarr_stats_demo_fixture`.
+- All COOLJAPAN policies compliant (no `unwrap`/`expect`/panics on
+  untrusted-input paths, pure Rust, workspace deps, snake_case, <2000
+  LoC/file).
+
 ## [0.3.5] - 2026-07-07
 
 LZH/LHA interoperability release: the `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec is rewritten from OxiArc's private, non-canonical bitstream format to genuine canonical LHA wire format, closing the interoperability gap left open by the 0.3.4 hardening pass (which covered LZMA, bzip2, 7z, ZIP, TAR, and XZ). Validated bidirectionally against a corpus of real third-party `.lzh` archives and a live `lha` (Lhasa) CLI oracle. Also fixes a Miri-flagged undefined-behavior class in the CRC fast paths, resource leaks in three archive writers' `into_inner()`, and a CLI exit-code bug on unrecognized archive formats.
@@ -567,6 +1032,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
+[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/cool-japan/oxiarc/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/cool-japan/oxiarc/compare/v0.3.2...v0.3.3

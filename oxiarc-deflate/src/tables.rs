@@ -142,7 +142,14 @@ pub const CODE_LENGTH_ORDER: [usize; 19] = [
 ];
 
 /// Convert a length value (3-258) to a length code (257-285).
-pub fn length_to_code(length: u16) -> (u16, u8, u16) {
+///
+/// `pub(crate)` rather than `pub`: this is validated only via
+/// `debug_assert!` (stripped in release builds), and out-of-range inputs
+/// fall through to `unreachable!()`. All call sites are internal and always
+/// pass an already-validated `3..=258` length, so this is safe as a
+/// crate-private helper; it must not be exposed as a public API without
+/// adding a real bounds check.
+pub(crate) fn length_to_code(length: u16) -> (u16, u8, u16) {
     debug_assert!(
         (3..=258).contains(&length),
         "Length out of range: {}",
@@ -171,7 +178,14 @@ pub fn length_to_code(length: u16) -> (u16, u8, u16) {
 }
 
 /// Convert a distance value (1-32768) to a distance code (0-29).
-pub fn distance_to_code(distance: u16) -> (u16, u8, u16) {
+///
+/// `pub(crate)` rather than `pub`: this is validated only via
+/// `debug_assert!` (stripped in release builds), and out-of-range inputs
+/// can fall through to `unreachable!()`. All call sites are internal and
+/// always pass an already-validated `1..=32768` distance, so this is safe
+/// as a crate-private helper; it must not be exposed as a public API
+/// without adding a real bounds check.
+pub(crate) fn distance_to_code(distance: u16) -> (u16, u8, u16) {
     debug_assert!(
         (1..=32768).contains(&distance),
         "Distance out of range: {}",

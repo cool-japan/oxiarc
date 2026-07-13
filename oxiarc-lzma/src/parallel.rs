@@ -170,14 +170,18 @@ pub fn lzma2_compress_parallel(
 ///
 /// ## Example
 ///
-/// ```ignore
+/// ```rust,no_run
 /// use oxiarc_lzma::ParallelLzma2Encoder;
 ///
+/// # fn run() -> oxiarc_core::error::Result<()> {
 /// let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| i as u8).collect();
 /// let compressed = ParallelLzma2Encoder::new()
 ///     .level(6)
 ///     .chunk_size(512 * 1024)
 ///     .encode(&data)?;
+/// # let _ = compressed;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct ParallelLzma2Encoder {

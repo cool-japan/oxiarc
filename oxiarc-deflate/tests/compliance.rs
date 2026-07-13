@@ -604,17 +604,16 @@ fn test_parallel_gzip_roundtrip_multi_member() {
     );
 }
 
-/// The single-shot `gzip_decompress` does NOT support multi-member streams.
+/// The single-shot `gzip_decompress` supports concatenated multi-member
+/// streams (RFC 1952 §2.2).
 ///
 /// For a 3 MiB input with 1 MiB chunks the parallel encoder produces 3 GZIP
-/// members; the serial decoder will encounter unexpected data after the first
-/// member's trailer and return an error (or silently truncate).
-///
-/// This test documents that boundary: `GzipStreamDecoder` must be used for
-/// multi-member streams; the single-shot `gzip_decompress` is for single members.
+/// members; the serial decoder must decode all of them in sequence and
+/// concatenate their contents — byte-identical to the original input.
+/// (Before the multi-member fix this failed with a spurious CRC mismatch.)
 #[cfg(feature = "parallel")]
 #[test]
-fn test_serial_decoder_rejects_multi_member() {
+fn test_serial_decoder_decodes_multi_member() {
     use oxiarc_deflate::gzip_compress_parallel;
 
     let chunk_size = 1024 * 1024; // 1 MiB chunks
@@ -623,21 +622,12 @@ fn test_serial_decoder_rejects_multi_member() {
     let compressed =
         gzip_compress_parallel(&input, 6, chunk_size).expect("gzip_compress_parallel failed");
 
-    // The serial decoder should fail or truncate on a multi-member stream.
-    // GzipStreamDecoder must be used for multi-member streams.
-    let result = gzip_decompress(&compressed);
-    match result {
-        Err(_) => { /* expected: serial decoder rejects multi-member input */ }
-        Ok(data) if data == input => {
-            panic!(
-                "Serial GzipDecoder now handles multi-member streams correctly! \
-                 Consider adding multi-member support to gzip_decompress."
-            );
-        }
-        Ok(_) => {
-            // Truncated / partial result — also counts as documented limitation of the serial path
-        }
-    }
+    let decompressed = gzip_decompress(&compressed)
+        .expect("serial gzip_decompress must decode multi-member streams (RFC 1952 §2.2)");
+    assert_eq!(
+        decompressed, input,
+        "serial multi-member gzip round-trip mismatch"
+    );
 }
 
 /// gzip_compress_parallel with empty input produces a valid single-member

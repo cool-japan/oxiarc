@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.5 (2026-07-07) | 76 tests passing**
+**Version: 0.3.6 (2026-07-13) | 100 tests passing (incl. libtiff/Pillow differential oracle)**
 
 ## Overview
 
@@ -23,19 +23,21 @@ LZW is a dictionary-based compression algorithm used in TIFF images, GIF animati
 - **LSB bitstream** - `bitstream_lsb` module with `LsbBitWriter`/`LsbBitReader` for GIF-compatible bit packing
 - **Configurable** - Adjustable code width (9-12 bits)
 - **Early change** - Code width increases before table full
+- **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs` and the pinned fixtures in `tests/data/`)
+- **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs
 
-All features are implemented and tested. API is stable.
+All features are implemented and tested. API is stable. `LzwConfig` implements `Default` (returning the TIFF preset), and `LzwError` is `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over it need a wildcard arm.
 
 ## Quick Start
 
 ```rust
-use oxiarc_lzw::{encode, decode, Config};
+use oxiarc_lzw::{compress, decompress, LzwConfig};
 
 // TIFF-style compression (MSB-first)
-let config = Config::tiff();
+let config = LzwConfig::TIFF;
 let original = b"ABCABCABCABC";
-let compressed = encode(original, &config);
-let decompressed = decode(&compressed, &config)?;
+let compressed = compress(original, config)?;
+let decompressed = decompress(&compressed, original.len(), config)?;
 assert_eq!(decompressed, original);
 ```
 
@@ -76,23 +78,34 @@ assert_eq!(reader.read_bits(4), Some(0b1100));
 
 ## Configuration
 
+`LzwConfig` selects clear-code/early-change semantics for the generic
+`compress`/`decompress`/`LzwEncoder`/`LzwDecoder` API, which always packs
+codes MSB-first. GIF's LSB-first bit ordering and variable minimum code size
+are handled separately by the dedicated `gif_compress`/`gif_decompress`
+functions (or `LzwStreamMode::Gif` in the streaming API) — see the GIF LZW
+Codec section above.
+
 ### TIFF Mode
 
 ```rust
-use oxiarc_lzw::Config;
+use oxiarc_lzw::LzwConfig;
 
-let config = Config::tiff();
+let config = LzwConfig::TIFF;
 // MSB-first bit ordering
-// 9-bit initial codes
-// Early change enabled
+// 9-12 bit codes
+// TIFF 6.0 clear codes (strip starts with ClearCode 256; table resets at
+// entry 4094) and early code change — libtiff/Pillow/GDAL-compatible
 ```
 
-### GIF Mode
+### GIF-flavored Mode (still MSB-first)
 
 ```rust
-let config = Config::gif(8); // 8-bit minimum code size
-// LSB-first bit ordering
-// Variable code width (9-12 bits)
+use oxiarc_lzw::LzwConfig;
+
+let config = LzwConfig::GIF;
+// MSB-first bit ordering (same bitstream as TIFF mode)
+// 9-12 bit codes
+// Uses a clear code; standard (non-early) code change
 ```
 
 ## API
@@ -100,48 +113,53 @@ let config = Config::gif(8); // 8-bit minimum code size
 ### High-Level Functions
 
 ```rust
-use oxiarc_lzw::{encode, decode, Config};
+use oxiarc_lzw::{compress, decompress, LzwConfig};
 
-let compressed = encode(data, &Config::tiff());
-let decompressed = decode(&compressed, &Config::tiff())?;
+let compressed = compress(data, LzwConfig::TIFF)?;
+let decompressed = decompress(&compressed, data.len(), LzwConfig::TIFF)?;
 ```
 
-### Streaming Encoder
+### Encoder / Decoder (reusable dictionary state)
+
+`LzwEncoder`/`LzwDecoder` own a resettable dictionary, but each `encode`/
+`decode` call still processes one complete buffer (see "Streaming
+Encoder/Decoder" below for incremental, chunk-at-a-time I/O):
 
 ```rust
-use oxiarc_lzw::Encoder;
+use oxiarc_lzw::{LzwEncoder, LzwConfig};
 
-let mut encoder = Encoder::new(Config::tiff());
-encoder.encode_bytes(data, &mut output);
-encoder.finish(&mut output);
+let mut encoder = LzwEncoder::new(LzwConfig::TIFF)?;
+let compressed = encoder.encode(data)?;
 ```
 
-### Streaming Decoder
-
 ```rust
-use oxiarc_lzw::Decoder;
+use oxiarc_lzw::{LzwDecoder, LzwConfig};
 
-let mut decoder = Decoder::new(Config::tiff());
-decoder.decode_bytes(&compressed, &mut output)?;
+let mut decoder = LzwDecoder::new(LzwConfig::TIFF)?;
+let decompressed = decoder.decode(&compressed, data.len())?;
 ```
 
 ### Streaming Encoder/Decoder (New in 0.2.6)
 
-Streaming interfaces for processing data incrementally without buffering entire inputs:
+`LzwStreamEncoder`/`LzwStreamDecoder` implement `std::io::Write`/
+`std::io::Read` for incremental processing; select TIFF or GIF framing via
+`LzwStreamMode` (the encoder flushes an independently-decompressible frame
+once its internal buffer reaches the block size):
 
 ```rust
-use oxiarc_lzw::{StreamingEncoder, StreamingDecoder, Config};
+use std::io::{Read, Write};
+use oxiarc_lzw::{LzwStreamEncoder, LzwStreamDecoder, LzwStreamMode};
 
-// Streaming encoder - feed data in chunks
-let mut encoder = StreamingEncoder::new(Config::tiff());
-encoder.write_chunk(chunk1, &mut output)?;
-encoder.write_chunk(chunk2, &mut output)?;
-encoder.finish(&mut output)?;
+// Streaming encoder - TIFF framing
+let mut encoder = LzwStreamEncoder::new(Vec::new(), LzwStreamMode::Tiff);
+encoder.write_all(data)?;
+let compressed = encoder.finish()?;
 
-// Streaming decoder - decode data in chunks
-let mut decoder = StreamingDecoder::new(Config::tiff());
-decoder.decode_chunk(chunk1, &mut output)?;
-decoder.decode_chunk(chunk2, &mut output)?;
+// Streaming decoder
+let mut decoder = LzwStreamDecoder::new(&compressed[..], LzwStreamMode::Tiff);
+let mut decompressed = Vec::new();
+decoder.read_to_end(&mut decompressed)?;
+assert_eq!(decompressed, data);
 ```
 
 ## Algorithm
@@ -164,11 +182,11 @@ LZW builds a dictionary dynamically:
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | yes | Standard library support |
+| `tiff-oracle` | off | Enables differential oracle tests (`tests/tiff_lzw_oracle.rs`) that validate TIFF-LZW interop against Pillow/libtiff in both directions; tests self-skip when `python3`+Pillow are absent. Test-only — the library compiles identically either way. |
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.2.6"
+oxiarc-lzw = "0.3.6"
 ```
 
 ## Use Cases

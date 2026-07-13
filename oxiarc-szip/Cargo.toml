@@ -5,17 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 description = "Pure Rust CCSDS-121.0-B-2 / libaec-compatible adaptive entropy coding (AEC/SZIP) implementation"
 readme = "README.md"
 keywords = ["szip", "aec", "ccsds", "compression", "decompression"]
 categories = ["compression", "encoding", "science"]
 
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Live differential oracle tests (tests/libaec_oracle.rs) that compile a tiny
+# C shim against an installed libaec (Homebrew/system prefixes, or the
+# LIBAEC_PREFIX env var) and validate BOTH directions against the reference
+# implementation: libaec-encode -> oxiarc-decode byte-identical, and
+# oxiarc-encode -> libaec-decode byte-identical. Self-skips (does not fail)
+# when no C compiler or libaec installation is found. Never enabled by
+# default; the always-run interop gate is tests/libaec_interop.rs, which uses
+# embedded libaec-produced fixtures.
+libaec-oracle = []
+
 [dependencies]
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "szip_bench"

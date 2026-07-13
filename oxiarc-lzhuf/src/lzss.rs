@@ -44,7 +44,12 @@ pub struct LzssDecoder {
 
 impl LzssDecoder {
     /// Create a new LZSS decoder with the specified window size.
+    ///
+    /// `window_size` is rounded up to the next power of two (minimum 16) if it
+    /// is not already one, matching [`LzssEncoder::new`]'s normalization,
+    /// since [`RingBuffer::new`] requires a nonzero power-of-two capacity.
     pub fn new(window_size: usize) -> Self {
+        let window_size = window_size.next_power_of_two().max(16);
         Self {
             ring: RingBuffer::new(window_size),
             output: Vec::new(),
@@ -605,6 +610,19 @@ mod tests {
     // -------------------------------------------------------------------------
     // Decoder tests
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lzss_decoder_new_normalizes_non_power_of_two_window() {
+        // Previously `LzssDecoder::new(100)` forwarded straight into
+        // `RingBuffer::new`, which asserts power-of-two/nonzero and would
+        // panic on this input. It must now normalize instead.
+        let mut decoder = LzssDecoder::new(100);
+        decoder.decode_literal(b'A');
+        assert_eq!(decoder.output(), b"A");
+
+        // Zero should also be handled without panicking (normalizes to 16).
+        let _ = LzssDecoder::new(0);
+    }
 
     #[test]
     fn test_lzss_decoder_literal() {

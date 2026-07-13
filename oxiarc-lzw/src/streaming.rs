@@ -16,11 +16,26 @@
 //! **Decoders** eagerly read all compressed data from the inner reader on the
 //! first `read` call, decompress it, and serve from an internal buffer.
 //!
+//! # Frame format
+//!
+//! Each frame is preceded by an 8-byte header:
+//!
+//! - 4 bytes: compressed frame length (`u32`, little-endian)
+//! - 4 bytes: uncompressed frame length (`u32`, little-endian)
+//!
+//! Carrying the true uncompressed length lets the decoder size its output
+//! exactly and validate each frame, instead of decompressing against a large
+//! sentinel bound (a previous revision allocated a hardcoded 64 MiB buffer
+//! per frame, which small malicious inputs could exploit as an allocation
+//! DoS). This framing is private to this crate's streaming API and is not
+//! part of the TIFF/GIF bitstream formats.
+//!
 //! # Modes
 //!
 //! [`LzwStreamMode`] selects between TIFF and GIF LZW variants:
 //!
-//! - **TIFF**: MSB-first bit order, early code change, no clear codes.
+//! - **TIFF**: MSB-first bit order, early code change, clear codes
+//!   (TIFF 6.0 / libtiff-compatible).
 //! - **GIF**: LSB-first bit order, clear codes, standard code change.
 //!
 //! # Example
@@ -48,12 +63,6 @@ use std::io::{self, Read, Write};
 /// Default block size for incremental encoder flushing (128 KiB).
 const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
-/// Large sentinel value used as `expected_size` for TIFF decompression.
-///
-/// The decoder breaks on EOI so this just needs to be large enough to not
-/// truncate valid output.
-const TIFF_SENTINEL_SIZE: usize = 64 * 1024 * 1024;
-
 /// GIF default minimum code size (8 bits for 256-colour data).
 const GIF_DEFAULT_MIN_CODE_SIZE: u8 = 8;
 
@@ -63,8 +72,9 @@ const GIF_DEFAULT_MIN_CODE_SIZE: u8 = 8;
 
 /// Selects the LZW variant used for streaming compression/decompression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LzwStreamMode {
-    /// TIFF LZW: MSB-first, early code change, no clear codes.
+    /// TIFF LZW: MSB-first, early code change, clear codes (TIFF 6.0).
     Tiff,
     /// GIF LZW: LSB-first, clear codes, standard code change.
     ///
@@ -126,6 +136,7 @@ impl<W: Write> LzwStreamEncoder<W> {
     ///
     /// When the internal buffer reaches this many bytes it is automatically
     /// compressed and written to the inner writer.
+    #[must_use]
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size.max(1);
         self
@@ -152,12 +163,27 @@ impl<W: Write> LzwStreamEncoder<W> {
 
     /// Compress `data` using the configured LZW mode and write it to `inner`.
     fn compress_and_write(&mut self, data: &[u8]) -> io::Result<()> {
+        // Both header fields are u32; frames are bounded by `block_size`
+        // via `maybe_flush_block`, but guard explicitly for callers that
+        // configure absurd block sizes.
+        let uncompressed_len = u32::try_from(data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LZW frame exceeds u32::MAX uncompressed bytes",
+            )
+        })?;
         let compressed = self.compress_block(data)?;
+        let compressed_len = u32::try_from(compressed.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LZW frame exceeds u32::MAX compressed bytes",
+            )
+        })?;
         if let Some(ref mut w) = self.inner {
-            // Write a 4-byte little-endian frame length prefix so the decoder
-            // can find frame boundaries in concatenated streams.
-            let len = compressed.len() as u32;
-            w.write_all(&len.to_le_bytes())?;
+            // 8-byte frame header: compressed length then uncompressed
+            // length, both little-endian u32 (see module docs).
+            w.write_all(&compressed_len.to_le_bytes())?;
+            w.write_all(&uncompressed_len.to_le_bytes())?;
             w.write_all(&compressed)?;
         }
         Ok(())
@@ -173,10 +199,14 @@ impl<W: Write> LzwStreamEncoder<W> {
         }
     }
 
-    /// If the buffer has reached `block_size`, flush it.
+    /// While the buffer holds at least `block_size` bytes, flush frames of
+    /// exactly `block_size` bytes. This bounds every frame (and therefore
+    /// the header's u32 length fields and the decoder's per-frame output
+    /// allocation) regardless of how large a single `write` call was.
     fn maybe_flush_block(&mut self) -> io::Result<()> {
-        if self.buffer.len() >= self.block_size {
-            let data = std::mem::take(&mut self.buffer);
+        while self.buffer.len() >= self.block_size {
+            let rest = self.buffer.split_off(self.block_size);
+            let data = std::mem::replace(&mut self.buffer, rest);
             self.compress_and_write(&data)?;
         }
         Ok(())
@@ -237,7 +267,8 @@ impl<W: Write> Write for LzwStreamEncoder<W> {
 /// that buffer for subsequent reads.
 ///
 /// The decoder expects the framing produced by [`LzwStreamEncoder`]: each
-/// compressed frame is preceded by a 4-byte little-endian length prefix.
+/// compressed frame is preceded by an 8-byte header carrying the compressed
+/// and uncompressed frame lengths (see the module docs).
 pub struct LzwStreamDecoder<R: Read> {
     /// The wrapped reader providing compressed input.
     inner: R,
@@ -291,8 +322,8 @@ impl<R: Read> LzwStreamDecoder<R> {
         let mut offset = 0;
 
         while offset < raw.len() {
-            // Read the 4-byte frame length prefix.
-            if offset + 4 > raw.len() {
+            // Read the 8-byte frame header (compressed + uncompressed len).
+            if offset + 8 > raw.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated LZW frame header",
@@ -304,7 +335,13 @@ impl<R: Read> LzwStreamDecoder<R> {
                 raw[offset + 2],
                 raw[offset + 3],
             ]) as usize;
-            offset += 4;
+            let uncompressed_len = u32::from_le_bytes([
+                raw[offset + 4],
+                raw[offset + 5],
+                raw[offset + 6],
+                raw[offset + 7],
+            ]) as usize;
+            offset += 8;
 
             if offset + frame_len > raw.len() {
                 return Err(io::Error::new(
@@ -316,7 +353,19 @@ impl<R: Read> LzwStreamDecoder<R> {
             let frame_data = &raw[offset..offset + frame_len];
             offset += frame_len;
 
-            let decompressed = self.decompress_frame(frame_data)?;
+            let decompressed = self.decompress_frame(frame_data, uncompressed_len)?;
+            // A frame that decodes to a different length than its header
+            // declares is corrupt; never silently return short/padded data.
+            if decompressed.len() != uncompressed_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZW frame decoded to {} bytes, header declared {}",
+                        decompressed.len(),
+                        uncompressed_len
+                    ),
+                ));
+            }
             all_decompressed.extend_from_slice(&decompressed);
         }
 
@@ -328,10 +377,16 @@ impl<R: Read> LzwStreamDecoder<R> {
     }
 
     /// Decompress a single frame according to the current mode.
-    fn decompress_frame(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+    ///
+    /// `uncompressed_len` is the frame header's declared output size. It is
+    /// untrusted: [`crate::LzwDecoder`] clamps its up-front allocation and
+    /// grows incrementally, so a lying header cannot force a large
+    /// allocation — the caller cross-checks the decoded length afterwards.
+    fn decompress_frame(&self, data: &[u8], uncompressed_len: usize) -> io::Result<Vec<u8>> {
         match self.mode {
-            LzwStreamMode::Tiff => decompress_tiff(data, TIFF_SENTINEL_SIZE)
-                .map_err(|e| io::Error::other(e.to_string())),
+            LzwStreamMode::Tiff => {
+                decompress_tiff(data, uncompressed_len).map_err(|e| io::Error::other(e.to_string()))
+            }
             LzwStreamMode::Gif(min_code_size) => {
                 gif_decompress(data, min_code_size).map_err(|e| io::Error::other(e.to_string()))
             }
@@ -643,5 +698,116 @@ mod tests {
 
         let decoder = LzwStreamDecoder::new(&[][..], LzwStreamMode::gif_default());
         assert_eq!(decoder.mode(), LzwStreamMode::Gif(8));
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame-header hardening (LZW-02 regression tests)
+    // -----------------------------------------------------------------------
+
+    /// Build one framed TIFF frame (header + compressed payload) by hand.
+    fn frame_tiff(data: &[u8]) -> Vec<u8> {
+        let compressed = crate::compress_tiff(data).expect("compress frame");
+        let mut out = Vec::with_capacity(8 + compressed.len());
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    /// Regression for the 64 MiB-per-frame sentinel allocation DoS: a stream
+    /// of many tiny frames previously forced one hardcoded 64 MiB
+    /// `Vec::with_capacity` per frame (50,000 frames = ~3 TiB of cumulative
+    /// allocator traffic for ~250 KiB of input). With the uncompressed
+    /// length carried in the frame header and the decoder's clamped
+    /// incremental growth, this must decode promptly and correctly.
+    #[test]
+    fn test_many_tiny_frames_no_allocation_amplification() {
+        let one = frame_tiff(b"A");
+        let count = 50_000usize;
+        let mut stream = Vec::with_capacity(one.len() * count);
+        for _ in 0..count {
+            stream.extend_from_slice(&one);
+        }
+
+        let mut decoder = LzwStreamDecoder::new(&stream[..], LzwStreamMode::Tiff);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).expect("read failed");
+        assert_eq!(output.len(), count);
+        assert!(output.iter().all(|&b| b == b'A'));
+    }
+
+    /// A frame whose header declares a different uncompressed length than
+    /// the payload actually decodes to must be rejected, not padded or
+    /// silently truncated.
+    #[test]
+    fn test_frame_length_mismatch_rejected() {
+        let mut stream = frame_tiff(b"hello world");
+        // Corrupt the declared uncompressed length (bytes 4..8).
+        stream[4..8].copy_from_slice(&12u32.to_le_bytes());
+
+        let mut decoder = LzwStreamDecoder::new(&stream[..], LzwStreamMode::Tiff);
+        let mut output = Vec::new();
+        let err = decoder.read_to_end(&mut output).expect_err("must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A tiny frame lying about a huge uncompressed length must fail fast
+    /// without attempting a matching up-front allocation.
+    #[test]
+    fn test_huge_declared_length_rejected_without_prealloc() {
+        let mut stream = frame_tiff(b"A");
+        stream[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut decoder = LzwStreamDecoder::new(&stream[..], LzwStreamMode::Tiff);
+        let mut output = Vec::new();
+        assert!(decoder.read_to_end(&mut output).is_err());
+    }
+
+    /// Truncated frame headers and payloads must error cleanly.
+    #[test]
+    fn test_truncated_frames_rejected() {
+        let stream = frame_tiff(b"some frame payload");
+        for cut in [1, 4, 7, stream.len() - 1] {
+            let mut decoder = LzwStreamDecoder::new(&stream[..cut], LzwStreamMode::Tiff);
+            let mut output = Vec::new();
+            assert!(
+                decoder.read_to_end(&mut output).is_err(),
+                "cut at {cut} must be rejected"
+            );
+        }
+    }
+
+    /// Large writes are split into bounded frames of `block_size` bytes.
+    #[test]
+    fn test_large_write_split_into_bounded_frames() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut encoder =
+            LzwStreamEncoder::new(Vec::new(), LzwStreamMode::Tiff).with_block_size(4096);
+        encoder.write_all(&data).expect("write failed");
+        let compressed = encoder.finish().expect("finish failed");
+
+        // Walk the frame headers: every declared uncompressed length must be
+        // bounded by the block size.
+        let mut offset = 0usize;
+        let mut frames = 0usize;
+        while offset < compressed.len() {
+            let comp_len =
+                u32::from_le_bytes(compressed[offset..offset + 4].try_into().expect("comp len"))
+                    as usize;
+            let uncomp_len = u32::from_le_bytes(
+                compressed[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("uncomp len"),
+            ) as usize;
+            assert!(uncomp_len <= 4096, "frame declares {uncomp_len} bytes");
+            offset += 8 + comp_len;
+            frames += 1;
+        }
+        assert!(frames >= 100_000 / 4096, "expected many bounded frames");
+
+        let mut decoder = LzwStreamDecoder::new(&compressed[..], LzwStreamMode::Tiff);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).expect("read failed");
+        assert_eq!(output, data);
     }
 }

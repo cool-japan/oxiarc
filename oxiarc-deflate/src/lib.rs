@@ -35,6 +35,20 @@
 //! - Level 1-3: Fast compression
 //! - Level 4-6: Balanced (default is 6)
 //! - Level 7-9: Best compression (slower)
+//!
+//! ## Naming Convention
+//!
+//! This crate exposes [`deflate()`]/[`inflate()`] rather than the workspace-wide
+//! `compress`/`decompress` naming used by sibling codec crates (e.g.
+//! `oxiarc_lz4::{compress, decompress}`, `oxiarc_brotli::{compress, decompress}`).
+//! This is intentional: `deflate`/`inflate` are the algorithm's own established
+//! names (RFC 1951 itself defines "the deflate format" and describes
+//! decompression as "inflating"), and callers frequently need to distinguish
+//! raw DEFLATE from the [`gzip`] and [`zlib`] container formats built on top of
+//! it, so a distinct verb pair avoids ambiguity. [`GzipEncoder`]/[`GzipDecoder`]
+//! and [`ZlibCompressor`]/[`ZlibDecompressor`] instead follow the generic
+//! `compress`/`decompress` convention for their function-style entry points
+//! ([`gzip_compress`]/[`gzip_decompress`], [`zlib_compress`]/[`zlib_decompress`]).
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]

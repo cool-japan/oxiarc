@@ -25,9 +25,7 @@ pub struct LzwDictionary {
 impl LzwDictionary {
     /// Create a new LZW dictionary with the given configuration.
     pub fn new(config: LzwConfig) -> Result<Self> {
-        if config.min_bits < 9 || config.min_bits > config.max_bits || config.max_bits > 12 {
-            return Err(LzwError::InvalidBitWidth(config.min_bits));
-        }
+        config.validate()?;
 
         let mut dict = Self {
             table: Vec::with_capacity(config.max_code() as usize + 1),
@@ -105,6 +103,26 @@ impl LzwDictionary {
         self.update_bit_width_decode();
 
         Ok(code)
+    }
+
+    /// Account for the phantom table entry the decoder creates while
+    /// processing the encoder's final data code.
+    ///
+    /// The decoder adds one dictionary entry for every code it reads after
+    /// the first, including the *last* data code — but the encoder has no
+    /// following input byte at that point, so it never performs a matching
+    /// `add_string`. Without compensation the decoder can cross a bit-width
+    /// threshold just before reading EOI while the encoder writes EOI at the
+    /// old width, desynchronizing the stream at exact boundary sizes.
+    ///
+    /// libtiff's `LZWPostEncode` increments `free_ent` (without storing an
+    /// entry) for exactly this reason; this method mirrors it. Call it after
+    /// emitting the final data code and before emitting EOI.
+    pub fn note_final_code(&mut self) {
+        if !self.is_full() {
+            self.next_code += 1;
+            self.update_bit_width();
+        }
     }
 
     /// Update bit width based on next_code.

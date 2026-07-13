@@ -3,13 +3,15 @@
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 218 tests passing.
+**Version 0.3.6** (2026-07-13) — 260 tests passing.
 
-**What's new in 0.3.x (latest)**:
+**What's new in 0.3.6**: New `gzip_streaming` and `parallel_gzip` runnable examples; `#[must_use]` added to the LZ77-heuristics builder setters (`with_nice_length`, `with_min_match_length`, `with_max_chain`, `with_good_length`, `with_lz77_params`) and to `ParallelGzipEncoder`'s builder setters (`level`, `chunk_size`, `num_threads`), so a discarded builder return value now warns; new `proptest`-based round-trip test suite (`tests/proptest_roundtrip.rs`); a decoder-only regression test for a hand-built fixed-Huffman length-258 back-reference closes a coverage gap. `oxiarc-core::FlushMode` (used by `Deflater`) is now `#[non_exhaustive]` as part of a pre-1.0 API freeze — the internal flush-mode dispatch already carries a forward-compatible wildcard arm.
+
+**What's new in 0.3.0–0.3.2**:
 - **Parallel GZIP compression** (`parallel` feature): pigz-style multi-member GZIP via `gzip_compress_parallel()` and `ParallelGzipEncoder` builder.
 - **LZ77 match heuristics tuning**: `Lz77Params` / `Lz77Preset` structs and `Deflater::with_lz77_params()` / `Deflater::with_lz77_preset()` builder methods for fine-grained speed/ratio trade-offs.
 - **DeflatePool memory pool**: `DeflatePool` for thread-safe window/hash buffer reuse with `Deflater::with_pool()` and `PoolStats` tracking.
@@ -60,21 +62,21 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-deflate = "0.3.5"
+oxiarc-deflate = "0.3.6"
 ```
 
 With async I/O support:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.3.5", features = ["async-io"] }
+oxiarc-deflate = { version = "0.3.6", features = ["async-io"] }
 ```
 
 With parallel GZIP compression:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.3.5", features = ["parallel"] }
+oxiarc-deflate = { version = "0.3.6", features = ["parallel"] }
 ```
 
 ## Quick Start
@@ -115,6 +117,7 @@ let decompressed = inflate(&compressed)?;
 ### Streaming API
 
 ```rust
+use oxiarc_core::traits::{Compressor, Decompressor};
 use oxiarc_deflate::{Deflater, Inflater};
 
 // Streaming compression
@@ -129,13 +132,17 @@ loop {
 }
 ```
 
+`compress_all`/`decompress`/`decompress_all` are default/trait methods from
+`oxiarc_core::traits::{Compressor, Decompressor}` — that trait must be in
+scope to call them, as shown above.
+
 ### LZ77 Encoder
 
 ```rust
 use oxiarc_deflate::{Lz77Encoder, Lz77Token};
 
-let mut encoder = Lz77Encoder::new(6);
-for token in encoder.encode(data) {
+let mut encoder = Lz77Encoder::with_level(6);
+for token in encoder.compress(data) {
     match token {
         Lz77Token::Literal(byte) => { /* literal byte */ }
         Lz77Token::Match { length, distance } => { /* back-reference */ }
@@ -150,7 +157,7 @@ use oxiarc_deflate::{HuffmanTree, HuffmanBuilder};
 
 // Build tree from code lengths
 let lengths = [3, 3, 3, 3, 3, 2, 4, 4];
-let tree = HuffmanTree::from_lengths(&lengths)?;
+let tree = HuffmanTree::from_code_lengths(&lengths)?;
 
 // Decode symbols
 let symbol = tree.decode(&mut bit_reader)?;
@@ -214,41 +221,52 @@ let symbol = tree.decode(&mut bit_reader)?;
 | `huffman` | Huffman tree operations |
 | `lz77` | LZ77 dictionary encoder; `Lz77Params`, `Lz77Preset` |
 | `tables` | Fixed Huffman tables, length/distance extra bits |
-| `gzip` | GZIP format (RFC 1952) encoding, decoding, and parallel compression |
+| `gzip` | GZIP format (RFC 1952) encoding and decoding |
+| `parallel` | Multi-threaded GZIP/DEFLATE compression (requires `parallel` feature): `gzip_compress_parallel`, `compress_deflate_parallel`, `ParallelGzipEncoder` |
 | `pool` | `DeflatePool` and `PoolStats` for window/hash buffer reuse |
 | `async_deflate` | Async streaming compression/decompression (requires `async-io` feature) |
 
 ### GZIP API
 
 ```rust
-use oxiarc_deflate::gzip::{gzip_encode, gzip_decode};
+use oxiarc_deflate::gzip::{gzip_compress, gzip_decompress};
 
 // Encode to GZIP format
-let compressed = gzip_encode(data, 6)?;
+let compressed = gzip_compress(data, 6)?;
 
 // Decode GZIP data
-let decompressed = gzip_decode(&compressed)?;
+let decompressed = gzip_decompress(&compressed)?;
 ```
 
 ### Async DEFLATE (requires `async-io` feature)
 
+The `async_deflate` module implements `oxiarc_core`'s `AsyncCompressor`/
+`AsyncDecompressor` traits directly on the existing `Deflater`/`Inflater`
+types (there is no separate `AsyncDeflater`/`AsyncInflater` type) — wrap
+either in the corresponding `oxiarc_core::async_io` adapter to drive it from
+an `AsyncRead`/`AsyncWrite` source:
+
 ```rust
-use oxiarc_deflate::async_deflate::{AsyncDeflater, AsyncInflater};
-use tokio::io::BufReader;
+use oxiarc_core::async_io::{
+    AsyncCompressor, AsyncCompressorWrapper, AsyncDecompressor, AsyncDecompressorWrapper,
+};
+use oxiarc_deflate::{Deflater, Inflater};
 
-// Async compression
-let mut deflater = AsyncDeflater::new(6);
-let compressed = deflater.compress_all(reader).await?;
+// Async compression — Deflater implements AsyncCompressor directly.
+let mut compressor = AsyncCompressorWrapper::new(Deflater::new(6));
+let mut compressed = Vec::new();
+compressor.compress_async(&mut reader, &mut compressed).await?;
 
-// Async decompression
-let mut inflater = AsyncInflater::new();
-let decompressed = inflater.decompress_all(reader).await?;
+// Async decompression — Inflater implements AsyncDecompressor directly.
+let mut decompressor = AsyncDecompressorWrapper::new(Inflater::new());
+let mut decompressed = Vec::new();
+decompressor.decompress_async(&mut reader, &mut decompressed).await?;
 ```
 
 ### Parallel GZIP (requires `parallel` feature)
 
 ```rust
-use oxiarc_deflate::gzip::{gzip_compress_parallel, ParallelGzipEncoder};
+use oxiarc_deflate::{gzip_compress_parallel, ParallelGzipEncoder};
 
 // One-shot parallel GZIP (pigz-style multi-member output)
 let compressed = gzip_compress_parallel(data, 6, 1 << 17)?; // level 6, 128 KB chunks
@@ -269,7 +287,7 @@ use oxiarc_deflate::{Deflater, Lz77Params, Lz77Preset};
 // Use a preset
 let compressed = Deflater::new(9)
     .with_lz77_preset(Lz77Preset::Ultra)
-    .compress_all(data)?;
+    .compress_to_vec(data)?;
 
 // Fine-grained control
 let params = Lz77Params {
@@ -279,7 +297,7 @@ let params = Lz77Params {
 };
 let compressed = Deflater::new(9)
     .with_lz77_params(params)
-    .compress_all(data)?;
+    .compress_to_vec(data)?;
 ```
 
 Available presets:
@@ -302,11 +320,11 @@ let pool = DeflatePool::new();
 // Reuse window/hash buffers across calls — reduces allocations
 let compressed = Deflater::new(6)
     .with_pool(&pool)
-    .compress_all(data)?;
+    .compress_to_vec(data)?;
 
 // Inspect pool statistics
 let stats = pool.stats();
-println!("hits={} allocs={}", stats.hits, stats.allocations);
+println!("window_hits={} window_allocations={}", stats.window_hits, stats.window_allocations);
 ```
 
 ## Performance

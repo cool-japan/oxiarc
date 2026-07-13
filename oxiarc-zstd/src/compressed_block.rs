@@ -24,7 +24,8 @@
 //! - `Size_Format` 11: 4 streams, 5-byte header, 18+18 bits
 
 use crate::bitwriter::BackwardBitWriter;
-use crate::fse::{FseTable, FseTableEntry};
+use crate::huffman_encoder::HuffmanEncoder;
+use crate::literals::LiteralsDecoder;
 use crate::lz77::Lz77Sequence;
 use oxiarc_core::error::{OxiArcError, Result};
 
@@ -129,11 +130,14 @@ pub fn encode_compressed_block(sequences: &[Lz77Sequence]) -> Result<Vec<u8>> {
 // Literals section encoding
 // ---------------------------------------------------------------------------
 
+/// Minimum literals-section size worth attempting Huffman compression on
+/// (the table description alone costs up to ~129 bytes).
+const HUFFMAN_LITERALS_MIN: usize = 64;
+
 /// Encode the literals section.
 ///
-/// Chooses the best representation among Raw, RLE, or (future) Huffman
-/// compressed. Currently favours Raw and RLE since Huffman encoding
-/// tables require a full encoder implementation.
+/// Chooses the smallest valid representation among RLE (all bytes equal),
+/// Huffman-compressed (when it wins and self-verifies), and Raw.
 fn encode_literals_section(literals: &[u8]) -> Result<Vec<u8>> {
     if literals.is_empty() {
         // Raw literals with 0 size: single header byte.
@@ -147,8 +151,92 @@ fn encode_literals_section(literals: &[u8]) -> Result<Vec<u8>> {
         return encode_rle_literals(literals);
     }
 
-    // Fall back to raw literals (no Huffman compression yet).
-    encode_raw_literals(literals)
+    let raw = encode_raw_literals(literals)?;
+    if literals.len() >= HUFFMAN_LITERALS_MIN {
+        if let Some(compressed) = try_huffman_literals(literals) {
+            if compressed.len() < raw.len() {
+                return Ok(compressed);
+            }
+        }
+    }
+    Ok(raw)
+}
+
+/// Attempt to Huffman-compress the literals section (RFC 8878 §3.1.1.3.1.4).
+///
+/// Produces a `Compressed_Literals_Block` with a direct-weight Huffman table
+/// description and a 1-stream (< 1 KiB) or 4-stream (with jump table)
+/// payload. Returns `None` whenever Huffman cannot be applied or does not
+/// verify — the caller then falls back to Raw literals.
+///
+/// As a hard safety gate the finished section is decoded back with this
+/// crate's (reference-exact) literals decoder and must reproduce the input
+/// byte-for-byte; any imperfection downgrades to Raw rather than risking an
+/// invalid frame.
+fn try_huffman_literals(literals: &[u8]) -> Option<Vec<u8>> {
+    let mut frequencies = [0u64; 256];
+    for &byte in literals {
+        frequencies[byte as usize] += 1;
+    }
+    let encoder = HuffmanEncoder::from_frequencies(&frequencies)?;
+    // Defense in depth: RFC 8878 caps literal code lengths at 11 bits and a
+    // usable table needs at least two coded symbols.
+    if encoder.max_bits() > crate::huffman::MAX_CODE_LENGTH || encoder.num_symbols() < 2 {
+        return None;
+    }
+    let table = encoder.serialize_table();
+
+    let single_stream = literals.len() < 1024;
+    let streams = if single_stream {
+        // Single stream (Size_Format 00).
+        encoder.encode_literals(literals)
+    } else {
+        // 4 streams: streams 1-3 carry ceil(n/4) literals each, stream 4 the
+        // remainder; a 6-byte jump table holds the sizes of streams 1-3.
+        let quarter = literals.len().div_ceil(4);
+        let (part1, rest) = literals.split_at(quarter);
+        let (part2, rest) = rest.split_at(quarter);
+        let (part3, part4) = rest.split_at(quarter);
+        let enc1 = encoder.encode_literals(part1);
+        let enc2 = encoder.encode_literals(part2);
+        let enc3 = encoder.encode_literals(part3);
+        let enc4 = encoder.encode_literals(part4);
+        if enc1.len() > u16::MAX as usize
+            || enc2.len() > u16::MAX as usize
+            || enc3.len() > u16::MAX as usize
+        {
+            return None;
+        }
+        let mut combined =
+            Vec::with_capacity(6 + enc1.len() + enc2.len() + enc3.len() + enc4.len());
+        combined.extend_from_slice(&(enc1.len() as u16).to_le_bytes());
+        combined.extend_from_slice(&(enc2.len() as u16).to_le_bytes());
+        combined.extend_from_slice(&(enc3.len() as u16).to_le_bytes());
+        combined.extend_from_slice(&enc1);
+        combined.extend_from_slice(&enc2);
+        combined.extend_from_slice(&enc3);
+        combined.extend_from_slice(&enc4);
+        combined
+    };
+
+    // The 3-byte header (Size_Format 00) only expresses sizes below 1024 and
+    // is the sole single-stream format; bail out if it cannot represent us.
+    let compressed_size = table.len() + streams.len();
+    if single_stream && compressed_size >= 1024 {
+        return None;
+    }
+
+    let section = encode_compressed_literals(literals.len(), &table, &streams).ok()?;
+
+    // Self-verification gate: never emit a Huffman section our own
+    // reference-exact decoder cannot reproduce exactly.
+    let mut check = LiteralsDecoder::new();
+    match check.decode(&section) {
+        Ok((decoded, consumed)) if decoded == literals && consumed == section.len() => {
+            Some(section)
+        }
+        _ => None,
+    }
 }
 
 /// Encode raw literals (uncompressed).
@@ -224,7 +312,6 @@ fn encode_rle_literals(literals: &[u8]) -> Result<Vec<u8>> {
 ///
 /// This produces a Compressed-type literals header followed by the Huffman
 /// table description and the compressed bitstream.
-#[allow(dead_code)]
 fn encode_compressed_literals(regen_size: usize, table: &[u8], streams: &[u8]) -> Result<Vec<u8>> {
     let compressed_size = table.len() + streams.len();
     let mut out = Vec::with_capacity(5 + compressed_size);
@@ -447,258 +534,209 @@ fn write_mode_table_data(out: &mut Vec<u8>, mode: &SequenceCompressionMode) {
     }
 }
 
-/// FSE encoding table: for each symbol, stores the list of decoding-table states
-/// that produce that symbol, along with their transition parameters.
-struct FseEncodingTable {
-    /// For each symbol, the list of encoding state entries from the decoding table.
-    symbol_states: Vec<Vec<FseEncState>>,
-    /// The underlying decoding table (borrowed data cached as owned copy).
-    decoding_table: FseTable,
+/// FSE compression table, mirroring the reference `FSE_buildCTable`.
+///
+/// `state_table` maps a "find state" index to the next encoder state value
+/// (which lives in `[table_size, 2*table_size)`); `symbol_tt` carries the
+/// per-symbol `(delta_nb_bits, delta_find_state)` transformation exactly as
+/// in the reference implementation.
+struct FseCTable {
+    /// Accuracy log (table size = 1 << table_log).
+    table_log: u8,
+    /// Next-state lookup, indexed by `(state >> nb_bits) + delta_find_state`.
+    state_table: Vec<u16>,
+    /// Per-symbol transformation entries.
+    symbol_tt: Vec<SymbolTransform>,
 }
 
-/// A single encoding-side state entry for a symbol.
-#[derive(Debug, Clone, Copy)]
-struct FseEncState {
-    /// The decoding table state index that produces this symbol.
-    state: usize,
-    /// Baseline for next-state computation: next_state = baseline + bits_read.
-    baseline: u16,
+/// Per-symbol encoding transform (see reference `FSE_symbolCompressionTransform`).
+#[derive(Debug, Clone, Copy, Default)]
+struct SymbolTransform {
+    /// Encodes both the bit count threshold and the state cutoff.
+    delta_nb_bits: u32,
+    /// Offset into `state_table` for this symbol's states.
+    delta_find_state: i32,
 }
 
-impl FseEncodingTable {
-    /// Build an encoding table from a decoding table.
-    fn from_decoding_table(table: FseTable) -> Self {
-        let table_size = 1usize << table.accuracy_log();
-        let mut max_symbol = 0u8;
+/// A running FSE encoder state.
+struct FseCState {
+    value: usize,
+}
 
-        for i in 0..table_size {
-            let entry = table.get(i);
-            if entry.symbol > max_symbol {
-                max_symbol = entry.symbol;
+impl FseCTable {
+    /// Build a compression table from a normalized distribution
+    /// (probabilities summing to `1 << table_log`, `-1` = "less than one").
+    fn from_normalized(table_log: u8, norm: &[i16]) -> Result<Self> {
+        let table_size = 1usize << table_log;
+        let table_mask = table_size - 1;
+        let step = (table_size >> 1) + (table_size >> 3) + 3;
+        let num_symbols = norm.len();
+
+        // Cumulative symbol start positions ("cumul" in the reference).
+        let mut cumul = vec![0i32; num_symbols + 1];
+        let mut table_symbol = vec![0u8; table_size];
+        let mut high_threshold = table_size - 1;
+
+        for s in 0..num_symbols {
+            if norm[s] == -1 {
+                cumul[s + 1] = cumul[s] + 1;
+                table_symbol[high_threshold] = s as u8;
+                high_threshold = high_threshold.wrapping_sub(1);
+            } else {
+                if norm[s] < 0 {
+                    return Err(OxiArcError::corrupted(0, "invalid FSE normalized count"));
+                }
+                cumul[s + 1] = cumul[s] + norm[s] as i32;
+            }
+        }
+        if cumul[num_symbols] != table_size as i32 {
+            return Err(OxiArcError::corrupted(
+                0,
+                "FSE normalized counts do not sum to table size",
+            ));
+        }
+
+        // Spread symbols across the table.
+        let mut position = 0usize;
+        for (s, &count) in norm.iter().enumerate() {
+            for _ in 0..count.max(0) {
+                table_symbol[position] = s as u8;
+                loop {
+                    position = (position + step) & table_mask;
+                    if position <= high_threshold {
+                        break;
+                    }
+                }
+            }
+        }
+        if position != 0 {
+            return Err(OxiArcError::corrupted(
+                0,
+                "FSE symbol spread did not terminate at position 0",
+            ));
+        }
+
+        // Build the next-state table, grouped by symbol.
+        let mut state_table = vec![0u16; table_size];
+        let mut cumul_run = cumul.clone();
+        for (u, &sym) in table_symbol.iter().enumerate() {
+            let slot = cumul_run[sym as usize];
+            cumul_run[sym as usize] += 1;
+            if slot < 0 || slot as usize >= table_size {
+                return Err(OxiArcError::corrupted(0, "FSE state table overflow"));
+            }
+            state_table[slot as usize] = (table_size + u) as u16;
+        }
+
+        // Build the per-symbol transforms.
+        let mut symbol_tt = vec![SymbolTransform::default(); num_symbols];
+        let mut total = 0i32;
+        for (s, &count) in norm.iter().enumerate() {
+            match count {
+                0 => {
+                    // Symbol never used; poison the bit count so accidental
+                    // use is caught by the assertion in `encode_symbol`.
+                    symbol_tt[s].delta_nb_bits =
+                        (((table_log as u32) + 1) << 16) - (1u32 << table_log);
+                }
+                -1 | 1 => {
+                    symbol_tt[s].delta_nb_bits = ((table_log as u32) << 16) - (1u32 << table_log);
+                    symbol_tt[s].delta_find_state = total - 1;
+                    total += 1;
+                }
+                _ => {
+                    let count_u = count as u32;
+                    let max_bits_out = table_log as u32 - (31 - (count_u - 1).leading_zeros());
+                    let min_state_plus = count_u << max_bits_out;
+                    symbol_tt[s].delta_nb_bits = (max_bits_out << 16).wrapping_sub(min_state_plus);
+                    symbol_tt[s].delta_find_state = total - count as i32;
+                    total += count as i32;
+                }
             }
         }
 
-        let mut symbol_states = vec![Vec::new(); max_symbol as usize + 1];
-
-        for i in 0..table_size {
-            let entry = table.get(i);
-            symbol_states[entry.symbol as usize].push(FseEncState {
-                state: i,
-                baseline: entry.baseline,
-            });
-        }
-
-        // Sort each symbol's states by baseline for efficient lookup
-        for states in &mut symbol_states {
-            states.sort_by_key(|s| s.baseline);
-        }
-
-        Self {
-            symbol_states,
-            decoding_table: table,
-        }
+        Ok(Self {
+            table_log,
+            state_table,
+            symbol_tt,
+        })
     }
 
-    /// Get the accuracy log from the underlying decoding table.
-    fn accuracy_log(&self) -> u8 {
-        self.decoding_table.accuracy_log()
+    /// Look up a symbol's transform, erroring on out-of-range symbols.
+    fn transform(&self, symbol: u8) -> Result<SymbolTransform> {
+        self.symbol_tt.get(symbol as usize).copied().ok_or_else(|| {
+            OxiArcError::corrupted(0, format!("symbol {} outside FSE table", symbol))
+        })
     }
 
-    /// Get a decoding table entry for a given state.
-    fn get_entry(&self, state: usize) -> &FseTableEntry {
-        self.decoding_table.get(state)
+    /// Initialize an encoder state for the *last* symbol of the stream
+    /// (reference `FSE_initCState2`); emits no bits.
+    fn init_state(&self, symbol: u8) -> Result<FseCState> {
+        let tt = self.transform(symbol)?;
+        let nb_bits_out = (tt.delta_nb_bits.wrapping_add(1 << 15)) >> 16;
+        let value = ((nb_bits_out << 16).wrapping_sub(tt.delta_nb_bits)) as u64;
+        let index = (value >> nb_bits_out) as i64 + tt.delta_find_state as i64;
+        let next = self.lookup_state(index, symbol)?;
+        Ok(FseCState {
+            value: next as usize,
+        })
+    }
+
+    /// Encode one symbol (reference `FSE_encodeSymbol`): emits the current
+    /// state's low bits and advances to the next state.
+    fn encode_symbol(
+        &self,
+        writer: &mut BackwardBitWriter,
+        state: &mut FseCState,
+        symbol: u8,
+    ) -> Result<()> {
+        let tt = self.transform(symbol)?;
+        let nb_bits = ((state.value as u32).wrapping_add(tt.delta_nb_bits)) >> 16;
+        if nb_bits > self.table_log as u32 + 1 {
+            return Err(OxiArcError::corrupted(
+                0,
+                "FSE encoder produced an invalid bit count (unused symbol?)",
+            ));
+        }
+        writer.write_bits(state.value as u64, nb_bits as u8);
+        let index = (state.value >> nb_bits) as i64 + tt.delta_find_state as i64;
+        state.value = self.lookup_state(index, symbol)? as usize;
+        Ok(())
+    }
+
+    /// Flush the final encoder state (reference `FSE_flushCState`).
+    fn flush_state(&self, writer: &mut BackwardBitWriter, state: &FseCState) {
+        writer.write_bits(state.value as u64, self.table_log);
+    }
+
+    /// Bounds-checked `state_table` lookup.
+    fn lookup_state(&self, index: i64, symbol: u8) -> Result<u16> {
+        if index < 0 || index as usize >= self.state_table.len() {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!("FSE encoder state out of range for symbol {}", symbol),
+            ));
+        }
+        Ok(self.state_table[index as usize])
     }
 }
 
-/// Encode all sequences into a backward bitstream.
-///
-/// The `BackwardBitWriter` produces a byte array where the first bits
-/// written are read first by the decoder.
-///
-/// **Decoder read order:**
-/// 1. LL initial state (acc_log bits), OF initial state, ML initial state
-/// 2. For each sequence (forward):
-///    a. OF state transition bits
-///    b. ML state transition bits
-///    c. LL state transition bits
-///    d. LL extra bits
-///    e. ML extra bits
-///    f. OF extra bits
-///
-/// **Encoding strategy:**
-/// FSE encoding must be done **backward** through the sequence list so that
-/// state transitions are consistent. We first compute the FSE state for each
-/// sequence position by working from the last sequence to the first, then
-/// write the bitstream in forward (decoder) order.
-fn encode_sequences_bitstream(
-    sequences: &[ZstdSequence],
-    ll_mode: &SequenceCompressionMode,
-    of_mode: &SequenceCompressionMode,
-    ml_mode: &SequenceCompressionMode,
-) -> Result<Vec<u8>> {
-    let mut writer = BackwardBitWriter::new();
+/// Predefined literal-length distribution (RFC 8878 §3.1.1.3.2.2, log 6).
+const LL_PREDEFINED_DIST: [i16; 36] = [
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1,
+];
 
-    // Build encoding tables.
-    let ll_enc = build_predefined_enc_table(ll_mode, TableCategory::LiteralLength);
-    let of_enc = build_predefined_enc_table(of_mode, TableCategory::Offset);
-    let ml_enc = build_predefined_enc_table(ml_mode, TableCategory::MatchLength);
+/// Predefined offset-code distribution (RFC 8878, log 5, symbols 0-28).
+const OF_PREDEFINED_DIST: [i16; 29] = [
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
+];
 
-    let n = sequences.len();
-    if n == 0 {
-        return Ok(writer.finish());
-    }
-
-    // Compute FSE states backward for each table.
-    // states[i] is the FSE state when the decoder processes sequence i.
-    // The decoder does: symbol = table[state_i].symbol, then
-    //   state_{i+1} = table[state_i].baseline + read_bits(table[state_i].num_bits)
-    //
-    // Working backward: choose state for last sequence, then find states for
-    // earlier sequences such that the transition from state_i reaches state_{i+1}.
-    let ll_states =
-        compute_fse_states_backward(&ll_enc, sequences.iter().map(|s| s.ll_code).collect());
-    let of_states =
-        compute_fse_states_backward(&of_enc, sequences.iter().map(|s| s.of_code).collect());
-    let ml_states =
-        compute_fse_states_backward(&ml_enc, sequences.iter().map(|s| s.ml_code).collect());
-
-    // 1. Write initial FSE states (read first by the decoder).
-    //    Decoder order: LL initial, OF initial, ML initial.
-    if let Some(ref enc) = ll_enc {
-        writer.write_bits(ll_states[0] as u64, enc.accuracy_log());
-    }
-    if let Some(ref enc) = of_enc {
-        writer.write_bits(of_states[0] as u64, enc.accuracy_log());
-    }
-    if let Some(ref enc) = ml_enc {
-        writer.write_bits(ml_states[0] as u64, enc.accuracy_log());
-    }
-
-    // 2. For each sequence (forward order), write state transition bits
-    //    and extra bits in decoder read order.
-    for idx in 0..n {
-        let seq = &sequences[idx];
-
-        // State transition bits (decoder reads OF, ML, LL).
-        // bits = state_{i+1} - baseline_i
-        if let Some(ref enc) = of_enc {
-            let entry = enc.get_entry(of_states[idx]);
-            if entry.num_bits > 0 {
-                let target_next = if idx + 1 < n {
-                    of_states[idx + 1]
-                } else {
-                    // Last sequence: decoder reads bits but result is unused.
-                    entry.baseline as usize
-                };
-                let bits_val = target_next.wrapping_sub(entry.baseline as usize);
-                writer.write_bits(bits_val as u64, entry.num_bits);
-            }
-        }
-
-        if let Some(ref enc) = ml_enc {
-            let entry = enc.get_entry(ml_states[idx]);
-            if entry.num_bits > 0 {
-                let target_next = if idx + 1 < n {
-                    ml_states[idx + 1]
-                } else {
-                    entry.baseline as usize
-                };
-                let bits_val = target_next.wrapping_sub(entry.baseline as usize);
-                writer.write_bits(bits_val as u64, entry.num_bits);
-            }
-        }
-
-        if let Some(ref enc) = ll_enc {
-            let entry = enc.get_entry(ll_states[idx]);
-            if entry.num_bits > 0 {
-                let target_next = if idx + 1 < n {
-                    ll_states[idx + 1]
-                } else {
-                    entry.baseline as usize
-                };
-                let bits_val = target_next.wrapping_sub(entry.baseline as usize);
-                writer.write_bits(bits_val as u64, entry.num_bits);
-            }
-        }
-
-        // Extra bits (decoder reads LL_extra, ML_extra, OF_extra).
-        if seq.ll_extra_bits > 0 {
-            writer.write_bits(seq.ll_extra_value as u64, seq.ll_extra_bits);
-        }
-        if seq.ml_extra_bits > 0 {
-            writer.write_bits(seq.ml_extra_value as u64, seq.ml_extra_bits);
-        }
-        if seq.of_extra_bits > 0 {
-            writer.write_bits(seq.of_extra_value as u64, seq.of_extra_bits);
-        }
-    }
-
-    Ok(writer.finish())
-}
-
-/// Compute FSE states backward through a sequence of symbols.
-///
-/// For each position i, `states[i]` is the FSE decoding table state such that
-/// `table[states[i]].symbol == symbols[i]` and the transition from `states[i]`
-/// can reach `states[i+1]`.
-///
-/// Returns an empty vec if `enc` is None.
-fn compute_fse_states_backward(enc: &Option<FseEncodingTable>, symbols: Vec<u8>) -> Vec<usize> {
-    let enc = match enc {
-        Some(e) => e,
-        None => return Vec::new(),
-    };
-    let n = symbols.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let mut states = vec![0usize; n];
-
-    // Start from the last sequence: choose any valid state for its symbol.
-    let last_sym = symbols[n - 1] as usize;
-    states[n - 1] = if last_sym < enc.symbol_states.len() && !enc.symbol_states[last_sym].is_empty()
-    {
-        enc.symbol_states[last_sym][0].state
-    } else {
-        0
-    };
-
-    // Work backward from n-2 to 0.
-    // For sequence i, we need a state whose symbol matches symbols[i] and
-    // whose transition range [baseline, baseline + 2^num_bits) includes states[i+1].
-    for i in (0..n.saturating_sub(1)).rev() {
-        let sym = symbols[i] as usize;
-        let target_next = states[i + 1];
-
-        if sym >= enc.symbol_states.len() || enc.symbol_states[sym].is_empty() {
-            states[i] = 0;
-            continue;
-        }
-
-        // Search for a state whose baseline range includes target_next.
-        let mut found = false;
-        for enc_state in &enc.symbol_states[sym] {
-            let entry = enc.get_entry(enc_state.state);
-            let range_size = 1usize << entry.num_bits;
-            let baseline = entry.baseline as usize;
-            if target_next >= baseline && target_next < baseline + range_size {
-                states[i] = enc_state.state;
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            // Fallback: pick the state whose baseline is closest to target_next.
-            // This can happen when the table doesn't have a perfect transition.
-            // Use the first available state (the decoder will still get the right symbol).
-            states[i] = enc.symbol_states[sym][0].state;
-        }
-    }
-
-    states
-}
+/// Predefined match-length distribution (RFC 8878, log 6, symbols 0-52).
+const ML_PREDEFINED_DIST: [i16; 53] = [
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
+];
 
 /// Table category for predefined FSE table construction.
 enum TableCategory {
@@ -707,42 +745,107 @@ enum TableCategory {
     MatchLength,
 }
 
-/// Build a predefined FSE encoding table for a given mode and category.
-fn build_predefined_enc_table(
+/// Build the FSE compression table for a mode (None for RLE — an RLE
+/// category emits no state or transition bits at all).
+fn build_ctable_for_mode(
     mode: &SequenceCompressionMode,
     category: TableCategory,
-) -> Option<FseEncodingTable> {
+) -> Result<Option<FseCTable>> {
     match mode {
         SequenceCompressionMode::Predefined => {
-            let dec_table = match category {
-                TableCategory::LiteralLength => {
-                    let probs: [i16; 36] = [
-                        4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                        3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1,
-                    ];
-                    FseTable::new(6, &probs).ok()?
-                }
-                TableCategory::Offset => {
-                    // Per RFC 8878: 29 symbols (0-28), accuracy_log=5
-                    let probs: [i16; 29] = [
-                        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1,
-                        -1, -1, -1, -1,
-                    ];
-                    FseTable::new(5, &probs).ok()?
-                }
-                TableCategory::MatchLength => {
-                    let probs: [i16; 53] = [
-                        1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1,
-                        -1, -1, -1, -1,
-                    ];
-                    FseTable::new(6, &probs).ok()?
-                }
-            };
-            Some(FseEncodingTable::from_decoding_table(dec_table))
+            let table = match category {
+                TableCategory::LiteralLength => FseCTable::from_normalized(6, &LL_PREDEFINED_DIST),
+                TableCategory::Offset => FseCTable::from_normalized(5, &OF_PREDEFINED_DIST),
+                TableCategory::MatchLength => FseCTable::from_normalized(6, &ML_PREDEFINED_DIST),
+            }?;
+            Ok(Some(table))
         }
-        SequenceCompressionMode::Rle(_) => None,
+        SequenceCompressionMode::Rle(_) => Ok(None),
     }
+}
+
+/// Encode all sequences into the RFC 8878 backward bitstream.
+///
+/// Mirrors the reference `ZSTD_encodeSequences`: because the decoder reads
+/// the stream back-to-front, the encoder emits data for the **last** sequence
+/// first and finishes with the initial FSE states.
+///
+/// Write order (decoder reads the reverse):
+/// 1. Init encoder states from the *last* sequence's codes (no bits).
+/// 2. Last sequence's extra bits: LL, ML, OF.
+/// 3. For each earlier sequence, back to front: OF/ML/LL state-transition
+///    bits, then LL/ML/OF extra bits.
+/// 4. Final states: ML, OF, LL (each `accuracy_log` bits).
+///
+/// The decoder therefore reads: LL/OF/ML initial states; per sequence the
+/// OF, ML, LL extra bits; and LL/ML/OF state updates after every sequence
+/// except the last — exactly RFC 8878 §3.1.1.4.
+fn encode_sequences_bitstream(
+    sequences: &[ZstdSequence],
+    ll_mode: &SequenceCompressionMode,
+    of_mode: &SequenceCompressionMode,
+    ml_mode: &SequenceCompressionMode,
+) -> Result<Vec<u8>> {
+    let mut writer = BackwardBitWriter::new();
+
+    let n = sequences.len();
+    if n == 0 {
+        return Ok(writer.finish());
+    }
+
+    let ll_ctable = build_ctable_for_mode(ll_mode, TableCategory::LiteralLength)?;
+    let of_ctable = build_ctable_for_mode(of_mode, TableCategory::Offset)?;
+    let ml_ctable = build_ctable_for_mode(ml_mode, TableCategory::MatchLength)?;
+
+    // 1. Initialize states from the last sequence (emits no bits).
+    let last = &sequences[n - 1];
+    let mut ml_state = match &ml_ctable {
+        Some(t) => Some(t.init_state(last.ml_code)?),
+        None => None,
+    };
+    let mut of_state = match &of_ctable {
+        Some(t) => Some(t.init_state(last.of_code)?),
+        None => None,
+    };
+    let mut ll_state = match &ll_ctable {
+        Some(t) => Some(t.init_state(last.ll_code)?),
+        None => None,
+    };
+
+    // 2. Last sequence's extra bits (LL, ML, OF).
+    writer.write_bits(last.ll_extra_value as u64, last.ll_extra_bits);
+    writer.write_bits(last.ml_extra_value as u64, last.ml_extra_bits);
+    writer.write_bits(last.of_extra_value as u64, last.of_extra_bits);
+
+    // 3. Remaining sequences, back to front.
+    for seq in sequences[..n - 1].iter().rev() {
+        if let (Some(table), Some(state)) = (&of_ctable, of_state.as_mut()) {
+            table.encode_symbol(&mut writer, state, seq.of_code)?;
+        }
+        if let (Some(table), Some(state)) = (&ml_ctable, ml_state.as_mut()) {
+            table.encode_symbol(&mut writer, state, seq.ml_code)?;
+        }
+        if let (Some(table), Some(state)) = (&ll_ctable, ll_state.as_mut()) {
+            table.encode_symbol(&mut writer, state, seq.ll_code)?;
+        }
+        writer.write_bits(seq.ll_extra_value as u64, seq.ll_extra_bits);
+        writer.write_bits(seq.ml_extra_value as u64, seq.ml_extra_bits);
+        writer.write_bits(seq.of_extra_value as u64, seq.of_extra_bits);
+    }
+
+    // 4. Flush final states (ML, OF, LL) — the decoder reads these first,
+    //    in reverse, as the LL/OF/ML initial states.
+    if let (Some(table), Some(state)) = (&ml_ctable, ml_state.as_ref()) {
+        table.flush_state(&mut writer, state);
+    }
+    if let (Some(table), Some(state)) = (&of_ctable, of_state.as_ref()) {
+        table.flush_state(&mut writer, state);
+    }
+    if let (Some(table), Some(state)) = (&ll_ctable, ll_state.as_ref()) {
+        table.flush_state(&mut writer, state);
+    }
+
+    Ok(writer.finish())
 }
 
 // ---------------------------------------------------------------------------

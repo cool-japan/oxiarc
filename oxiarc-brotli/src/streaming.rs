@@ -1,8 +1,26 @@
 //! Streaming compression and decompression for Brotli.
 //!
-//! Provides `Write`-based streaming compression and `Read`-based
-//! streaming decompression, suitable for processing large data
-//! that doesn't fit in memory.
+//! Provides `Write`-based compression and `Read`-based decompression
+//! **adapters**. Note the buffering model honestly:
+//!
+//! - [`BrotliCompressor`] buffers *all* written input in memory and
+//!   compresses it in one pass when [`BrotliCompressor::finish`] is called
+//!   (or on drop, best-effort). Peak memory is proportional to the total
+//!   input size.
+//! - [`BrotliDecompressor`] reads the *entire* compressed input and
+//!   materializes the *entire* decompressed output in memory on the first
+//!   `read` call; subsequent reads serve from that buffer.
+//!
+//! These types adapt the one-shot codec to `std::io` interfaces; they do
+//! **not** bound memory for data larger than RAM. For such data, feed the
+//! codec in application-level chunks instead.
+//!
+//! ## Drop behavior
+//!
+//! Dropping a [`BrotliCompressor`] without calling `finish()` performs a
+//! best-effort finish that **silently swallows I/O and encoding errors**.
+//! Always call [`BrotliCompressor::finish`] explicitly when you need to
+//! observe failures.
 //!
 //! ## Progress and Cancellation
 //!
@@ -40,9 +58,10 @@ const DEFAULT_BUF_SIZE: usize = 256 * 1024;
 
 /// A streaming Brotli compressor that implements `Write`.
 ///
-/// Data written to this compressor is buffered and compressed
-/// in blocks. Call `finish()` to flush all remaining data and
-/// write the final Brotli stream.
+/// All written data is buffered in memory and compressed in a single pass
+/// by `finish()` (peak memory is proportional to the total input). Call
+/// [`BrotliCompressor::finish`] explicitly: the `Drop` fallback compresses
+/// best-effort and silently discards any error.
 ///
 /// Supports optional progress reporting via [`ProgressHandle`] and
 /// cooperative cancellation via [`CancellationToken`].
@@ -131,6 +150,7 @@ impl<W: Write> BrotliCompressor<W> {
     /// compressor.write_all(b"Hello, pooled Brotli!").unwrap();
     /// let _ = compressor.finish();
     /// ```
+    #[must_use]
     pub fn with_pool(mut self, pool: &BrotliPool) -> Self {
         self.pool = Some(pool.clone());
         self
@@ -142,6 +162,7 @@ impl<W: Write> BrotliCompressor<W> {
     /// compressed block is written to the inner writer.  Since the
     /// compressor buffers all input until `finish()`, progress fires
     /// once per `finish()` call.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -152,6 +173,7 @@ impl<W: Write> BrotliCompressor<W> {
     /// The token is checked at the start of `finish()`. If it has been
     /// cancelled, `finish()` returns an I/O error with the message
     /// `"operation cancelled"`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -222,11 +244,14 @@ impl<W: Write> Drop for BrotliCompressor<W> {
 
 /// A streaming Brotli decompressor that implements `Read`.
 ///
-/// Reads compressed data from the inner reader and produces
-/// decompressed output.
+/// The first `read` call consumes the inner reader to its end, decompresses
+/// everything, and buffers the whole output in memory; subsequent reads
+/// serve from that buffer. Peak memory is proportional to the decompressed
+/// size.
 ///
-/// Supports optional progress reporting via [`ProgressHandle`] and
-/// cooperative cancellation via [`CancellationToken`].
+/// Supports optional progress reporting via [`ProgressHandle`],
+/// cooperative cancellation via [`CancellationToken`], and a memory budget
+/// via [`BrotliDecompressor::with_max_output`].
 ///
 /// # Example
 ///
@@ -252,6 +277,8 @@ pub struct BrotliDecompressor<R: Read> {
     progress: Option<ProgressHandle>,
     /// Optional cancellation token; checked before decompression starts.
     cancel: Option<CancellationToken>,
+    /// Optional memory budget; enforced per meta-block while decoding.
+    max_output: Option<usize>,
 }
 
 impl<R: Read> BrotliDecompressor<R> {
@@ -264,6 +291,7 @@ impl<R: Read> BrotliDecompressor<R> {
             finished: false,
             progress: None,
             cancel: None,
+            max_output: None,
         }
     }
 
@@ -271,6 +299,7 @@ impl<R: Read> BrotliDecompressor<R> {
     ///
     /// The sink's `on_progress(bytes_in_consumed, Some(bytes_in_consumed))` is
     /// called once after the entire compressed input has been decompressed.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -281,8 +310,23 @@ impl<R: Read> BrotliDecompressor<R> {
     /// The token is checked before decompression begins. If it has been
     /// cancelled, reading returns an I/O error with the message
     /// `"operation cancelled"`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Cap the decompressed output at `max_output` bytes.
+    ///
+    /// The cap is enforced *during* decoding — before the meta-block that
+    /// would exceed it is decoded — so an over-budget stream is rejected
+    /// without its expansion being allocated. Reading then fails with an
+    /// I/O error carrying [`crate::BrotliError::MemoryBudgetExceeded`]'s
+    /// message. Without this setting the crate's default 256 MB guard
+    /// applies.
+    #[must_use]
+    pub fn with_max_output(mut self, max_output: usize) -> Self {
+        self.max_output = Some(max_output);
         self
     }
 
@@ -301,10 +345,15 @@ impl<R: Read> BrotliDecompressor<R> {
             return Ok(());
         }
 
-        // Decompress with per-meta-block progress and cancellation hooks.
-        self.output_buf =
-            decompress_with_hooks(&compressed, self.progress.as_ref(), self.cancel.as_ref())
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        // Decompress with per-meta-block progress, cancellation and
+        // memory-budget enforcement.
+        self.output_buf = decompress_with_hooks(
+            &compressed,
+            self.progress.as_ref(),
+            self.cancel.as_ref(),
+            self.max_output,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
         self.output_pos = 0;
         self.finished = true;
 
@@ -352,7 +401,7 @@ pub fn decompress_from_reader<R: Read>(reader: &mut R) -> Result<Vec<u8>, Brotli
     reader
         .read_to_end(&mut compressed)
         .map_err(BrotliError::from)?;
-    decompress_with_hooks(&compressed, None, None)
+    decompress_with_hooks(&compressed, None, None, None)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 
-# oxiarc-core - Development Status (v0.3.5, 2026-07-07)
+# oxiarc-core - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -19,9 +19,10 @@
 - [x] Configurable sizes (4K, 8K, 32K, 64K)
 - [x] Safe indexing with modulo wrapping
 - [x] `OutputRingBuffer` for decompression
-- [x] `copy_from_self(distance, length)` for match expansion
+- [x] `RingBuffer::copy_from_history(distance, length, output)` / `OutputRingBuffer::copy_match(distance, length)` for match expansion
 - [x] Efficient bulk copy operations
-- [x] `get(offset)` with negative indexing
+- [x] `RingBuffer::read_at_distance(distance)` (1-based distance from the current write position)
+- [x] Non-panicking `RingBuffer::try_new`/`OutputRingBuffer::try_new` constructors (added 0.3.6; existing `new` constructors panic on invalid capacity, now with documented `# Panics` sections)
 
 ### CRC (940 lines)
 - [x] CRC-32 (ZIP/GZIP): polynomial 0xEDB88320 (reflected)
@@ -31,15 +32,16 @@
 - [x] DualCrc optimization
 - [x] Incremental computation
 - [x] One-shot `compute()` convenience method
+- [x] `is_simd_available()`/`implementation_name()` diagnostics report the actually-dispatched CRC-32 code path (fixed 0.3.6; x86_64 could previously misreport PCLMULQDQ while runtime dispatch had silently fallen back to software)
 
 ### Traits (283 lines)
-- [x] `Decompressor` trait with streaming interface
-- [x] `Compressor` trait with streaming interface
+- [x] `Decompressor` trait with streaming interface — docs corrected in 0.3.6 to describe it as an optional, DEFLATE-family-only trait, not a universal contract
+- [x] `Compressor` trait with streaming interface — same DEFLATE-family-only scope correction as `Decompressor`
 - [x] `ArchiveReader` trait for reading archives
 - [x] `ArchiveWriter` trait for writing archives
-- [x] `DecompressStatus` / `CompressStatus` enums
-- [x] `FlushMode` enum (None, Sync, Full, Finish)
-- [x] `CompressionLevel` (0-9)
+- [x] `DecompressStatus` / `CompressStatus` enums — `#[non_exhaustive]` since 0.3.6 (pre-1.0 API freeze)
+- [x] `FlushMode` enum (None, Sync, Full, Partial, Finish) — `#[non_exhaustive]` since 0.3.6 (pre-1.0 API freeze)
+- [x] ~~`CompressionLevel` (0-9)~~ — removed in 0.3.6: dead code, unused by every codec crate (each defines its own, differently-ranged level type instead)
 - [x] Default implementations for `decompress_all()` / `compress_all()`
 
 ### Entry (463 lines)
@@ -62,6 +64,7 @@
 - [x] `Corrupted` with offset and message
 - [x] `InvalidHeader`
 - [x] `Result<T>` type alias
+- [x] `#[non_exhaustive]` (since 0.3.6, pre-1.0 API freeze)
 
 ## Future Enhancements
 
@@ -121,18 +124,39 @@
 
 ## Test Coverage
 
-- Total: 154 tests (CRC-32/64 slicing-by-8, DualCrc optimization, size boundary, bitstream, msb_bitstream, ringbuffer, entry, traits)
+Per-module unit test counts (`cargo nextest list -p oxiarc-core --all-features`):
+
+- crc: 26 tests
+- mmap: 25 tests
+- entry: 24 tests
+- msb_bitstream: 22 tests
+- crc_simd: 14 tests
+- ringbuffer: 13 tests
+- async_io: 12 tests
+- bitstream: 8 tests
+- cancel: 5 tests
+- progress: 3 tests
+- error: 2 tests
+- traits: 1 test
+- **Total: 155 tests** (`cargo nextest run -p oxiarc-core --all-features`, verified 2026-07-08)
 
 ## Code Statistics
 
-| File | Lines |
-|------|-------|
-| crc.rs | 940 |
-| bitstream.rs | 601 |
-| entry.rs | 463 |
-| ringbuffer.rs | 417 |
-| traits.rs | 283 |
-| error.rs | 228 |
-| lib.rs | 83 |
-| (other) | ~550 |
-| **Total** | **~3,565** |
+Code lines per file (`tokei oxiarc-core/src`, code lines only, verified 2026-07-08):
+
+| File | Code Lines |
+|------|-----------|
+| async_io.rs | 810 |
+| entry.rs | 767 |
+| crc.rs | 667 |
+| crc_simd.rs | 594 |
+| mmap.rs | 549 |
+| msb_bitstream.rs | 429 |
+| ringbuffer.rs | 396 |
+| bitstream.rs | 373 |
+| error.rs | 152 |
+| traits.rs | 115 |
+| cancel.rs | 82 |
+| progress.rs | 60 |
+| lib.rs | 53 |
+| **Total** | **5,047** |

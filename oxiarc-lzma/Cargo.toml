@@ -5,17 +5,29 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Pure Rust LZMA/LZMA2 compression with custom dictionaries, memory pool, parallel and streaming support for OxiArc"
 keywords = ["lzma", "lzma2", "compression", "7z", "xz"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
 # Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for Lzma2Encoder/Lzma2Decoder
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 parallel = ["dep:rayon"]
+# Differential interop tests (tests/xz_interop.rs) that shell out to the real
+# `xz` CLI in BOTH directions (xz-compress -> oxiarc-decode byte-identical,
+# oxiarc-compress -> xz-decode byte-identical). Tests self-skip (with a note,
+# not a failure) when `xz` is absent from PATH. Mirrors the `lha-oracle`
+# pattern in `oxiarc-lzhuf`. Hermetic xz-produced fixtures under `tests/data/`
+# always run regardless of this feature.
+xz-oracle = []
 
 [dependencies]
 oxiarc-core.workspace = true
@@ -24,6 +36,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]

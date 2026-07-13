@@ -1,15 +1,21 @@
-//! Context modeling for Brotli compression.
+//! Context modeling for Brotli literal and distance coding.
 //!
-//! Brotli uses context-dependent prefix codes. The context is determined
-//! by one or two preceding bytes and a "context mode" that specifies
-//! how context IDs are computed.
+//! Brotli selects the prefix code for the next literal or distance from a
+//! context. For literals the context is derived from the previous two
+//! uncompressed bytes (`p1` = most recent, `p2` = second most recent) using
+//! one of four context modes; for distances it is derived from the copy
+//! length of the same command.
 //!
 //! ## Context Modes (RFC 7932 Section 7.1)
 //!
-//! - **LSB6**: Context = last byte & 0x3F (64 contexts)
-//! - **MSB6**: Context = last byte >> 2 (64 contexts)
-//! - **UTF8**: Optimized for UTF-8 text, uses lookup table
-//! - **Signed**: Optimized for signed deltas, uses lookup table
+//! - **LSB6**: Context ID = `p1 & 0x3F`
+//! - **MSB6**: Context ID = `p1 >> 2`
+//! - **UTF8**: Context ID = `LUT0[p1] | LUT1[p2]`
+//! - **Signed**: Context ID = `(LUT2[p1] << 3) | LUT2[p2]`
+//!
+//! The three lookup tables below are transcribed verbatim from RFC 7932
+//! Section 7.1 (CRC-32 values: Lut0 `0x8e91efb7`, Lut1 `0xd01a32f4`, Lut2
+//! `0x0dd7a0d6`).
 
 /// Context mode for literal context modeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,138 +49,91 @@ impl ContextMode {
     }
 }
 
+/// RFC 7932 Section 7.1 `Lut0` (UTF8 mode, indexed by `p1`).
+#[rustfmt::skip]
+const UTF8_LUT0: [u8; 256] = [
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  4,  4,  0,  0,  4,  0,  0,
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+     8, 12, 16, 12, 12, 20, 12, 16, 24, 28, 12, 12, 32, 12, 36, 12,
+    44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 32, 32, 24, 40, 28, 12,
+    12, 48, 52, 52, 52, 48, 52, 52, 52, 48, 52, 52, 52, 52, 52, 48,
+    52, 52, 52, 52, 52, 48, 52, 52, 52, 52, 52, 24, 12, 28, 12, 12,
+    12, 56, 60, 60, 60, 56, 60, 60, 60, 56, 60, 60, 60, 60, 60, 56,
+    60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 24, 12, 28, 12,  0,
+     0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+     0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+     0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+     0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+];
+
+/// RFC 7932 Section 7.1 `Lut1` (UTF8 mode, indexed by `p2`).
+#[rustfmt::skip]
+const UTF8_LUT1: [u8; 256] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1,
+    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1,
+    1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+];
+
+/// RFC 7932 Section 7.1 `Lut2` (Signed mode, indexed by `p1` and `p2`).
+#[rustfmt::skip]
+const SIGNED_LUT2: [u8; 256] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7,
+];
+
 /// Compute the context ID for a literal byte given the context mode
 /// and the two preceding bytes (p1 = most recent, p2 = second most recent).
+///
+/// This follows RFC 7932 Section 7.1 exactly; the result is in `0..64`.
 pub fn literal_context_id(mode: ContextMode, p1: u8, p2: u8) -> usize {
     match mode {
         ContextMode::Lsb6 => (p1 & 0x3F) as usize,
         ContextMode::Msb6 => (p1 >> 2) as usize,
-        ContextMode::Utf8 => utf8_context_id(p1, p2),
-        ContextMode::Signed => signed_context_id(p1, p2),
+        ContextMode::Utf8 => (UTF8_LUT0[p1 as usize] | UTF8_LUT1[p2 as usize]) as usize,
+        ContextMode::Signed => {
+            ((SIGNED_LUT2[p1 as usize] << 3) | SIGNED_LUT2[p2 as usize]) as usize
+        }
     }
 }
 
-/// UTF-8 context lookup table for the first byte (p1).
-/// Maps byte values to context categories.
+/// Distance context ID computation (RFC 7932 Section 7.2).
 ///
-/// Categories:
-/// 0: ASCII control/space
-/// 1: ASCII letter/digit
-/// 2: Start of 2-byte UTF-8 sequence (0xC0-0xDF)
-/// 3: Start of 3/4-byte UTF-8 sequence (0xE0-0xFF)
-/// 4: Continuation byte (0x80-0xBF)
-const UTF8_LUT0: [u8; 256] = {
-    let mut lut = [0u8; 256];
-    let mut i = 0;
-    while i < 256 {
-        lut[i] = if i < 0x21 {
-            0 // control + space
-        } else if i < 0x80 {
-            1 // ASCII printable
-        } else if i < 0xC0 {
-            4 // continuation byte
-        } else if i < 0xE0 {
-            2 // 2-byte start
-        } else {
-            3 // 3/4-byte start
-        };
-        i += 1;
-    }
-    lut
-};
-
-/// UTF-8 context lookup table for the second byte (p2).
-const UTF8_LUT1: [u8; 256] = {
-    let mut lut = [0u8; 256];
-    let mut i = 0;
-    while i < 256 {
-        lut[i] = if i < 0x21 {
-            0
-        } else if i < 0x80 {
-            1
-        } else if i < 0xC0 {
-            2
-        } else {
-            3
-        };
-        i += 1;
-    }
-    lut
-};
-
-/// Compute UTF-8 context ID.
-fn utf8_context_id(p1: u8, p2: u8) -> usize {
-    let c1 = UTF8_LUT0[p1 as usize] as usize;
-    let c2 = UTF8_LUT1[p2 as usize] as usize;
-    // Combine: 5 categories for p1 * 4 categories for p2 = 20 base contexts
-    // But we need 64, so we use a more detailed mapping.
-    // The actual Brotli spec uses two lookup tables that produce 6-bit context IDs.
-    // We use a simplified but correct mapping:
-    let base = match c1 {
-        0 => 0,  // control/space: contexts 0-15
-        1 => 16, // ASCII: contexts 16-31
-        2 => 32, // 2-byte UTF-8 start: contexts 32-47
-        3 => 48, // 3/4-byte start: contexts 48-55
-        4 => 56, // continuation: contexts 56-63
-        _ => 0,
-    };
-    let offset = match c1 {
-        0 | 1 => (c2 * 4 + (p1 as usize & 3)).min(15),
-        2 => (p1 as usize & 0x0F).min(15),
-        3 => ((p1 as usize & 0x07) + 8).min(15),
-        4 => (p1 as usize & 0x07).min(7),
-        _ => 0,
-    };
-    (base + offset) & 0x3F
-}
-
-/// Signed context lookup table.
-const SIGNED_LUT: [u8; 256] = {
-    let mut lut = [0u8; 256];
-    let mut i = 0i32;
-    while i < 256 {
-        // Interpret byte as signed (-128..127) and categorize.
-        let signed_val = if i >= 128 { i - 256 } else { i };
-        lut[i as usize] = if signed_val == 0 {
-            0
-        } else if signed_val > 0 && signed_val < 4 {
-            1
-        } else if signed_val >= 4 && signed_val < 16 {
-            2
-        } else if signed_val >= 16 {
-            3
-        } else if signed_val > -4 {
-            4
-        } else if signed_val > -16 {
-            5
-        } else {
-            6
-        };
-        i += 1;
-    }
-    lut
-};
-
-/// Compute signed context ID.
-fn signed_context_id(p1: u8, p2: u8) -> usize {
-    let c1 = SIGNED_LUT[p1 as usize] as usize;
-    let c2 = SIGNED_LUT[p2 as usize] as usize;
-    // 7 categories * ~9 = 63 contexts (fits in 64)
-    let id = c1 * 9 + c2.min(8);
-    id.min(63)
-}
-
-/// Distance context ID computation.
-///
-/// The distance context depends on the copy length:
-/// - copy_length = 2: context = 0
-/// - copy_length = 3: context = 1
-/// - copy_length = 4: context = 2
-/// - copy_length >= 5: context = 3
+/// The context IDs are 0, 1, 2, and 3 for copy lengths 2, 3, 4, and more
+/// than 4, respectively.
 pub fn distance_context_id(copy_length: usize) -> usize {
     match copy_length {
-        0 | 1 => 0,
-        2 => 0,
+        0..=2 => 0,
         3 => 1,
         4 => 2,
         _ => 3,
@@ -184,7 +143,10 @@ pub fn distance_context_id(copy_length: usize) -> usize {
 /// Maximum number of block types in Brotli.
 pub const MAX_BLOCK_TYPES: usize = 256;
 
-/// Maximum number of distance context values.
+/// Number of literal context IDs per block type.
+pub const NUM_LITERAL_CONTEXTS: usize = 64;
+
+/// Number of distance context IDs per block type.
 pub const NUM_DISTANCE_CONTEXTS: usize = 4;
 
 /// A context map that maps (block_type, context_id) to a prefix tree index.
@@ -223,6 +185,32 @@ impl ContextMap {
 mod tests {
     use super::*;
 
+    /// CRC-32 (as defined in RFC 7932 Appendix C) for table verification.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            let mut c = (crc ^ byte as u32) & 0xFF;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            crc = c ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    /// The three context tables must match the CRC-32 check values printed
+    /// in RFC 7932 Section 7.1.
+    #[test]
+    fn test_luts_match_rfc_crc32() {
+        assert_eq!(crc32(&UTF8_LUT0), 0x8e91efb7, "Lut0 CRC mismatch");
+        assert_eq!(crc32(&UTF8_LUT1), 0xd01a32f4, "Lut1 CRC mismatch");
+        assert_eq!(crc32(&SIGNED_LUT2), 0x0dd7a0d6, "Lut2 CRC mismatch");
+    }
+
     #[test]
     fn test_context_mode_from_bits() {
         assert_eq!(ContextMode::from_bits(0), Some(ContextMode::Lsb6));
@@ -246,6 +234,23 @@ mod tests {
     }
 
     #[test]
+    fn test_all_modes_stay_in_range() {
+        for mode in [
+            ContextMode::Lsb6,
+            ContextMode::Msb6,
+            ContextMode::Utf8,
+            ContextMode::Signed,
+        ] {
+            for p1 in 0..=255u8 {
+                for p2 in [0u8, 1, 0x20, b'a', 127, 128, 0xC3, 255] {
+                    let ctx = literal_context_id(mode, p1, p2);
+                    assert!(ctx < 64, "mode {mode:?} p1={p1} p2={p2} ctx={ctx}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_distance_context() {
         assert_eq!(distance_context_id(2), 0);
         assert_eq!(distance_context_id(3), 1);
@@ -259,37 +264,5 @@ mod tests {
         let cm = ContextMap::trivial(2, 64);
         assert_eq!(cm.tree_index(0, 0), 0);
         assert_eq!(cm.tree_index(1, 63), 0);
-    }
-
-    #[test]
-    fn test_num_contexts() {
-        assert_eq!(ContextMode::Lsb6.num_contexts(), 64);
-        assert_eq!(ContextMode::Utf8.num_contexts(), 64);
-    }
-
-    #[test]
-    fn test_utf8_context_ranges() {
-        // ASCII character should be in ASCII range.
-        let ctx = literal_context_id(ContextMode::Utf8, b'A', b' ');
-        assert!(ctx < 64);
-        // Control character
-        let ctx = literal_context_id(ContextMode::Utf8, 0x00, 0x00);
-        assert!(ctx < 64);
-        // High byte
-        let ctx = literal_context_id(ContextMode::Utf8, 0xE0, 0x80);
-        assert!(ctx < 64);
-    }
-
-    #[test]
-    fn test_signed_context_ranges() {
-        for p1 in 0..=255u8 {
-            for p2_sample in [0u8, 1, 127, 128, 255] {
-                let ctx = literal_context_id(ContextMode::Signed, p1, p2_sample);
-                assert!(
-                    ctx < 64,
-                    "context {ctx} out of range for p1={p1}, p2={p2_sample}"
-                );
-            }
-        }
     }
 }

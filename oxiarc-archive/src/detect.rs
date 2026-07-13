@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Known archive formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArchiveFormat {
     /// ZIP archive (.zip).
     Zip,
@@ -119,6 +120,55 @@ impl ArchiveFormat {
         }
 
         Self::Unknown
+    }
+
+    /// Guess a format from a filename extension.
+    ///
+    /// Covers only formats that carry **no magic bytes** and are therefore
+    /// invisible to [`ArchiveFormat::from_magic`] / [`ArchiveFormat::detect`]:
+    ///
+    /// * `.br` / `.brotli` — raw Brotli streams have no signature at all.
+    /// * `.sz` / `.snappy` — *raw* Snappy blocks have no signature either
+    ///   (the framed variant starts with the `sNaPpY` stream identifier and
+    ///   is detected by magic as usual).
+    ///
+    /// Matching is ASCII case-insensitive. Every other extension returns
+    /// [`ArchiveFormat::Unknown`] — content-based detection stays
+    /// authoritative for formats that do have magic bytes.
+    pub fn from_path_extension<P: AsRef<std::path::Path>>(path: P) -> Self {
+        let ext = path
+            .as_ref()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("br") | Some("brotli") => Self::Brotli,
+            Some("sz") | Some("snappy") => Self::Snappy,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Detect format from a reader, falling back to the filename extension
+    /// for magic-less formats.
+    ///
+    /// Behaves exactly like [`ArchiveFormat::detect`]; when the content
+    /// yields [`ArchiveFormat::Unknown`], the extension of `path` is
+    /// consulted via [`ArchiveFormat::from_path_extension`] so raw Brotli
+    /// (`.br`/`.brotli`) and raw Snappy (`.sz`/`.snappy`) files — which have
+    /// no magic bytes — can still be listed, tested, and extracted by
+    /// file-path commands.
+    ///
+    /// The reader is left at an unspecified position after this call;
+    /// callers should seek back to 0 before further use.
+    pub fn detect_with_path<R: Read + Seek, P: AsRef<std::path::Path>>(
+        reader: &mut R,
+        path: P,
+    ) -> Result<(Self, Vec<u8>)> {
+        let (format, magic) = Self::detect(reader)?;
+        if format != Self::Unknown {
+            return Ok((format, magic));
+        }
+        Ok((Self::from_path_extension(path), magic))
     }
 
     /// Detect format from a reader.
@@ -312,6 +362,56 @@ mod tests {
     fn test_detect_unknown() {
         let magic = [0x00, 0x00, 0x00, 0x00];
         assert_eq!(ArchiveFormat::from_magic(&magic), ArchiveFormat::Unknown);
+    }
+
+    #[test]
+    fn test_from_path_extension_magicless_formats() {
+        assert_eq!(
+            ArchiveFormat::from_path_extension("data.br"),
+            ArchiveFormat::Brotli
+        );
+        assert_eq!(
+            ArchiveFormat::from_path_extension("/tmp/x/data.BROTLI"),
+            ArchiveFormat::Brotli
+        );
+        assert_eq!(
+            ArchiveFormat::from_path_extension("data.sz"),
+            ArchiveFormat::Snappy
+        );
+        assert_eq!(
+            ArchiveFormat::from_path_extension("data.SNAPPY"),
+            ArchiveFormat::Snappy
+        );
+        // Formats with real magic bytes are NOT guessed from the extension.
+        assert_eq!(
+            ArchiveFormat::from_path_extension("data.zip"),
+            ArchiveFormat::Unknown
+        );
+        assert_eq!(
+            ArchiveFormat::from_path_extension("no_extension"),
+            ArchiveFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn test_detect_with_path_falls_back_to_extension() {
+        use std::io::Cursor;
+        // Raw Brotli output has no magic; content detection alone fails.
+        let raw = vec![0x1B, 0x1F, 0x00, 0xA4, 0xC2, 0xEA];
+        let mut cursor = Cursor::new(raw.clone());
+        let (by_content, _) = ArchiveFormat::detect(&mut cursor).expect("detect");
+        assert_eq!(by_content, ArchiveFormat::Unknown);
+
+        let mut cursor = Cursor::new(raw.clone());
+        let (with_path, _) =
+            ArchiveFormat::detect_with_path(&mut cursor, "example.br").expect("detect_with_path");
+        assert_eq!(with_path, ArchiveFormat::Brotli);
+
+        // Magic always wins over the extension.
+        let mut cursor = Cursor::new(vec![0x50, 0x4B, 0x03, 0x04, 0x00, 0x00]);
+        let (magic_wins, _) = ArchiveFormat::detect_with_path(&mut cursor, "mislabeled.br")
+            .expect("detect_with_path magic");
+        assert_eq!(magic_wins, ArchiveFormat::Zip);
     }
 
     #[test]

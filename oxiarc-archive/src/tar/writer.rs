@@ -14,6 +14,34 @@ const TAR_NAME_MAX: usize = 100;
 const TAR_LINKNAME_MAX: usize = 100;
 
 /// TAR archive writer.
+///
+/// Writes a POSIX UStar / PAX-compatible TAR stream to any [`std::io::Write`]
+/// sink — a `Vec<u8>`, a [`std::fs::File`], a network socket, etc. Filenames
+/// longer than 100 bytes (or link targets longer than 100 bytes) are
+/// automatically carried via PAX extended headers so they round-trip losslessly
+/// through any PAX-aware reader (including [`super::reader::TarReader`] and
+/// [`super::stream::TarStreamReader`]).
+///
+/// Dropping a `TarWriter` calls [`TarWriter::finish`] automatically, so the
+/// archive is always correctly terminated even if the caller forgets to call
+/// it explicitly — but callers that need to propagate a `finish` error should
+/// call it themselves before drop.
+///
+/// # Example
+/// ```
+/// use oxiarc_archive::TarWriter;
+///
+/// let mut buf = Vec::new();
+/// {
+///     let mut writer = TarWriter::new(&mut buf);
+///     writer.add_directory("docs").expect("add_directory");
+///     writer
+///         .add_file("docs/readme.txt", b"Hello, TAR!")
+///         .expect("add_file");
+///     writer.finish().expect("finish");
+/// }
+/// assert!(!buf.is_empty());
+/// ```
 pub struct TarWriter<W: Write> {
     writer: W,
     finished: bool,
@@ -24,7 +52,17 @@ pub struct TarWriter<W: Write> {
 }
 
 impl<W: Write> TarWriter<W> {
-    /// Create a new TAR writer.
+    /// Create a new TAR writer wrapping `writer`.
+    ///
+    /// # Example
+    /// ```
+    /// use oxiarc_archive::TarWriter;
+    ///
+    /// let mut buf = Vec::new();
+    /// let mut writer = TarWriter::new(&mut buf);
+    /// writer.add_file("a.txt", b"content").expect("add_file");
+    /// writer.finish().expect("finish");
+    /// ```
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -35,6 +73,7 @@ impl<W: Write> TarWriter<W> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -75,6 +114,100 @@ impl<W: Write> TarWriter<W> {
             handle.on_progress(data.len() as u64, None);
         }
 
+        Ok(())
+    }
+
+    /// Add a file with an explicit unix mode and modification time.
+    ///
+    /// Unlike [`TarWriter::add_file`] (which always uses `0o644`) and
+    /// [`TarWriter::add_file_with_mode`] (which always stamps the current
+    /// time), this preserves both pieces of metadata exactly as supplied —
+    /// intended for callers (e.g. `oxiarc create`) that read them from a
+    /// real filesystem entry and want the archive to reflect the source
+    /// file faithfully rather than silently normalizing them away.
+    ///
+    /// # Example
+    /// ```
+    /// use oxiarc_archive::TarWriter;
+    /// use std::time::{Duration, UNIX_EPOCH};
+    ///
+    /// let mut buf = Vec::new();
+    /// let mut writer = TarWriter::new(&mut buf);
+    /// let mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    /// writer
+    ///     .add_file_with_metadata("script.sh", b"#!/bin/sh\necho hi", 0o755, mtime)
+    ///     .expect("add_file_with_metadata");
+    /// writer.finish().expect("finish");
+    /// ```
+    pub fn add_file_with_metadata(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        mode: u32,
+        mtime: std::time::SystemTime,
+    ) -> Result<()> {
+        let mtime_secs = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let idx = self.entry_index;
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(name, idx);
+        }
+        self.entry_index += 1;
+
+        let needs_pax = name.len() > TAR_NAME_MAX;
+
+        if needs_pax {
+            self.write_pax_header(name, None)?;
+            let short_name = Self::tar_fallback_name(name);
+            let header =
+                TarHeader::new_file_with_mtime(&short_name, data.len() as u64, mode, mtime_secs);
+            self.write_header(&header)?;
+        } else {
+            let header = TarHeader::new_file_with_mtime(name, data.len() as u64, mode, mtime_secs);
+            self.write_header(&header)?;
+        }
+        self.write_data(data)?;
+
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(data.len() as u64, None);
+        }
+
+        Ok(())
+    }
+
+    /// Add a directory with an explicit unix mode and modification time.
+    ///
+    /// See [`TarWriter::add_file_with_metadata`] for the rationale; this is
+    /// the directory-entry counterpart.
+    pub fn add_directory_with_metadata(
+        &mut self,
+        name: &str,
+        mode: u32,
+        mtime: std::time::SystemTime,
+    ) -> Result<()> {
+        let mtime_secs = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let dir_name = if name.ends_with('/') {
+            name.to_string()
+        } else {
+            format!("{}/", name)
+        };
+
+        if dir_name.len() > TAR_NAME_MAX {
+            self.write_pax_header(&dir_name, None)?;
+            let short_name = Self::tar_fallback_name(&dir_name);
+            let header = TarHeader::new_directory_with_mtime(&short_name, mode, mtime_secs);
+            self.write_header(&header)?;
+        } else {
+            let header = TarHeader::new_directory_with_mtime(&dir_name, mode, mtime_secs);
+            self.write_header(&header)?;
+        }
         Ok(())
     }
 
@@ -311,7 +444,22 @@ impl<W: Write> TarWriter<W> {
         Ok(())
     }
 
-    /// Finish the archive by writing two zero blocks.
+    /// Finish the archive by writing the two all-zero end-of-archive blocks.
+    ///
+    /// Idempotent: calling it more than once (including implicitly via
+    /// [`Drop`]) only writes the terminator once.
+    ///
+    /// # Example
+    /// ```
+    /// use oxiarc_archive::TarWriter;
+    ///
+    /// let mut buf = Vec::new();
+    /// let mut writer = TarWriter::new(&mut buf);
+    /// writer.add_file("a.txt", b"content").expect("add_file");
+    /// writer.finish().expect("finish");
+    /// // Calling finish again is a harmless no-op.
+    /// writer.finish().expect("second finish is a no-op");
+    /// ```
     pub fn finish(&mut self) -> Result<()> {
         if !self.finished {
             self.writer.write_all(&[0u8; BLOCK_SIZE])?;

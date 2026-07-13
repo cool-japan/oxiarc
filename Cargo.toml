@@ -17,11 +17,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxiarc"
+homepage = "https://github.com/cool-japan/oxiarc"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "Pure Rust archive/compression library - The Oxidized Archiver"
 keywords = ["archive", "compression", "zip", "lzh", "deflate"]
@@ -62,6 +63,7 @@ memmap2 = "0.9.11"
 criterion = "0.8.2"
 weezl = "0.2.1"
 glob = "0.3.3"
+proptest = "1.11.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

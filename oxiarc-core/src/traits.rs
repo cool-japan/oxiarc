@@ -8,7 +8,11 @@ use crate::error::Result;
 use std::io::{Read, Write};
 
 /// Status of a streaming decompression operation.
+///
+/// Marked `#[non_exhaustive]` so new statuses can be added in a minor release
+/// without breaking downstream `match` expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecompressStatus {
     /// More input is needed to continue decompression.
     NeedsInput,
@@ -21,7 +25,11 @@ pub enum DecompressStatus {
 }
 
 /// Status of a streaming compression operation.
+///
+/// Marked `#[non_exhaustive]` so new statuses can be added in a minor release
+/// without breaking downstream `match` expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompressStatus {
     /// More input data can be accepted.
     NeedsInput,
@@ -32,7 +40,11 @@ pub enum CompressStatus {
 }
 
 /// Flush mode for compression.
+///
+/// Marked `#[non_exhaustive]` so new flush modes can be added in a minor
+/// release without breaking downstream `match` expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FlushMode {
     /// No flush - buffer data for best compression.
     #[default]
@@ -49,8 +61,15 @@ pub enum FlushMode {
 
 /// A streaming decompressor (decoder).
 ///
-/// This trait is implemented by all decompression algorithms (Deflate, LZSS, etc.).
-/// It provides a streaming interface that can process data in chunks.
+/// This trait models the DEFLATE-family streaming contract (consume input,
+/// produce output, report status) and is implemented by the Deflate/LZH/LZ4
+/// family of codecs in this workspace. It is an *optional* convenience
+/// abstraction, not a requirement placed on every codec crate: algorithms
+/// whose native streaming shape does not map cleanly onto this
+/// consume/produce/status contract (e.g. block-oriented codecs such as
+/// bzip2, or codecs built around a different streaming API) are free to
+/// expose their own encoder/decoder types instead of implementing this
+/// trait.
 pub trait Decompressor {
     /// Decompress data from input to output.
     ///
@@ -100,7 +119,15 @@ pub trait Decompressor {
 
 /// A streaming compressor (encoder).
 ///
-/// This trait is implemented by all compression algorithms.
+/// This trait models the DEFLATE-family streaming contract (consume input,
+/// produce output, report status) and is implemented by the Deflate/LZH/LZ4
+/// family of codecs in this workspace. It is an *optional* convenience
+/// abstraction, not a requirement placed on every codec crate: algorithms
+/// whose native streaming shape does not map cleanly onto this
+/// consume/produce/status contract (e.g. block-oriented codecs such as
+/// bzip2, or codecs built around a different streaming API) are free to
+/// expose their own encoder/decoder types instead of implementing this
+/// trait.
 pub trait Compressor {
     /// Compress data from input to output.
     ///
@@ -225,57 +252,25 @@ pub trait ArchiveWriter {
     fn finish(&mut self) -> Result<()>;
 }
 
-/// Compression level for algorithms that support it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompressionLevel(u8);
-
-impl CompressionLevel {
-    /// No compression (store only).
-    pub const NONE: Self = Self(0);
-    /// Fastest compression.
-    pub const FAST: Self = Self(1);
-    /// Default compression (balanced).
-    pub const DEFAULT: Self = Self(6);
-    /// Best compression (slowest).
-    pub const BEST: Self = Self(9);
-
-    /// Create a custom compression level (0-9).
-    pub fn new(level: u8) -> Self {
-        Self(level.min(9))
-    }
-
-    /// Get the level value.
-    pub fn level(&self) -> u8 {
-        self.0
-    }
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl From<u8> for CompressionLevel {
-    fn from(level: u8) -> Self {
-        Self::new(level)
-    }
-}
+// NOTE: A `CompressionLevel(u8)` newtype previously lived here as a proposed
+// shared compression-level abstraction. It has been removed as part of the
+// pre-1.0 API freeze: no codec in this workspace ever adopted it (each
+// format defines its own level enum — see `oxiarc_bzip2::CompressionLevel`,
+// `ZipCompressionLevel`, `LzhCompressionLevel`, and the CLI's own
+// `CompressionLevel` — and `oxiarc_bzip2::CompressionLevel` even collides on
+// the name), so keeping an unused, never-implemented "shared" type in core
+// would advertise an abstraction nothing honors. Per-codec level types are
+// the deliberate, documented design: each compression format has a
+// different natural level range/semantics (e.g. 0-9 vs 0-11), and forcing
+// them through one shared type would either lose precision or require
+// lossy conversions at every call site. If a genuinely shared level
+// abstraction is wanted in the future, it should be reintroduced only once
+// at least the majority of codecs are prepared to adopt it directly,
+// tracked per-crate.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_compression_level() {
-        assert_eq!(CompressionLevel::NONE.level(), 0);
-        assert_eq!(CompressionLevel::FAST.level(), 1);
-        assert_eq!(CompressionLevel::DEFAULT.level(), 6);
-        assert_eq!(CompressionLevel::BEST.level(), 9);
-
-        // Test clamping
-        assert_eq!(CompressionLevel::new(100).level(), 9);
-    }
 
     #[test]
     fn test_flush_mode_default() {

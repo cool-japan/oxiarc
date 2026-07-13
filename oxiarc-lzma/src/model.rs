@@ -123,6 +123,13 @@ impl Default for State {
     }
 }
 
+/// Maximum literal context bits (`lc`) permitted by the LZMA format.
+pub const LC_MAX: u32 = 8;
+/// Maximum literal position bits (`lp`) permitted by the LZMA format.
+pub const LP_MAX: u32 = 4;
+/// Maximum position bits (`pb`) permitted by the LZMA format.
+pub const PB_MAX: u32 = 4;
+
 /// LZMA properties (lc, lp, pb).
 #[derive(Debug, Clone, Copy)]
 pub struct LzmaProperties {
@@ -136,8 +143,27 @@ pub struct LzmaProperties {
 
 impl LzmaProperties {
     /// Create new properties.
+    ///
+    /// Out-of-range values are saturated to the LZMA format limits
+    /// (`lc <= 8`, `lp <= 4`, `pb <= 4`), mirroring [`crate::LzmaLevel::new`].
+    /// Without this clamp, `1 << (lc + lp)` in the literal-model allocation
+    /// could request a multi-TiB buffer and abort the process — a safe public
+    /// API must never be able to do that.
     pub fn new(lc: u32, lp: u32, pb: u32) -> Self {
-        Self { lc, lp, pb }
+        Self {
+            lc: lc.min(LC_MAX),
+            lp: lp.min(LP_MAX),
+            pb: pb.min(PB_MAX),
+        }
+    }
+
+    /// Whether these properties are within the LZMA format limits
+    /// (`lc <= 8`, `lp <= 4`, `pb <= 4`).
+    ///
+    /// Properties produced by [`Self::new`] and [`Self::from_byte`] are always
+    /// valid; a struct-literal-built value may not be.
+    pub fn is_valid(&self) -> bool {
+        self.lc <= LC_MAX && self.lp <= LP_MAX && self.pb <= PB_MAX
     }
 
     /// Parse from property byte.
@@ -160,13 +186,20 @@ impl LzmaProperties {
     }
 
     /// Get number of literal states.
+    ///
+    /// The shift amount is clamped to the format limits so that even a
+    /// struct-literal-built value with out-of-range fields (the fields are
+    /// public) can never request an allocation beyond `1 << 12` states.
     pub fn num_lit_states(&self) -> usize {
-        1 << (self.lc + self.lp)
+        1 << (self.lc.min(LC_MAX) + self.lp.min(LP_MAX))
     }
 
     /// Get number of position states.
+    ///
+    /// The shift amount is clamped to the format limit (see
+    /// [`Self::num_lit_states`]).
     pub fn num_pos_states(&self) -> usize {
-        1 << self.pb
+        1 << self.pb.min(PB_MAX)
     }
 }
 
@@ -207,18 +240,8 @@ impl LengthModel {
         }
     }
 
-    /// Reset the model.
-    pub fn reset(&mut self) {
-        self.choice = PROB_INIT;
-        self.choice2 = PROB_INIT;
-        for arr in &mut self.low {
-            arr.fill(PROB_INIT);
-        }
-        for arr in &mut self.mid {
-            arr.fill(PROB_INIT);
-        }
-        self.high.fill(PROB_INIT);
-    }
+    // NOTE: a former `reset(&mut self)` helper cascade was removed here; the
+    // codec resets probabilities by rebuilding the model (`LzmaModel::new`).
 }
 
 /// Literal decoder/encoder model.
@@ -237,18 +260,17 @@ impl LiteralModel {
         }
     }
 
-    /// Reset the model.
-    pub fn reset(&mut self) {
-        for state in &mut self.probs {
-            state.fill(PROB_INIT);
-        }
-    }
-
     /// Get the literal state index.
+    ///
+    /// `lc`/`lp` are clamped to the LZMA format limits so an out-of-range
+    /// value can neither underflow the `8 - lc` shift nor index past the
+    /// table allocated by [`LiteralModel::new`].
     pub fn get_state(&self, pos: u64, prev_byte: u8, lc: u32, lp: u32) -> usize {
+        let lc = lc.min(LC_MAX) as usize;
+        let lp = lp.min(LP_MAX);
         let lit_pos = pos & ((1 << lp) - 1);
-        let prev_bits = (prev_byte as usize) >> (8 - lc as usize);
-        ((lit_pos as usize) << lc as usize) + prev_bits
+        let prev_bits = (prev_byte as usize) >> (8 - lc);
+        ((lit_pos as usize) << lc) + prev_bits
     }
 }
 
@@ -276,15 +298,6 @@ impl DistanceModel {
             special: [PROB_INIT; SPEC_POS_PROBS],
             align: [PROB_INIT; DIST_ALIGN_SIZE],
         }
-    }
-
-    /// Reset the model.
-    pub fn reset(&mut self) {
-        for s in &mut self.slot {
-            s.fill(PROB_INIT);
-        }
-        self.special.fill(PROB_INIT);
-        self.align.fill(PROB_INIT);
     }
 }
 
@@ -345,24 +358,6 @@ impl LzmaModel {
             distance: DistanceModel::new(),
         }
     }
-
-    /// Reset all probabilities to initial values.
-    pub fn reset(&mut self) {
-        for state in &mut self.is_match {
-            state.fill(PROB_INIT);
-        }
-        self.is_rep.fill(PROB_INIT);
-        self.is_rep0.fill(PROB_INIT);
-        self.is_rep1.fill(PROB_INIT);
-        self.is_rep2.fill(PROB_INIT);
-        for state in &mut self.is_rep0_long {
-            state.fill(PROB_INIT);
-        }
-        self.match_len.reset();
-        self.rep_len.reset();
-        self.literal.reset();
-        self.distance.reset();
-    }
 }
 
 #[cfg(test)]
@@ -408,5 +403,43 @@ mod tests {
 
         assert_eq!(model.is_match.len(), NUM_STATES);
         assert_eq!(model.is_rep.len(), NUM_STATES);
+    }
+
+    /// LZMA-03 regression: `LzmaProperties::new(20, 20, 4)` used to build a
+    /// model requesting a multi-TiB literal table, aborting the process
+    /// (SIGABRT) from a safe public API. The constructor now saturates.
+    #[test]
+    fn test_properties_new_clamps_out_of_range() {
+        let props = LzmaProperties::new(20, 20, 20);
+        assert_eq!((props.lc, props.lp, props.pb), (LC_MAX, LP_MAX, PB_MAX));
+        assert!(props.is_valid());
+
+        // Model construction is bounded (max 2^12 literal states) — this
+        // call aborted the process before the fix.
+        let model = LzmaModel::new(props);
+        assert_eq!(model.literal.probs.len(), 1 << (LC_MAX + LP_MAX));
+    }
+
+    /// The fields are public, so a struct literal can bypass `new()`; every
+    /// consumer must still be allocation- and panic-safe.
+    #[test]
+    fn test_struct_literal_props_cannot_force_huge_alloc() {
+        let props = LzmaProperties {
+            lc: 30,
+            lp: 30,
+            pb: 30,
+        };
+        assert!(!props.is_valid());
+        assert_eq!(props.num_lit_states(), 1 << (LC_MAX + LP_MAX));
+        assert_eq!(props.num_pos_states(), 1 << PB_MAX);
+
+        // Must not abort (bounded allocation) …
+        let model = LzmaModel::new(props);
+        assert_eq!(model.literal.probs.len(), 1 << (LC_MAX + LP_MAX));
+
+        // … and the literal-state lookup must not underflow `8 - lc` or
+        // index out of bounds.
+        let state = model.literal.get_state(123, 0xFF, props.lc, props.lp);
+        assert!(state < 1 << (LC_MAX + LP_MAX));
     }
 }

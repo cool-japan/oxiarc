@@ -6,16 +6,31 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["compression", "lzw", "tiff", "pure-rust", "archive"]
 categories = ["compression", "encoding"]
 description = "Pure Rust LZW compression for TIFF and GIF formats"
 readme = "README.md"
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# TIFF-LZW differential oracle tests (tests/tiff_lzw_oracle.rs) that shell out
+# to `python3` + Pillow (libtiff-backed) and, when present, libtiff's `tiffcp`.
+# They validate real-world interop in BOTH directions: Pillow-compressed
+# strips must decode byte-identically, and oxiarc-compressed TIFFs must be
+# accepted by Pillow/libtiff. Tests self-skip when the tools are absent.
+# Mirrors the `lha-oracle` feature pattern in `oxiarc-lzhuf`.
+tiff-oracle = []
 
 [dependencies]
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 weezl.workspace = true
 
 [[bench]]
@@ -24,7 +39,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[features]
-default = ["std"]
-std = []

@@ -1,4 +1,4 @@
-# oxiarc-lz4 - Development Status (v0.3.5, 2026-07-07)
+# oxiarc-lz4 - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -86,7 +86,9 @@
 - xxhash: 8 tests
 - hc: 9 tests
 - lib: 51 tests
-- Total: 138 tests
+- dict_block_roundtrip: 12 tests (new in 0.3.6 — block-layer prefix-dictionary compression)
+- proptest_roundtrip: 2 tests (new in 0.3.6 — property-based round-trip/no-panic)
+- Total: 140 tests
 
 ## Code Statistics
 

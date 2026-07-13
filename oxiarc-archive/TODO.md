@@ -1,5 +1,5 @@
 
-# oxiarc-archive - Development Status (v0.3.5, 2026-07-07)
+# oxiarc-archive - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 
@@ -196,53 +196,105 @@
 - [x] Archive repair/recovery — `ZipRepair` / `TarRepair` structs + `repair_zip` / `repair_tar` convenience functions; rolling LFH scanner for ZIP, 512-byte UStar block scanner for TAR; `RepairReport` with recovered entries, skipped byte ranges, and per-entry `RecoveryStatus` (Verified/Recovered/RawOnly) (done 2026-05-16)
 - [x] Lenient-mode corruption recovery — ZIP/TAR/LZH readers .lenient(bool) + CLI --lenient flag on extract/list (planned 2026-04-20)
 
+### Security Hardening (0.3.6)
+
+- [x] ZIP AES: fixed an integer underflow in compressed-size accounting on a
+  crafted header; central directory and per-entry reads validate declared
+  lengths against actual remaining stream bytes.
+- [x] ZIP `LocalFileHeader::modified_time`: a crafted header encoding a zero
+  DOS month/day field underflowed the `month - 1` term; both fields now
+  clamp to the minimum valid value (1).
+- [x] ZIP: classic and Zip64 end-of-central-directory records declaring more
+  than one disk (spanned/multi-volume archives) are now rejected.
+- [x] TAR: fixed a slice-index panic in the PAX extended-header parser on
+  malformed short records; bounded the untrusted declared sizes for
+  PAX/GNU long-name payloads and whole-entry extraction.
+- [x] Bounded (`try_reserve`/`try_reserve_exact`) allocation in
+  `zip::header::reader`, `zip::stream`, `lzh::reader`, and `sevenz::header`
+  against declared-but-unverified header lengths.
+- [x] ISO 9660 `walk_directory`: visited-LBA tracking (`HashSet<u32>`),
+  `MAX_DIR_DEPTH` recursion cap, and `MAX_DIR_EXTENT_SIZE` bound close a
+  crafted-image cyclic-directory/unbounded-allocation DoS.
+- [x] Genuine FIPS-197 AES cipher (real AES-128/192/256 keyed by actual key
+  length, replacing the old AES-256-only zero-padded-key implementation),
+  constant-time AE-2/HMAC-SHA1 tag comparison (`ct_eq`), and CSPRNG-sourced
+  (`/dev/urandom`) salts/ZipCrypto header randomization.
+
 ## Test Coverage
 
-- detect: ~15 tests
-- zip: ~40 tests (including Zip64, data descriptors, async)
-- gzip: ~15 tests
-- tar: ~20 tests (PAX, GNU long names)
-- lzh: ~10 tests
-- xz: ~10 tests
-- 7z: ~5 tests
-- cab: ~5 tests
-- lz4/zstd/bzip2 archive: ~15 tests
-- integration: ~5 tests
-- Total: ~392 tests
+Unit tests (in-module `#[cfg(test)]`), by area:
+
+- zip: 100 (headers, reader, writer, Zip64, data descriptors, streaming, encryption)
+- tar: 54 (PAX, GNU long names, sparse)
+- lzh: 52
+- iso9660: 23 (including cyclic-directory and depth/size-bound DoS guards)
+- xz: 20
+- repair: 16
+- detect: 14
+- brotli: 14
+- snappy: 12
+- sevenz (7z): 11
+- zstd: 9
+- gzip: 8
+- bzip2: 8
+- lz4: 6
+- cab: 5
+- async_zip / async_tar / async_lzh: 4 / 3 / 3
+
+Integration-test suites under `tests/` (82 tests across 14 files), including
+two added in 0.3.6 — `cab_interop` and `iso9660_interop` — plus
+`lzh_corpus_reader`, `lzh_ext_headers`, `lzh_japanese_names`,
+`lzh_large_payload`, `lzh_lha_oracle`, `lzh_lhd_lh1`, `sevenz_interop`,
+`tar_pax_japanese`, `test_multifile_bug`, `test_simple_deflate`,
+`zip_encryption_e2e`, `zip_name_encoding`.
+
+**Total: 444 tests** (`cargo nextest run -p oxiarc-archive --all-features`).
 
 ## Code Statistics
 
-| Module | Lines |
-|--------|-------|
-| zip/ | ~3,000 (header, reader, writer, types, async_zip) |
-| tar/ | ~1,500 |
-| lzh/ | ~1,000 |
-| gzip/ | ~800 |
-| xz/ | ~600 |
-| sevenz/ | ~500 |
-| cab/ | ~400 |
-| detect.rs | ~300 |
-| lz4/zstd/bzip2 | ~500 |
-| lib.rs | ~200 |
-| **Total** | **~7,897** |
+| Module | Lines (code) |
+|--------|---------------|
+| zip/ (+ async_zip.rs) | 5,450 |
+| tar/ (+ async_tar.rs) | 2,836 |
+| lzh/ (+ async_lzh.rs) | 2,552 |
+| sevenz/ | 1,291 |
+| xz/ | 1,070 |
+| iso9660/ | 1,031 |
+| cab/ | 589 |
+| gzip/ | 368 |
+| repair.rs + repair_zip.rs + repair_tar.rs | 869 |
+| brotli/ | 286 |
+| zstd/ | 286 |
+| bzip2/ | 253 |
+| snappy/ | 245 |
+| lz4/ | 223 |
+| detect.rs | 261 |
+| lib.rs | 69 |
+| lenient.rs | 20 |
+| **Total** | **17,699** |
+
+(measured via `tokei oxiarc-archive/src`, code lines only — excludes comments/blanks)
 
 ## Format Support Matrix
 
-| Feature | ZIP | GZIP | TAR | LZH | XZ | 7z | CAB | LZ4 | Zstd | Bzip2 | Brotli | Snappy |
-|---------|-----|------|-----|-----|----|----|-----|-----|------|-------|--------|--------|
-| Read | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| List entries | Yes | N/A | Yes | Yes | N/A | Yes | Yes | N/A | N/A | N/A | N/A | N/A |
-| Extract | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Create | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes |
-| Async | Yes | No | No | No | No | No | No | No | No | No | No | No |
+| Feature | ZIP | GZIP | TAR | LZH | XZ | 7z | CAB | LZ4 | Zstd | Bzip2 | Brotli | Snappy | ISO 9660 |
+|---------|-----|------|-----|-----|----|----|-----|-----|------|-------|--------|--------|--------|
+| Read | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| List entries | Yes | N/A | Yes | Yes | N/A | Yes | Yes | N/A | N/A | N/A | N/A | N/A | Yes |
+| Extract | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Create | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No |
+| Async | Yes | No | Yes | Yes | No | No | No | No | No | No | No | No | No |
 
 ## Known Limitations
 
-1. No split/multi-part ZIP archive support
+1. No split/multi-part ZIP archive support (spanned/multi-volume ZIP is
+   detected and explicitly rejected with an error rather than silently
+   misread).
 2. TAR sparse: read support lands hole-preserving extraction via in-memory
    materialization (GNU old-format + PAX `GNU.sparse.*`); writer-side sparse
    emission and on-disk hole-punching during extraction remain out of scope.
-3. LZH level 3 headers not supported
-4. No RAR format support
-5. 7z and CAB are read-only (no create/write)
-6. Async I/O only available for ZIP format
+3. No RAR format support.
+4. 7z and CAB are read-only (no create/write).
+5. Async I/O provides whole-entry/metadata access for ZIP, TAR, and LZH via
+   `spawn_blocking`-wrapped sync calls (see `async_zip`/`async_tar`/
+   `async_lzh`), not true non-blocking streaming for any format.

@@ -3,6 +3,7 @@
 use super::types::LZ4_LEGACY_MAGIC;
 use super::types::{FrameDescriptor, LZ4_FRAME_MAGIC};
 use crate::block::decompress_block;
+use crate::dict::{Lz4Dict, MAX_DICT_SIZE, decompress_with_dict};
 use crate::xxhash::{XxHash32, xxhash32};
 use oxiarc_core::error::{OxiArcError, Result};
 
@@ -110,6 +111,13 @@ pub(super) fn decompress_frame(input: &[u8], max_output: usize) -> Result<Vec<u8
 
     let block_max = desc.block_max_size.size_bytes();
 
+    // For linked (block-dependent, `lz4 -BD`) frames, each block may reference
+    // the previous block's last 64 KiB of output. We carry that tail forward as
+    // a prefix dictionary. For the default block-independent frames this stays
+    // empty and every block decodes on its own.
+    let linked = !desc.block_independence;
+    let mut prev_tail: Vec<u8> = Vec::new();
+
     loop {
         if pos + 4 > input.len() {
             return Err(OxiArcError::corrupted(pos as u64, "truncated block header"));
@@ -159,9 +167,14 @@ pub(super) fn decompress_frame(input: &[u8], max_output: usize) -> Result<Vec<u8
             }
         }
 
-        // Decompress block
+        // Decompress block. In linked-block mode a compressed block is decoded
+        // against the previous block's tail as a prefix dictionary so that
+        // cross-block back-references resolve correctly.
         let decompressed = if uncompressed {
             block_data.to_vec()
+        } else if linked && !prev_tail.is_empty() {
+            let dict = Lz4Dict::new(&prev_tail);
+            decompress_with_dict(block_data, block_max, &dict)?
         } else {
             decompress_block(block_data, block_max)?
         };
@@ -169,6 +182,19 @@ pub(super) fn decompress_frame(input: &[u8], max_output: usize) -> Result<Vec<u8
         // Update content hash
         if let Some(ref mut hasher) = content_hasher {
             hasher.update(&decompressed);
+        }
+
+        // Roll the prefix-dictionary tail forward for the next linked block.
+        if linked {
+            if decompressed.len() >= MAX_DICT_SIZE {
+                prev_tail = decompressed[decompressed.len() - MAX_DICT_SIZE..].to_vec();
+            } else {
+                let keep = MAX_DICT_SIZE - decompressed.len();
+                if prev_tail.len() > keep {
+                    prev_tail.drain(..prev_tail.len() - keep);
+                }
+                prev_tail.extend_from_slice(&decompressed);
+            }
         }
 
         output.extend_from_slice(&decompressed);

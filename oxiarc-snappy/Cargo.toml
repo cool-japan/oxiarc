@@ -5,14 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 description = "Pure Rust Snappy compression implementation with block and framed format support"
 readme = "README.md"
 keywords = ["snappy", "compression", "decompression", "framing", "crc32c"]
 categories = ["compression", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 oxiarc-core = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
@@ -20,9 +26,18 @@ rayon = { workspace = true, optional = true }
 default = []
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 parallel = ["dep:rayon"]
+# Differential oracle tests (tests/snappy_oracle.rs) that shell out to
+# `python3` and its `cramjam` module (a reference-grade Rust-backed Snappy
+# binding implementing the same framing/CRC32C spec as Google's canonical
+# C++ `snappy`) to validate both directions of the framing format:
+# reference-compress -> oxiarc-decode and oxiarc-compress -> reference-decode.
+# Self-skips (does not fail) at runtime if `python3` or `cramjam` is
+# unavailable. Never enabled by default; not needed for normal library use.
+snappy-oracle = []
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 rayon.workspace = true
 
 [[bench]]

@@ -105,29 +105,33 @@ impl<R: Read> BitReader<R> {
             return Ok(());
         }
 
-        // Calculate how many bytes we need
-        let bits_needed = count - self.bits_in_buffer;
-        let bytes_needed = bits_needed.div_ceil(8).min(7) as usize; // Max 7 to stay under 64 bits
-
-        // Try to read multiple bytes at once for better performance
+        // Loop reading from the underlying reader, packing whatever bytes
+        // arrive until we have enough bits. A short read (fewer bytes than
+        // requested — common with TCP/pipe/stdin/throttled/adapter readers)
+        // must be retried rather than treated as end of file; only a genuine
+        // `Ok(0)` before enough bits are available is a real EOF. Reading in a
+        // loop preserves the LSB-first packing order exactly, because each byte
+        // is still shifted into `buffer` at the current `bits_in_buffer`.
         let mut temp_buf = [0u8; 8];
-        match self.reader.read(&mut temp_buf[..bytes_needed]) {
-            Ok(0) => {
-                return Err(OxiArcError::unexpected_eof(bytes_needed));
-            }
-            Ok(n) => {
-                // Pack bytes into buffer (LSB-first)
-                for byte in temp_buf.iter().take(n) {
-                    self.buffer |= (*byte as u64) << self.bits_in_buffer;
-                    self.bits_in_buffer += 8;
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+        while self.bits_in_buffer < count {
+            // Bytes still required, capped at 7 so the 64-bit buffer never
+            // overflows (`count <= 57`, so packing stops at <= 64 bits).
+            let bits_needed = count - self.bits_in_buffer;
+            let bytes_needed = bits_needed.div_ceil(8).min(7) as usize;
 
-        // Check if we got enough bits
-        if self.bits_in_buffer < count {
-            return Err(OxiArcError::unexpected_eof(1));
+            match self.reader.read(&mut temp_buf[..bytes_needed]) {
+                Ok(0) => {
+                    return Err(OxiArcError::unexpected_eof(bytes_needed));
+                }
+                Ok(n) => {
+                    // Pack bytes into buffer (LSB-first).
+                    for byte in temp_buf.iter().take(n) {
+                        self.buffer |= (*byte as u64) << self.bits_in_buffer;
+                        self.bits_in_buffer += 8;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         Ok(())
@@ -610,5 +614,69 @@ mod tests {
 
         reader.read_bytes(&mut buf).expect("read next 2 bytes");
         assert_eq!(buf, [0x56, 0x78]);
+    }
+
+    /// A `Read` adapter that yields at most one byte per `read()` call,
+    /// reproducing the short reads produced by TCP sockets, pipes, stdin, and
+    /// throttled/adapter readers. Used to exercise the `fill_buffer` retry loop
+    /// (CORE-01): a naive single-`read()` implementation would spuriously report
+    /// `UnexpectedEof` on the first short read of valid data.
+    struct OneByteAtATime<R: Read> {
+        inner: R,
+    }
+
+    impl<R: Read> Read for OneByteAtATime<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.inner.read(&mut buf[..1])
+        }
+    }
+
+    #[test]
+    fn test_fill_buffer_handles_short_reads_16bit() {
+        // 0x34, 0x12 -> LSB-first 16-bit value 0x1234. A single fill_buffer(16)
+        // must pack both bytes across two short reads instead of erroring.
+        let reader = OneByteAtATime {
+            inner: Cursor::new(vec![0x34, 0x12]),
+        };
+        let mut bit_reader = BitReader::new(reader);
+        assert_eq!(
+            bit_reader
+                .read_bits(16)
+                .expect("short-read fill_buffer must assemble the full 16-bit value"),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn test_fill_buffer_handles_short_reads_32bit() {
+        // Four bytes delivered one at a time, assembled into a 32-bit value.
+        let reader = OneByteAtATime {
+            inner: Cursor::new(vec![0x78, 0x56, 0x34, 0x12]),
+        };
+        let mut bit_reader = BitReader::new(reader);
+        assert_eq!(
+            bit_reader
+                .read_bits(32)
+                .expect("short-read fill_buffer must assemble the full 32-bit value"),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn test_fill_buffer_genuine_eof_after_short_reads() {
+        // Only one byte is available but 16 bits are requested: the loop must
+        // consume the byte, then return UnexpectedEof on the genuine Ok(0),
+        // rather than failing prematurely on the first short read.
+        let reader = OneByteAtATime {
+            inner: Cursor::new(vec![0xAB]),
+        };
+        let mut bit_reader = BitReader::new(reader);
+        let err = bit_reader
+            .read_bits(16)
+            .expect_err("must surface EOF once the reader is genuinely exhausted");
+        assert!(matches!(err, OxiArcError::UnexpectedEof { .. }));
     }
 }

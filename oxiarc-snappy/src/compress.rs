@@ -40,6 +40,20 @@ pub fn max_compress_len(input_len: usize) -> usize {
 ///
 /// # Returns
 /// A vector containing the compressed data in Snappy block format.
+///
+/// # Why this cannot fail
+///
+/// Unlike every other codec's `compress` in this workspace, this function
+/// returns `Vec<u8>` rather than `Result<Vec<u8>, SnappyError>`. This is a
+/// deliberate, documented exception, not an oversight: Snappy block
+/// compression has no fallible steps. It performs no I/O, has no dictionary
+/// or configuration that can be malformed, imposes no maximum input length
+/// (the block loop in this function chunks arbitrarily large inputs), and
+/// the LZ77-style matcher and varint/copy emitters are total functions over
+/// `&[u8]` — every byte sequence, including the empty slice, has a valid
+/// encoding. There is intentionally no `Result`-returning counterpart;
+/// callers that need a uniform fallible signature across codecs (e.g. a
+/// `Codec` trait object) should wrap this call as `Ok(compress(input))`.
 pub fn compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() {
         // Empty input: just the varint-encoded length (0)

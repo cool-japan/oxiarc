@@ -3,12 +3,12 @@
 
 Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
-![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
+![Tests](https://img.shields.io/badge/tests-114%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.5 (2026-07-07) | 112 tests passing**
+**Version: 0.3.6 (2026-07-13) | 140 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-snappy = "0.3.5"
+oxiarc-snappy = "0.3.6"
 ```
 
 ### Block Format
@@ -84,16 +84,17 @@ assert_eq!(output, b"Hello, streaming Snappy!");
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `parallel` | no | Multi-threaded frame compression via Rayon (`compress_parallel`) |
+| `async-io` | no | `AsyncSnappyCompressor`/`AsyncSnappyDecompressor` (`oxiarc_core::async_io` traits) for `tokio`-based async I/O; reads the input fully before compressing/decompressing synchronously (not bounded-memory streaming) |
 
-All other functionality — block format, framing format, CRC32C (with SSE 4.2 hardware acceleration on x86_64) — is enabled by default.
+All other functionality — block format, framing format, CRC32C (with SSE 4.2 hardware acceleration on x86_64), and the `SnappyPool` buffer pool (`SnappyPool`, `FrameEncoder::with_pool`, `FrameDecoder::with_pool`, `compress_frame_pooled`) — is enabled by default.
 
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-snappy = "0.3.5"
+oxiarc-snappy = "0.3.6"
 
 # With parallel compression
-oxiarc-snappy = { version = "0.3.5", features = ["parallel"] }
+oxiarc-snappy = { version = "0.3.6", features = ["parallel"] }
 ```
 
 ## CRC32C
@@ -108,6 +109,14 @@ On x86_64 hosts, the CRC32C path is accelerated at runtime when SSE 4.2 is avail
 - Fast path uses `_mm_crc32_u64` (8 bytes/cycle), with `_mm_crc32_u8` for trailing 1–7 bytes.
 - The output is bitwise-identical to the scalar path — no difference in correctness.
 - On non-x86_64 platforms (e.g. aarch64/macOS) and on x86_64 without SSE 4.2, the scalar fallback is used transparently.
+
+## What's new in 0.3.6
+
+- **`SnappyError` is now `#[non_exhaustive]`** (pre-1.0 API-stability freeze); its `Display`/`Error`/`From<io::Error>` impls are now generated via `thiserror` instead of hand-written (messages are unchanged). Downstream `match` expressions on `SnappyError` must include a wildcard arm.
+- New `proptest`-based round-trip regression suite (`tests/proptest_roundtrip.rs`): decompression never panics on arbitrary input, and compress→decompress round-trips.
+- New `pooled_streaming` example demonstrating `SnappyPool`-backed `FrameEncoder`/`FrameDecoder` and `compress_frame_pooled` across many repeated operations, including `SnappyPool::stats()` hit/allocation counters.
+- Previously `ignore`-fenced doctests (including the `async-io` examples) now compile and run as part of `cargo test`.
+- Expanded rustdoc on `compress()` documenting why it deliberately returns `Vec<u8>` rather than `Result<Vec<u8>, SnappyError>` (block compression has no fallible steps).
 
 ## What's new in 0.3.1
 

@@ -37,11 +37,16 @@ const ROOT: usize = TABLE_SIZE - 1; // 626
 const MAX_FREQ: u32 = 0x8000;
 
 /// MSB-first bit reader. Reads past the end of the data return 0 bits,
-/// matching the zero-padding convention of `LZHUF.C`.
+/// matching the zero-padding convention of `LZHUF.C`. Such reads flip the
+/// [`exhausted`](BitReader::exhausted) flag so callers can distinguish
+/// genuine stream content from fabricated zero padding and refuse to decode
+/// unbounded output from a truncated/malformed stream.
 struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     bit_pos: u8,
+    /// Set once a bit has been requested beyond the end of `data`.
+    exhausted: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -50,13 +55,19 @@ impl<'a> BitReader<'a> {
             data,
             byte_pos: 0,
             bit_pos: 0,
+            exhausted: false,
         }
     }
 
     fn get_bit(&mut self) -> u32 {
         let bit = match self.data.get(self.byte_pos) {
             Some(&byte) => u32::from((byte >> (7 - self.bit_pos)) & 1),
-            None => 0,
+            None => {
+                // No real input remains; LZHUF.C convention is to feed zero
+                // bits, but we record the over-read so the decoder can stop.
+                self.exhausted = true;
+                0
+            }
         };
         self.bit_pos += 1;
         if self.bit_pos == 8 {
@@ -348,7 +359,10 @@ fn encode_position(writer: &mut BitWriter, pos: usize, p_code: &[u8; 64], p_len:
 ///
 /// # Errors
 ///
-/// Returns an error if `original_size` does not fit in `usize`.
+/// Returns an error if `original_size` does not fit in `usize`, or if the
+/// compressed stream is truncated/malformed and is exhausted before
+/// producing `original_size` bytes (guarding against a declared size that
+/// far exceeds the real payload — a decompression-bomb / DoS vector).
 pub fn decode_lh1(data: &[u8], original_size: u64) -> Result<Vec<u8>> {
     let expected = usize::try_from(original_size)
         .map_err(|_| OxiArcError::corrupted(0, "lh1: original size does not fit in memory"))?;
@@ -364,12 +378,28 @@ pub fn decode_lh1(data: &[u8], original_size: u64) -> Result<Vec<u8>> {
 
     while out.len() < expected {
         let c = tree.decode_char(&mut reader);
+        // A valid stream encodes exactly `expected` bytes; its final symbol
+        // is fully contained in `data`. If decoding a symbol required bits
+        // past the end of the real input, the stream is truncated/malformed
+        // and any further output would be fabricated from zero padding.
+        if reader.exhausted {
+            return Err(OxiArcError::corrupted(
+                reader.byte_pos as u64,
+                "lh1: compressed stream exhausted before producing declared size",
+            ));
+        }
         if c < 256 {
             out.push(c as u8);
             ring[r] = c as u8;
             r = (r + 1) & (RING_SIZE - 1);
         } else {
             let pos = decode_position(&mut reader, &d_code, &d_len);
+            if reader.exhausted {
+                return Err(OxiArcError::corrupted(
+                    reader.byte_pos as u64,
+                    "lh1: compressed stream exhausted decoding match position",
+                ));
+            }
             let start = (r + RING_SIZE - pos - 1) & (RING_SIZE - 1);
             let length = c - 255 + THRESHOLD;
             for k in 0..length {
@@ -609,6 +639,36 @@ mod tests {
         let decoded = decode_lh1(&encoded, original.len() as u64)?;
         assert_eq!(decoded, original, "lh1 beyond-window roundtrip mismatch");
         Ok(())
+    }
+
+    #[test]
+    fn truncated_stream_with_huge_size_errors_quickly() {
+        // A tiny malformed payload declaring a gigantic uncompressed size
+        // must NOT hang or balloon memory: the decoder has to detect that
+        // the bitstream is exhausted and return an error promptly.
+        // Without the exhaustion guard this loops pushing zero-padding
+        // derived bytes until `out.len()` reaches ~4 GiB.
+        let garbage = [0xFFu8; 8];
+        let result = decode_lh1(&garbage, 1u64 << 32); // 4 GiB declared
+
+        match result {
+            Err(OxiArcError::CorruptedData { .. }) => {}
+            Err(other) => panic!("expected CorruptedData error, got {other:?}"),
+            Ok(out) => panic!(
+                "truncated lh1 stream must error, but decoded {} bytes",
+                out.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn empty_data_with_nonzero_size_errors() {
+        // No input at all but a non-zero declared size is corruption.
+        let result = decode_lh1(&[], 1024);
+        assert!(
+            matches!(result, Err(OxiArcError::CorruptedData { .. })),
+            "empty payload with non-zero size must be rejected"
+        );
     }
 
     #[test]

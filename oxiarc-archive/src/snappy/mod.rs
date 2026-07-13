@@ -88,12 +88,14 @@ impl SnappyReader {
     }
 
     /// Attach a progress sink forwarded to the underlying Snappy decoder.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying Snappy decoder.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -104,7 +106,40 @@ impl SnappyReader {
         self.data.len()
     }
 
+    /// Decompress the entire file with an output-size limit.
+    ///
+    /// The Snappy framing format declares no *total* uncompressed size, but
+    /// every chunk declares its own, so the limit is enforced *during*
+    /// decoding: a chunk that would push the cumulative output past
+    /// `max_out` is rejected before it is decoded, and the error is
+    /// [`OxiArcError::MemoryBudgetExceeded`]. This is the hook the CLI's
+    /// `--memory-limit` routes through for `.sz` input.
+    pub fn decompress_with_limit(&mut self, max_out: u64) -> Result<Vec<u8>> {
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_snappy::decompress_frame_with_limit(&self.data, max_out)
+                .map_err(OxiArcError::from);
+        }
+
+        // With hooks attached, drive the framed decoder, which forwards them
+        // and applies the same per-chunk budget check.
+        let mut decoder =
+            oxiarc_snappy::FrameDecoder::new(&self.data[..]).with_max_output_size(max_out);
+        if let Some(handle) = self.progress.clone() {
+            decoder = decoder.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            decoder = decoder.with_cancel(token);
+        }
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output)?;
+        Ok(output)
+    }
+
     /// Decompress the entire file using the framed decoder.
+    ///
+    /// The output size is bounded only by the codec's default 4 GiB
+    /// total-output guard; use [`SnappyReader::decompress_with_limit`] for
+    /// untrusted input.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
         let mut decoder = oxiarc_snappy::FrameDecoder::new(&self.data[..]);
         if let Some(handle) = self.progress.clone() {
@@ -140,12 +175,14 @@ impl SnappyWriter {
     }
 
     /// Attach a progress sink forwarded to the underlying Snappy encoder.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying Snappy encoder.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -176,11 +213,23 @@ impl Default for SnappyWriter {
 }
 
 /// Decompress Snappy framed data directly.
+///
+/// Prefer [`decompress_with_limit`] for untrusted input.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = oxiarc_snappy::FrameDecoder::new(data);
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)?;
     Ok(output)
+}
+
+/// Decompress Snappy framed data with an output-size limit (the
+/// decompression-bomb guard for untrusted input).
+///
+/// Returns [`OxiArcError::MemoryBudgetExceeded`] as soon as a chunk's
+/// declared output would push the total past `max_out`, before that chunk is
+/// decoded — the expansion is never allocated.
+pub fn decompress_with_limit(data: &[u8], max_out: u64) -> Result<Vec<u8>> {
+    oxiarc_snappy::decompress_frame_with_limit(data, max_out).map_err(OxiArcError::from)
 }
 
 /// Compress data to Snappy framed format.

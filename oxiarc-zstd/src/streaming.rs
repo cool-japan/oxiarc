@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use std::io::{Read, Write};
 //! use oxiarc_zstd::streaming::{ZstdStreamEncoder, ZstdStreamDecoder};
 //!
@@ -118,6 +118,7 @@ impl<W: Write> ZstdStreamEncoder<W> {
     ///
     /// When the internal buffer reaches this many bytes it is automatically
     /// compressed and written to the inner writer as a Zstandard frame.
+    #[must_use]
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size.max(1);
         self
@@ -128,6 +129,7 @@ impl<W: Write> ZstdStreamEncoder<W> {
     /// The sink's `on_progress(cumulative_bytes, None)` is called after each
     /// block is flushed to the inner writer. `on_finish()` is called after
     /// `finish` flushes the final block.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -138,6 +140,7 @@ impl<W: Write> ZstdStreamEncoder<W> {
     /// The token is checked before each block is compressed and written.
     /// If cancelled, returns an I/O error wrapping
     /// [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -311,6 +314,7 @@ impl<R: Read> ZstdStreamDecoder<R> {
     /// The sink's `on_progress(decompressed_bytes, None)` is called once
     /// after the entire stream is decompressed into the internal buffer.
     /// `on_finish()` is called at the same point.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -321,6 +325,7 @@ impl<R: Read> ZstdStreamDecoder<R> {
     /// The token is checked before the compressed stream is read and
     /// decompressed. If cancelled, an I/O error wrapping
     /// [`oxiarc_core::error::OxiArcError::Cancelled`] is returned.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

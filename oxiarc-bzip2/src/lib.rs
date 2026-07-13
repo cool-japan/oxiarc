@@ -7,7 +7,25 @@
 //! 2. Burrows-Wheeler Transform (BWT) - Block sorting for better compression
 //! 3. Move-to-Front Transform (MTF) - Locality transformation
 //! 4. Zero-Run Length Encoding - Special encoding for zeros
-//! 5. Huffman Coding - Final entropy coding
+//! 5. Huffman Coding - Final entropy coding (up to 6 tables per block,
+//!    selected per 50-symbol group, as in libbz2)
+//!
+//! The decoder matches `bzip2 -d` semantics: concatenated multi-stream
+//! files (pbzip2/lbzip2, `cat a.bz2 b.bz2`) are decoded in full, and
+//! legacy randomised blocks (bzip2 <= 0.9.0) are supported. For untrusted
+//! input, [`decompress_with_limit`] caps the output size to defend against
+//! decompression bombs.
+//!
+//! # Example
+//!
+//! ```rust
+//! use oxiarc_bzip2::{compress, decompress, CompressionLevel};
+//!
+//! let data = b"Hello, World! Hello, World!";
+//! let compressed = compress(data, CompressionLevel::new(9)).expect("compress");
+//! let decompressed = decompress(&compressed[..]).expect("decompress");
+//! assert_eq!(decompressed, data);
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -20,9 +38,10 @@ mod decode;
 mod encode;
 mod huffman;
 mod mtf;
+mod rand;
 mod rle;
 
-pub use decode::{BzDecoder, decompress};
+pub use decode::{BzDecoder, decompress, decompress_with_limit};
 pub use encode::{BzEncoder, compress};
 
 #[cfg(feature = "parallel")]

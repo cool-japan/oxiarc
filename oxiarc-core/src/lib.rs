@@ -14,6 +14,18 @@
 //! - `async_io`: Async I/O support (requires `async-io` feature)
 //! - `mmap`: Memory-mapped file support (requires `mmap` feature)
 //!
+//! ## Pre-1.0 API notes
+//!
+//! - [`traits::Compressor`]/[`traits::Decompressor`] model the DEFLATE-family
+//!   streaming contract and are implemented by the codecs that fit it
+//!   (Deflate, LZH, LZ4); they are an optional convenience, not a
+//!   requirement on every codec crate. See the trait docs for details.
+//! - The `CompressStatus`/`DecompressStatus`/`FlushMode` enums are
+//!   `#[non_exhaustive]` so new variants can be added without a breaking
+//!   change.
+//! - There is no shared `CompressionLevel` type in core; each codec defines
+//!   its own (see `traits` module source for the rationale).
+//!
 //! ## Architecture
 //!
 //! OxiArc is designed as a layered protocol stack:
@@ -83,8 +95,8 @@ pub use msb_bitstream::{MsbBitReader, MsbBitWriter};
 pub use progress::{NoopProgress, ProgressHandle, ProgressSink, noop_progress};
 pub use ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
 pub use traits::{
-    ArchiveReader, ArchiveWriter, CompressStatus, CompressionLevel, Compressor, DecompressStatus,
-    Decompressor, FlushMode,
+    ArchiveReader, ArchiveWriter, CompressStatus, Compressor, DecompressStatus, Decompressor,
+    FlushMode,
 };
 
 // Optional async-io re-exports
@@ -100,6 +112,23 @@ pub use async_io::{
 pub use mmap::{MappedFile, MmapOptions, MmapReader};
 
 /// Prelude module for convenient imports.
+///
+/// # Why only `oxiarc-core` has a prelude
+///
+/// This is a deliberate, documented pre-1.0 API decision: `oxiarc-core` is
+/// the one crate in the workspace whose public surface is broad enough
+/// (bitstream I/O, CRCs, entry metadata, error types, ring buffers, core
+/// traits) to benefit from a single glob-importable module. The codec
+/// crates (`oxiarc-deflate`, `oxiarc-bzip2`, `oxiarc-lz4`, etc.) and the
+/// container crate (`oxiarc-archive`) intentionally do **not** get their
+/// own `prelude` modules. Each of those crates already re-exports its
+/// small, flat public API directly at the crate root (`oxiarc_bzip2::compress`,
+/// `oxiarc_archive::zip::ZipWriter`, and so on), so a `prelude` submodule
+/// would just be a redundant, parallel-maintained copy of the crate root
+/// with no import ergonomics gained. Do not add per-crate preludes to the 9
+/// codec/format crates during the API freeze; if a specific crate's root
+/// surface grows large enough to warrant one, that should be a deliberate,
+/// separately-reviewed decision for that crate, not a blanket pattern.
 pub mod prelude {
     #[cfg(feature = "async-io")]
     pub use crate::async_io::{
@@ -113,7 +142,5 @@ pub mod prelude {
     pub use crate::mmap::{MappedFile, MmapOptions, MmapReader};
     pub use crate::msb_bitstream::{MsbBitReader, MsbBitWriter};
     pub use crate::ringbuffer::{OutputRingBuffer, RingBuffer, RingSnapshot};
-    pub use crate::traits::{
-        ArchiveReader, ArchiveWriter, CompressionLevel, Compressor, Decompressor,
-    };
+    pub use crate::traits::{ArchiveReader, ArchiveWriter, Compressor, Decompressor};
 }

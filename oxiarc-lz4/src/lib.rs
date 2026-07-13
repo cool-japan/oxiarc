@@ -21,6 +21,19 @@
 //! let decompressed = decompress(&compressed, data.len() * 2).unwrap();
 //! assert_eq!(decompressed, data);
 //! ```
+//!
+//! ## Sizing decompression output
+//!
+//! Unlike some codecs, [`decompress`] (and [`decompress_bytes`]) require an
+//! explicit `max_output` size hint rather than discovering the output size
+//! from the stream itself: raw LZ4 blocks carry no uncompressed-length
+//! trailer, so the caller must supply an upper bound (e.g. from an external
+//! header, or the LZ4 frame's content-size field via
+//! [`get_frame_dict_id`]-adjacent frame APIs). Passing too small a value
+//! yields an error rather than silent truncation; passing a generous
+//! over-estimate is always safe and only costs a larger scratch allocation.
+
+#![warn(missing_docs)]
 
 pub mod block;
 pub mod dict;
@@ -53,7 +66,11 @@ pub use frame::{compress_parallel, compress_with_options_parallel};
 use oxiarc_core::error::Result;
 
 /// LZ4 compression level.
+///
+/// Marked `#[non_exhaustive]` so additional levels (e.g. a future `HighCompression`
+/// tier mapping to a specific LZ4-HC clevel) can be added without a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Lz4Level {
     /// Fast compression (default).
     #[default]

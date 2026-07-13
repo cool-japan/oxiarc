@@ -15,7 +15,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **ZIP** - PKZIP format with DEFLATE and Store methods, Zip64 support
 - **TAR** - POSIX tar with UStar and PAX extended headers
 - **GZIP** - GNU zip single-file compression (RFC 1952)
-- **LZH/LHA** - Japanese archive format with lh0-lh7 methods
+- **LZH/LHA** - Japanese archive format with lh0, lh1, lh4, lh5, lh6, lh7, lhd methods
 - **XZ** - Modern LZMA2 compression format
 - **7z** - 7-Zip archive format (read-only)
 - **CAB** - Microsoft Cabinet format (read-only)
@@ -24,25 +24,26 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Bzip2** - Block-sorting compression
 - **Brotli** - Brotli compression (RFC 7932)
 - **Snappy** - Google's fast compression format
-- **AEC/SZIP** - CCSDS-121.0-B-2 adaptive entropy coding (HDF5/NetCDF scientific data)
+- **ISO 9660** - CD/DVD disc image format (read-only)
 
 ### Compression Algorithms (11 implemented)
 - **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
-- **LZH** - LZSS + Huffman (lh0, lh4-lh7) plus lh1 (LZHUF adaptive Huffman) and lhd directory entries
+- **LZH** - LZSS + Huffman (lh0, lh4, lh5, lh6, lh7) plus lh1 (LZHUF adaptive Huffman) and lhd directory entries; lh2/lh3 are not implemented
 - **Bzip2** - BWT + MTF + RLE + Huffman
 - **LZ4** - Ultra-fast LZ77 variant with LZ4-HC
-- **Zstandard** - FSE + Huffman entropy coding
+- **Zstandard** (RFC 8878) - Full decoder (FSE + 1/4-stream Huffman literals); encoder emits Huffman-compressed literals with predefined/RLE FSE sequence coding
 - **LZW** - Lempel-Ziv-Welch for TIFF and GIF compression (MSB/LSB bitstream)
-- **Brotli** (RFC 7932) - LZ77 + context-dependent Huffman, static dictionary, quality 0-11
+- **Brotli** (RFC 7932) - LZ77 + context-dependent Huffman, complete Appendix A static dictionary (122,784 bytes, all 121 transforms), quality 0-11
 - **Snappy** - Ultra-fast LZ77 variant with block and framed formats
 - **Store** - No compression
 - **AEC/SZIP** (CCSDS-121.0-B-2) - Adaptive entropy coding for scientific datasets
 
 ### Core Features
 - **Pure Rust** - No C/Fortran dependencies, 100% safe Rust
+- **Reference-Interop Verified** - Every codec is validated by differential tests against the reference implementation, in both directions (see [Reference-Implementation Differential Testing](#reference-implementation-differential-testing-oracles))
 - **Optimized CRC** - Slicing-by-8 implementation (3-5x faster than table lookup)
-- **SIMD CRC32** - Hardware-accelerated CRC32 via aarch64 PMULL (Apple Silicon) and x86_64 SSE 4.2
+- **SIMD CRC32** - Hardware-accelerated CRC32 via aarch64 PMULL (Apple Silicon) and x86_64 PCLMULQDQ + SSE4.1
 - **Modern CLI** - Progress bars, verbose output, JSON support, shell completions
 - **Streaming API** - Memory-efficient processing with stdin/stdout support
 - **Async I/O** - Async ZIP and async deflate support (async-io feature flag)
@@ -76,6 +77,9 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **CLI Man Pages** - Full set of troff `.1` man pages for all CLI subcommands in `man/` directory
 - **Snappy/Brotli Interop Tests** - 35 new integration tests against wire-format golden vectors (16 Snappy, 19 Brotli) validating spec compliance
 - **AEC/SZIP Codec** - CCSDS-121.0-B-2 compliant adaptive entropy coding via `oxiarc-szip` with `BitReader`/`BitWriter`, `encode`/`decode`/`encode_bytes` entry points, `SzipParams` configuration, `SzipError` error type
+- **Non-Panicking Constructors** - `RingBuffer::try_new`/`OutputRingBuffer::try_new` fallible alternatives to the panicking constructors, for untrusted/arbitrary window sizes (oxiarc-core)
+- **CLI Quiet Mode & Stdin Everywhere** - Global `--quiet`/`-q` flag; `list`/`test`/`info`/`detect` now accept `-` for stdin (previously only `extract`/`create` did)
+- **Symlink-Aware Extraction** - TAR entries that declare a symlink are recreated as real symlinks on extraction instead of being silently followed/overwritten
 
 ## Architecture
 
@@ -85,15 +89,15 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 |     CLI with progress bars, verbose mode, filters        |
 +----------------------------------------------------------+
 | L3: Container (oxiarc-archive)                           |
-|     ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy |
+|     ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660 |
 +----------------------------------------------------------+
 | L2: Codecs                                               |
 |     oxiarc-deflate: DEFLATE (RFC 1951) + async + GZip    |
 |     oxiarc-lzma: LZMA/LZMA2                              |
-|     oxiarc-lzhuf: LZH (lh0-lh7)                          |
+|     oxiarc-lzhuf: LZH (lh0, lh1, lh4, lh5, lh6, lh7, lhd) |
 |     oxiarc-bzip2: BWT + MTF + Huffman                    |
 |     oxiarc-lz4: LZ4 block/frame                          |
-|     oxiarc-zstd: Zstandard (FSE + Huffman)               |
+|     oxiarc-zstd: Zstandard (RFC 8878 FSE + Huffman)      |
 |     oxiarc-lzw: LZW (GIF/TIFF, MSB/LSB bitstream)       |
 |     oxiarc-brotli: Brotli (RFC 7932)                     |
 |     oxiarc-snappy: Snappy (block + framed)                |
@@ -108,20 +112,22 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream, RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~4,373 | 154 |
-| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip + streaming (GzipStream/ZlibStream) | ~4,522 | 218 |
-| `oxiarc-lzhuf` | LZH compression (lh0-lh7) with LZSS + Huffman + custom dictionaries | ~3,436 | 163 |
-| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + Huffman | ~2,037 | 68 |
-| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, acceleration parameter | ~4,120 | 138 |
-| `oxiarc-zstd` | Zstandard with FSE + Huffman + XXHash64, dictionary support, multi-frame | ~6,207 | 179 |
-| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool | ~4,191 | 151 |
-| `oxiarc-archive` | 12 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy) + async ZIP + archive repair | ~8,389 | 392 |
-| `oxiarc-lzw` | LZW compression (GIF/TIFF) with MSB/LSB bitstream, streaming encoder/decoder | ~2,094 | 76 |
-| `oxiarc-brotli` | Brotli compression (RFC 7932) with static dictionary, quality 0-11, streaming | ~3,536 | 163 |
-| `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~1,451 | 112 |
-| `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): BitReader/BitWriter, encode/decode/encode_bytes, SzipParams, SzipError | ~1,148 | 19 |
-| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, man pages | ~2,947 | 45 |
-| **Total** | **Pure Rust archive/compression library** | **~72,000 SLoC (234 files)** | **1,878** |
+| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~5,573 | 187 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip (multi-member) + true streaming (GzipStream/ZlibStream) | ~8,756 | 260 |
+| `oxiarc-lzhuf` | LZH compression (lh0, lh1, lh4, lh5, lh6, lh7, lhd) with LZSS + Huffman + custom dictionaries | ~6,606 | 188 |
+| `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + multi-table Huffman, multi-stream decode, de-randomisation | ~3,303 | 108 |
+| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~5,971 | 166 |
+| `oxiarc-zstd` | Zstandard (RFC 8878) with FSE + Huffman + XXHash64, dictionary support, multi-frame | ~7,336 | 208 |
+| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool, multi-chunk `.xz` | ~7,957 | 187 |
+| `oxiarc-archive` | 13 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660) + async ZIP + archive repair | ~22,153 | 524 |
+| `oxiarc-lzw` | LZW compression (GIF/TIFF incl. TIFF 6.0 Clear Code) with MSB/LSB bitstream, streaming encoder/decoder | ~2,775 | 100 |
+| `oxiarc-brotli` | Brotli compression (RFC 7932) with the full Appendix A static dictionary, quality 0-11, streaming | ~7,153 | 219 |
+| `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~4,304 | 140 |
+| `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): encode/decode/encode_bytes, SzipParams, libaec-interoperable | ~1,902 | 47 |
+| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, man pages | ~6,897 | 92 |
+| **Total** | **Pure Rust archive/compression library** | **~90,686 code lines (317 Rust files; 336 workspace-wide incl. fuzz)** | **2,426** |
+
+Lines are tokei Rust code lines per crate (src + tests + examples); tests are nextest tests + doctests, measured 2026-07-13.
 
 ## Installation
 
@@ -144,15 +150,15 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.3.5"  # For archive format support
-oxiarc-deflate = "0.3.5"  # For DEFLATE compression
-oxiarc-lzma = "0.3.5"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.3.5"    # For Bzip2 compression
-oxiarc-lz4 = "0.3.5"      # For LZ4 compression
-oxiarc-zstd = "0.3.5"     # For Zstandard compression
-oxiarc-brotli = "0.3.5"   # For Brotli compression
-oxiarc-snappy = "0.3.5"   # For Snappy compression
-oxiarc-szip = "0.3.5"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
+oxiarc-archive = "0.3.6"  # For archive format support
+oxiarc-deflate = "0.3.6"  # For DEFLATE compression
+oxiarc-lzma = "0.3.6"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.3.6"    # For Bzip2 compression
+oxiarc-lz4 = "0.3.6"      # For LZ4 compression
+oxiarc-zstd = "0.3.6"     # For Zstandard compression
+oxiarc-brotli = "0.3.6"   # For Brotli compression
+oxiarc-snappy = "0.3.6"   # For Snappy compression
+oxiarc-szip = "0.3.6"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
 ```
 
 ## Quick Start
@@ -219,12 +225,12 @@ The standard compression used in ZIP, GZIP, and PNG:
 - Supports stored, fixed, and dynamic blocks
 - Compression levels 0-9
 
-### LZH (lh0-lh7)
+### LZH (lh0, lh1, lh4, lh5, lh6, lh7, lhd)
 
 Japanese archive format compression:
 - LZSS with configurable window sizes (4KB-64KB)
 - Static Huffman coding with dual trees (codes + offsets)
-- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh4, lh5, lh6, lh7, lhd (directory); unknown methods are listed and skipped per entry
+- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh4, lh5, lh6, lh7, lhd (directory); lh2/lh3 are not implemented; unknown methods (including lh2/lh3) are listed and skipped per entry
 - Shift_JIS filenames and level-2 headers (LHA 2.x standard) on write
 
 ### LZMA/LZMA2
@@ -252,9 +258,9 @@ Ultra-fast compression:
 
 ### Zstandard
 
-Modern fast compression:
-- Finite State Entropy (FSE)
-- Huffman coding
+Modern fast compression (RFC 8878):
+- Full decoder: FSE (predefined, RLE, custom `FSE_Compressed`, and repeat modes) plus 1- and 4-stream Huffman literals — differentially verified byte-identical against reference `zstd` (incl. dictionary frames), with the RFC 8878 LIFO/MSB-first backward bitstream
+- Encoder: Huffman-compressed literal sections (chosen when they beat Raw/RLE, self-verified per section); sequences use the RFC 8878 predefined/RLE FSE tables — RFC-valid and accepted by `zstd -d`, but custom block-optimal sequence tables are not emitted yet, so ratio on some inputs trails the reference encoder
 - XXHash64 checksums
 - Dictionary support
 
@@ -263,21 +269,22 @@ Modern fast compression:
 Lempel-Ziv-Welch compression:
 - GIF LZW codec with configurable initial code size
 - LSB-first bitstream packing (GIF standard)
-- MSB-first bitstream packing (TIFF standard)
+- MSB-first bitstream packing (TIFF standard) with TIFF 6.0 Clear Code semantics — interoperable with libtiff/Pillow/GDAL in both directions (oxiarc's encoded output is byte-identical to libtiff's)
 - Variable bit widths (2-12 bits) with clear/EOI codes
 
 ### Brotli (RFC 7932)
 
 Modern compression format:
-- LZ77 with context-dependent Huffman coding
-- Static dictionary with 120+ common words/phrases
+- Full RFC 7932 decoder: block-type switching, context maps with the exact §7.1 context tables, the complete distance code space, metadata meta-blocks — differentially verified byte-identical against the reference `brotli` CLI (qualities 0-11, windows 10-24)
+- The complete, byte-exact 122,784-byte Appendix A static dictionary with all 121 word transforms (UTF-8-aware ferment casing)
+- RFC-conformant encoder accepted by `brotli -d`; ratio trails the reference encoder at quality 10-11 and on structured binary data (no encode-side block-splitting/context modeling — a ratio limitation, not a correctness one)
 - Quality levels 0-11 (fast to best compression)
 - Streaming compression/decompression API
 
 ### AEC/SZIP (CCSDS-121.0-B-2)
 
 Adaptive entropy coding for scientific data:
-- CCSDS-121.0-B-2 standard implementation (libaec-compatible)
+- CCSDS-121.0-B-2 standard implementation, differentially verified byte-identical against live libaec 1.1.4 in both directions
 - Used in HDF5 and NetCDF scientific datasets
 - `BitReader`/`BitWriter` for efficient bit manipulation
 - `SzipParams` struct for encoding/decoding configuration
@@ -288,22 +295,22 @@ Adaptive entropy coding for scientific data:
 
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
-| oxiarc-core     | Stable  | 228        | 154           |
-| oxiarc-deflate  | Stable  | 168        | 218           |
-| oxiarc-lzhuf    | Stable  | 106        | 163           |
-| oxiarc-bzip2    | Stable  | 56         | 68            |
-| oxiarc-lz4      | Stable  | 126        | 138           |
-| oxiarc-zstd     | Stable  | 161        | 179           |
-| oxiarc-lzma     | Stable  | 188        | 151           |
-| oxiarc-archive  | Stable  | 438        | 392           |
-| oxiarc-lzw      | Stable  | 67         | 76            |
-| oxiarc-brotli   | Stable  | 101        | 163           |
-| oxiarc-snappy   | Stable  | 35         | 112           |
-| oxiarc-szip     | Stable  | 27         | 19            |
-| oxiarc-cli      | Stable  | 45         | 45            |
-| **Total**       |         | **1,746**  | **1,878**     |
+| oxiarc-core     | Stable  | 228        | 187           |
+| oxiarc-deflate  | Stable  | 168        | 260           |
+| oxiarc-lzhuf    | Stable  | 106        | 188           |
+| oxiarc-bzip2    | Stable  | 56         | 108           |
+| oxiarc-lz4      | Stable  | 126        | 166           |
+| oxiarc-zstd     | Stable  | 161        | 208           |
+| oxiarc-lzma     | Stable  | 188        | 186           |
+| oxiarc-archive  | Stable  | 438        | 524           |
+| oxiarc-lzw      | Stable  | 67         | 100           |
+| oxiarc-brotli   | Stable  | 101        | 219           |
+| oxiarc-snappy   | Stable  | 35         | 140           |
+| oxiarc-szip     | Stable  | 27         | 47            |
+| oxiarc-cli      | Stable  | 45         | 92            |
+| **Total**       |         | **1,746**  | **2,426**     |
 
-All crates are feature-complete, tested, and API-stable as of v0.3.5 (2026-07-07).
+Test counts measured 2026-07-13 (nextest tests + doctests, all features, 0 failed, 0 ignored); public-API item counts are the v0.3.6 snapshot. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions. Ahead of a 1.0 release, 18 public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -313,19 +320,69 @@ Streaming compression/decompression support in `oxiarc-deflate`:
 
 | Format | Read | Write | Compression | Checksums | Notes |
 |--------|------|-------|-------------|-----------|-------|
-| **ZIP** | ✅ | ✅ | DEFLATE, Store | CRC-32 | Zip64 support, data descriptors, async ZIP (async-io feature) |
-| **TAR** | ✅ | ✅ | N/A (container only) | None | UStar, PAX, GNU long names |
+| **ZIP** | ✅ | ✅ | DEFLATE, Store | CRC-32 | Zip64 support, data descriptors, async ZIP (async-io feature), AES-128/192/256 + ZipCrypto encryption (external encrypted archives detected via general-purpose bit 0); spanned/multi-volume ZIP unsupported (rejected) |
+| **TAR** | ✅ | ✅ | N/A (container only) | None | UStar, PAX, GNU long names, GNU sparse (old-format 'S' + PAX 0.1, both readers; PAX 1.0 sparse unsupported) |
 | **GZIP** | ✅ | ✅ | DEFLATE | CRC-32 | RFC 1952 compliant |
-| **LZH** | ✅ | ✅ | lh0-lh7 | CRC-16 | Shift_JIS support, all header levels |
+| **LZH** | ✅ | ✅ | lh0, lh1, lh4, lh5, lh6, lh7 | CRC-16 | Shift_JIS support, all header levels; lh2/lh3 not implemented |
 | **XZ** | ✅ | ✅ | LZMA2 | CRC-64 | Block checksums |
 | **7z** | ✅ | ❌ | LZMA/LZMA2 | CRC-32 | Read-only, partial support |
-| **CAB** | ✅ | ❌ | None, MSZIP | CRC-32 | Microsoft Cabinet, read-only |
+| **CAB** | ✅ | ❌ | None, MSZIP | CFDATA checksums | Microsoft Cabinet, read-only; MSZIP window carried across CFDATA blocks, per-block checksums validated; Quantum/LZX unsupported (clean error, never silent raw copy) |
 | **LZ4** | ✅ | ✅ | LZ4, LZ4-HC | XXHash32 | Frame format, block/content checksums |
-| **Zstd** | ✅ | ✅ | Zstandard | XXHash64 | Frame format with FSE+Huffman |
+| **Zstd** | ✅ | ✅ | Zstandard | XXHash64 | RFC 8878 frame format; full decoder (FSE + 1/4-stream Huffman); encoder: Huffman literals + predefined/RLE FSE sequences (custom sequence tables not emitted — ratio, not correctness) |
 | **Bzip2** | ✅ | ✅ | BWT + Huffman | CRC-32 | Block-sorting compression |
-| **Brotli** | ✅ | ✅ | Brotli (RFC 7932) | None | Quality levels 0-11, static dictionary |
+| **Brotli** | ✅ | ✅ | Brotli (RFC 7932) | None | Quality levels 0-11, full Appendix A static dictionary; `.br` file-path CLI support via extension fallback (raw Brotli has no magic bytes) |
 | **Snappy** | ✅ | ✅ | Snappy | CRC32C | Block and framed formats |
 | **ISO 9660** | ✅ | ❌ | Store | None | Read-only; list/extract/info/detect support |
+
+### ZIP Encryption
+
+- **AES-128 / AES-192 / AES-256** (WinZip AE-2) via a genuine, FIPS-197-compliant AES cipher (key schedule/round count derived from key length), CTR mode, HMAC-SHA1 authentication tag verified in constant time, and OS-CSPRNG-sourced salts. AE-2 entries write CRC=0 per the WinZip AES spec.
+- **Traditional ZipCrypto** encryption/decryption, with a CSPRNG-sourced header. Info-ZIP (`zip -e`) streamed archives — which derive the password-check byte from the DOS mtime rather than the CRC — decrypt correctly.
+- **Encryption detection uses the ZIP general-purpose bit 0** (plus method 99 for AES), so archives encrypted by external tools (`zip -e`, 7-Zip, WinRAR, Python) are correctly reported as encrypted and require a password — they are never silently extracted as garbage.
+- **Spanned/multi-volume ZIP archives are not supported** — both classic and Zip64 end-of-central-directory records that declare more than one disk are rejected with an explicit error rather than silently misread.
+
+### `--memory-limit`
+
+`extract`/`list --memory-limit <BYTES>` bounds memory use **during decompression for every supported format**. Container entries (ZIP/TAR/LZH/7z/CAB/ISO) are checked against their declared sizes before allocating. Single-file formats are enforced during decode: gzip via the trailing ISIZE field, xz via the stream index's declared uncompressed size, lz4/zstd via the frame content-size fields, and bzip2/brotli/snappy via bounded decoders (`decompress_with_limit`) that return an error as soon as output would exceed the limit — no pre-flight size field is required. Measured: a brotli decompression bomb extracted under `--memory-limit 1M` peaks at 3.3 MB RSS (vs 72.9 MB unbounded) and exits non-zero.
+
+Independently of `--memory-limit`, every header-driven allocation across the readers (ZIP central directory/AES payloads, TAR PAX/extension data, LZH, 7z, ISO 9660 directory extents, zstd frame content-size, LZMA/LZMA2 dictionaries) validates the declared length against the bytes actually available and allocates via `try_reserve`/`try_reserve_exact` rather than an unconditional `Vec::with_capacity`/`vec![0; n]`. A crafted, wildly-oversized header therefore surfaces as a clean error instead of an allocator abort/OOM even with no `--memory-limit` set at all.
+
+## Reference-Implementation Differential Testing (Oracles)
+
+Self round-trips alone cannot prove interoperability — an encoder and decoder that share the same deviation from a spec will round-trip perfectly while being incompatible with everything else. Every OxiArc codec is therefore validated by **differential tests against the reference implementation, in both directions**: reference-produced streams must decode byte-identically, and oxiarc-produced streams must be accepted (and decode byte-identically) by the reference tool.
+
+Two layers keep this permanent:
+
+1. **Always-run embedded corpora** — golden byte vectors generated by the reference tools are committed and checked on every `cargo nextest run`, with no external dependencies.
+2. **Live oracle suites** — opt-in Cargo features that shell out to the real reference tool. They **self-skip with a printed note (never fail) when the tool is absent**, so enabling them is always safe and CI stays hermetic.
+
+| Crate | Feature | Reference oracle |
+|-------|---------|------------------|
+| `oxiarc-zstd` | `zstd-oracle` | `zstd` CLI |
+| `oxiarc-brotli` | `brotli-oracle` | `brotli` CLI |
+| `oxiarc-lzma` | `xz-oracle` | `xz` (XZ Utils) CLI |
+| `oxiarc-bzip2` | `bzip2-oracle` | `bzip2` CLI |
+| `oxiarc-lz4` | `lz4-oracle` | `lz4` CLI |
+| `oxiarc-snappy` | `snappy-oracle` | `python3` + `cramjam` |
+| `oxiarc-deflate` | `zlib-oracle` | `python3` (zlib/gzip) + `gzip` CLI |
+| `oxiarc-lzw` | `tiff-oracle` | `python3` + Pillow (libtiff), `tiffcp` when present |
+| `oxiarc-szip` | `libaec-oracle` | libaec (compiled harness; `LIBAEC_PREFIX` env var) |
+| `oxiarc-lzhuf` | `lha-oracle` | `lha` (Lhasa) CLI |
+| `oxiarc-archive` | `zip-oracle`, `xz-oracle`, `lha-oracle` | Info-ZIP `zip`/`unzip` + Python `zipfile`; `xz`; `lha` |
+
+```bash
+# Run one codec's live oracle against the reference tool
+cargo nextest run -p oxiarc-zstd --features zstd-oracle
+cargo nextest run -p oxiarc-brotli --features brotli-oracle
+
+# Archive-level oracles
+cargo nextest run -p oxiarc-archive --features zip-oracle,xz-oracle,lha-oracle
+
+# Everything, everywhere (oracle suites self-skip for any missing tool)
+cargo nextest run --workspace --all-features
+```
+
+Verified interop snapshot (2026-07-13, live tools): zstd 64/64 corpus + 101/101 wide frames decode byte-identical, 85/85 oxiarc frames accepted by `zstd -d`; brotli 608/608 decode / 588/588 accepted; xz 5.8.3 60/60 decode / 8/8 encode; bzip2 1.0.8 324/324 both directions; lz4 1.10.0 11/11 + 44/44 + 3/3 linked; TIFF-LZW 125/125 vs Pillow/libtiff (encoder byte-identical to libtiff); libaec 1.1.4 2450/2450 decode + 4900/4900 encode; DEFLATE/zlib/gzip bit-exact vs CPython + gzip CLI.
 
 ## Performance
 
@@ -760,8 +817,9 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all 1,878 tests
-cargo nextest run --all-features
+# Run all tests (2,289 via nextest + 137 doctests = 2,426)
+cargo nextest run --workspace --all-features
+cargo test --doc --workspace --all-features
 
 # Build CLI only
 cargo build --release -p oxiarc-cli
@@ -857,7 +915,9 @@ OxiArc is part of the COOLJAPAN ecosystem and follows strict development policie
 6. **Submit Pull Request**
    - Describe your changes clearly
    - Reference related issues
-   - Ensure CI passes
+   - Ensure `cargo clippy --workspace --all-features --all-targets` and
+     `cargo nextest run --workspace --all-features` pass locally (this
+     project has no CI pipeline yet, so these checks are not automated)
    - Wait for review from maintainers
 
 ### Code Style

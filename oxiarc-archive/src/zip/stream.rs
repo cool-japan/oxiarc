@@ -39,6 +39,43 @@ const ZIP64_EXTRA_FIELD_ID: u16 = 0x0001;
 /// ZIP local file header signature (PK\x03\x04).
 const LOCAL_FILE_HEADER_SIG: u32 = 0x04034B50;
 
+/// Upper bound (per chunk) on how much memory a single incremental read
+/// grows the output buffer by. Reading in bounded increments — rather than
+/// eagerly zero-filling a `declared_len`-sized buffer up front — means a
+/// crafted local file header that declares an implausible `compressed_size`
+/// (e.g. several GiB) cannot force a single huge allocation before a single
+/// byte of actual data has been read: the stream itself (which has no
+/// `Seek`, so its true remaining length is unknown ahead of time) will run
+/// out and yield an `UnexpectedEof` well before the buffer grows anywhere
+/// near the declared size.
+const STREAM_READ_CHUNK: usize = 64 * 1024;
+
+/// Read exactly `len` bytes from `reader` into a freshly allocated `Vec`,
+/// growing the buffer incrementally in [`STREAM_READ_CHUNK`]-sized steps
+/// via `try_reserve` instead of allocating `len` bytes up front.
+///
+/// This bounds worst-case allocation against bytes *actually observed* on
+/// the stream rather than trusting an untrusted header-declared length,
+/// and turns allocator failure into a proper `Err` instead of a panic/abort.
+fn read_vec_bounded<R: Read>(reader: &mut R, len: u64) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        let take = remaining.min(STREAM_READ_CHUNK as u64) as usize;
+        let old_len = data.len();
+        data.try_reserve(take).map_err(|_| {
+            OxiArcError::corrupted(
+                0,
+                format!("unable to allocate {take} more bytes while reading entry data"),
+            )
+        })?;
+        data.resize(old_len + take, 0);
+        reader.read_exact(&mut data[old_len..])?;
+        remaining -= take as u64;
+    }
+    Ok(data)
+}
+
 /// Metadata for a single entry in a streaming ZIP archive.
 #[derive(Debug, Clone)]
 pub struct ZipStreamEntryMeta {
@@ -96,12 +133,14 @@ impl<R: Read> ZipStreamReader<R> {
     }
 
     /// Attach a progress sink that will be notified for each entry.
+    #[must_use]
     pub fn with_progress(mut self, progress: ProgressHandle) -> Self {
         self.progress = Some(progress);
         self
     }
 
     /// Attach a cancellation token.
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
@@ -205,8 +244,7 @@ impl<R: Read> ZipStreamReader<R> {
             let compressed_size = lfh.actual_compressed_size();
             let uncompressed_size = lfh.actual_uncompressed_size();
 
-            let mut compressed = vec![0u8; compressed_size as usize];
-            self.reader.read_exact(&mut compressed)?;
+            let compressed = read_vec_bounded(&mut self.reader, compressed_size)?;
 
             let decompressed = match lfh.method {
                 CompressionMethod::Stored => compressed,
@@ -961,5 +999,56 @@ mod tests {
         let mut extracted = Vec::new();
         std::io::Read::read_to_end(&mut entry, &mut extracted).expect("read_to_end");
         assert_eq!(extracted, raw);
+    }
+
+    /// A crafted local file header declaring a wildly oversized
+    /// `compressed_size` (far larger than the bytes actually present in
+    /// the stream) must yield a clean `Err` from `read_vec_bounded` — not
+    /// an attempt to eagerly allocate multiple GiB up front.
+    #[test]
+    fn test_zip_stream_oversized_compressed_size_errors() {
+        let buf = build_zip(&[("small.txt", b"hi")]);
+
+        // Local file header layout: 4-byte signature, then compressed_size
+        // is the little-endian u32 at bytes [18..22).
+        let mut corrupted = buf.clone();
+        corrupted[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let cursor = Cursor::new(corrupted);
+        let mut stream = ZipStreamReader::new(cursor);
+
+        let result = stream.next_entry();
+        // Any proper error is acceptable; the key property is that it is
+        // an `Err` (i.e. no panic/abort/OOM), not an `Ok`.
+        assert!(
+            result.is_err(),
+            "oversized compressed_size must not succeed"
+        );
+    }
+
+    /// Same idea but for a stream that is truncated well before the
+    /// declared compressed size is reached — must not panic and must not
+    /// attempt to allocate the full declared amount before observing EOF.
+    #[test]
+    fn test_zip_stream_truncated_after_declared_size_errors() {
+        let buf = build_zip(&[("small.txt", b"hi")]);
+
+        let mut corrupted = buf.clone();
+        // Declare a compressed size much larger than what actually follows.
+        corrupted[18..22].copy_from_slice(&1_000_000u32.to_le_bytes());
+
+        // Truncate right after the local file header + filename so the
+        // "remaining" data is far smaller than the declared size.
+        let truncate_at = 30 + "small.txt".len();
+        corrupted.truncate(truncate_at + 1);
+
+        let cursor = Cursor::new(corrupted);
+        let mut stream = ZipStreamReader::new(cursor);
+
+        let result = stream.next_entry();
+        assert!(
+            result.is_err(),
+            "truncated stream with oversized declared size must error, not panic"
+        );
     }
 }

@@ -12,6 +12,43 @@ use super::sparse::{SparseMap, SparseMapTable};
 use super::{BLOCK_SIZE, LENIENT_SCAN_MAX_BLOCKS};
 
 /// TAR archive reader with extraction support.
+///
+/// Parses a POSIX UStar / PAX / GNU-extension TAR stream from any
+/// [`std::io::Read`] + [`std::io::Seek`] source (a `Cursor<Vec<u8>>`, a
+/// [`std::fs::File`], etc.), building an in-memory index of every entry up
+/// front so that [`TarReader::entries`] and [`TarReader::extract_by_name`]
+/// can be used without re-scanning the archive. GNU long name/link records,
+/// PAX extended headers (including PAX and GNU old-format sparse files), and
+/// header checksum validation are all handled transparently.
+///
+/// For archives that only support forward [`std::io::Read`] (e.g. streamed
+/// from a pipe or network socket with no seeking), use
+/// [`super::stream::TarStreamReader`] instead.
+///
+/// # Example
+/// ```
+/// use oxiarc_archive::{TarReader, TarWriter};
+/// use std::io::Cursor;
+///
+/// // Build a small in-memory archive.
+/// let mut buf = Vec::new();
+/// {
+///     let mut writer = TarWriter::new(&mut buf);
+///     writer.add_file("hello.txt", b"Hello, TAR!").expect("add_file");
+///     writer.finish().expect("finish");
+/// }
+///
+/// // Open it, list entries, and extract one by name.
+/// let mut reader = TarReader::new(Cursor::new(buf)).expect("TarReader::new");
+/// assert_eq!(reader.entries().len(), 1);
+/// assert_eq!(reader.entries()[0].name, "hello.txt");
+///
+/// let data = reader
+///     .extract_by_name("hello.txt")
+///     .expect("extract_by_name")
+///     .expect("entry present");
+/// assert_eq!(&data, b"Hello, TAR!");
+/// ```
 pub struct TarReader<R: Read + Seek> {
     reader: R,
     entries: Vec<Entry>,
@@ -42,7 +79,28 @@ pub struct TarReader<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> TarReader<R> {
-    /// Create a new TAR reader.
+    /// Create a new TAR reader, eagerly scanning `reader` and indexing every
+    /// entry.
+    ///
+    /// Returns [`OxiArcError::InvalidHeader`] on the first header whose
+    /// checksum does not match — use [`TarReader::new_lenient`] to instead
+    /// skip over corrupt blocks while scanning.
+    ///
+    /// # Example
+    /// ```
+    /// use oxiarc_archive::{TarReader, TarWriter};
+    /// use std::io::Cursor;
+    ///
+    /// let mut buf = Vec::new();
+    /// {
+    ///     let mut writer = TarWriter::new(&mut buf);
+    ///     writer.add_file("a.txt", b"one").expect("add_file");
+    ///     writer.finish().expect("finish");
+    /// }
+    ///
+    /// let reader = TarReader::new(Cursor::new(buf)).expect("TarReader::new");
+    /// assert_eq!(reader.entries().len(), 1);
+    /// ```
     pub fn new(mut reader: R) -> Result<Self> {
         let mut warnings = Vec::new();
         let (entries, headers, sparse_maps) =
@@ -96,6 +154,7 @@ impl<R: Read + Seek> TarReader<R> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -104,6 +163,7 @@ impl<R: Read + Seek> TarReader<R> {
     /// Toggle lenient-mode **extraction**. Note: this does NOT re-run
     /// the initial entry scan. If you need lenient scanning to skip
     /// corrupt header blocks, use [`TarReader::new_lenient`] instead.
+    #[must_use]
     pub fn lenient(mut self, enabled: bool) -> Self {
         self.lenient = enabled;
         self
@@ -413,8 +473,34 @@ impl<R: Read + Seek> TarReader<R> {
     }
 
     /// Read header data (for PAX extended headers and GNU long name/link).
+    ///
+    /// `size` comes straight from an untrusted header field (PAX extended
+    /// header / GNU long name-link record), so it must never be trusted
+    /// to drive an unconditional allocation: a crafted archive could
+    /// declare an enormous size and trigger an out-of-memory abort before
+    /// a single byte is actually read. Bound the allocation against the
+    /// number of bytes actually remaining in the underlying stream and use
+    /// `try_reserve` so an oversized-but-still-remaining declaration
+    /// yields a proper `Err` instead of an allocator panic.
     fn read_header_data(reader: &mut R, size: u64) -> Result<Vec<u8>> {
-        let mut data = vec![0u8; size as usize];
+        let current = reader.stream_position()?;
+        let end = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(current))?;
+        let remaining = end.saturating_sub(current);
+
+        if size > remaining {
+            return Err(OxiArcError::invalid_header(format!(
+                "TAR extended header declares size {size} but only {remaining} bytes remain"
+            )));
+        }
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(size as usize).map_err(|_| {
+            OxiArcError::invalid_header(format!(
+                "unable to allocate {size} bytes for TAR extended header data"
+            ))
+        })?;
+        data.resize(size as usize, 0);
         reader.read_exact(&mut data)?;
 
         // Skip padding to block boundary
@@ -455,6 +541,26 @@ impl<R: Read + Seek> TarReader<R> {
     /// logical content is materialized: non-hole runs are read from the
     /// data stream, and hole regions are filled with zero bytes. The full
     /// `entry.size` bytes (the logical size) are written to `writer`.
+    ///
+    /// # Example
+    /// ```
+    /// use oxiarc_archive::{TarReader, TarWriter};
+    /// use std::io::Cursor;
+    ///
+    /// let mut buf = Vec::new();
+    /// {
+    ///     let mut writer = TarWriter::new(&mut buf);
+    ///     writer.add_file("a.txt", b"payload").expect("add_file");
+    ///     writer.finish().expect("finish");
+    /// }
+    ///
+    /// let mut reader = TarReader::new(Cursor::new(buf)).expect("TarReader::new");
+    /// let entry = reader.entries()[0].clone();
+    /// let mut out = Vec::new();
+    /// let written = reader.extract(&entry, &mut out).expect("extract");
+    /// assert_eq!(written, 7);
+    /// assert_eq!(&out, b"payload");
+    /// ```
     pub fn extract<W: Write>(&mut self, entry: &Entry, writer: &mut W) -> Result<u64> {
         // Emit extraction progress
         if let Some(ref handle) = self.progress {
@@ -498,8 +604,27 @@ impl<R: Read + Seek> TarReader<R> {
     }
 
     /// Extract an entry to a Vec.
+    ///
+    /// `entry.size` is derived from untrusted header fields, so it is
+    /// never used to drive an unconditional allocation directly: doing so
+    /// would let a crafted archive (declaring, say, `u64::MAX` bytes for a
+    /// tiny file) trigger an allocator abort before any data is even
+    /// read. Instead the pre-allocation is capped at the number of bytes
+    /// actually remaining in the underlying stream, and `try_reserve` is
+    /// used so an oversized-but-plausible declaration still yields a
+    /// proper `Err` rather than panicking.
     pub fn extract_to_vec(&mut self, entry: &Entry) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(entry.size as usize);
+        let end = self.reader.seek(SeekFrom::End(0))?;
+        let remaining = end.saturating_sub(entry.offset);
+        let cap = entry.size.min(remaining) as usize;
+
+        let mut data = Vec::new();
+        data.try_reserve_exact(cap).map_err(|_| {
+            OxiArcError::invalid_header(format!(
+                "unable to allocate {cap} bytes to extract entry '{}'",
+                entry.name
+            ))
+        })?;
         self.extract(entry, &mut data)?;
         Ok(data)
     }

@@ -45,6 +45,15 @@ pub fn parse_dir_record(data: &[u8], offset: usize, joliet: bool) -> Option<(Dir
 
     let record = &data[offset..offset + len_dr];
 
+    // A directory record is at least 34 bytes (33 fixed bytes + a 1-byte
+    // identifier, ECMA-119 §9.1). A non-zero LEN_DR smaller than that would
+    // make the fixed-field indexing below read out of bounds on a crafted
+    // image, so treat it as malformed padding and let the caller skip to
+    // the next sector boundary.
+    if record.len() < 34 {
+        return None;
+    }
+
     // LBA: LE at bytes 2-5
     let lba = u32::from_le_bytes([record[2], record[3], record[4], record[5]]);
     // Size: LE at bytes 10-13
@@ -167,6 +176,34 @@ mod tests {
     fn test_parse_zero_len_dr() {
         let data = [0u8; 64];
         assert!(parse_dir_record(&data, 0, false).is_none());
+    }
+
+    /// ISO-01 regression: every undersized non-zero LEN_DR in 1..34 must be
+    /// rejected with `None` instead of panicking on the fixed-field indexes
+    /// (`record[2..6]`, `record[10..14]`, `record[25]`, `record[32]`).
+    #[test]
+    fn test_parse_undersized_len_dr_sweep_no_panic() {
+        for len_dr in 1u8..34 {
+            // Fill with 0xFF so any accidental read would produce maximally
+            // hostile values rather than friendly zeros.
+            let mut data = vec![0xFFu8; 64];
+            data[0] = len_dr;
+            for joliet in [false, true] {
+                assert!(
+                    parse_dir_record(&data, 0, joliet).is_none(),
+                    "LEN_DR={len_dr} (joliet={joliet}) must be rejected"
+                );
+            }
+        }
+    }
+
+    /// ISO-01: the undersized-record guard must also hold at a non-zero
+    /// offset near the end of the buffer (the original panic path).
+    #[test]
+    fn test_parse_undersized_len_dr_at_tail_offset() {
+        let mut data = vec![0u8; 40];
+        data[35] = 5; // LEN_DR = 5 with only 5 bytes remaining
+        assert!(parse_dir_record(&data, 35, false).is_none());
     }
 
     #[test]

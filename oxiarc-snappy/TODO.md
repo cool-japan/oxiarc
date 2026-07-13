@@ -1,4 +1,4 @@
-# oxiarc-snappy - Development Status (v0.3.5, 2026-07-07)
+# oxiarc-snappy - Development Status (v0.3.6, 2026-07-08)
 
 ## Completed Features (COMPLETE)
 

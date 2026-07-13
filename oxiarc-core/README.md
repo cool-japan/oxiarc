@@ -3,11 +3,13 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 154 tests passing.
+**Version 0.3.6** (2026-07-13) — 187 tests passing.
+
+**What's new in 0.3.6**: Non-panicking `RingBuffer::try_new`/`OutputRingBuffer::try_new` constructors alongside the existing panicking `new` methods (now with documented `# Panics` contracts) — prefer the fallible form when a window/capacity size originates from untrusted input. Fixed `Crc32::is_simd_available()`/`Crc32::implementation_name()` to report the CRC-32 code path actually dispatched at runtime (previously x86_64 could misreport PCLMULQDQ while dispatch had silently fallen back to software). `FlushMode`, `CompressStatus`, `DecompressStatus`, and `OxiArcError` are now `#[non_exhaustive]` as part of a pre-1.0 API freeze — downstream `match` expressions need a wildcard arm. Removed the unused `CompressionLevel(u8)` newtype (dead code; every codec crate already defines its own, differently-ranged level type). `Compressor`/`Decompressor` trait docs now correctly describe them as optional, DEFLATE-family-only traits rather than a universal contract. New `mmap_read` example.
 
 **What's new in 0.3.5**: Added `msb_bitstream` — `MsbBitReader`/`MsbBitWriter`, genuine most-significant-bit-first bit I/O for canonical LZH/LHA-family bitstream work (mirrors canonical LHA `getbits`/`putbits`/`fillbuf` semantics), a sibling to the existing LSB-first `BitReader`/`BitWriter` used by DEFLATE. Re-exported from the crate root and `prelude`.
 
@@ -94,14 +96,15 @@ use oxiarc_core::ringbuffer::{RingBuffer, OutputRingBuffer};
 
 // Basic ring buffer
 let mut rb = RingBuffer::new(32768); // 32KB window
-rb.push(b'A');
-let byte = rb.get(-1); // Get last byte
+rb.write_byte(b'A');
+let byte = rb.read_at_distance(1)?; // Read the most recently written byte
 
-// Output ring buffer with copy-from-self
+// Output ring buffer with copy-from-history
 let mut out = OutputRingBuffer::new(32768);
-out.put_byte(b'H');
-out.put_byte(b'i');
-out.copy_from_self(2, 4); // Copy "Hi" twice -> "HiHiHi"
+out.write_literal(b'H');
+out.write_literal(b'i');
+out.copy_match(2, 4)?; // Copy "Hi" twice -> "HiHiHi"
+assert_eq!(out.output(), b"HiHiHi");
 ```
 
 Configurable sizes for different algorithms:
@@ -109,6 +112,12 @@ Configurable sizes for different algorithms:
 - 8KB (lh5)
 - 32KB (Deflate, lh6)
 - 64KB (lh7)
+
+Both `RingBuffer::new`/`OutputRingBuffer::new` panic on a zero or
+non-power-of-two capacity (see their documented `# Panics` sections); the
+non-panicking `RingBuffer::try_new`/`OutputRingBuffer::try_new` counterparts
+return `Result` instead and should be preferred whenever the capacity comes
+from untrusted or externally supplied input.
 
 ### crc
 
@@ -160,6 +169,7 @@ Archive entry metadata.
 
 ```rust
 use oxiarc_core::entry::{Entry, EntryType, CompressionMethod};
+use std::time::SystemTime;
 
 let entry = Entry {
     name: "file.txt".to_string(),
@@ -167,7 +177,7 @@ let entry = Entry {
     compressed_size: 567,
     entry_type: EntryType::File,
     method: CompressionMethod::Deflate,
-    mtime: Some(1704067200),
+    modified: Some(SystemTime::now()),
     crc32: Some(0xABCD1234),
     ..Default::default()
 };
@@ -182,14 +192,15 @@ Unified error types using thiserror.
 ```rust
 use oxiarc_core::error::{OxiArcError, Result};
 
-// Error variants
+// A sample of error variants (OxiArcError is #[non_exhaustive]; match
+// expressions need a wildcard arm)
 OxiArcError::Io(io_error)
 OxiArcError::InvalidMagic { expected, found }
-OxiArcError::UnsupportedMethod(method_name)
+OxiArcError::UnsupportedMethod { method }
 OxiArcError::CrcMismatch { expected, computed }
-OxiArcError::InvalidHuffmanCode
-OxiArcError::Corrupted { offset, message }
-OxiArcError::InvalidHeader(message)
+OxiArcError::InvalidHuffmanCode { bit_position }
+OxiArcError::CorruptedData { offset, message }
+OxiArcError::InvalidHeader { message }
 ```
 
 ## Features
@@ -208,14 +219,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.3.5"
+oxiarc-core = "0.3.6"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.3.5", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.3.6", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

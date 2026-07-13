@@ -80,6 +80,7 @@ impl GzipHeader {
     }
 
     /// Set the modification time to now.
+    #[must_use]
     pub fn with_mtime_now(mut self) -> Self {
         self.mtime = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -232,6 +233,7 @@ impl<R: Read> GzipReader<R> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -324,6 +326,7 @@ impl GzipWriter {
     }
 
     /// Set compression level (0-9).
+    #[must_use]
     pub fn level(mut self, level: u8) -> Self {
         self.level = level.min(9);
         // Set XFL based on level

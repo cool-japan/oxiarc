@@ -255,6 +255,15 @@ impl TarHeader {
             if value_end > 0 && data.get(value_end - 1) == Some(&b'\n') {
                 value_end -= 1;
             }
+
+            // The declared record length must cover at least the
+            // "length " prefix that was already consumed (digits + the
+            // separating space). Otherwise `space_pos + 1` would land
+            // past `value_end` and the slice below would panic on a
+            // malformed/truncated record (e.g. `b"1 X=Y\n"`).
+            if space_pos + 1 > value_end {
+                break;
+            }
             let record = &data[space_pos + 1..value_end];
 
             // Find the = separator
@@ -313,6 +322,29 @@ impl TarHeader {
         }
     }
 
+    /// Create a header for a regular file, stamping an explicit `mtime`
+    /// (Unix seconds since the epoch) instead of the current time.
+    ///
+    /// Use this when the caller has a real modification time to preserve
+    /// (e.g. copied from a source filesystem entry) rather than defaulting
+    /// to "now" as [`TarHeader::new_file`] does.
+    pub fn new_file_with_mtime(name: &str, size: u64, mode: u32, mtime: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            mode,
+            uid: 1000,
+            gid: 1000,
+            size,
+            mtime,
+            typeflag: b'0',
+            linkname: String::new(),
+            ustar: true,
+            uname: String::new(),
+            gname: String::new(),
+            prefix: String::new(),
+        }
+    }
+
     /// Create a header for a directory.
     pub fn new_directory(name: &str, mode: u32) -> Self {
         let now = std::time::SystemTime::now()
@@ -327,6 +359,25 @@ impl TarHeader {
             gid: 1000,
             size: 0,
             mtime: now,
+            typeflag: b'5',
+            linkname: String::new(),
+            ustar: true,
+            uname: String::new(),
+            gname: String::new(),
+            prefix: String::new(),
+        }
+    }
+
+    /// Create a header for a directory, stamping an explicit `mtime` (Unix
+    /// seconds since the epoch) instead of the current time.
+    pub fn new_directory_with_mtime(name: &str, mode: u32, mtime: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            mode,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime,
             typeflag: b'5',
             linkname: String::new(),
             ustar: true,
@@ -457,6 +508,69 @@ impl TarHeader {
         let bytes = s.as_bytes();
         if bytes.len() < field.len() {
             field[..bytes.len()].copy_from_slice(bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: a PAX record whose declared length only covers the
+    /// digits + separating space (and not even a whole `=` pair) must be
+    /// skipped rather than causing a slice-index panic in
+    /// `&data[space_pos + 1..value_end]`.
+    ///
+    /// Before the fix, `b"1 X=Y\n"` parsed as `record_len == 1`,
+    /// `record_end == 1`, `space_pos == 1`, so `value_end` (0 or 1) was
+    /// less than `space_pos + 1` (2), and the slice start > end panicked.
+    #[test]
+    fn test_parse_pax_data_short_length_prefix_does_not_panic() {
+        let attrs = TarHeader::parse_pax_data(b"1 X=Y\n");
+        assert!(
+            attrs.is_empty(),
+            "malformed short-prefix record must be skipped, not parsed"
+        );
+    }
+
+    /// Same class of bug with a record length of exactly 2 (covers digit +
+    /// space but nothing past it).
+    #[test]
+    fn test_parse_pax_data_length_exactly_covers_prefix() {
+        let attrs = TarHeader::parse_pax_data(b"2 X=Y\n");
+        assert!(
+            attrs.is_empty(),
+            "record length that stops exactly at the separating space must not panic"
+        );
+    }
+
+    /// A zero-length record must already be rejected by the existing
+    /// `record_len == 0` guard.
+    #[test]
+    fn test_parse_pax_data_zero_length_record() {
+        let attrs = TarHeader::parse_pax_data(b"0 X=Y\n");
+        assert!(attrs.is_empty());
+    }
+
+    /// A well-formed record after a malformed one must still parse: the
+    /// parser breaks out of the loop entirely on the first malformed
+    /// record (matching the existing malformed-length behavior), so only
+    /// records before the corruption are recovered.
+    #[test]
+    fn test_parse_pax_data_valid_record_still_parses() {
+        let attrs = TarHeader::parse_pax_data(b"17 path=test.txt\n");
+        assert_eq!(attrs.get("path").map(|s| s.as_str()), Some("test.txt"));
+    }
+
+    /// Fuzz-style sweep over short malformed prefixes to make sure none of
+    /// them panic (this is the core acceptance criterion for the fix).
+    #[test]
+    fn test_parse_pax_data_no_panic_on_various_short_records() {
+        let candidates: &[&[u8]] = &[
+            b"1 X=Y\n", b"2 X=Y\n", b"1 \n", b"1 =\n", b"3 \n", b"1 ", b"2 ", b"4 a=\n",
+        ];
+        for candidate in candidates {
+            let _ = TarHeader::parse_pax_data(candidate);
         }
     }
 }

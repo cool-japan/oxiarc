@@ -7,35 +7,38 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.5 (2026-07-07) | 179 tests passing**
+**Version: 0.3.6 (2026-07-13) | 208 tests passing**
 
 ## Overview
 
-Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.2.6 includes improvements to the frame, streaming, and core library modules.
+Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.3.6 hardens the frame decoder against malformed/hostile headers (bounded, `try_reserve`-based output allocation instead of trusting the untrusted `Frame_Content_Size` field outright) and — most importantly — makes the FSE/Huffman entropy layer bit-exact with RFC 8878: the backward bitstream is now read/written with the reference `BIT_*` semantics, so real `zstd`-produced frames decode byte-identically and every oxiarc-produced frame is accepted by the reference `zstd` CLI (verified continuously by the `zstd-oracle` differential test suite).
 
 
 ## Features
 
 - **Pure Rust** - No C dependencies or unsafe FFI
-- **Excellent compression ratios** - Better than DEFLATE, competitive with BZip2
-- **Fast decompression** - Faster than BZip2, competitive with DEFLATE
+- **Reference interoperability, both directions** - frames produced by the reference `zstd` CLI (levels 1-19, `--ultra -22`, `--long`, `--no-check`, `--no-content-size`, raw-content dictionaries, multi-frame streams) decode byte-identically, and every frame this encoder emits is accepted and correctly decoded by `zstd -d`; enforced by embedded reference-frame fixtures (always on) plus a live CLI differential suite (`zstd-oracle` feature)
+- **Full RFC 8878 entropy decoding** - FSE-compressed sequence tables, 1- and 4-stream Huffman literals, repeat offsets, treeless literals, repeat table modes
+- **Huffman literals on the encode path** - literal sections are Huffman-compressed when that wins (self-verified with Raw/RLE fallback); sequences use the RFC 8878 predefined/RLE FSE tables, so the ratio on some inputs trails the reference encoder (custom block-optimal sequence tables are not emitted yet)
 - **Parallel compression** - Multi-threaded block compression with Rayon (`parallel` feature)
-- **Dictionary support** - Pre-trained dictionaries for better compression
+- **Dictionary support** - Raw-content dictionaries, interoperable with `zstd -D` in both directions
 - **Checksum support** - XXH64 checksums for data integrity
 - **Streaming API** - Incremental encoder/decoder for large data
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on encoders and stream decoder
 - **Cancellation** - `with_cancel(CancellationToken)` builder for cooperative cancellation
+- **Hardened frame decoding** - untrusted header fields (e.g. `Frame_Content_Size`) are bounds-checked and reserved with `Vec::try_reserve` rather than trusted outright; every FSE/Huffman table index is validated, so malformed or truncated input returns a clean error instead of panicking or over-allocating
+- **Reference-decoder-safe framing** - one-shot output above the internal window cap, dictionary frames, and frames without a stored content size get an explicit, bounded `Window_Descriptor`, so they stay decodable by reference decoders with a default `windowLogMax`
 
-All features are implemented and tested. API is stable.
+All features are implemented and tested. API is stable. `BlockType`/`LiteralsBlockType` are `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over them need a wildcard arm.
 
 ## Quick Start
 
 ```rust
-use oxiarc_zstd::{compress, decompress};
+use oxiarc_zstd::{compress_with_level, decompress};
 
 // Compress data
 let original = b"Hello, Zstandard! ".repeat(100);
-let compressed = compress(&original, 3)?; // Level 3 (default)
+let compressed = compress_with_level(&original, 3)?; // Level 3
 
 // Decompress data
 let decompressed = decompress(&compressed)?;
@@ -54,29 +57,34 @@ assert_eq!(decompressed, original);
 ## Parallel Compression
 
 ```rust
-use oxiarc_zstd::compress_parallel;
+use oxiarc_zstd::ZstdEncoder;
 
-// Use all available CPU cores (requires `parallel` feature)
-let compressed = compress_parallel(&data, 3)?;
+// Use all available CPU cores (requires the `parallel` feature)
+let mut encoder = ZstdEncoder::new();
+encoder.set_level(3);
+let compressed = encoder.compress_parallel(&data)?;
 ```
+
+`oxiarc_zstd::compress_parallel(data)` is also available as a free function for the default level.
 
 ## API
 
 ### One-Shot Functions
 
 ```rust
-use oxiarc_zstd::{compress, decompress};
+use oxiarc_zstd::{compress_with_level, decompress};
 
-let compressed = compress(data, level)?;
+let compressed = compress_with_level(data, level)?;
 let decompressed = decompress(&compressed)?;
 ```
 
 ### Streaming Compression
 
 ```rust
-use oxiarc_zstd::Encoder;
+use oxiarc_zstd::ZstdEncoder;
 
-let mut encoder = Encoder::new(3); // Level 3
+let mut encoder = ZstdEncoder::new();
+encoder.set_level(3);
 encoder.set_checksum(true);
 let compressed = encoder.compress(data)?;
 ```
@@ -84,11 +92,35 @@ let compressed = encoder.compress(data)?;
 ### Streaming Decompression
 
 ```rust
-use oxiarc_zstd::Decoder;
+use oxiarc_zstd::ZstdDecoder;
 
-let mut decoder = Decoder::new();
-let decompressed = decoder.decompress(&compressed)?;
+let mut decoder = ZstdDecoder::new();
+let decompressed = decoder.decode_frame(&compressed)?;
 ```
+
+### Dictionary Compression
+
+Training a dictionary from representative samples improves the ratio for
+small, similarly-structured inputs (e.g. JSON log lines) that are too short
+to build good entropy tables on their own:
+
+```rust
+use oxiarc_zstd::{ZstdEncoder, decompress_with_dict, train_dictionary};
+
+let samples: Vec<&[u8]> = vec![b"sample one", b"sample two", b"sample three"];
+let dict = train_dictionary(&samples, 4096)?;
+
+let mut encoder = ZstdEncoder::new();
+encoder.set_level(19);
+encoder.set_dictionary(dict.data());
+let compressed = encoder.compress(payload)?;
+
+let decompressed = decompress_with_dict(&compressed, dict.data())?;
+assert_eq!(decompressed, payload);
+```
+
+See `examples/dictionary_compress.rs` for a complete, runnable version
+(`cargo run -p oxiarc-zstd --example dictionary_compress`).
 
 ## Progress Reporting and Cancellation
 
@@ -96,15 +128,18 @@ let decompressed = decoder.decompress(&compressed)?;
 
 ```rust
 use std::sync::Arc;
-use oxiarc_zstd::{ZstdEncoder, ProgressSink, CancellationToken};
+use oxiarc_core::{CancellationToken, ProgressSink};
+use oxiarc_zstd::ZstdEncoder;
 
 // Progress reporting
 let sink: Arc<dyn ProgressSink> = Arc::new(MyProgressHandler);
-let encoder = ZstdEncoder::new(3).with_progress(sink);
+let mut encoder = ZstdEncoder::new();
+encoder.set_level(3);
+let encoder = encoder.with_progress(sink);
 
 // Cooperative cancellation
 let token = CancellationToken::new();
-let encoder = ZstdEncoder::new(3).with_cancel(token.clone());
+let encoder = encoder.with_cancel(token.clone());
 
 // Cancel from another thread
 token.cancel();
@@ -117,24 +152,24 @@ The `with_progress` and `with_cancel` builders can be chained together.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `parallel` | no | Multi-threaded block compression via Rayon |
+| `zstd-oracle` | no | Live differential tests against the reference `zstd` CLI (`cargo test -p oxiarc-zstd --features zstd-oracle`); tests self-skip when `zstd` is not on PATH |
 
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-zstd = "0.3.5"
+oxiarc-zstd = "0.3.6"
 
 # With parallel compression
-oxiarc-zstd = { version = "0.3.5", features = ["parallel"] }
+oxiarc-zstd = { version = "0.3.6", features = ["parallel"] }
 ```
 
 ## Algorithm
 
 Zstandard uses a sophisticated multi-stage approach:
-1. **LZ77 matching** - Find repeated sequences
-2. **Finite State Entropy (FSE)** - Advanced entropy coding
-3. **Huffman coding** - For literals
-4. **Sequence encoding** - Efficient match/literal/offset representation
-5. **Block structure** - Independent blocks for parallelization
+1. **LZ77 matching** - Find repeated sequences (levels 1-22; deeper search at higher levels)
+2. **Huffman literals** - The encoder emits Huffman-compressed literal sections when they beat Raw/RLE (each section is self-verified before use); the decoder supports the full 1- and 4-stream formats including FSE-compressed weight tables
+3. **Finite State Entropy (FSE)** - Sequences (literal/match lengths, offsets) are entropy-coded with the RFC 8878 predefined tables (or RLE tables for constant symbol categories); the decoder additionally handles custom `FSE_Compressed` tables and repeat modes
+4. **Block structure** - Independent blocks for parallelization
 
 ### Frame Format
 

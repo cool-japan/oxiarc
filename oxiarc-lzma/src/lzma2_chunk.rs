@@ -29,6 +29,16 @@ pub const UNCOMPRESSED_CHUNK_MAX: usize = 1 << 16;
 pub const DEFAULT_CHUNK_SIZE: usize = LZMA_CHUNK_MAX_UNCOMPRESSED;
 
 /// Control byte constants and utilities for LZMA2.
+///
+/// Bits 5-6 of an LZMA chunk's control byte form a 2-bit *reset field*
+/// (LZMA2 spec):
+///
+/// | field | meaning                                            |
+/// |-------|----------------------------------------------------|
+/// | 0     | no reset (continuation chunk)                      |
+/// | 1     | state reset                                        |
+/// | 2     | state reset + new properties byte follows          |
+/// | 3     | state reset + new properties + dictionary reset    |
 pub mod control {
     /// End of stream marker.
     pub const EOS: u8 = 0x00;
@@ -42,14 +52,23 @@ pub mod control {
     /// LZMA chunk mask (bit 7 set).
     pub const LZMA_MASK: u8 = 0x80;
 
-    /// Dictionary reset flag (bit 5).
+    /// Reset-field bit meaning "dictionary reset" *when combined with*
+    /// [`STATE_RESET`] (field value 3). On its own (field value 1) it means
+    /// "state reset without new properties" — see the module docs.
     pub const DICT_RESET: u8 = 0x20;
 
-    /// State/properties reset flag (bit 6).
+    /// Reset-field bit meaning "state reset + new properties byte follows"
+    /// (field values 2 and 3).
     pub const STATE_RESET: u8 = 0x40;
 
     /// High bits of uncompressed size mask (bits 0-4).
     pub const SIZE_HIGH_MASK: u8 = 0x1F;
+
+    /// Extract the 2-bit reset field (0-3) from an LZMA chunk control byte.
+    #[inline]
+    pub const fn reset_field(ctrl: u8) -> u8 {
+        (ctrl >> 5) & 0x3
+    }
 
     /// Check if control byte indicates LZMA chunk.
     #[inline]
@@ -57,26 +76,37 @@ pub mod control {
         ctrl & LZMA_MASK != 0
     }
 
-    /// Check if control byte indicates dictionary reset.
+    /// Check if control byte indicates a dictionary reset (reset field 3).
     #[inline]
     pub const fn has_dict_reset(ctrl: u8) -> bool {
-        ctrl & DICT_RESET != 0
+        reset_field(ctrl) == 3
     }
 
-    /// Check if control byte indicates state/properties reset.
+    /// Check if control byte indicates a state reset (reset field >= 1).
     #[inline]
     pub const fn has_state_reset(ctrl: u8) -> bool {
-        ctrl & STATE_RESET != 0
+        reset_field(ctrl) >= 1
+    }
+
+    /// Check if a properties byte follows the chunk header (reset field >= 2).
+    #[inline]
+    pub const fn has_new_props(ctrl: u8) -> bool {
+        reset_field(ctrl) >= 2
     }
 
     /// Build LZMA control byte.
+    ///
+    /// A dictionary reset always implies a state reset and new properties
+    /// (reset field 3) — LZMA2 cannot express a dictionary reset alone, so
+    /// `reset_dict = true` produces field 3 regardless of `reset_state`.
+    /// `reset_state = true` alone produces field 2 (state reset + new
+    /// properties); callers must then emit the properties byte.
     #[inline]
     pub const fn build_lzma(uncompressed_size_high: u8, reset_dict: bool, reset_state: bool) -> u8 {
         let mut ctrl = LZMA_MASK | (uncompressed_size_high & SIZE_HIGH_MASK);
         if reset_dict {
-            ctrl |= DICT_RESET;
-        }
-        if reset_state {
+            ctrl |= DICT_RESET | STATE_RESET;
+        } else if reset_state {
             ctrl |= STATE_RESET;
         }
         ctrl
@@ -95,6 +125,22 @@ pub struct Lzma2Config {
     /// Dictionary size.
     pub dict_size: u32,
 }
+
+// `LzmaProperties` (defined in the internal `model` module) does not derive
+// `PartialEq`/`Eq`, so a plain `#[derive(PartialEq, Eq)]` on `Lzma2Config`
+// would not compile. Compare `props` structurally via its encoded byte
+// (`lc`/`lp`/`pb` round-trip losslessly through `to_byte`/`from_byte`) so
+// config values can still be compared in tests without touching `model.rs`.
+impl PartialEq for Lzma2Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.chunk_size == other.chunk_size
+            && self.props.to_byte() == other.props.to_byte()
+            && self.level == other.level
+            && self.dict_size == other.dict_size
+    }
+}
+
+impl Eq for Lzma2Config {}
 
 impl Default for Lzma2Config {
     fn default() -> Self {
@@ -175,62 +221,83 @@ impl ChunkType {
     }
 }
 
-/// Internal state for LZMA2 chunked encoder.
+/// Entropy-coder state carried between LZMA2 chunks (probability model,
+/// LZMA state-machine state, rep distances).
+struct CarriedState {
+    model: LzmaModel,
+    state: State,
+    rep: [u32; 4],
+}
+
+/// Outcome of attempting to emit one input piece as a stateful LZMA chunk.
+enum ChunkAttempt {
+    /// The chunk was written and the persistent state advanced.
+    Emitted,
+    /// Compression did not shrink the piece; store it verbatim instead.
+    Incompressible,
+    /// The compressed payload overflowed the 16-bit chunk size field; the
+    /// piece must be re-encoded as several smaller chunks.
+    Overflow,
+}
+
+/// Internal state for the stateful LZMA2 chunked encoder.
+///
+/// Mirrors the persistent state of [`crate::Lzma2Decoder`]: the sliding
+/// window (dictionary), the entropy-coder state, and the global uncompressed
+/// position all survive chunk boundaries, so continuation chunks (reset
+/// field 0) can be emitted exactly like liblzma does.
 struct ChunkedEncoderState {
     /// Current LZMA properties.
     props: LzmaProperties,
-    /// LZMA model state.
-    #[allow(dead_code)]
-    model: LzmaModel,
-    /// Decoder state.
-    #[allow(dead_code)]
-    state: State,
-    /// Rep distances.
-    #[allow(dead_code)]
-    rep: [u32; 4],
-    /// Dictionary content (for reference across chunks).
-    dictionary: Vec<u8>,
-    /// Position in dictionary.
-    dict_pos: usize,
-    /// Whether this is the first chunk.
-    first_chunk: bool,
+    /// Entropy state carried into the next LZMA chunk. `None` when the next
+    /// LZMA chunk must reset the state (stream start, after an uncompressed
+    /// chunk, or after a mid-stream properties change).
+    carry: Option<CarriedState>,
+    /// Sliding window of the most recently encoded bytes (up to the
+    /// dictionary size) — the decoder-visible history for back-references
+    /// and literal contexts.
+    window: Vec<u8>,
+    /// Global uncompressed position since the last dictionary reset.
+    global_pos: u64,
+    /// True until the first chunk is emitted; that chunk must reset the
+    /// dictionary (LZMA2 spec).
+    need_dict_reset: bool,
 }
 
 impl ChunkedEncoderState {
-    fn new(props: LzmaProperties, dict_size: u32) -> Self {
+    fn new(props: LzmaProperties) -> Self {
         Self {
             props,
-            model: LzmaModel::new(props),
-            state: State::new(),
-            rep: [0; 4],
-            dictionary: vec![0u8; dict_size as usize],
-            dict_pos: 0,
-            first_chunk: true,
+            carry: None,
+            window: Vec::new(),
+            global_pos: 0,
+            need_dict_reset: true,
         }
     }
 
+    /// Drop any carried entropy state so the next LZMA chunk starts from a
+    /// fresh state (reset field >= 2), optionally switching properties.
     fn reset_state(&mut self, new_props: Option<LzmaProperties>) {
         if let Some(props) = new_props {
             self.props = props;
-            self.model = LzmaModel::new(props);
-        } else {
-            self.model.reset();
         }
-        self.state = State::new();
-        self.rep = [0; 4];
+        self.carry = None;
     }
 
-    #[allow(dead_code)]
-    fn reset_dictionary(&mut self) {
-        self.dictionary.fill(0);
-        self.dict_pos = 0;
-    }
-
-    fn update_dictionary(&mut self, data: &[u8]) {
-        let dict_capacity = self.dictionary.len();
-        for &byte in data {
-            self.dictionary[self.dict_pos] = byte;
-            self.dict_pos = (self.dict_pos + 1) % dict_capacity;
+    /// Record `data` as emitted: advance the global position and slide the
+    /// window forward, keeping at most `window_cap` bytes of history.
+    fn push_history(&mut self, data: &[u8], window_cap: usize) {
+        self.global_pos += data.len() as u64;
+        if data.len() >= window_cap {
+            self.window.clear();
+            self.window
+                .extend_from_slice(&data[data.len() - window_cap..]);
+        } else {
+            self.window.extend_from_slice(data);
+            if self.window.len() > window_cap {
+                let excess = self.window.len() - window_cap;
+                self.window.drain(..excess);
+            }
         }
     }
 }
@@ -262,7 +329,7 @@ impl Lzma2ChunkedEncoder {
 
     /// Create a new chunked LZMA2 encoder with custom configuration.
     pub fn with_config(config: Lzma2Config) -> Self {
-        let encoder_state = ChunkedEncoderState::new(config.props, config.dict_size);
+        let encoder_state = ChunkedEncoderState::new(config.props);
         Self {
             config,
             encoder_state,
@@ -276,6 +343,7 @@ impl Lzma2ChunkedEncoder {
     ///
     /// The sink's `on_progress(cumulative_bytes, None)` is called after each
     /// chunk is encoded. `on_finish()` is called after the end-of-stream marker.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -285,6 +353,7 @@ impl Lzma2ChunkedEncoder {
     ///
     /// The token is checked before each chunk is encoded.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -333,52 +402,128 @@ impl Lzma2ChunkedEncoder {
         Ok(output)
     }
 
-    /// Encode a single chunk.
+    /// Effective sliding-window capacity (the encoder clamps its dictionary
+    /// to at least 4 KiB, so the history we keep must match).
+    fn window_cap(&self) -> usize {
+        self.config.dict_size.max(4096) as usize
+    }
+
+    /// Build a per-chunk [`LzmaEncoder`] seeded with the persistent stream
+    /// state, and the reset field its chunk header must carry.
+    ///
+    /// The window is passed as a preset dictionary (virtual prefix) so the
+    /// match finder can emit back-references across chunk boundaries, and the
+    /// entropy state — when carried — makes the chunk a pure continuation
+    /// (reset field 0), matching liblzma's chunked encoder.
+    fn make_chunk_encoder(&mut self) -> (u8, LzmaEncoder) {
+        let mut encoder = LzmaEncoder::with_props(
+            self.config.level,
+            self.config.dict_size,
+            self.encoder_state.props,
+        );
+        let st = &self.encoder_state;
+
+        if st.need_dict_reset {
+            // First chunk of the stream: everything resets (field 3).
+            return (3, encoder);
+        }
+
+        if !st.window.is_empty() {
+            encoder.set_dictionary(&st.window);
+        }
+
+        match &st.carry {
+            Some(carried) => {
+                // Continuation chunk: model/state/reps carry over (field 0).
+                encoder.preload_entropy_state(
+                    carried.model.clone(),
+                    carried.state,
+                    carried.rep,
+                    st.global_pos,
+                );
+                (0, encoder)
+            }
+            None => {
+                // State reset with new properties (field 2): required after
+                // an uncompressed chunk or a mid-stream properties change.
+                // Field 2 (rather than 1) so the props byte is always present
+                // even if no earlier LZMA chunk delivered one.
+                encoder.set_stream_pos(st.global_pos);
+                (2, encoder)
+            }
+        }
+    }
+
+    /// Encode a single chunk of input, continuing the persistent stream state.
     fn encode_chunk(&mut self, output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
 
-        let reset_dict = self.encoder_state.first_chunk;
-        // Always reset state because we create a fresh LzmaEncoder for each chunk.
-        // The encoder's probability tables are always initialized, so the decoder
-        // must also reset its state to match.
-        let reset_state = true;
+        match self.try_emit_lzma_chunk(output, data)? {
+            ChunkAttempt::Emitted => Ok(()),
+            ChunkAttempt::Incompressible => self.write_uncompressed_chunks(output, data),
+            ChunkAttempt::Overflow => self.encode_chunk_split(output, data),
+        }
+    }
 
-        // Try to compress with LZMA (chunk payload: no end-of-stream marker,
-        // since the chunk header carries the exact sizes)
-        let encoder = LzmaEncoder::new(self.config.level, self.config.dict_size);
-        let compressed = encoder.compress_chunk(data)?;
+    /// Try to emit `data` as one stateful LZMA chunk.
+    ///
+    /// On [`ChunkAttempt::Emitted`] the persistent state has been advanced;
+    /// otherwise the attempt is discarded and the state is untouched (the
+    /// throwaway encoder worked on a clone of the carried model).
+    fn try_emit_lzma_chunk(&mut self, output: &mut Vec<u8>, data: &[u8]) -> Result<ChunkAttempt> {
+        let (reset_field, encoder) = self.make_chunk_encoder();
+        let (compressed, model, state, rep) = encoder.compress_chunk_stateful(data)?;
 
-        // Check if compression is worthwhile
         if compressed.len() >= data.len() {
-            self.write_uncompressed_chunks(output, data, reset_dict)?;
-        } else {
-            self.write_lzma_chunks(output, data, &compressed, reset_dict, reset_state)?;
+            return Ok(ChunkAttempt::Incompressible);
+        }
+        if compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {
+            return Ok(ChunkAttempt::Overflow);
         }
 
-        // Update dictionary
-        self.encoder_state.update_dictionary(data);
-        self.encoder_state.first_chunk = false;
+        self.write_single_lzma_chunk(output, data.len(), &compressed, reset_field)?;
+        self.encoder_state.carry = Some(CarriedState { model, state, rep });
+        self.encoder_state.need_dict_reset = false;
+        let cap = self.window_cap();
+        self.encoder_state.push_history(data, cap);
+        Ok(ChunkAttempt::Emitted)
+    }
+
+    /// Split `data` into small pieces and emit each as a stateful LZMA chunk
+    /// (or an uncompressed chunk when even the small piece will not shrink).
+    ///
+    /// Used when the whole chunk's compressed payload overflowed the 16-bit
+    /// chunk size field: conservative 16 KiB pieces cannot overflow it.
+    fn encode_chunk_split(&mut self, output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+        const SUB_CHUNK_SIZE: usize = 16 * 1024;
+
+        for piece in data.chunks(SUB_CHUNK_SIZE) {
+            match self.try_emit_lzma_chunk(output, piece)? {
+                ChunkAttempt::Emitted => {}
+                // A 16 KiB piece can never overflow the 64 KiB compressed
+                // field, so any non-fit means "store verbatim".
+                ChunkAttempt::Incompressible | ChunkAttempt::Overflow => {
+                    self.write_uncompressed_chunks(output, piece)?;
+                }
+            }
+        }
 
         Ok(())
     }
 
-    /// Write data as uncompressed chunks.
-    fn write_uncompressed_chunks(
-        &mut self,
-        output: &mut Vec<u8>,
-        data: &[u8],
-        mut reset_dict: bool,
-    ) -> Result<()> {
-        let mut offset = 0;
+    /// Write data as uncompressed chunks (64 KiB pieces), updating the
+    /// persistent stream state.
+    ///
+    /// Only the stream's very first chunk resets the dictionary; verbatim
+    /// bytes otherwise extend the decoder's dictionary exactly like LZMA-coded
+    /// bytes. Per the LZMA2 spec the next LZMA chunk must then reset the
+    /// entropy state, so the carried state is dropped.
+    fn write_uncompressed_chunks(&mut self, output: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+        let mut reset_dict = self.encoder_state.need_dict_reset;
 
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let chunk_size = remaining.min(UNCOMPRESSED_CHUNK_MAX);
-            let chunk = &data[offset..offset + chunk_size];
-
-            // Control byte
+        for piece in data.chunks(UNCOMPRESSED_CHUNK_MAX) {
             let control_byte = if reset_dict {
                 control::UNCOMPRESSED_RESET
             } else {
@@ -387,62 +532,38 @@ impl Lzma2ChunkedEncoder {
             output.write_all(&[control_byte])?;
 
             // Size (big-endian, minus 1)
-            let size = (chunk_size - 1) as u16;
+            let size = (piece.len() - 1) as u16;
             output.write_all(&size.to_be_bytes())?;
 
             // Data
-            output.write_all(chunk)?;
+            output.write_all(piece)?;
 
-            offset += chunk_size;
             reset_dict = false;
         }
 
-        // Reset state after uncompressed chunk
-        if self.encoder_state.first_chunk {
-            self.encoder_state.reset_state(None);
-        }
+        self.encoder_state.need_dict_reset = false;
+        self.encoder_state.carry = None;
+        let cap = self.window_cap();
+        self.encoder_state.push_history(data, cap);
 
         Ok(())
     }
 
-    /// Write data as LZMA compressed chunks.
-    fn write_lzma_chunks(
-        &mut self,
-        output: &mut Vec<u8>,
-        uncompressed: &[u8],
-        compressed: &[u8],
-        reset_dict: bool,
-        reset_state: bool,
-    ) -> Result<()> {
-        // Check if we need to split into multiple chunks
-        if compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {
-            return self.write_lzma_chunks_split(output, uncompressed, reset_dict);
-        }
-
-        self.write_single_lzma_chunk(
-            output,
-            uncompressed.len(),
-            compressed,
-            reset_dict,
-            reset_state,
-        )
-    }
-
-    /// Write a single LZMA chunk.
+    /// Write a single LZMA chunk with the given reset field (0-3); the
+    /// properties byte is emitted for fields 2 and 3 as the spec requires.
     fn write_single_lzma_chunk(
         &mut self,
         output: &mut Vec<u8>,
         uncompressed_size: usize,
         compressed: &[u8],
-        reset_dict: bool,
-        reset_state: bool,
+        reset_field: u8,
     ) -> Result<()> {
         let uncompressed_minus_1 = uncompressed_size - 1;
         let size_high = ((uncompressed_minus_1 >> 16) & 0x1F) as u8;
         let size_low = (uncompressed_minus_1 & 0xFFFF) as u16;
 
-        // Build control byte
-        let control_byte = control::build_lzma(size_high, reset_dict, reset_state);
+        // Build control byte: 0x80 | reset field (bits 5-6) | size high bits.
+        let control_byte = control::LZMA_MASK | ((reset_field & 0x3) << 5) | size_high;
         output.write_all(&[control_byte])?;
 
         // Uncompressed size low 16 bits
@@ -452,74 +573,13 @@ impl Lzma2ChunkedEncoder {
         let compressed_size = (compressed.len() - 1) as u16;
         output.write_all(&compressed_size.to_be_bytes())?;
 
-        // Properties byte if reset_state
-        if reset_state {
+        // Properties byte for reset fields 2 and 3
+        if reset_field >= 2 {
             output.write_all(&[self.encoder_state.props.to_byte()])?;
         }
 
         // Compressed data
         output.write_all(compressed)?;
-
-        Ok(())
-    }
-
-    /// Split data and write multiple LZMA chunks.
-    fn write_lzma_chunks_split(
-        &mut self,
-        output: &mut Vec<u8>,
-        data: &[u8],
-        mut reset_dict: bool,
-    ) -> Result<()> {
-        // Use a conservative sub-chunk size that will compress under 64KB
-        let sub_chunk_size = 16 * 1024;
-        let mut offset = 0;
-
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let chunk_size = remaining.min(sub_chunk_size);
-            let chunk = &data[offset..offset + chunk_size];
-
-            // Compress this sub-chunk (chunk payload: no end-of-stream marker)
-            let encoder = LzmaEncoder::new(self.config.level, self.config.dict_size);
-            let compressed = encoder.compress_chunk(chunk)?;
-
-            // Check if compression is worthwhile
-            if compressed.len() >= chunk.len() || compressed.len() > LZMA_CHUNK_MAX_COMPRESSED {
-                // Write as uncompressed (may need to split further)
-                let mut unc_offset = 0;
-                while unc_offset < chunk.len() {
-                    let unc_remaining = chunk.len() - unc_offset;
-                    let unc_size = unc_remaining.min(UNCOMPRESSED_CHUNK_MAX);
-                    let unc_chunk = &chunk[unc_offset..unc_offset + unc_size];
-
-                    let ctrl = if reset_dict {
-                        control::UNCOMPRESSED_RESET
-                    } else {
-                        control::UNCOMPRESSED
-                    };
-                    output.write_all(&[ctrl])?;
-                    output.write_all(&((unc_size - 1) as u16).to_be_bytes())?;
-                    output.write_all(unc_chunk)?;
-
-                    reset_dict = false;
-                    unc_offset += unc_size;
-                }
-            } else {
-                // Write as LZMA chunk
-                // Always reset state since we create a fresh encoder for each sub-chunk
-                let reset_state = true;
-                self.write_single_lzma_chunk(
-                    output,
-                    chunk.len(),
-                    &compressed,
-                    reset_dict,
-                    reset_state,
-                )?;
-                reset_dict = false;
-            }
-
-            offset += chunk_size;
-        }
 
         Ok(())
     }
@@ -573,16 +633,17 @@ mod tests {
 
     #[test]
     fn test_control_byte_building() {
-        // No resets
+        // No resets (continuation chunk, reset field 0)
         assert_eq!(control::build_lzma(0, false, false), 0x80);
 
-        // Dict reset only
-        assert_eq!(control::build_lzma(0, true, false), 0xA0);
+        // A dictionary reset always implies a state reset + new properties
+        // (reset field 3): LZMA2 cannot express a dictionary reset alone.
+        assert_eq!(control::build_lzma(0, true, false), 0xE0);
 
-        // State reset only
+        // State reset + new properties (reset field 2)
         assert_eq!(control::build_lzma(0, false, true), 0xC0);
 
-        // Both resets
+        // Both resets (reset field 3)
         assert_eq!(control::build_lzma(0, true, true), 0xE0);
 
         // With size bits
@@ -597,15 +658,29 @@ mod tests {
         assert!(!control::is_lzma(0x01));
         assert!(!control::is_lzma(0x02));
 
-        assert!(control::has_dict_reset(0xA0));
+        // Reset field values (bits 5-6)
+        assert_eq!(control::reset_field(0x80), 0);
+        assert_eq!(control::reset_field(0xA0), 1);
+        assert_eq!(control::reset_field(0xC0), 2);
+        assert_eq!(control::reset_field(0xE0), 3);
+
+        // Only reset field 3 resets the dictionary; 0xA0 is a state reset.
         assert!(control::has_dict_reset(0xE0));
+        assert!(!control::has_dict_reset(0xA0));
         assert!(!control::has_dict_reset(0x80));
         assert!(!control::has_dict_reset(0xC0));
 
+        // Reset fields 1-3 all reset the LZMA state.
+        assert!(control::has_state_reset(0xA0));
         assert!(control::has_state_reset(0xC0));
         assert!(control::has_state_reset(0xE0));
         assert!(!control::has_state_reset(0x80));
-        assert!(!control::has_state_reset(0xA0));
+
+        // A properties byte follows for reset fields 2 and 3 only.
+        assert!(control::has_new_props(0xC0));
+        assert!(control::has_new_props(0xE0));
+        assert!(!control::has_new_props(0x80));
+        assert!(!control::has_new_props(0xA0));
     }
 
     #[test]
@@ -626,11 +701,13 @@ mod tests {
                 reset_state: false
             }
         );
+        // Reset field 1 (0xA0) is a state reset WITHOUT a dictionary reset;
+        // the buggy pre-fix parser misread bit 5 as a dictionary reset.
         assert_eq!(
             ChunkType::from_control_byte(0xA0),
             ChunkType::Lzma {
-                reset_dict: true,
-                reset_state: false
+                reset_dict: false,
+                reset_state: true
             }
         );
         assert_eq!(
@@ -720,6 +797,58 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// Deterministic pseudo-varied bytes via a byte LCG (no `rand`).
+    ///
+    /// Produces non-repetitive, literal-heavy data so the LZMA2 chunk stream
+    /// actually exercises the per-chunk literal-coder context. Repeated-byte
+    /// payloads (`vec![b; n]`) cannot reproduce the cross-chunk desync this
+    /// guards against — see the note on [`Lzma2ChunkedEncoder::encode_chunk`].
+    fn varied_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..len {
+            // Numerical Recipes LCG constants.
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(0x20u8.wrapping_add(((state >> 16) as u8) % 0x5f));
+        }
+        out
+    }
+
+    #[test]
+    fn test_varied_data_across_multiple_small_chunks() {
+        // Regression: varied (non-repetitive) data crossing several small chunk
+        // boundaries must round-trip byte-for-byte. Before the dictionary-reset
+        // fix this failed with "Invalid LZMA data" once two literals collided.
+        let data = varied_bytes(300 * 1024);
+        let config = Lzma2Config::with_level(LzmaLevel::DEFAULT).chunk_size(4 * 1024);
+        let encoded = encode_lzma2_with_config(&data, config).expect("encode failed");
+        let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
+        assert_eq!(decoded, data, "varied multi-chunk round-trip mismatch");
+    }
+
+    #[test]
+    fn test_varied_data_multiple_chunk_sizes() {
+        // Exercise a range of small chunk sizes so the boundary is crossed a
+        // varying number of times, including many crossings.
+        let data = varied_bytes(64 * 1024);
+        for chunk in [512usize, 1024, 3000, 7000, 20_000] {
+            let config = Lzma2Config::with_level(LzmaLevel::FAST).chunk_size(chunk);
+            let encoded = encode_lzma2_with_config(&data, config).expect("encode failed");
+            let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
+            assert_eq!(decoded, data, "mismatch at chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn test_varied_data_default_chunk_over_2mb() {
+        // Regression: a >2 MiB varied input routed through the DEFAULT chunk
+        // path (crate::lzma2::encode_lzma2 -> encode_chunked) must round-trip.
+        let data = varied_bytes(3 * 1024 * 1024 + 777);
+        let encoded = crate::lzma2::encode_lzma2(&data, LzmaLevel::DEFAULT).expect("encode failed");
+        let decoded = crate::lzma2::decode_lzma2(&encoded, 1 << 24).expect("decode failed");
+        assert_eq!(decoded, data, "varied default-chunk round-trip mismatch");
+    }
+
     #[test]
     fn test_encoder_property_change() {
         let original: Vec<u8> = vec![b'Z'; 20_000];
@@ -732,6 +861,23 @@ mod tests {
         let encoded = encoder.encode(&original).expect("encode failed");
         let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
         assert_eq!(decoded, original);
+    }
+
+    /// Regression: custom properties must actually be used to CODE the
+    /// payload, not merely declared in the chunk header. Before the
+    /// `LzmaEncoder::with_props` fix the payload was always coded with the
+    /// default (3,0,2) while the header declared the custom values; the
+    /// repeated-byte test above happened to survive that mismatch, varied
+    /// data does not.
+    #[test]
+    fn test_encoder_property_change_varied_data() {
+        let data = varied_bytes(50_000);
+        let mut encoder = Lzma2ChunkedEncoder::new(LzmaLevel::DEFAULT);
+        encoder.set_properties(LzmaProperties::new(2, 1, 2));
+
+        let encoded = encoder.encode(&data).expect("encode failed");
+        let decoded = decode_lzma2_chunked(&encoded, 1 << 20).expect("decode failed");
+        assert_eq!(decoded, data, "custom-props varied-data round-trip");
     }
 
     use oxiarc_core::cancel::CancellationToken;

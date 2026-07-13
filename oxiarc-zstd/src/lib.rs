@@ -7,18 +7,33 @@
 //!
 //! ## Features
 //!
-//! - Full LZ77 + Huffman + FSE compression (levels 1-22)
-//! - Complete Zstandard frame parsing and decompression
-//! - FSE (Finite State Entropy) encoding and decoding
-//! - Huffman encoding and decoding for literals
-//! - Dictionary-based compression for small data
+//! - LZ77 match-finding with entropy-coded sequences (levels 1-22)
+//! - Complete Zstandard frame parsing and decompression, validated
+//!   byte-for-byte against frames produced by the reference `zstd` CLI
+//!   (all levels, `--ultra -22`, `--long`, `--no-check`,
+//!   `--no-content-size`, raw-content dictionaries, multi-frame streams)
+//! - FSE (Finite State Entropy) sequence coding using the RFC 8878
+//!   predefined tables (and RLE tables for constant symbol categories);
+//!   the decoder additionally handles custom `FSE_Compressed` tables
+//! - Huffman literals in both directions: 1- and 4-stream decoding, and
+//!   Huffman-compressed literal sections on the encode path (self-verified,
+//!   with Raw/RLE fallback)
+//! - Encoder output is accepted by the reference `zstd` CLI; the live
+//!   differential gate lives behind the `zstd-oracle` cargo feature
+//! - Raw-content dictionary compression for small data (interoperable with
+//!   `zstd -D` in both directions)
 //! - Streaming Write/Read API
 //! - XXH64 checksum verification
 //! - Optional parallel compression
 //!
+//! Ratio note: sequences always use the predefined/RLE FSE tables (custom
+//! block-optimal tables are not emitted yet), so compression ratio on some
+//! inputs trails the reference encoder even though every frame is fully
+//! interoperable.
+//!
 //! ## Example
 //!
-//! ```rust,no_run
+//! ```rust
 //! use oxiarc_zstd::{compress_with_level, decompress, encode_all, decode_all};
 //!
 //! // Buffer-based compression with level
@@ -43,10 +58,13 @@ pub mod dict;
 mod encode;
 mod frame;
 mod fse;
+// Custom (non-predefined) FSE table *compression* for sequences is not
+// wired into the encoder yet: sequences use the RFC 8878 predefined/RLE
+// tables, which reference decoders accept. This module stays dormant until
+// FSE_Compressed sequence modes are emitted.
 #[allow(dead_code)]
 mod fse_encoder;
 mod huffman;
-#[allow(dead_code)]
 mod huffman_encoder;
 mod literals;
 mod lz77;
@@ -77,11 +95,20 @@ pub type ZstdWriter<W> = ZstdStreamEncoder<W>;
 // Dictionary API
 pub use dict::{ZstdDict, train_dictionary};
 
-// Advanced: LZ77 types (for users who want fine-grained control)
-pub use lz77::{LevelConfig, Lz77Sequence, MatchFinder};
-
-// Advanced: Bitstream writers (for custom encoding)
+// API freeze (0.3.x): the LZ77 building blocks
+// (`lz77::{LevelConfig, Lz77Sequence, MatchFinder}`) and the low-level bitstream
+// writers (`bitwriter::{ForwardBitWriter, BackwardBitWriter}`) are NOT part of the
+// stable public API. They are crate-internal implementation details whose shape
+// may change without notice, so they are hidden from the documentation and are
+// not covered by the crate's SemVer guarantees. They are re-exported as
+// `#[doc(hidden)]` (rather than removed outright) only because some of their
+// helper methods currently have no in-crate call sites; making them fully private
+// would require crate-internal `#[allow(dead_code)]` annotations that live outside
+// this module.
+#[doc(hidden)]
 pub use bitwriter::{BackwardBitWriter, ForwardBitWriter};
+#[doc(hidden)]
+pub use lz77::{LevelConfig, Lz77Sequence, MatchFinder};
 
 #[cfg(feature = "parallel")]
 pub use encode::compress_parallel;
@@ -105,6 +132,7 @@ pub const MAX_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Block types in Zstandard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockType {
     /// Raw uncompressed block.
     Raw,
@@ -134,6 +162,7 @@ impl BlockType {
 
 /// Literals block type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LiteralsBlockType {
     /// Raw literals (uncompressed).
     Raw,

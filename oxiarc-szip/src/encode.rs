@@ -7,67 +7,104 @@ use crate::{SzipError, bitreader::BitWriter, params::SzipParams};
 /// Encode raw sample values into an AEC/SZIP-compatible bit stream.
 ///
 /// This implementation uses the **no-compression** option ID for every block,
-/// which is always valid per the CCSDS-121.0-B-2 specification.  The output
-/// is therefore a lossless but uncompressed AEC stream that the decoder can
-/// consume correctly.
+/// which is always valid per the CCSDS-121.0-B-2 specification. The output
+/// is therefore a lossless but uncompressed AEC stream that any conforming
+/// decoder — including the libaec reference implementation — can consume
+/// correctly (when `params.msb` is `true`, the standard bit ordering).
 ///
-/// When `params.nn_preprocess` is `true`, the unit-delay NN predictor is
-/// applied before coding so that the decoder can correctly invert it.
+/// Framing follows CCSDS-121.0-B-2 §5.2 / libaec exactly:
+///
+/// - Every coded block starts with its option ID; the block body follows.
+/// - Blocks always contain `pixels_per_block` samples. A trailing partial
+///   block is padded by repeating the last sample value (matching libaec's
+///   flush behaviour); the decoder discards the padding.
+/// - When `params.nn_preprocess` is `true`, the first sample of each
+///   reference sample interval is the verbatim reference sample (sample #0
+///   of that RSI's first block, *after* the block's option ID) and every
+///   other sample is the theta-clamped prediction residual of the unit-delay
+///   predictor.
+///
+/// # Errors
+///
+/// - [`SzipError::InputTooShort`] if `samples.len() < params.samples`.
+/// - [`SzipError::SampleOutOfRange`] if any encoded sample exceeds
+///   [`SzipParams::xmax`].
+/// - [`SzipError::InvalidParam`] if `params` fail validation.
 ///
 /// # Note
-/// This encoder is provided primarily to enable round-trip testing of the
-/// decoder.  It does not attempt to compress the data.
+///
+/// This encoder is provided primarily to enable round-trip and
+/// interoperability testing of the decoder. It does not attempt to compress
+/// the data.
 pub fn encode(samples: &[u64], params: &SzipParams) -> Result<Vec<u8>, SzipError> {
     params.validate()?;
 
-    if samples.is_empty() || params.samples == 0 {
+    if params.samples == 0 {
         return Ok(Vec::new());
+    }
+    if samples.len() < params.samples {
+        return Err(SzipError::InputTooShort {
+            need: params.samples,
+            have: samples.len(),
+        });
+    }
+
+    let data = &samples[..params.samples];
+    let xmax = params.xmax();
+    for (index, &value) in data.iter().enumerate() {
+        if value > xmax {
+            return Err(SzipError::SampleOutOfRange {
+                index,
+                value,
+                max: xmax,
+            });
+        }
     }
 
     let bpp = params.bits_per_pixel;
-    let ppb = params.pixels_per_block as usize;
-    let id_no_compress = params.id_no_compress();
+    let block_size = params.pixels_per_block as usize;
     let id_len = params.id_len();
+    let id_no_compress = params.id_no_compress();
 
-    // If reference_sample_interval == 0, treat the whole stream as one RSI.
+    // Reference sample interval in samples. `0` means the whole stream is a
+    // single RSI.
     let rsi_samples = if params.reference_sample_interval == 0 {
-        params.samples
+        params.samples.div_ceil(block_size) * block_size
     } else {
         params.reference_sample_interval as usize
     };
 
-    // Apply NN preprocessing if requested.
-    let working: Vec<u64> = if params.nn_preprocess {
-        apply_nn_preprocess(samples, params, rsi_samples)
-    } else {
-        samples.to_vec()
-    };
-
     let mut writer = BitWriter::new(params.msb);
-    let mut processed = 0usize;
+    let mut offset = 0usize;
 
-    while processed < params.samples {
-        // ── Reference sample (verbatim bpp bits) ──
-        let ref_val = working[processed];
-        write_sample(&mut writer, ref_val, bpp);
-        processed += 1;
+    while offset < data.len() {
+        let chunk_end = (offset + rsi_samples).min(data.len());
+        let chunk = &data[offset..chunk_end];
+        let blocks = chunk.len().div_ceil(block_size);
 
-        // ── Encode blocks until the end of this RSI ──
-        let rsi_end = (processed - 1 + rsi_samples).min(params.samples);
+        // Pad the trailing partial block (if any) by repeating the last
+        // sample, exactly as libaec's encoder does when flushing.
+        let mut padded: Vec<u32> = chunk.iter().map(|&v| v as u32).collect();
+        if let Some(&last) = padded.last() {
+            padded.resize(blocks * block_size, last);
+        }
 
-        while processed < rsi_end {
-            let block_end = (processed + ppb).min(rsi_end);
-            let block_len = block_end - processed;
+        // Apply the unit-delay predictor across the whole RSI if requested.
+        // Slot 0 keeps the verbatim reference sample.
+        let coded = if params.nn_preprocess {
+            preprocess_rsi(&padded, xmax)
+        } else {
+            padded
+        };
 
-            // Emit the no-compression option ID.
+        for block in coded.chunks_exact(block_size) {
+            // Option ID first, then the block's samples — the reference
+            // sample (when preprocessing) is sample #0 of the RSI's first
+            // block and sits *inside* the block, after the ID.
             writer.write_bits(id_no_compress, id_len);
-
-            // Write block_len samples verbatim at bpp bits each.
-            for &val in working[processed..(processed + block_len)].iter() {
-                write_sample(&mut writer, val, bpp);
+            for &value in block {
+                writer.write_bits(value, bpp);
             }
-
-            processed += block_len;
         }
 
         // If byte-alignment is requested between RSIs, pad to the next byte
@@ -75,6 +112,8 @@ pub fn encode(samples: &[u64], params: &SzipParams) -> Result<Vec<u8>, SzipError
         if params.rsi_byte_align {
             writer.align_to_byte();
         }
+
+        offset = chunk_end;
     }
 
     Ok(writer.finish())
@@ -84,67 +123,54 @@ pub fn encode(samples: &[u64], params: &SzipParams) -> Result<Vec<u8>, SzipError
 // NN preprocessing (forward pass — applied before AEC coding)
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Apply the unit-delay NN predictor (forward pass).
+/// Apply the unit-delay predictor (forward pass) to one RSI of samples.
 ///
-/// For each non-reference sample, compute the sigma-mapped residual relative
-/// to the previous reconstructed sample:
+/// Implements the CCSDS-121.0-B-2 §4 preprocessor for unsigned samples,
+/// identical to libaec's `preprocess_unsigned`: each non-reference sample is
+/// replaced by the theta-clamped mapped prediction residual
 ///
-/// - σ(delta) = 2·delta       if delta ≥ 0
-/// - σ(delta) = −2·delta − 1  if delta <  0
-fn apply_nn_preprocess(samples: &[u64], params: &SzipParams, rsi_samples: usize) -> Vec<u64> {
-    let xmax = params.xmax() as i64;
-    let mut out = Vec::with_capacity(samples.len());
-    let mut processed = 0usize;
+/// - Δ ≥ 0, Δ ≤ θ → 2·Δ
+/// - Δ < 0, |Δ| ≤ θ → 2·|Δ| − 1
+/// - otherwise      → θ + |Δ|
+///
+/// where the prediction is the previous sample `x[i-1]` and
+/// `θ = min(x[i-1], xmax − x[i-1])`. The clamping guarantees every residual
+/// fits in `bits_per_pixel` bits. Slot 0 keeps the verbatim reference
+/// sample.
+fn preprocess_rsi(x: &[u32], xmax: u64) -> Vec<u32> {
+    let mut d = Vec::with_capacity(x.len());
+    let Some(&first) = x.first() else {
+        return d;
+    };
+    d.push(first);
 
-    while processed < samples.len() {
-        // Reference sample: written verbatim.
-        let ref_val = samples[processed];
-        out.push(ref_val);
-        processed += 1;
-
-        let rsi_end = (processed - 1 + rsi_samples).min(samples.len());
-        let mut prev = ref_val as i64;
-
-        while processed < rsi_end {
-            let curr = samples[processed] as i64;
-            let delta = curr - prev;
-            let sigma = sigma_map(delta);
-            out.push(sigma);
-            // Clamp to simulate the reconstructed value at the decoder.
-            prev = curr.clamp(0, xmax);
-            processed += 1;
-        }
+    for pair in x.windows(2) {
+        let prev = u64::from(pair[0]);
+        let cur = u64::from(pair[1]);
+        let mapped = if cur >= prev {
+            let delta = cur - prev;
+            // Δ ≥ 0 implies Δ ≤ xmax − prev, so the only reachable clamp is
+            // θ = prev; θ + Δ then equals the current sample itself.
+            if delta <= prev { 2 * delta } else { cur }
+        } else {
+            let delta = prev - cur;
+            // Δ < 0 implies |Δ| ≤ prev, so the only reachable clamp is
+            // θ = xmax − prev; θ + |Δ| then equals xmax − cur.
+            if delta <= xmax - prev {
+                2 * delta - 1
+            } else {
+                xmax - cur
+            }
+        };
+        d.push(mapped as u32);
     }
 
-    out
-}
-
-/// Forward sigma map.
-fn sigma_map(delta: i64) -> u64 {
-    if delta >= 0 {
-        (2 * delta) as u64
-    } else {
-        (-2 * delta - 1) as u64
-    }
+    d
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Helpers
+// Byte/sample conversion helpers
 // ───────────────────────────────────────────────────────────────────────────
-
-/// Write a single `bpp`-bit sample to the writer.
-fn write_sample(writer: &mut BitWriter, value: u64, bpp: u8) {
-    if bpp <= 32 {
-        writer.write_bits(value as u32, bpp);
-    } else {
-        // For bpp > 32, split into two write_bits calls.
-        let high_bits = bpp - 32;
-        let high = (value >> 32) as u32;
-        let low = value as u32;
-        writer.write_bits(high, high_bits);
-        writer.write_bits(low, 32);
-    }
-}
 
 /// Convert raw uncompressed bytes to a `Vec<u64>` sample array, interpreting
 /// each sample as `bytes_per_sample` bytes in big-endian order.
@@ -167,9 +193,22 @@ pub fn bytes_to_samples(bytes: &[u8], params: &SzipParams) -> Vec<u64> {
 }
 
 /// Encode a raw byte slice (as produced by the decoder output format) back
-/// into a compressed AEC stream.  This is a convenience wrapper around
-/// [`encode`] for callers who work in bytes rather than `u64` sample arrays.
+/// into an AEC stream. This is a convenience wrapper around [`encode`] for
+/// callers who work in bytes rather than `u64` sample arrays.
+///
+/// # Errors
+///
+/// In addition to everything [`encode`] rejects, returns
+/// [`SzipError::InvalidParam`] when `input.len()` is not a whole multiple of
+/// [`SzipParams::bytes_per_sample`] (a trailing partial sample would
+/// otherwise be silently dropped).
 pub fn encode_bytes(input: &[u8], params: &SzipParams) -> Result<Vec<u8>, SzipError> {
+    params.validate()?;
+    if input.len() % params.bytes_per_sample() != 0 {
+        return Err(SzipError::InvalidParam(
+            "input length is not a multiple of bytes_per_sample",
+        ));
+    }
     let samples = bytes_to_samples(input, params);
     encode(&samples, params)
 }

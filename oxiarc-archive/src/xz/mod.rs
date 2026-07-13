@@ -11,15 +11,22 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use oxiarc_archive::xz;
 //!
-//! // Decompress data
-//! let compressed = include_bytes!("data.xz");
-//! let data = xz::decompress(&mut &compressed[..]).unwrap();
+//! // Round-trip through the crate's own compressor rather than depending
+//! // on an external fixture file.
+//! let original = b"Hello, XZ!";
+//! let compressed = xz::compress(original, 6)?;
+//! let data = xz::decompress(&mut &compressed[..])?;
+//! assert_eq!(data, original);
+//! # Ok::<(), oxiarc_core::error::OxiArcError>(())
 //! ```
 
 mod header;
 pub(crate) mod sha256;
 
-pub use header::{XzReader, XzWriter, compress, decompress};
+// `CheckType` is re-exported because it appears in the public signature of
+// [`XzWriter::with_check_type`]; without this the parameter type would be
+// reachable but unnameable by downstream crates (rustc's `unnameable_types`).
+pub use header::{CheckType, XzReader, XzWriter, compress, decompress};

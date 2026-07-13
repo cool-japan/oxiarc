@@ -25,13 +25,21 @@ const ATTR_READONLY: u16 = 0x01;
 const ATTR_HIDDEN: u16 = 0x02;
 /// File attribute: System
 const ATTR_SYSTEM: u16 = 0x04;
-/// File attribute: Directory (archive)
-const ATTR_ARCHIVE: u16 = 0x20;
 /// File attribute: UTF-8 name encoding
 const ATTR_NAME_IS_UTF: u16 = 0x80;
 
+/// Maximum length accepted for any null-terminated string in a CAB header
+/// (CFFILE names, prev/next cabinet names and disk labels).
+///
+/// The CAB specification limits `szName` in CFFILE to 256 bytes; 4096 is
+/// generous headroom for non-conformant writers while still preventing an
+/// attacker-controlled name with no NUL terminator from forcing an
+/// unbounded byte-at-a-time read of the remaining file.
+const MAX_NULL_STRING_LEN: usize = 4096;
+
 /// Compression type enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompressionType {
     /// No compression (stored)
     None,
@@ -41,10 +49,20 @@ pub enum CompressionType {
     Quantum,
     /// LZX compression with window size parameter
     Lzx(u8),
+    /// Unrecognized compression method code.
+    ///
+    /// Carried through so extraction can report the offending code instead
+    /// of silently treating the folder as stored.
+    Unknown(u16),
 }
 
 impl CompressionType {
     /// Parse compression type from u16 value.
+    ///
+    /// Method codes outside the specified set `{0, 1, 2, 3}` map to
+    /// [`CompressionType::Unknown`] and are rejected at extraction time,
+    /// matching the treatment of the recognized-but-unimplemented Quantum
+    /// and LZX methods (never a silent raw-copy fallback).
     pub fn from_u16(value: u16) -> Self {
         let method = value & 0x00FF;
         let param = ((value >> 8) & 0x1F) as u8;
@@ -54,7 +72,7 @@ impl CompressionType {
             1 => CompressionType::MsZip,
             2 => CompressionType::Quantum,
             3 => CompressionType::Lzx(param),
-            _ => CompressionType::None, // Default to stored for unknown
+            _ => CompressionType::Unknown(method),
         }
     }
 }
@@ -295,12 +313,16 @@ impl CabFile {
         self.attributes & ATTR_SYSTEM != 0
     }
 
-    /// Check if entry is a directory.
+    /// Check if entry is a directory placeholder.
+    ///
+    /// The CAB format has no real directory entries — directories are
+    /// implied by path separators in file names. Some writers nevertheless
+    /// emit zero-length entries whose name ends with a separator as
+    /// placeholders; those are the only entries reported as directories.
+    /// (`ATTR_ARCHIVE` is the DOS archive bit, not a directory marker, and
+    /// is deliberately not consulted here.)
     pub fn is_directory(&self) -> bool {
-        // CAB doesn't have explicit directory entries, but archive flag can indicate it
-        self.attributes & ATTR_ARCHIVE != 0
-            && self.uncompressed_size == 0
-            && self.name.ends_with('/')
+        self.uncompressed_size == 0 && self.name.ends_with('/')
     }
 
     /// Get the modification time.
@@ -315,7 +337,12 @@ fn read_null_string<R: Read>(reader: &mut R) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Read null-terminated bytes.
+/// Read null-terminated bytes, capped at [`MAX_NULL_STRING_LEN`].
+///
+/// The length is attacker-controlled (bounded only by a NUL byte in the
+/// input), so refuse to buffer more than the cap: a CFFILE name with no
+/// terminator must fail with a corruption error instead of slurping the
+/// rest of the file into memory one byte at a time.
 fn read_null_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1];
@@ -324,6 +351,15 @@ fn read_null_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
         reader.read_exact(&mut buf)?;
         if buf[0] == 0 {
             break;
+        }
+        if bytes.len() >= MAX_NULL_STRING_LEN {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "CAB string exceeds {} bytes without a NUL terminator",
+                    MAX_NULL_STRING_LEN
+                ),
+            ));
         }
         bytes.push(buf[0]);
     }
@@ -395,6 +431,65 @@ mod tests {
         assert_eq!(CompressionType::from_u16(0x0001), CompressionType::MsZip);
         assert_eq!(CompressionType::from_u16(0x0002), CompressionType::Quantum);
         assert_eq!(CompressionType::from_u16(0x0F03), CompressionType::Lzx(15));
+    }
+
+    #[test]
+    fn test_compression_type_unknown_codes_not_treated_as_stored() {
+        // Any method code outside {0,1,2,3} must surface as Unknown, never
+        // silently as stored/None (CAB-04 regression).
+        for code in [4u16, 5, 0x7F, 0xFF] {
+            assert_eq!(
+                CompressionType::from_u16(code),
+                CompressionType::Unknown(code),
+                "method code {code:#06x} must map to Unknown"
+            );
+        }
+        // High parameter bits must not rescue an unknown low-byte method.
+        assert_eq!(
+            CompressionType::from_u16(0x1F04),
+            CompressionType::Unknown(4)
+        );
+    }
+
+    #[test]
+    fn test_read_null_bytes_caps_unterminated_names() {
+        use std::io::Cursor;
+
+        // A "name" longer than the cap with no NUL terminator must error
+        // out rather than buffering the whole stream (CAB-05 regression).
+        let unterminated = vec![b'A'; MAX_NULL_STRING_LEN + 16];
+        let err = read_null_bytes(&mut Cursor::new(&unterminated));
+        assert!(
+            err.is_err(),
+            "unterminated over-cap string must be an error"
+        );
+
+        // At the cap with a terminator is still accepted.
+        let mut ok_data = vec![b'B'; MAX_NULL_STRING_LEN];
+        ok_data.push(0);
+        let ok = read_null_bytes(&mut Cursor::new(&ok_data)).expect("cap-length string");
+        assert_eq!(ok.len(), MAX_NULL_STRING_LEN);
+    }
+
+    #[test]
+    fn test_is_directory_placeholder_semantics() {
+        let mk = |name: &str, size: u32, attrs: u16| CabFile {
+            uncompressed_size: size,
+            folder_offset: 0,
+            folder_index: 0,
+            date: 0,
+            time: 0,
+            attributes: attrs,
+            name: name.to_string(),
+        };
+
+        // Zero-length trailing-slash placeholder is a directory regardless
+        // of the DOS archive bit (CAB-07: bit 0x20 is not a dir marker).
+        assert!(mk("nested/", 0, 0).is_directory());
+        assert!(mk("nested/", 0, 0x20).is_directory());
+        // Regular files are never directories.
+        assert!(!mk("nested/file.bin", 10, 0x20).is_directory());
+        assert!(!mk("file.txt", 0, 0).is_directory());
     }
 
     #[test]

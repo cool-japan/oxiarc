@@ -487,6 +487,7 @@ impl MmapOptions {
     /// # Returns
     ///
     /// Self for method chaining.
+    #[must_use]
     pub fn populate(mut self, populate: bool) -> Self {
         self.populate = populate;
         self

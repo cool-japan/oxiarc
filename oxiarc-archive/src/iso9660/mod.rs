@@ -26,6 +26,20 @@ use volume_descriptor::{
 /// Logical block size for ISO 9660 (always 2048 bytes).
 const SECTOR_SIZE: u64 = 2048;
 
+/// Maximum directory nesting depth allowed while walking the ISO tree.
+///
+/// ECMA-119 itself limits path nesting to 8 levels, but we allow some slack
+/// for non-conformant images while still bounding recursion against a
+/// maliciously crafted image that points a directory record back at one of
+/// its ancestors (which would otherwise recurse forever / overflow the stack).
+const MAX_DIR_DEPTH: usize = 64;
+
+/// Maximum size in bytes we are willing to allocate for a single directory
+/// extent. A conforming ISO 9660 directory extent is a handful of sectors;
+/// this cap (256 MiB) is generous while still preventing a crafted image
+/// from claiming a ~4 GiB `dir_size` and causing an OOM allocation.
+const MAX_DIR_EXTENT_SIZE: u64 = 256 * 1024 * 1024;
+
 /// An entry (file or directory) found in the ISO 9660 image.
 #[derive(Debug, Clone)]
 pub struct IsoEntry {
@@ -125,6 +139,7 @@ impl<R: Read + Seek> IsoReader<R> {
         };
 
         let mut entries = Vec::new();
+        let mut visited = std::collections::HashSet::new();
         walk_directory(
             &mut reader,
             root_lba,
@@ -132,6 +147,8 @@ impl<R: Read + Seek> IsoReader<R> {
             String::new(),
             use_joliet,
             &mut entries,
+            &mut visited,
+            0,
         )?;
 
         Ok(IsoReader {
@@ -202,6 +219,12 @@ impl<R: Read + Seek> IsoReader<R> {
 }
 
 /// Recursively walk a directory extent, populating `out` with entries.
+///
+/// `visited` tracks LBAs of directories already walked in this image so a
+/// crafted directory record that points back at an ancestor (or itself)
+/// cannot cause unbounded recursion. `depth` is checked against
+/// [`MAX_DIR_DEPTH`] as a second, independent guard.
+#[allow(clippy::too_many_arguments)]
 fn walk_directory<R: Read + Seek>(
     reader: &mut R,
     dir_lba: u32,
@@ -209,15 +232,42 @@ fn walk_directory<R: Read + Seek>(
     prefix: String,
     joliet: bool,
     out: &mut Vec<IsoEntry>,
+    visited: &mut std::collections::HashSet<u32>,
+    depth: usize,
 ) -> Result<()> {
+    if depth > MAX_DIR_DEPTH {
+        return Err(OxiArcError::invalid_header(format!(
+            "ISO: directory nesting exceeds maximum depth {MAX_DIR_DEPTH} (possible cyclic or maliciously deep image)"
+        )));
+    }
+
+    if !visited.insert(dir_lba) {
+        return Err(OxiArcError::invalid_header(format!(
+            "ISO: cyclic directory reference detected at LBA {dir_lba}"
+        )));
+    }
+
+    if dir_size > MAX_DIR_EXTENT_SIZE {
+        return Err(OxiArcError::memory_budget_exceeded(
+            MAX_DIR_EXTENT_SIZE as usize,
+            dir_size as usize,
+        ));
+    }
+
     let byte_offset = (dir_lba as u64) * SECTOR_SIZE;
     reader.seek(SeekFrom::Start(byte_offset)).map_err(|e| {
         OxiArcError::invalid_header(format!("ISO: seek to dir LBA {dir_lba} failed: {e}"))
     })?;
 
-    // Read the entire directory extent into a buffer (size is typically small)
+    // Read the entire directory extent into a buffer (size is typically small).
+    // Use try_reserve so an (already capped) but still large declared size that
+    // cannot actually be satisfied by the allocator surfaces as an error
+    // instead of aborting the process.
     let buf_size = dir_size as usize;
-    let mut buf = vec![0u8; buf_size];
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(buf_size)
+        .map_err(|_| OxiArcError::memory_budget_exceeded(MAX_DIR_EXTENT_SIZE as usize, buf_size))?;
+    buf.resize(buf_size, 0u8);
     reader
         .read_exact(&mut buf)
         .map_err(|e| OxiArcError::invalid_header(format!("ISO: read dir extent failed: {e}")))?;
@@ -289,7 +339,16 @@ fn walk_directory<R: Read + Seek>(
 
     // Recurse into subdirectories
     for (sub_lba, sub_size, sub_path) in subdirs {
-        walk_directory(reader, sub_lba, sub_size, sub_path, joliet, out)?;
+        walk_directory(
+            reader,
+            sub_lba,
+            sub_size,
+            sub_path,
+            joliet,
+            out,
+            visited,
+            depth + 1,
+        )?;
     }
 
     Ok(())
@@ -771,5 +830,169 @@ mod tests {
         r[30..32].copy_from_slice(&1u16.to_be_bytes());
         r[32] = 1;
         r[33] = 0x00;
+    }
+
+    /// Write a directory record with an ordinary (non-dot) name into `buf` at
+    /// byte 0. Used to fabricate a subdirectory entry that points at an
+    /// arbitrary LBA, e.g. to build a cyclic directory graph for regression
+    /// testing. Returns the record length.
+    fn write_named_subdir_record(buf: &mut [u8], name: &[u8], lba: u32, size: u32) -> usize {
+        let len_fi = name.len() as u8;
+        let padding = if len_fi % 2 == 0 { 1u8 } else { 0u8 };
+        let len_dr = 33u8 + len_fi + padding;
+
+        buf[0] = len_dr;
+        buf[1] = 0;
+        buf[2..6].copy_from_slice(&lba.to_le_bytes());
+        buf[6..10].copy_from_slice(&lba.to_be_bytes());
+        buf[10..14].copy_from_slice(&size.to_le_bytes());
+        buf[14..18].copy_from_slice(&size.to_be_bytes());
+        buf[18..25].copy_from_slice(&[126, 5, 6, 0, 0, 0, 0]);
+        buf[25] = 0x02; // directory flag
+        buf[28..30].copy_from_slice(&1u16.to_le_bytes());
+        buf[30..32].copy_from_slice(&1u16.to_be_bytes());
+        buf[32] = len_fi;
+        buf[33..33 + len_fi as usize].copy_from_slice(name);
+
+        len_dr as usize
+    }
+
+    /// Build a crafted ISO whose PVD root directory (LBA 20) contains an
+    /// ordinary-named subdirectory record ("LOOP") that points back at the
+    /// root directory's own LBA, forming a cycle. Before the cycle/depth
+    /// guard was added, walking this image would recurse forever and
+    /// overflow the stack.
+    fn build_cyclic_iso() -> Vec<u8> {
+        let total_lbas = 21u32;
+        let mut iso = vec![0u8; (total_lbas as usize) * 2048];
+
+        // LBA 16: Primary Volume Descriptor
+        {
+            let pvd = &mut iso[16 * 2048..17 * 2048];
+            pvd[0] = 1;
+            pvd[1..6].copy_from_slice(b"CD001");
+            pvd[6] = 1;
+            for b in pvd[40..72].iter_mut() {
+                *b = b' ';
+            }
+            pvd[40..47].copy_from_slice(b"CYCLIC!");
+            pvd[80..84].copy_from_slice(&total_lbas.to_le_bytes());
+            pvd[84..88].copy_from_slice(&total_lbas.to_be_bytes());
+            pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+            pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
+            // Root directory record: root at LBA 20, size = full sector so
+            // the cyclic subdir record fits.
+            write_dir_record_dot_local(pvd, 156, 20u32, 2048u32);
+        }
+
+        // LBA 17: Volume Descriptor Set Terminator
+        {
+            let term = &mut iso[17 * 2048..18 * 2048];
+            term[0] = 255;
+            term[1..6].copy_from_slice(b"CD001");
+            term[6] = 1;
+        }
+
+        // LBA 20: PVD root directory containing "." ".." and a "LOOP"
+        // subdirectory record whose LBA points back at the root itself.
+        {
+            let dir = &mut iso[20 * 2048..21 * 2048];
+            let mut pos = 0usize;
+            pos += write_dot_record(&mut dir[pos..], 20u32, 2048u32);
+            pos += write_dotdot_record(&mut dir[pos..], 20u32, 2048u32);
+            let _ = write_named_subdir_record(&mut dir[pos..], b"LOOP", 20u32, 2048u32);
+        }
+
+        iso
+    }
+
+    /// ISO-01 end-to-end regression: an image whose root directory extent
+    /// contains a record with a non-zero LEN_DR smaller than the 34-byte
+    /// minimum must not panic when walked from `IsoReader::new` on an
+    /// untrusted image. The undersized record is treated as padding (the
+    /// walker skips to the next sector), so parsing either succeeds with
+    /// the record ignored or fails cleanly — it must never panic.
+    #[test]
+    fn test_iso_undersized_dir_record_no_panic() {
+        for bad_len in [1u8, 2, 5, 25, 26, 32, 33] {
+            let mut iso = build_minimal_iso();
+
+            // Corrupt the PVD root directory (LBA 20): overwrite the first
+            // record's LEN_DR with an undersized non-zero value and fill
+            // the rest of the old record with hostile bytes.
+            let dir_start = 20 * 2048;
+            iso[dir_start] = bad_len;
+            for b in iso[dir_start + 1..dir_start + 34].iter_mut() {
+                *b = 0xFF;
+            }
+
+            let result = std::panic::catch_unwind(|| IsoReader::new(Cursor::new(iso)));
+            let outcome = result.unwrap_or_else(|_| {
+                panic!("IsoReader::new panicked on LEN_DR={bad_len} in a directory extent")
+            });
+            // Ok (record skipped) or Err (structure rejected) are both
+            // acceptable; only a panic is a defect.
+            let _ = outcome;
+        }
+    }
+
+    #[test]
+    fn test_iso_cyclic_directory_reference_returns_err() {
+        let iso = build_cyclic_iso();
+        let result = IsoReader::new(Cursor::new(iso));
+        assert!(
+            result.is_err(),
+            "cyclic directory reference must be rejected, not recursed into forever"
+        );
+    }
+
+    #[test]
+    fn test_iso_oversized_dir_size_rejected() {
+        // A directory extent that claims to be far larger than any real
+        // ISO 9660 directory (and larger than MAX_DIR_EXTENT_SIZE) must be
+        // rejected before an allocation is attempted, instead of trying to
+        // allocate ~4 GiB.
+        let mut entries = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut cursor = Cursor::new(vec![0u8; 64 * 2048]);
+        let result = walk_directory(
+            &mut cursor,
+            16,
+            u32::MAX as u64,
+            String::new(),
+            false,
+            &mut entries,
+            &mut visited,
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "oversized declared directory extent size must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_iso_excessive_depth_rejected() {
+        // Depth guard must trip independently of the visited-LBA cycle
+        // guard: a strictly increasing chain of distinct LBAs deeper than
+        // MAX_DIR_DEPTH must still be rejected rather than recursing
+        // unbounded.
+        let mut entries = Vec::new();
+        let mut visited: std::collections::HashSet<u32> = (0..MAX_DIR_DEPTH as u32).collect();
+        let mut cursor = Cursor::new(vec![0u8; 64 * 2048]);
+        let result = walk_directory(
+            &mut cursor,
+            MAX_DIR_DEPTH as u32,
+            0,
+            String::new(),
+            false,
+            &mut entries,
+            &mut visited,
+            MAX_DIR_DEPTH + 1,
+        );
+        assert!(
+            result.is_err(),
+            "directory nesting beyond MAX_DIR_DEPTH must be rejected"
+        );
     }
 }

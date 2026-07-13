@@ -125,35 +125,50 @@ pub fn encode_zero_runs(data: &[u8]) -> Vec<u16> {
 }
 
 /// Decode zero-run encoded data (utility counterpart of `encode_zero_runs`).
+///
+/// Zero runs are capped at 25 RUNA/RUNB digits (the same bound the block
+/// decoder enforces, comfortably above any run a real 900 kB block can
+/// hold), so a malicious symbol stream cannot overflow the run arithmetic
+/// or force an unbounded allocation. Symbols that do not fit in a byte
+/// after the RUNA/RUNB shift are corrupted input.
 #[allow(dead_code)]
-pub fn decode_zero_runs(data: &[u16], num_symbols: usize) -> Vec<u8> {
+pub fn decode_zero_runs(data: &[u16], num_symbols: usize) -> Result<Vec<u8>> {
+    /// Maximum RUNA/RUNB digits in one zero run (matches the block decoder).
+    const MAX_RUN_BITS: u32 = 25;
+
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
 
     while i < data.len() {
         let sym = data[i];
 
-        if sym == 0 || sym == 1 {
-            // RUNA or RUNB - decode run of zeros
-            let mut power = 1usize;
-            let mut count = 0usize;
+        if sym <= 1 {
+            // RUNA or RUNB - decode run of zeros (bijective base 2).
+            let mut bit = 0u32;
+            let mut count = 0u64;
 
-            while i < data.len() && (data[i] == 0 || data[i] == 1) {
-                if data[i] == 0 {
-                    // RUNA
-                    count += power;
-                } else {
-                    // RUNB
-                    count += 2 * power;
+            while i < data.len() && data[i] <= 1 {
+                if bit >= MAX_RUN_BITS {
+                    return Err(OxiArcError::corrupted(i as u64, "BZip2 zero run too long"));
                 }
-                power *= 2;
+                count += u64::from(data[i] + 1) << bit;
+                bit += 1;
                 i += 1;
             }
 
+            let count = usize::try_from(count)
+                .map_err(|_| OxiArcError::corrupted(i as u64, "BZip2 zero run overflows"))?;
             result.resize(result.len() + count, 0);
         } else if (sym as usize) <= num_symbols {
-            // Regular symbol (offset by 1)
-            result.push((sym - 1) as u8);
+            // Regular symbol (offset by 1 for RUNA/RUNB).
+            let value = sym - 1;
+            if value > u16::from(u8::MAX) {
+                return Err(OxiArcError::corrupted(
+                    i as u64,
+                    "BZip2 MTF symbol out of byte range",
+                ));
+            }
+            result.push(value as u8);
             i += 1;
         } else {
             // End of block symbol
@@ -161,7 +176,7 @@ pub fn decode_zero_runs(data: &[u16], num_symbols: usize) -> Vec<u8> {
         }
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -219,7 +234,20 @@ mod tests {
     fn test_zero_run_roundtrip() {
         let data = vec![0, 0, 0, 1, 0, 0, 2, 0, 0, 0, 0, 0];
         let encoded = encode_zero_runs(&data);
-        let decoded = decode_zero_runs(&encoded, 256);
+        let decoded = decode_zero_runs(&encoded, 256).expect("decode zero runs");
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_zero_run_too_long_is_error() {
+        // 26 RUNA digits exceed the 25-digit cap: error, not overflow.
+        let overlong = vec![0u16; 26];
+        assert!(decode_zero_runs(&overlong, 256).is_err());
+    }
+
+    #[test]
+    fn test_zero_run_symbol_out_of_byte_range_is_error() {
+        // Symbol 300 would decode to MTF value 299, which cannot be a byte.
+        assert!(decode_zero_runs(&[300], 1000).is_err());
     }
 }

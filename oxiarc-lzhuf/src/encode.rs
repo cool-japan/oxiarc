@@ -245,6 +245,7 @@ impl LzhEncoder {
     ///
     /// Optimal parsing is slower than greedy parsing but typically produces
     /// equal or smaller compressed output.
+    #[must_use]
     pub fn with_optimal(mut self) -> Self {
         self.use_optimal = true;
         self
@@ -255,6 +256,7 @@ impl LzhEncoder {
     /// The sink will be called with `on_progress(input_consumed, None)` at
     /// each block boundary during encoding. `input_consumed` is the cumulative
     /// number of uncompressed bytes processed up to that block boundary.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self

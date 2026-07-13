@@ -15,6 +15,18 @@
 
 use crate::error::{OxiArcError, Result};
 
+/// Maximum number of bytes a single back-reference copy may produce.
+///
+/// Back-reference `length` fields in LZ77/LZSS streams are attacker-controlled.
+/// An unbounded value would spin the copy loop for a very long time or, in
+/// [`OutputRingBuffer::copy_match`], request a multi-gigabyte allocation that
+/// aborts the whole process (`capacity overflow` for values near
+/// [`usize::MAX`]). No real codec emits a single back-reference longer than a
+/// few hundred kilobytes (DEFLATE caps a match at 258 bytes), so this generous
+/// 256 MiB ceiling never rejects valid input while turning a crafted length
+/// into a recoverable [`OxiArcError`] instead of a hang or an allocator abort.
+pub const MAX_COPY_LENGTH: usize = 256 * 1024 * 1024;
+
 /// Common window sizes for different compression methods.
 pub mod sizes {
     /// Window size for DEFLATE (32 KB).
@@ -73,6 +85,39 @@ impl RingBuffer {
             capacity,
             mask: capacity - 1,
         }
+    }
+
+    /// Create a new ring buffer with the specified capacity, without panicking.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - Must be a power of 2 (e.g., 4096, 8192, 32768, 65536)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError`] if `capacity` is zero or not a power of two.
+    /// This is the non-panicking counterpart to [`RingBuffer::new`]; prefer
+    /// it whenever `capacity` originates from untrusted or externally
+    /// supplied input.
+    pub fn try_new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(OxiArcError::InvalidHeader {
+                message: "RingBuffer capacity must be greater than 0".to_string(),
+            });
+        }
+        if !capacity.is_power_of_two() {
+            return Err(OxiArcError::InvalidHeader {
+                message: format!("RingBuffer capacity must be a power of 2, got {capacity}"),
+            });
+        }
+
+        Ok(Self {
+            buffer: vec![0; capacity],
+            position: 0,
+            size: 0,
+            capacity,
+            mask: capacity - 1,
+        })
     }
 
     /// Create a new ring buffer for DEFLATE decompression (32 KB).
@@ -157,6 +202,13 @@ impl RingBuffer {
     /// # Returns
     ///
     /// The number of bytes written to output (if provided).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::InvalidDistance`] if `distance` is zero or larger
+    /// than the current history, and [`OxiArcError::MemoryBudgetExceeded`] if
+    /// `length` exceeds [`MAX_COPY_LENGTH`] (guarding against a crafted length
+    /// that would otherwise spin the copy loop indefinitely).
     pub fn copy_from_history(
         &mut self,
         distance: usize,
@@ -165,6 +217,9 @@ impl RingBuffer {
     ) -> Result<usize> {
         if distance == 0 || distance > self.size {
             return Err(OxiArcError::invalid_distance(distance, self.size));
+        }
+        if length > MAX_COPY_LENGTH {
+            return Err(OxiArcError::memory_budget_exceeded(MAX_COPY_LENGTH, length));
         }
 
         let mut written = 0;
@@ -295,6 +350,13 @@ pub struct OutputRingBuffer {
 
 impl OutputRingBuffer {
     /// Create a new output ring buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `window_size` is zero or not a power of two (see
+    /// [`RingBuffer::new`]). Use [`OutputRingBuffer::try_new`] to construct
+    /// from an untrusted or externally supplied `window_size` without
+    /// panicking.
     pub fn new(window_size: usize) -> Self {
         Self {
             ring: RingBuffer::new(window_size),
@@ -302,7 +364,24 @@ impl OutputRingBuffer {
         }
     }
 
+    /// Create a new output ring buffer, without panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `window_size` is zero or not a power of two.
+    pub fn try_new(window_size: usize) -> Result<Self> {
+        Ok(Self {
+            ring: RingBuffer::try_new(window_size)?,
+            output: Vec::new(),
+        })
+    }
+
     /// Create with an initial output capacity hint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `window_size` is zero or not a power of two (see
+    /// [`RingBuffer::new`]).
     pub fn with_capacity(window_size: usize, output_capacity: usize) -> Self {
         Self {
             ring: RingBuffer::new(window_size),
@@ -324,13 +403,28 @@ impl OutputRingBuffer {
     }
 
     /// Copy from back-reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::InvalidDistance`] if `distance` is zero or larger
+    /// than the current history, and [`OxiArcError::MemoryBudgetExceeded`] if
+    /// `length` exceeds [`MAX_COPY_LENGTH`] or the output buffer cannot be grown
+    /// to hold the copied bytes. A crafted `length` therefore fails gracefully
+    /// instead of triggering a `capacity overflow` allocator abort.
     pub fn copy_match(&mut self, distance: usize, length: usize) -> Result<()> {
         if distance == 0 || distance > self.ring.len() {
             return Err(OxiArcError::invalid_distance(distance, self.ring.len()));
         }
+        if length > MAX_COPY_LENGTH {
+            return Err(OxiArcError::memory_budget_exceeded(MAX_COPY_LENGTH, length));
+        }
 
-        // Reserve space for efficiency
-        self.output.reserve(length);
+        // Reserve space for efficiency. `length` is bounded above by
+        // `MAX_COPY_LENGTH`, and `try_reserve` turns a genuine allocation
+        // failure into a recoverable error rather than aborting the process.
+        self.output
+            .try_reserve(length)
+            .map_err(|_| OxiArcError::memory_budget_exceeded(MAX_COPY_LENGTH, length))?;
 
         let mut src_pos =
             (self.ring.position().wrapping_sub(distance)) & (self.ring.capacity() - 1);
@@ -528,6 +622,20 @@ mod tests {
     }
 
     #[test]
+    fn test_try_new_rejects_zero_and_non_power_of_two() {
+        assert!(RingBuffer::try_new(0).is_err());
+        assert!(RingBuffer::try_new(100).is_err());
+        assert!(RingBuffer::try_new(4096).is_ok());
+    }
+
+    #[test]
+    fn test_output_ringbuffer_try_new() {
+        assert!(OutputRingBuffer::try_new(0).is_err());
+        assert!(OutputRingBuffer::try_new(100).is_err());
+        assert!(OutputRingBuffer::try_new(64).is_ok());
+    }
+
+    #[test]
     fn test_output_ringbuffer() {
         let mut orb = OutputRingBuffer::new(32);
 
@@ -564,6 +672,44 @@ mod tests {
         orb.copy_match(5, 5)
             .expect("copy match should succeed after drain since ring still holds history"); // back-ref to "Hello"
         assert_eq!(orb.output(), b"Hello");
+    }
+
+    #[test]
+    fn test_copy_match_rejects_bogus_length() {
+        // A crafted length near usize::MAX must be rejected with an error
+        // instead of aborting the process via `output.reserve` capacity
+        // overflow (CORE-02).
+        let mut orb = OutputRingBuffer::new(32);
+        orb.write_literals(b"AB");
+        let err = orb
+            .copy_match(2, usize::MAX)
+            .expect_err("oversized copy length must be rejected, not abort");
+        assert!(matches!(err, OxiArcError::MemoryBudgetExceeded { .. }));
+        // The output must be untouched by the rejected copy.
+        assert_eq!(orb.output(), b"AB");
+    }
+
+    #[test]
+    fn test_copy_from_history_rejects_bogus_length() {
+        // A crafted length above the cap must be rejected before the copy loop
+        // spins for a very long time (CORE-02).
+        let mut ring = RingBuffer::new(32);
+        ring.write_bytes(b"AB");
+        let err = ring
+            .copy_from_history(2, MAX_COPY_LENGTH + 1, None)
+            .expect_err("oversized copy length must be rejected, not spin");
+        assert!(matches!(err, OxiArcError::MemoryBudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn test_copy_match_accepts_in_bound_length() {
+        // Lengths within MAX_COPY_LENGTH remain fully functional (behaviour is
+        // preserved for all valid inputs).
+        let mut orb = OutputRingBuffer::new(32);
+        orb.write_literals(b"AB");
+        orb.copy_match(2, 4)
+            .expect("in-bound overlapping copy must still succeed");
+        assert_eq!(orb.output(), b"ABABAB");
     }
 
     #[test]

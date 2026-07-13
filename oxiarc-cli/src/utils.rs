@@ -29,8 +29,113 @@ use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use oxiarc_core::{Entry, EntryType};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
 
 pub type ExtractedEntry = (String, bool, Vec<u8>);
+
+/// A seekable byte source: either a file on disk or an in-memory buffer read
+/// from standard input. Used by the read-only commands (`list`, `test`,
+/// `info`, `detect`) so they can accept `-` as a stand-in for stdin, mirroring
+/// what `extract`/`create` already do for their streams.
+pub trait ReadSeek: Read + std::io::Seek {}
+impl<T: Read + std::io::Seek> ReadSeek for T {}
+
+/// Open an archive input, transparently handling the `-` stdin sentinel.
+///
+/// For a real path the file is opened lazily and buffered. For `-` the whole
+/// of stdin is slurped into memory and wrapped in a [`std::io::Cursor`] so the
+/// archive readers (which all require `Seek`) can operate on a non-seekable
+/// pipe. Every I/O error names the offending source.
+pub fn open_input(path: &str) -> Result<Box<dyn ReadSeek>, Box<dyn std::error::Error>> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("<stdin>: {e}"))?;
+        Ok(Box::new(std::io::Cursor::new(buf)))
+    } else {
+        let file = open_file(Path::new(path))?;
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Human-facing display name for an archive source (`<stdin>` for `-`).
+pub fn input_display_name(path: &str) -> String {
+    if path == "-" {
+        "<stdin>".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// `File::open` with the path folded into the error message.
+///
+/// The bare [`std::io::Error`] returned by the standard library omits the path
+/// (e.g. just "No such file or directory"), which is useless in a CLI that may
+/// touch many files. These wrappers guarantee every filesystem error names the
+/// file it refers to.
+pub fn open_file(path: &Path) -> Result<File, String> {
+    File::open(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `File::create` with the path folded into the error message.
+pub fn create_file(path: &Path) -> Result<File, String> {
+    File::create(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `std::fs::read` with the path folded into the error message.
+pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `std::fs::write` with the path folded into the error message.
+pub fn write_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    std::fs::write(path, data).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `std::fs::symlink_metadata` (does NOT follow symlinks) with the path folded
+/// into the error message.
+pub fn symlink_metadata_for(path: &Path) -> Result<std::fs::Metadata, String> {
+    std::fs::symlink_metadata(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `std::fs::read_dir` with the path folded into the error message.
+pub fn read_dir_for(path: &Path) -> Result<std::fs::ReadDir, String> {
+    std::fs::read_dir(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// `std::fs::read_link` with the path folded into the error message.
+pub fn read_link_for(path: &Path) -> Result<std::path::PathBuf, String> {
+    std::fs::read_link(path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// Extract the Unix permission bits (masked to `0o7777`) from `metadata`.
+///
+/// On non-Unix platforms there is no meaningful mode, so a sane default is
+/// returned for files (`0o644`) and directories (`0o755`).
+#[cfg(unix)]
+pub fn unix_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+pub fn unix_mode(metadata: &std::fs::Metadata) -> u32 {
+    if metadata.is_dir() { 0o755 } else { 0o644 }
+}
+
+/// Seconds since the Unix epoch for `metadata`'s modification time, or `0` if
+/// unavailable (pre-epoch or unsupported platform).
+pub fn mtime_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 pub fn create_progress_bar(len: u64, enable: bool) -> ProgressBar {
     if !enable {
@@ -38,12 +143,13 @@ pub fn create_progress_bar(len: u64, enable: bool) -> ProgressBar {
     }
 
     let pb = ProgressBar::new(len);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .expect("progress bar template is valid")
-            .progress_chars("█▓▒░ "),
-    );
+    // Degrade gracefully to the plain default bar if a future template edit
+    // introduces a parse error, rather than panicking (no-panic policy).
+    let style = ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .map(|s| s.progress_chars("█▓▒░ "))
+        .unwrap_or_else(|_| ProgressStyle::default_bar());
+    pb.set_style(style);
     pb
 }
 

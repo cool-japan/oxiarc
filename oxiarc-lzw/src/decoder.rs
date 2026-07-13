@@ -8,6 +8,16 @@ use crate::config::LzwConfig;
 use crate::dictionary::LzwDictionary;
 use crate::error::{LzwError, Result};
 
+/// Upper bound on the output capacity reserved up-front in
+/// [`LzwDecoder::decode`] (64 KiB).
+///
+/// `expected_size` may come from untrusted framing, so pre-reserving it
+/// verbatim lets tiny malicious inputs force enormous allocations
+/// (resource-exhaustion DoS). Reserving at most this much and letting the
+/// `Vec` grow geometrically keeps allocation proportional to bytes actually
+/// decoded while still avoiding realloc churn for typical TIFF strips.
+const MAX_INITIAL_CAPACITY: usize = 64 * 1024;
+
 /// LZW decoder for decompression.
 #[derive(Debug)]
 pub struct LzwDecoder {
@@ -45,8 +55,14 @@ impl LzwDecoder {
     /// Decompressed byte sequence of exactly `expected_size` bytes (or less if
     /// EOI code is encountered early).
     pub fn decode(&mut self, input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+        // Always start from a clean dictionary so a reused decoder handles
+        // each independently encoded stream correctly.
+        self.dict.reset();
+
         let mut reader = MsbBitReader::new(input);
-        let mut output = Vec::with_capacity(expected_size);
+        // Clamp the up-front reservation: `expected_size` is untrusted (see
+        // MAX_INITIAL_CAPACITY). The Vec grows on demand beyond this.
+        let mut output = Vec::with_capacity(expected_size.min(MAX_INITIAL_CAPACITY));
 
         // Previous code (for dictionary building)
         let mut prev_code: Option<u16> = None;
@@ -71,13 +87,18 @@ impl LzwDecoder {
 
             // Handle special codes
             if code == self.dict.clear_code() {
-                // Clear code: reset dictionary
+                // Clear code: reset dictionary and drop back to the minimum
+                // code width. TIFF 6.0 mandates one at the start of every
+                // strip and again whenever the encoder's table reaches entry
+                // 4094; encoders may also emit one at any other point (e.g.
+                // libtiff's compression-ratio checkpoint resets), so accept
+                // it anywhere in the stream.
                 if self.dict.config().use_clear_code {
                     self.dict.reset();
                     prev_code = None;
                     continue;
                 } else {
-                    // TIFF doesn't use clear codes in the stream
+                    // Legacy/non-standard configuration without clear codes
                     return Err(LzwError::InvalidClearCode {
                         position: reader.bits_read(),
                     });

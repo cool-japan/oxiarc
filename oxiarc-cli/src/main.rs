@@ -31,6 +31,7 @@ Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2, Brotli, Snappy
 Examples:
   oxiarc list archive.zip
   oxiarc list archive.7z
+  oxiarc list --json --tree archive.zip
   oxiarc extract archive.zip
   oxiarc extract archive.7z
   oxiarc extract data.xz
@@ -39,17 +40,23 @@ Examples:
   oxiarc extract data.bz2
   oxiarc extract data.br
   oxiarc extract data.sz
+  oxiarc extract --password secret --lenient archive.zip
+  oxiarc extract --memory-limit 512M archive.zip
   oxiarc create archive.zip file1.txt file2.txt
   oxiarc create data.xz file.txt
   oxiarc create data.lz4 file.txt
   oxiarc create data.bz2 file.txt
   oxiarc create data.br file.txt
   oxiarc create data.sz file.txt
+  oxiarc add archive.zip newfile.txt
+  oxiarc add archive.tar dir/
   oxiarc convert archive.lzh output.zip
   oxiarc convert archive.7z output.zip
   oxiarc test archive.lzh
   oxiarc info archive.7z
+  oxiarc man ./man
 ")]
+/// Top-level parsed command line for the `oxiarc` binary.
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -57,6 +64,10 @@ pub struct Cli {
     /// Control color output
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     color: ColorChoice,
+
+    /// Suppress non-error output
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
 }
 
 #[derive(Subcommand)]
@@ -64,8 +75,8 @@ enum Commands {
     /// List contents of an archive
     #[command(alias = "l")]
     List {
-        /// Archive file to list
-        archive: PathBuf,
+        /// Archive file to list (use "-" for stdin)
+        archive: String,
 
         /// Show verbose output
         #[arg(short, long)]
@@ -130,8 +141,8 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Show progress bar
-        #[arg(short = 'P', long, default_value = "true")]
+        /// Show progress bar (opt-in; off by default)
+        #[arg(short = 'P', long)]
         progress: bool,
 
         /// Format hint for stdin (gzip, xz, bz2, lz4, zst, br, snappy)
@@ -187,8 +198,8 @@ enum Commands {
     /// Test archive integrity
     #[command(alias = "t")]
     Test {
-        /// Archive file to test
-        archive: PathBuf,
+        /// Archive file to test (use "-" for stdin)
+        archive: String,
 
         /// Show verbose output
         #[arg(short, long)]
@@ -249,14 +260,14 @@ enum Commands {
     /// Show information about an archive
     #[command(alias = "i")]
     Info {
-        /// Archive file to inspect
-        archive: PathBuf,
+        /// Archive file to inspect (use "-" for stdin)
+        archive: String,
     },
 
     /// Detect archive format
     Detect {
-        /// File to detect
-        file: PathBuf,
+        /// File to detect (use "-" for stdin)
+        file: String,
     },
 
     /// Convert archive to another format
@@ -365,6 +376,7 @@ impl From<CompressionLevelArg> for CompressionLevel {
 fn main() {
     let cli = Cli::parse();
     let styler = Styler::new(cli.color);
+    let quiet = cli.quiet;
 
     let result = match cli.command {
         Commands::List {
@@ -389,6 +401,7 @@ fn main() {
                 exclude: &exclude,
                 lenient,
                 memory_limit,
+                quiet,
             };
             cmd_list(&archive, &options, &styler)
         }
@@ -433,10 +446,11 @@ fn main() {
                 strict_names,
                 lenient,
                 memory_limit,
+                quiet,
             },
             &styler,
         ),
-        Commands::Test { archive, verbose } => cmd_test(&archive, verbose),
+        Commands::Test { archive, verbose } => cmd_test(&archive, verbose, quiet, &styler),
         Commands::Create {
             archive,
             files,
@@ -453,6 +467,8 @@ fn main() {
             compress_threshold,
             verbose,
             dry_run,
+            quiet,
+            &styler,
         ),
         Commands::Add {
             archive,
@@ -460,9 +476,17 @@ fn main() {
             compression,
             verbose,
             dry_run,
-        } => cmd_add(&archive, &files, compression.into(), verbose, dry_run),
-        Commands::Info { archive } => cmd_info(&archive, &styler),
-        Commands::Detect { file } => cmd_detect(&file, &styler),
+        } => cmd_add(
+            &archive,
+            &files,
+            compression.into(),
+            verbose,
+            quiet,
+            dry_run,
+            &styler,
+        ),
+        Commands::Info { archive } => cmd_info(&archive, quiet, &styler),
+        Commands::Detect { file } => cmd_detect(&file, quiet, &styler),
         Commands::Convert {
             input,
             output,
@@ -475,6 +499,8 @@ fn main() {
             format.map(Into::into),
             compression.into(),
             verbose,
+            quiet,
+            &styler,
         ),
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();

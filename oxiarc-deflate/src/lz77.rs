@@ -34,7 +34,7 @@ const MAX_CHAIN_LENGTH: usize = 4096;
 /// All fields have per-level defaults that reproduce the existing encoder output
 /// bit-for-bit. The heuristics only activate when the caller explicitly sets values
 /// smaller than the per-level defaults.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lz77Params {
     /// Stop searching when a match of this length or longer is found.
     ///
@@ -93,6 +93,7 @@ impl Default for Lz77Params {
 /// Each preset trades speed for compression ratio. `Default` reproduces the
 /// level-6 encoder's implicit parameters (same output as `Lz77Params::for_level(6)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Lz77Preset {
     /// Fastest search: small nice_length and small max_chain.
     Fast,
@@ -273,6 +274,7 @@ impl Lz77Encoder {
     /// Override the nice match length (stops searching for longer matches once a match
     /// of this length is found). Default is level-dependent (64–258).
     /// Clamped to `[MIN_MATCH, MAX_MATCH]`.
+    #[must_use]
     pub fn with_nice_length(mut self, nice: usize) -> Self {
         self.nice_length = nice.clamp(MIN_MATCH, MAX_MATCH);
         self
@@ -280,6 +282,7 @@ impl Lz77Encoder {
 
     /// Set the minimum useful match length. Matches shorter than this are treated as
     /// literals even if the hash chain finds them. Clamped to `[MIN_MATCH, MAX_MATCH]`.
+    #[must_use]
     pub fn with_min_match_length(mut self, min_match: usize) -> Self {
         self.min_useful_match = min_match.clamp(MIN_MATCH, MAX_MATCH);
         self
@@ -289,6 +292,7 @@ impl Lz77Encoder {
     ///
     /// Larger values find better matches but cost more CPU time.
     /// Use `usize::MAX` (or a value ≥ `MAX_CHAIN_LENGTH`) for uncapped search.
+    #[must_use]
     pub fn with_max_chain(mut self, max_chain: usize) -> Self {
         self.max_chain = max_chain;
         self
@@ -303,6 +307,7 @@ impl Lz77Encoder {
     ///
     /// Set to `MAX_MATCH + 1` (or any value > `MAX_MATCH`) to disable entirely.
     /// Clamped to `[MIN_MATCH, MAX_MATCH + 1]`.
+    #[must_use]
     pub fn with_good_length(mut self, good_length: usize) -> Self {
         self.good_length = good_length.clamp(MIN_MATCH, MAX_MATCH + 1);
         self
@@ -310,6 +315,7 @@ impl Lz77Encoder {
 
     /// Apply [`Lz77Params`] to this encoder, overriding `nice_length`,
     /// `max_chain`, and `good_length` in one call.
+    #[must_use]
     pub fn with_lz77_params(self, params: &Lz77Params) -> Self {
         self.with_nice_length(params.nice_length as usize)
             .with_max_chain(params.max_chain as usize)

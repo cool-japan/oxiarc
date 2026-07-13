@@ -3,11 +3,22 @@
 
 Pure Rust implementation of CCSDS-121.0-B-2 / libaec-compatible AEC (Adaptive Entropy Coding) / SZIP compression.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 19 tests passing.
+**Version 0.3.6** (2026-07-13) — 47 tests passing.
+
+**What's new in 0.3.6**:
+
+- **libaec interoperability fixed and differentially verified (both directions).** The bit-stream framing now follows CCSDS-121.0-B-2 §5.2 / libaec exactly: the option ID precedes *all* `pixels_per_block` samples of an RSI's first block (the reference sample is sample #0 of that block, present only when `nn_preprocess` is on); fundamental-sequence codewords are zero-run/one-terminated; sample-split blocks group all FS quotients before the k-bit remainders; zero-block runs (incl. ROS and 64-block segments) and the second-extension option are fully decoded; the NN preprocessor uses the standard theta-clamped mapping; `id_len`/`k_max` match the unrestricted CCSDS option space; and blocks are always whole (trailing partial blocks are padded/discarded). Verified against libaec 1.1.4: 888/888 reference-encoded streams decode byte-identical, 1776/1776 oxiarc-encoded streams are accepted byte-identical by the reference decoder (`tests/libaec_interop.rs` embeds reference fixtures; a live gate is available behind the `libaec-oracle` feature).
+- **`pixels_per_block: 64` supported** (full CCSDS/libaec block-size range).
+- **Typed validation errors** instead of panics/silent corruption: short encode buffers → `InputTooShort`; out-of-range sample values → new `SampleOutOfRange`; `encode_bytes` inputs with a trailing partial sample → `InvalidParam`; out-of-spec sample-split option IDs (`k > k_max()`) → `InvalidBlockOption`; over-long zero-block runs → `LengthMismatch`.
+
+- **`SzipError` is now `#[non_exhaustive]`** (pre-1.0 API-stability freeze), and every struct-variant field gained a doc comment (satisfying a newly-enabled `#![warn(missing_docs)]` lint).
+- **`SzipParams` gained a `Default` impl** (`bits_per_pixel: 8, pixels_per_block: 8, samples: 0, reference_sample_interval: 8, msb: true, nn_preprocess: false, rsi_byte_align: false`) and now derives `PartialEq`/`Eq`.
+- New `sample_decode` example.
+- New `proptest`-based round-trip suite (`tests/proptest_roundtrip.rs`) and a corrupt-input regression suite (`tests/corrupt_input.rs`) covering truncated/empty/bit-flipped streams — malformed input now reliably returns `Err` instead of panicking.
 
 **What's new in 0.3.2**: Initial release of `oxiarc-szip`. Implements the full AEC/SZIP encode/decode pipeline as specified in CCSDS-121.0-B-2 and compatible with the `libaec` reference library. Supports configurable `bits_per_pixel` (1–32), `pixels_per_block` (8/16/32), `reference_sample_interval`, MSB/LSB bit ordering, NN preprocessing (unit-delay predictor), and RSI byte alignment. Exposed via `encode`, `encode_bytes`, and `decode` free functions together with `SzipParams` and `SzipError` public types.
 
@@ -37,8 +48,9 @@ It is used in:
 - **`encode_bytes`** — Convenience wrapper: converts raw `&[u8]` input to samples and calls `encode`
 - **`decode`** — Decompress an AEC/SZIP byte stream back to raw sample bytes
 - **`SzipParams`** — Strongly-typed parameter struct covering all knobs required by the standard
+- **`SzipParams::default()`** — common 8-bit settings (`bits_per_pixel: 8, pixels_per_block: 8, reference_sample_interval: 8, msb: true`); combine with struct-update syntax (`SzipParams { samples: N, ..SzipParams::default() }`) to only override what differs
 - **Configurable `bits_per_pixel`** — Supports 1–32 bits per sample; common values are 8, 16, and 32
-- **Configurable `pixels_per_block`** — Supports block sizes of 8, 16, or 32 samples (J parameter)
+- **Configurable `pixels_per_block`** — Supports block sizes of 8, 16, 32, or 64 samples (J parameter)
 - **Configurable `reference_sample_interval`** — Controls restart-point frequency in the bit stream
 - **MSB / LSB bit ordering** — `msb: true` selects the most-common hardware/CHIPS mode; `msb: false` selects LSB-first
 - **NN preprocessing** — `nn_preprocess: true` enables the unit-delay NN predictor; decoder automatically applies the inverse transform
@@ -53,13 +65,8 @@ All features are implemented and tested. API is stable.
 use oxiarc_szip::{SzipParams, decode, encode};
 
 let params = SzipParams {
-    bits_per_pixel: 8,
-    pixels_per_block: 8,
     samples: 16,
-    reference_sample_interval: 8,
-    msb: true,
-    nn_preprocess: false,
-    rsi_byte_align: false,
+    ..SzipParams::default()
 };
 
 let samples: Vec<u64> = (0..16u64).collect();
@@ -75,7 +82,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-szip = "0.3.5"
+oxiarc-szip = "0.3.6"
 ```
 
 ## API Reference
@@ -145,8 +152,8 @@ Notable methods on `SzipParams`:
 | Method | Description |
 |--------|-------------|
 | `validate()` | Returns `Err(SzipError::InvalidParam(...))` if any field is out of range |
-| `id_len()` | Length in bits of the block option-ID field (derived from `bits_per_pixel`) |
-| `k_max()` | Maximum Golomb-Rice `k` parameter (`bpp - 2`, capped at 14) |
+| `id_len()` | Length in bits of the block option-ID field: 3 for bpp ≤ 8, 4 for bpp ≤ 16, 5 for bpp ≤ 32 (CCSDS unrestricted mode) |
+| `k_max()` | Maximum Golomb-Rice `k` parameter: `min(bpp - 2, 2^id_len - 3)` |
 | `id_no_compress()` | All-ones pattern of `id_len()` bits; signals a no-compression block |
 | `xmax()` | Maximum representable sample value `(1 << bpp) - 1` |
 | `bytes_per_sample()` | Number of output bytes per decoded sample |
@@ -155,17 +162,19 @@ Notable methods on `SzipParams`:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SzipError {
     InputTooShort    { need: usize, have: usize },
     InvalidBlockOption { id: u32, bpp: u8 },
     InvalidParam     (&'static str),
     LengthMismatch   { expected: usize, actual: usize },
     UnsupportedOption { mask: u8 },
+    SampleOutOfRange { index: usize, value: u64, max: u64 },
     UnexpectedEof    { offset: usize },
 }
 ```
 
-All variants carry structured fields so that error messages are machine-readable. The `Display` impl is derived from `thiserror`.
+All variants carry structured fields so that error messages are machine-readable. The `Display` impl is derived from `thiserror`. As of 0.3.6 the enum is `#[non_exhaustive]` (pre-1.0 API-stability freeze): `match` expressions on `SzipError` must include a wildcard arm, since new variants may be added in a semver-compatible release.
 
 ## Use in OxiArc
 
@@ -188,17 +197,24 @@ The AEC bit stream is partitioned into RSI (Reference Sample Interval) segments.
 
 | Option ID | Coding Method |
 |-----------|---------------|
-| `0` | Zero block (all samples are zero) |
-| `1 .. k_max` | Golomb-Rice with split-sample parameter `k` |
-| `id_no_compress()` | No-compression (raw samples, `bits_per_pixel` each) |
+| `0` + extension bit `0` | Zero-block run (FS-coded run length; a length of 5 means "remainder of segment") |
+| `0` + extension bit `1` | Second-extension option (sample pairs coded as one FS codeword) |
+| `1 ..= k_max() + 1` | Sample-split (Golomb-Rice) with `k = ID − 1`: FS-coded quotients for the whole block, then the grouped k-bit remainders |
+| `id_no_compress()` (all ones) | No-compression (raw samples, `bits_per_pixel` each) |
+
+When `nn_preprocess` is enabled, the first sample of each RSI is a verbatim reference sample: it is sample #0 of the RSI's first block and is read directly after that block's option ID (and after the low-entropy extension bit, where applicable). Blocks always contain `pixels_per_block` samples; a trailing partial block is padded by the encoder (repeating the last sample) and the padding is discarded by the decoder.
 
 ### NN Preprocessing
 
-When `nn_preprocess` is `true`, a unit-delay nearest-neighbour predictor is applied before entropy coding. Each sample `x[i]` is replaced by the prediction residual `x[i] - x[i-1]` (with `x[-1] = 0`), mapped to a non-negative integer via the standard CCSDS zigzag mapping. The decoder reverses this step after entropy decoding.
+When `nn_preprocess` is `true`, a unit-delay predictor is applied before entropy coding. Each non-reference sample `x[i]` is replaced by the theta-clamped mapped residual of `Δ = x[i] - x[i-1]` per CCSDS-121.0-B-2 §4 (with `θ = min(x[i-1], xmax - x[i-1])`): `2Δ` for `0 ≤ Δ ≤ θ`, `2|Δ| - 1` for `-θ ≤ Δ < 0`, and `θ + |Δ|` otherwise, which guarantees every residual fits in `bits_per_pixel` bits. The decoder reverses this step after entropy decoding. Signed-sample preprocessing (libaec's `AEC_DATA_SIGNED`) is not implemented.
 
 ### MSB / LSB Bit Ordering
 
-The `msb` flag controls whether bits are packed into bytes most-significant-first or least-significant-first. The MSB-first order is the default for CCSDS hardware and the HDF5 SZIP filter. LSB-first is available for compatibility with certain software implementations.
+The `msb` flag controls whether bits are packed into bytes most-significant-first or least-significant-first. MSB-first is the CCSDS-121 / libaec bit ordering and is required for interoperability (it is what the HDF5 SZIP filter uses). LSB-first is a crate-local extension that only round-trips with this crate.
+
+### Interoperability Verification
+
+The framing is differentially tested against libaec 1.1.4 in both directions: reference-encoded streams must decode byte-identically, and oxiarc-encoded streams must be accepted byte-identically by the reference decoder. `tests/libaec_interop.rs` embeds 17 libaec-produced fixtures (covering zero-block runs/ROS, second-extension, sample-split at several `k`, no-compression, 1/4/8/13/16/32 bpp, block sizes 8–64, multi-RSI layouts, partial trailing blocks, and `AEC_PAD_RSI` alignment) so the gate always runs; enabling the `libaec-oracle` cargo feature additionally compiles a live harness against an installed libaec and sweeps a ~2 600-case matrix (self-skips when libaec or a C compiler is absent).
 
 ## Comparison with Other Codecs
 

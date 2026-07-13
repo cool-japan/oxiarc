@@ -15,6 +15,7 @@ const JOLIET_ESCAPES: &[[u8; 3]] = &[
 ];
 
 /// Parsed volume descriptor variants.
+#[non_exhaustive]
 pub enum VolumeDescriptor {
     /// Primary Volume Descriptor (type 1).
     Primary {

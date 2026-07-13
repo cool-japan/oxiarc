@@ -2,17 +2,19 @@
 
 Pure Rust implementation of LZH (LZSS + Huffman) compression.
 
-![Version](https://img.shields.io/badge/version-0.3.5-blue)
+![Version](https://img.shields.io/badge/version-0.3.6-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.3.5** (2026-07-07) — 163 tests passing.
+**Version 0.3.6** (2026-07-13) — 188 tests passing.
 
 **What's new in 0.3.0**: 4-byte multiplicative hash for better avalanche and fewer collisions; `LzssOptimalParser` — two-pass optimal LZSS parser with Huffman-cost retraining; `LzhEncoder::with_optimal()` builder; custom dictionary support via `LzhEncoder::with_dictionary`, `LzhDecoder::with_dictionary`, `LzssEncoder::preload_dictionary`, and `LzssDecoder::preload_dictionary`.
 
 **What's new in 0.3.1**: Custom dictionary support — `LzhEncoder::with_dictionary(method, dict)` and `set_dictionary(&mut self, dict)` allow seeding the encoder with a known prefix corpus; `LzhDecoder::with_dictionary(method, size, dict)` and `set_dictionary` mirror the interface for the decoder; `LzssEncoder::preload_dictionary` and `LzssDecoder::preload_dictionary` seed hash chains and ring buffer from the dict tail, improving compression ratio when encoder and decoder share a known corpus prefix.
 
 **What's new in 0.3.5**: The `-lh4-`/`-lh5-`/`-lh6-`/`-lh7-` codec now speaks genuine canonical LHA wire format instead of the previous private, self-consistent-only bitstream — MSB-first bit order (via the new `oxiarc-core::msb_bitstream` module), corrected code-table length encoding, pt-tree zero-run handling, and position/offset encoding. Validated against 6 real third-party `.lzh` archives (`tests/data/`, sourced from the `fragglet/lhasa` corpus) and a live `lha` (Lhasa) CLI oracle behind the new opt-in `lha-oracle` feature. The streaming decoder was rewritten to match, and a `parallel` header-size bug that made real LHA tools report zero entries in parallel-built archives is fixed.
+
+**What's new in 0.3.6**: Fixed `LzssDecoder::new` panicking on a non-power-of-two or zero window size — it now rounds up to the next power of two (minimum 16), mirroring `LzssEncoder::new`'s normalization. Fixed a decompression-bomb DoS in the `-lh1-` decoder: a malformed/truncated stream paired with a large declared output size could previously loop indefinitely, fabricating zero-padding output; the bit reader now flags end-of-input exhaustion and `decode_lh1` returns an error as soon as decoding would read past the real compressed data. `#[must_use]` added to `ParallelLzhBuilder::with_num_threads`. New corrupt-input (`tests/corrupt_input.rs`: bit-flip and heavy multi-byte-corruption fuzzing) and `proptest`-based round-trip (`tests/proptest_roundtrip.rs`) test suites.
 
 ## Overview
 
@@ -23,7 +25,7 @@ This crate implements the core compression algorithm, separate from the archive 
 ## Features
 
 - **Pure Rust** - No C bindings or unsafe code
-- **Multiple methods** - lh0, lh4, lh5, lh6, lh7
+- **Multiple methods** - lh0, lh1, lh4, lh5, lh6, lh7
 - **Real LHA interoperability** - lh4/lh5/lh6/lh7 speak genuine canonical LHA wire format (MSB-first), validated against real-world `.lzh` archives and a live `lha` CLI oracle
 - **Dual Huffman trees** - Codes + Offsets
 - **Configurable window sizes** - 4KB to 64KB
@@ -45,7 +47,7 @@ let original = b"Hello, World! Hello, World!";
 let compressed = encode_lzh(original, LzhMethod::Lh5)?;
 
 // One-shot decompression
-let decompressed = decode_lzh(&compressed, LzhMethod::Lh5, original.len())?;
+let decompressed = decode_lzh(&compressed, LzhMethod::Lh5, original.len() as u64)?;
 assert_eq!(&decompressed, original);
 ```
 
@@ -54,6 +56,7 @@ assert_eq!(&decompressed, original);
 | Method | Window | Max Length | Huffman | Description |
 |--------|--------|------------|---------|-------------|
 | lh0 | - | - | None | Stored (no compression) |
+| lh1 | 4 KB | 60 | Adaptive | LZHUF (LHarc 1.x legacy format) |
 | lh4 | 4 KB | 256 | Static | Legacy, rarely used |
 | lh5 | 8 KB | 256 | Static | Most common method |
 | lh6 | 32 KB | 256 | Static | Better compression |
@@ -128,9 +131,12 @@ encoder.encode(data, &mut compressed, true)?;
 
 ```rust
 use oxiarc_lzhuf::LzhDecoder;
+use std::io::Cursor;
 
 let mut decoder = LzhDecoder::new(LzhMethod::Lh5, uncompressed_size);
-let decompressed = decoder.decode(&compressed)?;
+// `decode` takes a `Read` source, not a byte slice directly.
+let mut cursor = Cursor::new(&compressed);
+let decompressed = decoder.decode(&mut cursor)?;
 ```
 
 ### LZSS Layer
@@ -183,7 +189,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzhuf = "0.3.5"
+oxiarc-lzhuf = "0.3.6"
 ```
 
 ## Compatibility
