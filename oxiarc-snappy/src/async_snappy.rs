@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-snappy = { version = "0.3.3", features = ["async-io"] }
+//! oxiarc-snappy = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Note

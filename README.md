@@ -118,14 +118,14 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + multi-table Huffman, multi-stream decode, de-randomisation | ~3,303 | 108 |
 | `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~5,971 | 166 |
 | `oxiarc-zstd` | Zstandard (RFC 8878) with FSE + Huffman + XXHash64, dictionary support, multi-frame | ~7,336 | 208 |
-| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool, multi-chunk `.xz` | ~7,957 | 186 |
+| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool, multi-chunk `.xz` | ~7,957 | 187 |
 | `oxiarc-archive` | 13 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660) + async ZIP + archive repair | ~22,153 | 524 |
 | `oxiarc-lzw` | LZW compression (GIF/TIFF incl. TIFF 6.0 Clear Code) with MSB/LSB bitstream, streaming encoder/decoder | ~2,775 | 100 |
 | `oxiarc-brotli` | Brotli compression (RFC 7932) with the full Appendix A static dictionary, quality 0-11, streaming | ~7,153 | 219 |
 | `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~4,304 | 140 |
 | `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): encode/decode/encode_bytes, SzipParams, libaec-interoperable | ~1,902 | 47 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, man pages | ~6,897 | 92 |
-| **Total** | **Pure Rust archive/compression library** | **~90,686 code lines (317 Rust files; 336 workspace-wide incl. fuzz)** | **2,425** |
+| **Total** | **Pure Rust archive/compression library** | **~90,686 code lines (317 Rust files; 336 workspace-wide incl. fuzz)** | **2,426** |
 
 Lines are tokei Rust code lines per crate (src + tests + examples); tests are nextest tests + doctests, measured 2026-07-13.
 
@@ -308,7 +308,7 @@ Adaptive entropy coding for scientific data:
 | oxiarc-snappy   | Stable  | 35         | 140           |
 | oxiarc-szip     | Stable  | 27         | 47            |
 | oxiarc-cli      | Stable  | 45         | 92            |
-| **Total**       |         | **1,746**  | **2,425**     |
+| **Total**       |         | **1,746**  | **2,426**     |
 
 Test counts measured 2026-07-13 (nextest tests + doctests, all features, 0 failed, 0 ignored); public-API item counts are the v0.3.6 snapshot. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions. Ahead of a 1.0 release, 18 public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
 Streaming compression/decompression support in `oxiarc-deflate`:
@@ -817,7 +817,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all tests (2,288 via nextest + 137 doctests = 2,425)
+# Run all tests (2,289 via nextest + 137 doctests = 2,426)
 cargo nextest run --workspace --all-features
 cargo test --doc --workspace --all-features
 

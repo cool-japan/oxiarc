@@ -7,7 +7,7 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-08) | 195 tests passing (+6 live-oracle tests)**
+**Version: 0.3.6 (2026-07-13) | 208 tests passing**
 
 ## Overview
 

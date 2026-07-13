@@ -6,6 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["compression", "lzw", "tiff", "pure-rust", "archive"]
 categories = ["compression", "encoding"]
 description = "Pure Rust LZW compression for TIFF and GIF formats"

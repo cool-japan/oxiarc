@@ -22,6 +22,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxiarc"
+homepage = "https://github.com/cool-japan/oxiarc"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "Pure Rust archive/compression library - The Oxidized Archiver"
 keywords = ["archive", "compression", "zip", "lzh", "deflate"]

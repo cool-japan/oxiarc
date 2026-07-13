@@ -7,6 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 keywords = ["bzip2", "compression", "bwt", "huffman", "mtf"]
 categories = ["compression", "encoding"]

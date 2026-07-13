@@ -10,7 +10,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! oxiarc-brotli = { version = "0.3", features = ["async-io"] }
+//! oxiarc-brotli = { version = "0.3.6", features = ["async-io"] }
 //! ```
 //!
 //! # Memory Note

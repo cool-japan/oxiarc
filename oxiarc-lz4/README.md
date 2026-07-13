@@ -7,7 +7,7 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-08) | 140 tests passing**
+**Version: 0.3.6 (2026-07-13) | 166 tests passing**
 
 ## Overview
 
@@ -32,6 +32,9 @@ LZ4 is a lossless compression algorithm focused on compression and decompression
 - **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap working-set size
 - **Block-layer prefix dictionary** - `compress_block_with_dict` / `decompress_block_dict` free functions and `Lz4DictBlockEncoder` / `Lz4DictBlockDecoder` builders for prefix-dictionary block compression (dictionary truncated to last 64 KiB per LZ4 spec)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing, plus a dedicated dictionary round-trip suite (`tests/dict_block_roundtrip.rs`)
+- **LASTLITERALS(5) + block-independence compliance** - Encoders now honor the LZ4 end-of-block invariant (reference `lz4` previously rejected frames for common repetitive inputs); the frame decoder correctly follows the block-independence flag via a new `FrameDescriptor::with_block_independence` builder plus a rolling dictionary (`lz4 -BD` linked frames previously failed at block 2); verified byte-identical against reference `lz4 1.10.0` (fixed in 0.3.6)
+- **Decompression-bomb cap enforced mid-sequence** - `decompress_block` now checks the projected output size before every literal/match copy instead of only between sequences, closing a gap that let one crafted sequence overshoot `max_output` by up to 15,937x (fixed in 0.3.6)
+- **Reference oracle testing** - Opt-in `lz4-oracle` Cargo feature runs differential tests against the real `lz4` CLI, self-skipping cleanly when it is not on PATH (new in 0.3.6)
 
 All features are implemented and tested. API is stable. `Lz4Level` is `#[non_exhaustive]` ahead of the crate's 1.0 release (so `match` expressions need a wildcard arm), and the dictionary-builder setters (`DictBuilder`, `Lz4DictBlockEncoder`, `DictFrameDescriptor`) are now `#[must_use]` — the compiler warns if a chained call's return value is discarded.
 
