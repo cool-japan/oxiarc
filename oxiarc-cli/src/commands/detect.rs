@@ -9,7 +9,10 @@ pub fn cmd_detect(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = open_input(file)?;
 
-    let (format, magic) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`); `-` (stdin) has no
+    // extension, so it degrades to plain content detection.
+    let (format, magic) = ArchiveFormat::detect_with_path(&mut reader, file)?;
 
     // Detection still runs under --quiet (so an unreadable input errors), but
     // its informational report is suppressed.

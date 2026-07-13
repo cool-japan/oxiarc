@@ -26,4 +26,7 @@
 mod header;
 pub(crate) mod sha256;
 
-pub use header::{XzReader, XzWriter, compress, decompress};
+// `CheckType` is re-exported because it appears in the public signature of
+// [`XzWriter::with_check_type`]; without this the parameter type would be
+// reachable but unnameable by downstream crates (rustc's `unnameable_types`).
+pub use header::{CheckType, XzReader, XzWriter, compress, decompress};

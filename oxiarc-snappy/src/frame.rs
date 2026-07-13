@@ -21,7 +21,8 @@ use crate::error::SnappyError;
 use crate::pool::{PoolInner, SnappyPool};
 
 /// Stream identifier magic bytes: "sNaPpY" (0xff 0x06 0x00 0x00 0x73 0x4e 0x61 0x50 0x70 0x59)
-const STREAM_IDENTIFIER: [u8; 10] = [0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
+pub(crate) const STREAM_IDENTIFIER: [u8; 10] =
+    [0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
 
 /// OxiArc dictionary-frame skippable chunk type.
 /// Skippable chunks are 0x80..=0xFE.  We use 0xFE to identify the dict info.
@@ -31,19 +32,43 @@ const CHUNK_TYPE_OXIARC_DICT: u8 = 0xFE;
 const OXIARC_DICT_MAGIC: &[u8] = b"OXIAD";
 
 /// The "sNaPpY" body of the stream identifier (without the chunk header).
-const STREAM_BODY: [u8; 6] = [0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
+pub(crate) const STREAM_BODY: [u8; 6] = [0x73, 0x4E, 0x61, 0x50, 0x70, 0x59];
 
 /// Chunk type: compressed data
-const CHUNK_TYPE_COMPRESSED: u8 = 0x00;
+pub(crate) const CHUNK_TYPE_COMPRESSED: u8 = 0x00;
 
 /// Chunk type: uncompressed data
-const CHUNK_TYPE_UNCOMPRESSED: u8 = 0x01;
+pub(crate) const CHUNK_TYPE_UNCOMPRESSED: u8 = 0x01;
 
 /// Chunk type: stream identifier
-const CHUNK_TYPE_STREAM_ID: u8 = 0xFF;
+pub(crate) const CHUNK_TYPE_STREAM_ID: u8 = 0xFF;
 
 /// Maximum uncompressed chunk size (64 KiB).
-const MAX_UNCOMPRESSED_CHUNK_SIZE: usize = 65536;
+pub(crate) const MAX_UNCOMPRESSED_CHUNK_SIZE: usize = 65536;
+
+/// Maximum on-wire length (`chunk_len`, i.e. 4-byte checksum + payload) for a
+/// compressed or uncompressed data chunk. Per the Snappy framing format
+/// spec, a content chunk's *uncompressed* payload can never exceed
+/// [`MAX_UNCOMPRESSED_CHUNK_SIZE`]; a conformant encoder therefore never
+/// emits an uncompressed chunk larger than that, nor a compressed chunk
+/// whose compressed payload is *larger* than the uncompressed data it
+/// replaces (it would simply emit the uncompressed chunk instead). Any
+/// chunk claiming a larger on-wire length is out-of-spec/malicious and is
+/// rejected before a single byte of its payload is read.
+pub(crate) const MAX_CHUNK_WIRE_LEN: usize = MAX_UNCOMPRESSED_CHUNK_SIZE + 4;
+
+/// Default maximum total decompressed output, across every chunk, that a
+/// single [`FrameDecoder`] will produce before returning an error.
+///
+/// The per-chunk cap (`MAX_UNCOMPRESSED_CHUNK_SIZE`) prevents a single
+/// chunk from decompression-amplifying far beyond its wire size, but a
+/// stream may still contain an unbounded number of spec-compliant chunks.
+/// This secondary, overridable guard (see
+/// [`FrameDecoder::with_max_output_size`]) bounds the total memory a caller
+/// can be driven to allocate via `read_to_end` on a single decode session.
+/// 4 GiB is generous enough for legitimate large-stream use while still
+/// bounding pathological/unbounded inputs.
+pub const DEFAULT_MAX_TOTAL_OUTPUT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Snappy framed format encoder.
 ///
@@ -104,6 +129,7 @@ impl<W: Write> FrameEncoder<W> {
 
     /// Attach a progress sink that will receive `on_progress` callbacks once
     /// per encoded chunk.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -112,6 +138,7 @@ impl<W: Write> FrameEncoder<W> {
     /// Attach a cancellation token.  The token is checked before each chunk
     /// is written; if it has been cancelled the operation returns an I/O
     /// error with the message `"operation cancelled"`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -314,6 +341,11 @@ pub struct FrameDecoder<R: Read> {
     bytes_processed: u64,
     /// Optional shared memory pool for scratch buffer reuse.
     pool: Option<Arc<PoolInner>>,
+    /// Maximum total decompressed output this decoder will produce across
+    /// all chunks before returning an error. See
+    /// [`DEFAULT_MAX_TOTAL_OUTPUT_SIZE`] and
+    /// [`FrameDecoder::with_max_output_size`].
+    max_total_output: u64,
 }
 
 impl<R: Read> FrameDecoder<R> {
@@ -329,6 +361,7 @@ impl<R: Read> FrameDecoder<R> {
             cancel: None,
             bytes_processed: 0,
             pool: None,
+            max_total_output: DEFAULT_MAX_TOTAL_OUTPUT_SIZE,
         }
     }
 
@@ -343,6 +376,7 @@ impl<R: Read> FrameDecoder<R> {
 
     /// Attach a progress sink that will receive `on_progress` callbacks once
     /// per decoded chunk.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -351,8 +385,21 @@ impl<R: Read> FrameDecoder<R> {
     /// Attach a cancellation token.  The token is checked before each chunk
     /// is decoded; if it has been cancelled the operation returns an I/O
     /// error with the message `"operation cancelled"`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Override the maximum total decompressed output (summed across every
+    /// chunk) that this decoder will produce before returning an error.
+    ///
+    /// Defaults to [`DEFAULT_MAX_TOTAL_OUTPUT_SIZE`]. Pass `u64::MAX` to
+    /// effectively disable the limit for callers who intentionally decode
+    /// arbitrarily large trusted streams.
+    #[must_use]
+    pub fn with_max_output_size(mut self, max_bytes: u64) -> Self {
+        self.max_total_output = max_bytes;
         self
     }
 
@@ -411,12 +458,12 @@ impl<R: Read> FrameDecoder<R> {
         match chunk_type {
             CHUNK_TYPE_COMPRESSED => {
                 self.read_compressed_chunk(chunk_len)?;
-                self.emit_chunk_progress();
+                self.emit_chunk_progress()?;
                 Ok(true)
             }
             CHUNK_TYPE_UNCOMPRESSED => {
                 self.read_uncompressed_chunk(chunk_len)?;
-                self.emit_chunk_progress();
+                self.emit_chunk_progress()?;
                 Ok(true)
             }
             CHUNK_TYPE_STREAM_ID => {
@@ -432,23 +479,80 @@ impl<R: Read> FrameDecoder<R> {
                 ))
             }
             _ => {
-                // 0x80..=0xFE: Skippable chunk -- skip the data
-                let mut skip_buf = vec![0u8; chunk_len];
-                self.inner.read_exact(&mut skip_buf)?;
+                // 0x80..=0xFE: Skippable chunk -- discard the data.
+                //
+                // `chunk_len` is attacker-controlled and can claim up to
+                // ~16 MiB (the 3-byte length field's range) while the
+                // stream actually contains little or no data. Do NOT
+                // eagerly allocate a `chunk_len`-sized buffer before any of
+                // that data has been validated to exist; instead discard it
+                // incrementally through a small, fixed-size internal buffer
+                // via `io::copy`, and confirm the full declared length was
+                // actually present (otherwise the stream is truncated).
+                let mut limited = (&mut self.inner).take(chunk_len as u64);
+                let discarded = io::copy(&mut limited, &mut io::sink())?;
+                if discarded != chunk_len as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated skippable chunk",
+                    ));
+                }
                 Ok(true)
             }
         }
     }
 
-    /// Update `bytes_processed` with the latest chunk size and notify the
-    /// progress sink.  Called after a data chunk has been placed in
-    /// `output_buffer`.
-    fn emit_chunk_progress(&mut self) {
+    /// Reject a chunk whose (declared) output would push the cumulative
+    /// decompressed size past `self.max_total_output`.
+    ///
+    /// This is the *pre*-decode half of the total-output cap: both chunk
+    /// kinds declare their uncompressed size in a header field (the block
+    /// varint for compressed chunks, the chunk length for uncompressed
+    /// ones), so an over-budget stream is rejected before the offending
+    /// chunk's output is allocated, not after.
+    ///
+    /// # Errors
+    /// Returns [`SnappyError::TotalOutputExceeded`] (as an `InvalidData` I/O
+    /// error) when the projected total exceeds the configured maximum.
+    fn check_total_output_budget(&self, incoming: u64) -> io::Result<()> {
+        let projected = self.bytes_processed.saturating_add(incoming);
+        if projected > self.max_total_output {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                SnappyError::TotalOutputExceeded {
+                    produced: projected,
+                    max: self.max_total_output,
+                }
+                .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Update `bytes_processed` with the latest chunk size, enforce the
+    /// total-output cap, and notify the progress sink.  Called after a data
+    /// chunk has been placed in `output_buffer`.
+    ///
+    /// # Errors
+    /// Returns an error if the cumulative decompressed output exceeds
+    /// `self.max_total_output` (see [`FrameDecoder::with_max_output_size`]).
+    fn emit_chunk_progress(&mut self) -> io::Result<()> {
         let chunk_size = self.output_buffer.len() as u64;
         self.bytes_processed += chunk_size;
+        if self.bytes_processed > self.max_total_output {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                SnappyError::TotalOutputExceeded {
+                    produced: self.bytes_processed,
+                    max: self.max_total_output,
+                }
+                .to_string(),
+            ));
+        }
         if let Some(ref handle) = self.progress {
             handle.on_progress(self.bytes_processed, None);
         }
+        Ok(())
     }
 
     /// Acquire a scratch buffer for reading chunk data.
@@ -498,6 +602,24 @@ impl<R: Read> FrameDecoder<R> {
                 "compressed chunk too short for checksum",
             ));
         }
+        // Reject before reading a single byte of payload: per the Snappy
+        // framing format spec, a conformant encoder never emits a
+        // compressed chunk whose on-wire length exceeds the uncompressed
+        // data it replaces (it would emit an uncompressed chunk instead),
+        // and the uncompressed data itself can never exceed 64 KiB. A
+        // larger declared length is out-of-spec/malicious; reading it would
+        // allocate up to ~16 MiB (the 3-byte length field's range) for
+        // nothing.
+        if chunk_len > MAX_CHUNK_WIRE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                SnappyError::ChunkTooLarge {
+                    size: chunk_len,
+                    max: MAX_CHUNK_WIRE_LEN,
+                }
+                .to_string(),
+            ));
+        }
 
         let mut chunk_data = self.acquire_decoder_scratch(chunk_len);
         self.inner.read_exact(&mut chunk_data)?;
@@ -507,11 +629,37 @@ impl<R: Read> FrameDecoder<R> {
             u32::from_le_bytes([chunk_data[0], chunk_data[1], chunk_data[2], chunk_data[3]]);
 
         let compressed_data = &chunk_data[4..];
+
+        // Enforce the total-output cap *before* decoding: a Snappy block
+        // declares its exact uncompressed length in its header, so the
+        // projected total is known without decompressing anything. A bomb is
+        // rejected without its expansion ever being allocated (the after-the-
+        // fact check in `emit_chunk_progress` remains as a backstop).
+        let declared = decompress::get_decompress_len(compressed_data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.check_total_output_budget(declared as u64)?;
+
         let decompressed = decompress::decompress(compressed_data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // Return scratch buffer to pool before we replace output_buffer.
         self.release_decoder_scratch(chunk_data);
+
+        // Defense-in-depth: even though the *wire* length is bounded above,
+        // a compressed payload can still decode to far more than 64 KiB via
+        // chained back-references (the block decompressor itself only
+        // enforces the crate-wide 256 MiB cap). Enforce the framing
+        // format's actual per-chunk uncompressed cap here.
+        if decompressed.len() > MAX_UNCOMPRESSED_CHUNK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                SnappyError::ChunkTooLarge {
+                    size: decompressed.len(),
+                    max: MAX_UNCOMPRESSED_CHUNK_SIZE,
+                }
+                .to_string(),
+            ));
+        }
 
         // Verify checksum
         let computed_checksum = masked_crc32c(&decompressed);
@@ -539,6 +687,25 @@ impl<R: Read> FrameDecoder<R> {
                 "uncompressed chunk too short for checksum",
             ));
         }
+        // Reject before reading: an uncompressed chunk's payload (minus the
+        // 4-byte checksum) IS the uncompressed data, so the framing
+        // format's 64 KiB per-chunk cap applies directly to the wire
+        // length. A larger declared length is out-of-spec/malicious.
+        if chunk_len > MAX_CHUNK_WIRE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                SnappyError::ChunkTooLarge {
+                    size: chunk_len,
+                    max: MAX_CHUNK_WIRE_LEN,
+                }
+                .to_string(),
+            ));
+        }
+
+        // An uncompressed chunk's payload (minus the 4-byte checksum) IS the
+        // output, so the projected total is known from the header alone;
+        // reject over-budget input before the payload is even read.
+        self.check_total_output_budget((chunk_len - 4) as u64)?;
 
         let mut chunk_data = self.acquire_decoder_scratch(chunk_len);
         self.inner.read_exact(&mut chunk_data)?;
@@ -864,6 +1031,17 @@ pub fn decompress_frame_with_dict(input: &[u8], dict: &[u8]) -> Result<Vec<u8>, 
                         message: "compressed chunk too short for checksum".to_string(),
                     });
                 }
+                // Same wire-length bound as `FrameDecoder::read_compressed_chunk`:
+                // a conformant encoder never emits a compressed chunk larger
+                // than 64 KiB + 4 (it would fall back to an uncompressed
+                // chunk instead), so a bigger declared length is
+                // out-of-spec/malicious.
+                if chunk_body.len() > MAX_CHUNK_WIRE_LEN {
+                    return Err(SnappyError::ChunkTooLarge {
+                        size: chunk_body.len(),
+                        max: MAX_CHUNK_WIRE_LEN,
+                    });
+                }
                 let expected_checksum = u32::from_le_bytes([
                     chunk_body[0],
                     chunk_body[1],
@@ -873,6 +1051,16 @@ pub fn decompress_frame_with_dict(input: &[u8], dict: &[u8]) -> Result<Vec<u8>, 
                 let compressed_payload = &chunk_body[4..];
                 let decompressed =
                     decompress::decompress_block_with_dict(compressed_payload, dict)?;
+
+                // Defense-in-depth: reject decompression amplification
+                // beyond the framing format's 64 KiB per-chunk cap, even
+                // though the wire length above is already bounded.
+                if decompressed.len() > MAX_UNCOMPRESSED_CHUNK_SIZE {
+                    return Err(SnappyError::ChunkTooLarge {
+                        size: decompressed.len(),
+                        max: MAX_UNCOMPRESSED_CHUNK_SIZE,
+                    });
+                }
 
                 let computed_checksum = masked_crc32c(&decompressed);
                 if expected_checksum != computed_checksum {
@@ -887,6 +1075,14 @@ pub fn decompress_frame_with_dict(input: &[u8], dict: &[u8]) -> Result<Vec<u8>, 
                 if chunk_body.len() < 4 {
                     return Err(SnappyError::CorruptedData {
                         message: "uncompressed chunk too short for checksum".to_string(),
+                    });
+                }
+                // An uncompressed chunk's payload IS the uncompressed data,
+                // so the framing format's per-chunk cap applies directly.
+                if chunk_body.len() > MAX_CHUNK_WIRE_LEN {
+                    return Err(SnappyError::ChunkTooLarge {
+                        size: chunk_body.len(),
+                        max: MAX_CHUNK_WIRE_LEN,
                     });
                 }
                 let expected_checksum = u32::from_le_bytes([
@@ -1517,6 +1713,264 @@ mod tests {
         assert_eq!(
             output, data,
             "incremental max-size chunk decoder roundtrip failed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SNAPPY-01 regression tests: per-chunk / total-output amplification caps
+    // -----------------------------------------------------------------------
+
+    /// A compressed chunk's *wire* length can be small and fully
+    /// spec-compliant while its compressed payload decodes (via chained
+    /// back-references) to far more than the framing format's 64 KiB
+    /// per-chunk cap. `FrameDecoder` must reject it outright rather than
+    /// silently returning the amplified output.
+    #[test]
+    fn test_snappy01_rejects_decompression_amplification() {
+        // 200 KiB of a single repeated byte: compresses to a tiny payload
+        // but decodes to over 3x the framing format's per-chunk cap.
+        let bomb_source = vec![0xABu8; 200_000];
+        let compressed = compress::compress(&bomb_source);
+        assert!(
+            compressed.len() + 4 <= MAX_CHUNK_WIRE_LEN,
+            "test precondition: the crafted chunk's wire length ({} + 4) must itself be \
+             spec-compliant, or this isn't exercising the amplification path",
+            compressed.len()
+        );
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&STREAM_IDENTIFIER);
+        write_chunk_header(&mut stream, CHUNK_TYPE_COMPRESSED, 4 + compressed.len())
+            .expect("write chunk header");
+        let checksum = masked_crc32c(&bomb_source);
+        stream.extend_from_slice(&checksum.to_le_bytes());
+        stream.extend_from_slice(&compressed);
+
+        let mut decoder = FrameDecoder::new(&stream[..]);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+
+        assert!(
+            result.is_err(),
+            "FrameDecoder must reject a chunk that decodes beyond 64 KiB, got Ok with {} bytes",
+            output.len()
+        );
+        assert!(
+            output.len() <= MAX_UNCOMPRESSED_CHUNK_SIZE,
+            "no more than one chunk's worth of data should ever have been buffered before \
+             rejection ({} bytes buffered)",
+            output.len()
+        );
+    }
+
+    /// A chunk header that merely *declares* an out-of-spec length (beyond
+    /// `MAX_CHUNK_WIRE_LEN`) must be rejected before the declared payload is
+    /// read, even when that many bytes are actually present in the stream.
+    #[test]
+    fn test_snappy01_rejects_oversized_declared_chunk_len() {
+        let declared_len: usize = 200_000;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&STREAM_IDENTIFIER);
+        write_chunk_header(&mut stream, CHUNK_TYPE_COMPRESSED, declared_len)
+            .expect("write chunk header");
+        stream.extend(vec![0u8; declared_len]);
+
+        let mut decoder = FrameDecoder::new(&stream[..]);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+
+        assert!(
+            result.is_err(),
+            "a chunk declaring a length above the framing format's 64 KiB + 4 cap must be \
+             rejected even when the declared bytes are actually present"
+        );
+    }
+
+    /// Same as above but the stream is truncated immediately after the
+    /// chunk header (no payload bytes at all) — proves rejection is driven
+    /// purely by the declared length, without attempting to read the
+    /// (absent) payload first.
+    #[test]
+    fn test_snappy01_rejects_oversized_declared_chunk_len_no_payload() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&STREAM_IDENTIFIER);
+        write_chunk_header(&mut stream, CHUNK_TYPE_COMPRESSED, 16_000_000)
+            .expect("write chunk header");
+        // No payload bytes follow.
+
+        let mut decoder = FrameDecoder::new(&stream[..]);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+
+        assert!(
+            result.is_err(),
+            "a chunk declaring an oversized length with no payload present must still return \
+             Err quickly, not hang or attempt to read nonexistent data"
+        );
+    }
+
+    /// A skippable chunk (`0x80..=0xFE`) that claims far more data than is
+    /// actually present must be rejected via the bounded, incremental
+    /// discard path — not by eagerly allocating a `chunk_len`-sized buffer
+    /// before checking whether that data exists.
+    #[test]
+    fn test_snappy01_skippable_chunk_truncated_rejected() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&STREAM_IDENTIFIER);
+        // Chunk type 0x80 (skippable), declares far more data than follows.
+        write_chunk_header(&mut stream, 0x80, 5_000_000).expect("write chunk header");
+        stream.extend_from_slice(&[0u8; 16]); // far short of the declared length
+
+        let mut decoder = FrameDecoder::new(&stream[..]);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+
+        assert!(
+            result.is_err(),
+            "a truncated skippable chunk must return Err, not panic or silently succeed"
+        );
+    }
+
+    /// A large but fully-present skippable chunk must still be correctly
+    /// discarded (proves the incremental `io::copy`-based path is
+    /// functionally correct, not just fail-safe), and decoding must
+    /// continue correctly with the data chunk that follows it.
+    #[test]
+    fn test_snappy01_skippable_chunk_large_but_present_is_skipped() {
+        let payload = b"data after a large skippable chunk";
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&STREAM_IDENTIFIER);
+
+        // A fully-present 100,000-byte skippable chunk (type 0x80).
+        let skip_data = vec![0x99u8; 100_000];
+        write_chunk_header(&mut stream, 0x80, skip_data.len()).expect("write chunk header");
+        stream.extend_from_slice(&skip_data);
+
+        // Followed by a normal uncompressed data chunk.
+        let checksum = masked_crc32c(payload);
+        write_chunk_header(&mut stream, CHUNK_TYPE_UNCOMPRESSED, 4 + payload.len())
+            .expect("write chunk header");
+        stream.extend_from_slice(&checksum.to_le_bytes());
+        stream.extend_from_slice(payload);
+
+        let mut decoder = FrameDecoder::new(&stream[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("skippable chunk followed by a valid data chunk should decode successfully");
+
+        assert_eq!(output, payload);
+    }
+
+    /// `FrameDecoder::with_max_output_size` bounds cumulative decompressed
+    /// output across every chunk, independent of the (already-enforced)
+    /// per-chunk cap.
+    #[test]
+    fn test_snappy01_total_output_cap_enforced() {
+        let chunk_payload = vec![0x11u8; 1000];
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder
+                .write_all(&chunk_payload)
+                .expect("write should succeed");
+            encoder
+                .write_all(&chunk_payload)
+                .expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        // Cap far below the total (2000) decompressed bytes.
+        let mut decoder = FrameDecoder::new(&compressed[..]).with_max_output_size(500);
+        let mut output = Vec::new();
+        let result = decoder.read_to_end(&mut output);
+
+        assert!(
+            result.is_err(),
+            "decoding must fail once cumulative output exceeds the configured max_output_size"
+        );
+    }
+
+    /// A `max_output_size` set generously above the actual total must not
+    /// interfere with a normal round-trip.
+    #[test]
+    fn test_snappy01_total_output_cap_generous_limit_unaffected() {
+        let data = vec![0x22u8; 10_000];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        let mut decoder = FrameDecoder::new(&compressed[..]).with_max_output_size(1_000_000);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("read should succeed under a generous cap");
+        assert_eq!(output, data);
+    }
+
+    /// After enforcing the per-chunk and total-output caps, a completely
+    /// ordinary multi-chunk round-trip (spanning the 64 KiB chunk boundary)
+    /// must still work exactly as before.
+    #[test]
+    fn test_snappy01_normal_roundtrip_unaffected() {
+        let data: Vec<u8> = (0..150_000u32).map(|i| (i % 250) as u8).collect();
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = FrameEncoder::new(&mut compressed);
+            encoder.write_all(&data).expect("write should succeed");
+            encoder.finish().expect("finish should succeed");
+        }
+
+        let mut decoder = FrameDecoder::new(&compressed[..]);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("legitimate multi-chunk stream must still decode after SNAPPY-01 hardening");
+        assert_eq!(output, data);
+    }
+
+    /// SNAPPY-01 applies equally to the dict-frame path: a wire-compliant
+    /// compressed chunk that decodes beyond 64 KiB must be rejected by
+    /// `decompress_frame_with_dict`.
+    #[test]
+    fn test_snappy01_decompress_frame_with_dict_rejects_amplification() {
+        let dict = b"a small shared dictionary";
+        let bomb_source = vec![0x37u8; 200_000];
+        let compressed = crate::compress::compress_block_with_dict(&bomb_source, dict);
+        assert!(
+            compressed.len() + 4 <= MAX_CHUNK_WIRE_LEN,
+            "test precondition: the crafted chunk's wire length must itself be spec-compliant"
+        );
+
+        let mut frame_bytes = Vec::new();
+        frame_bytes.extend_from_slice(&STREAM_IDENTIFIER);
+
+        let dict_crc = crc32c(dict);
+        let mut dict_body = Vec::new();
+        dict_body.extend_from_slice(OXIARC_DICT_MAGIC);
+        dict_body.extend_from_slice(&dict_crc.to_le_bytes());
+        dict_body.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+        write_chunk_header_vec(&mut frame_bytes, CHUNK_TYPE_OXIARC_DICT, dict_body.len());
+        frame_bytes.extend_from_slice(&dict_body);
+
+        let checksum = masked_crc32c(&bomb_source);
+        write_chunk_header_vec(
+            &mut frame_bytes,
+            CHUNK_TYPE_COMPRESSED,
+            4 + compressed.len(),
+        );
+        frame_bytes.extend_from_slice(&checksum.to_le_bytes());
+        frame_bytes.extend_from_slice(&compressed);
+
+        let result = decompress_frame_with_dict(&frame_bytes, dict);
+        assert!(
+            result.is_err(),
+            "decompress_frame_with_dict must reject a chunk that decodes beyond 64 KiB"
         );
     }
 }

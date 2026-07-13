@@ -6,10 +6,18 @@
 //! zero-run coding in bijective base 2, 2-6 Huffman tables with MTF-coded
 //! selectors every 50 symbols, and an end-of-block symbol at
 //! `alphabet_size - 1` where `alphabet_size = used_symbols + 2`.
+//!
+//! Multi-stream (concatenated) files — as produced by `pbzip2`, `lbzip2`,
+//! or plain `cat a.bz2 b.bz2` — are decoded in full: after each
+//! end-of-stream marker the decoder probes for a following `BZh<1-9>`
+//! header and continues transparently, exactly like `bzip2 -d`. Trailing
+//! bytes that are not a valid stream header are an error, never silently
+//! dropped. Legacy randomised blocks (bzip2 <= 0.9.0) are de-randomised
+//! with libbz2's `BZ2_rNums` schedule (`src/rand.rs`).
 
 use crate::bitio::MsbBitReader;
 use crate::crc::Bz2Crc;
-use crate::{BZIP2_MAGIC, bwt, huffman, rle};
+use crate::{BZIP2_MAGIC, bwt, huffman, rand, rle};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
@@ -86,18 +94,27 @@ impl<R: Read> BzDecoder<R> {
     /// The sink's `on_progress(cumulative_decompressed_bytes, None)` is
     /// called once per decoded block. `on_finish()` is invoked when the
     /// end-of-stream marker is processed.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before each block is read.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
     }
 
     /// Read and decode the next block.
+    ///
+    /// Blocks from concatenated streams (`cat a.bz2 b.bz2`, pbzip2/lbzip2
+    /// output) are delivered transparently: at each end-of-stream marker
+    /// the combined CRC is verified and the decoder probes for another
+    /// `BZh<1-9>` header, continuing with the next stream if one follows.
+    /// `Ok(None)` therefore means the whole input is exhausted. Trailing
+    /// bytes that do not start a valid stream header are an error.
     pub fn read_block(&mut self) -> Result<Option<Vec<u8>>> {
         if self.finished {
             return Ok(None);
@@ -108,33 +125,79 @@ impl<R: Read> BzDecoder<R> {
             token.check()?;
         }
 
-        // Read block / end-of-stream marker (48 bits).
-        let magic = self.reader.read_bits_u64(48)?;
-        if magic == EOS_MAGIC_BITS {
-            // Stream CRC combines all block CRCs.
+        // Loop across stream boundaries: an end-of-stream marker followed
+        // by a concatenated stream continues with that stream's blocks.
+        loop {
+            // Read block / end-of-stream marker (48 bits).
+            let magic = self.reader.read_bits_u64(48)?;
+            if magic == BLOCK_MAGIC_BITS {
+                return self.decode_block_body().map(Some);
+            }
+            if magic != EOS_MAGIC_BITS {
+                return Err(OxiArcError::invalid_header("Invalid block header"));
+            }
+
+            // Stream CRC combines all block CRCs of this stream.
             let stored_crc = self.reader.read_bits(32)?;
             if stored_crc != self.combined_crc {
                 return Err(OxiArcError::crc_mismatch(stored_crc, self.combined_crc));
             }
-            self.finished = true;
-            if let Some(ref handle) = self.progress {
-                handle.on_finish();
+
+            // Probe for a concatenated follow-up stream; on clean end of
+            // input the decode is complete.
+            if !self.begin_next_stream()? {
+                self.finished = true;
+                if let Some(ref handle) = self.progress {
+                    handle.on_finish();
+                }
+                return Ok(None);
             }
-            return Ok(None);
         }
-        if magic != BLOCK_MAGIC_BITS {
-            return Err(OxiArcError::invalid_header("Invalid block header"));
-        }
+    }
 
-        let block_crc = self.reader.read_bits(32)?;
-
-        // Randomised blocks (deprecated since bzip2 0.9.5) are not produced
-        // by any modern encoder; reject them explicitly.
-        if self.reader.read_bits(1)? != 0 {
-            return Err(OxiArcError::unsupported_method(
-                "randomised BZip2 block (deprecated format)",
+    /// After an end-of-stream marker, check whether another concatenated
+    /// bzip2 stream follows.
+    ///
+    /// Streams are zero-padded to whole bytes, so the reader is realigned
+    /// first. Returns `Ok(false)` on clean end of input. If any bytes
+    /// follow they must form a `BZh<1-9>` stream header; anything else is
+    /// reported as corruption rather than silently ignored.
+    fn begin_next_stream(&mut self) -> Result<bool> {
+        self.reader.align_to_byte();
+        let Some(first) = self.reader.try_read_aligned_byte()? else {
+            return Ok(false);
+        };
+        let rest = [
+            self.reader.read_bits(8)? as u8,
+            self.reader.read_bits(8)? as u8,
+            self.reader.read_bits(8)? as u8,
+        ];
+        if first != BZIP2_MAGIC[0] || rest[0] != BZIP2_MAGIC[1] || rest[1] != b'h' {
+            return Err(OxiArcError::corrupted(
+                0,
+                "trailing data after BZip2 end-of-stream is not a concatenated stream",
             ));
         }
+        let level = rest[2].wrapping_sub(b'0');
+        if !(1..=9).contains(&level) {
+            return Err(OxiArcError::invalid_header(
+                "Invalid block size in concatenated BZip2 stream",
+            ));
+        }
+        // Each stream carries its own block size and combined CRC.
+        self.block_size = level as usize * 100_000;
+        self.combined_crc = 0;
+        Ok(true)
+    }
+
+    /// Decode one block after its 48-bit block magic has been consumed.
+    fn decode_block_body(&mut self) -> Result<Vec<u8>> {
+        let block_crc = self.reader.read_bits(32)?;
+
+        // Randomised blocks (deprecated since bzip2 0.9.5, produced only by
+        // bzip2 <= 0.9.0) need a de-randomisation pass after the inverse
+        // BWT; libbz2 still decodes them and so do we.
+        let randomised = self.reader.read_bits(1)? != 0;
 
         let orig_ptr = self.reader.read_bits(24)? as usize;
 
@@ -288,8 +351,12 @@ impl<R: Read> BzDecoder<R> {
             ));
         }
 
-        // Inverse BWT, then undo the initial run-length encoding.
-        let rle1_data = bwt::inverse_transform(&bwt_data, orig_ptr as u32);
+        // Inverse BWT, undo the legacy randomisation if the block used it,
+        // then undo the initial run-length encoding.
+        let mut rle1_data = bwt::inverse_transform(&bwt_data, orig_ptr as u32);
+        if randomised {
+            rand::derandomise(&mut rle1_data);
+        }
         let data = rle::rle1_decode(&rle1_data)?;
 
         // Verify the block CRC (bzip2-specific CRC-32).
@@ -309,16 +376,33 @@ impl<R: Read> BzDecoder<R> {
             handle.on_progress(self.bytes_processed, None);
         }
 
-        Ok(Some(data))
+        Ok(data)
     }
 
-    /// Get the block size.
+    /// Get the block size of the stream currently being decoded.
+    ///
+    /// Concatenated streams each carry their own level digit, so this
+    /// value can change after a stream boundary is crossed.
     pub fn block_size(&self) -> usize {
         self.block_size
     }
 }
 
 /// Decompress BZip2 data.
+///
+/// Concatenated multi-stream input (pbzip2/lbzip2 output, `cat a.bz2
+/// b.bz2`) is decoded in full, matching `bzip2 -d`. Trailing bytes that do
+/// not form another bzip2 stream are an error.
+///
+/// # Memory characteristics
+///
+/// The whole decompressed payload is accumulated in one `Vec<u8>`. A
+/// single block expands to at most ~46 MiB (900 kB of RLE1 data at the
+/// maximum 255x run expansion), but a crafted file may contain arbitrarily
+/// many blocks, so the total output — and therefore the allocation — is
+/// unbounded. When decoding untrusted input, use
+/// [`decompress_with_limit`] to cap the output size, or drive
+/// [`BzDecoder::read_block`] directly for streaming consumption.
 ///
 /// # Example
 ///
@@ -335,6 +419,48 @@ pub fn decompress<R: Read>(reader: R) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
     while let Some(block) = decoder.read_block()? {
+        output.extend_from_slice(&block);
+    }
+
+    Ok(output)
+}
+
+/// Decompress BZip2 data with an output-size limit.
+///
+/// Behaves like [`decompress`] (including multi-stream support) but returns
+/// [`OxiArcError::MemoryBudgetExceeded`] as soon as the accumulated output
+/// would exceed `max_out` bytes — the decompression-bomb guard for
+/// untrusted input.
+///
+/// # Memory characteristics
+///
+/// Peak memory is bounded by `max_out` plus one decoded block (a block
+/// expands to at most ~46 MiB): the limit is enforced *before* each block
+/// is appended to the output, so a bomb is rejected without ever
+/// materialising the oversized result.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_bzip2::{compress, decompress_with_limit, CompressionLevel};
+///
+/// let data = vec![0u8; 100_000];
+/// let compressed = compress(&data, CompressionLevel::new(9)).expect("compress");
+/// // Generous limit: succeeds.
+/// let ok = decompress_with_limit(&compressed[..], 1 << 20).expect("decompress");
+/// assert_eq!(ok, data);
+/// // Tight limit: rejected instead of allocating 100 kB.
+/// assert!(decompress_with_limit(&compressed[..], 1024).is_err());
+/// ```
+pub fn decompress_with_limit<R: Read>(reader: R, max_out: usize) -> Result<Vec<u8>> {
+    let mut decoder = BzDecoder::new(reader)?;
+    let mut output = Vec::new();
+
+    while let Some(block) = decoder.read_block()? {
+        let projected = output.len().saturating_add(block.len());
+        if projected > max_out {
+            return Err(OxiArcError::memory_budget_exceeded(max_out, projected));
+        }
         output.extend_from_slice(&block);
     }
 
@@ -439,6 +565,77 @@ mod tests {
         assert_eq!(output, original);
         assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
         assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn decodes_randomised_blocks_roundtrip() {
+        // The randomised test encoder applies libbz2's legacy XOR schedule
+        // and sets the block's randomised bit; the decoder must undo it.
+        use crate::CompressionLevel;
+        let data = b"repetitive repetitive repetitive!\n".repeat(64);
+        let stream = crate::encode::compress_randomised_for_tests(&data, CompressionLevel::new(1))
+            .expect("build randomised stream");
+        let decoded = decompress(&stream[..]).expect("decode randomised stream");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn randomised_fixture_matches_generator() {
+        // Pins the committed fixture (verified byte-identical via
+        // `bzip2 -d` at development time, re-checked by the bzip2-oracle
+        // suite) to the in-tree generator so its provenance stays
+        // auditable. If this drifts, re-verify against `bzip2 -d` before
+        // re-blessing tests/data/randomised_rep_l1.bz2.
+        use crate::CompressionLevel;
+        let data = b"repetitive repetitive repetitive!\n".repeat(64);
+        let stream = crate::encode::compress_randomised_for_tests(&data, CompressionLevel::new(1))
+            .expect("build randomised stream");
+        assert_eq!(
+            stream,
+            include_bytes!("../tests/data/randomised_rep_l1.bz2"),
+            "randomised fixture drifted from its generator"
+        );
+    }
+
+    #[test]
+    fn decodes_concatenated_own_streams() {
+        use crate::{CompressionLevel, compress};
+        let first = b"stream one payload".repeat(20);
+        let second = b"stream TWO payload, different level".repeat(15);
+        let mut cat = compress(&first, CompressionLevel::new(9)).expect("compress first");
+        cat.extend_from_slice(
+            &compress(&second, CompressionLevel::new(1)).expect("compress second"),
+        );
+
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        let decoded = decompress(&cat[..]).expect("decode concatenated streams");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn trailing_garbage_after_stream_is_error() {
+        use crate::{CompressionLevel, compress};
+        let mut stream =
+            compress(b"payload before garbage", CompressionLevel::new(1)).expect("compress");
+        stream.extend_from_slice(b"NOT A BZIP2 STREAM");
+        assert!(
+            decompress(&stream[..]).is_err(),
+            "trailing non-stream bytes must not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn decompress_with_limit_enforces_cap() {
+        use crate::{CompressionLevel, compress};
+        let data = vec![0x5Au8; 50_000];
+        let compressed = compress(&data, CompressionLevel::new(1)).expect("compress");
+
+        let ok = decompress_with_limit(&compressed[..], data.len()).expect("within limit");
+        assert_eq!(ok, data);
+
+        let err = decompress_with_limit(&compressed[..], data.len() - 1);
+        assert!(matches!(err, Err(OxiArcError::MemoryBudgetExceeded { .. })));
     }
 
     #[test]

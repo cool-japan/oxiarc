@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// LZH compression level for writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum LzhCompressionLevel {
     /// Store without compression (lh0).
     Store,
@@ -74,6 +75,7 @@ impl<W: Write> LzhWriter<W> {
 
     /// Set the header level for subsequent entries.
     /// Panics if `level > 3` (programmer error).
+    #[must_use]
     pub fn with_header_level(mut self, level: u8) -> Self {
         assert!(level <= 3, "LZH header level must be 0, 1, 2, or 3");
         self.header_level = level;
@@ -81,6 +83,7 @@ impl<W: Write> LzhWriter<W> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self

@@ -105,9 +105,18 @@ mod tests {
     use crate::lzh::{LzhCompressionLevel, LzhWriter};
 
     /// Build an LZH archive in a temp file and return the path.
-    fn build_test_lzh() -> (std::path::PathBuf, Vec<(&'static str, &'static [u8])>) {
+    ///
+    /// `tag` must be unique per test (use the test-fn name): the default
+    /// test runner executes these `#[tokio::test]`s in parallel, and a
+    /// path shared across tests that each delete it races into
+    /// intermittent `NotFound` failures.
+    fn build_test_lzh(tag: &str) -> (std::path::PathBuf, Vec<(&'static str, &'static [u8])>) {
         let mut dir = std::env::temp_dir();
-        dir.push(format!("oxiarc_async_lzh_test_{}.lzh", std::process::id()));
+        dir.push(format!(
+            "oxiarc_async_lzh_test_{}_{}.lzh",
+            std::process::id(),
+            tag
+        ));
         let files: Vec<(&str, &[u8])> = vec![
             ("alpha.txt", b"Hello, async LZH!"),
             ("beta.txt", b"Another LZH entry."),
@@ -127,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_lzh_entries_async() {
-        let (path, expected_files) = build_test_lzh();
+        let (path, expected_files) = build_test_lzh("entries");
 
         let entries = read_lzh_entries_async(&path)
             .await
@@ -144,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_lzh_entry_async() {
-        let (path, expected_files) = build_test_lzh();
+        let (path, expected_files) = build_test_lzh("entry");
 
         for (i, (_name, data)) in expected_files.iter().enumerate() {
             let content = read_lzh_entry_async(&path, i)
@@ -158,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_lzh_entry_async_out_of_bounds() {
-        let (path, _) = build_test_lzh();
+        let (path, _) = build_test_lzh("out_of_bounds");
 
         let result = read_lzh_entry_async(&path, 999).await;
         let _ = std::fs::remove_file(&path);

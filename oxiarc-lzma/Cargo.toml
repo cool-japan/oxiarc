@@ -20,6 +20,13 @@ default = []
 # Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for Lzma2Encoder/Lzma2Decoder
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 parallel = ["dep:rayon"]
+# Differential interop tests (tests/xz_interop.rs) that shell out to the real
+# `xz` CLI in BOTH directions (xz-compress -> oxiarc-decode byte-identical,
+# oxiarc-compress -> xz-decode byte-identical). Tests self-skip (with a note,
+# not a failure) when `xz` is absent from PATH. Mirrors the `lha-oracle`
+# pattern in `oxiarc-lzhuf`. Hermetic xz-produced fixtures under `tests/data/`
+# always run regardless of this feature.
+xz-oracle = []
 
 [dependencies]
 oxiarc-core.workspace = true

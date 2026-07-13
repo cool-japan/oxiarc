@@ -30,6 +30,10 @@ harness = false
 [features]
 default = []
 parallel = ["rayon"]
+# Enables differential interop tests that shell out to the reference `lz4` CLI.
+# The tests self-skip when the binary is not on PATH, so enabling this feature
+# is always safe; without it the interop tests are compiled out entirely.
+lz4-oracle = []
 
 [lints]
 workspace = true

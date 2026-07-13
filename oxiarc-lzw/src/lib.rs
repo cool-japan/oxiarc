@@ -12,12 +12,15 @@
 //!
 //! ## TIFF LZW Specification
 //!
-//! TIFF uses a specific variant of LZW compression:
+//! TIFF uses a specific variant of LZW compression (TIFF 6.0 §13,
+//! libtiff/Pillow/GDAL-compatible):
 //!
 //! - **MSB-first bit order**: Bits are packed from most significant to least
 //! - **9-12 bit codes**: Variable-length codes starting at 9 bits
 //! - **Early code change**: Bit width increases one code earlier than standard
-//! - **No clear codes**: TIFF doesn't use clear codes in the stream
+//! - **Clear codes**: Every strip begins with code 256 (ClearCode); the
+//!   encoder emits another ClearCode and resets the table when it reaches
+//!   entry 4094, and the decoder accepts ClearCode resets anywhere
 //! - **EOI termination**: Streams end with code 257 (End of Information)
 //!
 //! ## Example

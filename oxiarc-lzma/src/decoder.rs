@@ -105,7 +105,19 @@ impl<R: Read> LzmaDecoder<R> {
     /// is grown lazily (one byte at a time as output is produced) up to `dict_size` as
     /// data is actually decoded, rather than eagerly zero-filled at the
     /// declared maximum.
+    ///
+    /// Also returns an error if `props` is outside the LZMA format limits
+    /// (`lc <= 8`, `lp <= 4`, `pb <= 4`). Properties from
+    /// [`LzmaProperties::new`] / [`LzmaProperties::from_byte`] are always in
+    /// range; a struct-literal-built value may not be, and decoding with such
+    /// a value would previously attempt an unbounded model allocation.
     pub fn new(reader: R, props: LzmaProperties, dict_size: u32) -> Result<Self> {
+        if !props.is_valid() {
+            return Err(OxiArcError::invalid_header(format!(
+                "Invalid LZMA properties: lc={} lp={} pb={} (limits: lc<=8, lp<=4, pb<=4)",
+                props.lc, props.lp, props.pb
+            )));
+        }
         let dict_size = dict_size.max(4096);
         if dict_size > DICT_SIZE_ALLOC_CAP {
             return Err(OxiArcError::corrupted(
@@ -178,6 +190,7 @@ impl<R: Read> LzmaDecoder<R> {
     /// Attach a progress sink; called for every ~4096 bytes decompressed.
     ///
     /// The `on_progress` callback receives `(bytes_produced, uncompressed_size_if_known)`.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -186,6 +199,7 @@ impl<R: Read> LzmaDecoder<R> {
     /// Attach a cancellation token; checked every ~4096 bytes decompressed.
     ///
     /// If the token is cancelled the decoder returns `Err(OxiArcError::Cancelled)`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -355,14 +369,33 @@ impl<R: Read> LzmaDecoder<R> {
         Ok(dist)
     }
 
-    /// Get byte from dictionary at distance.
-    fn get_byte(&self, dist: usize) -> u8 {
+    /// Get byte from dictionary at distance `dist` (0-based: `dist == 0` is the
+    /// most recently written byte).
+    ///
+    /// A back-reference is only valid when the referenced byte is still present
+    /// in the sliding dictionary window. That window holds
+    /// `min(bytes_decoded, dict_size)` bytes, so a valid `dist` must be strictly
+    /// less than that bound. A malformed LZMA1 stream can encode a match/rep
+    /// distance that points before the start of the produced output or beyond
+    /// the dictionary size; such a distance would underflow the ring-buffer
+    /// index computation below (`dict_size - (dist - dict_pos) - 1`) and either
+    /// panic on the subtraction or read an unrelated/overwritten byte. We reject
+    /// it here with a corrupted-data error so no out-of-range `dist` can ever
+    /// reach `self.dict[pos]`.
+    fn get_byte(&self, dist: usize) -> Result<u8> {
+        let available = self.bytes_decoded.min(self.dict_size as u64) as usize;
+        if dist >= available {
+            return Err(OxiArcError::corrupted(
+                self.bytes_decoded,
+                "LZMA match distance exceeds available dictionary history",
+            ));
+        }
         let pos = if self.dict_pos > dist {
             self.dict_pos - dist - 1
         } else {
             self.dict_size - (dist - self.dict_pos) - 1
         };
-        self.dict[pos]
+        Ok(self.dict[pos])
     }
 
     /// Write a decoded byte into the (lazily-grown) circular dictionary
@@ -415,12 +448,12 @@ impl<R: Read> LzmaDecoder<R> {
                 let prev_byte = if self.bytes_decoded == 0 {
                     0
                 } else {
-                    self.get_byte(0)
+                    self.get_byte(0)?
                 };
 
                 let match_byte =
                     if !self.state.is_literal() && self.rep[0] < self.bytes_decoded as u32 {
-                        self.get_byte(self.rep[0] as usize)
+                        self.get_byte(self.rep[0] as usize)?
                     } else {
                         0
                     };
@@ -482,7 +515,7 @@ impl<R: Read> LzmaDecoder<R> {
                                 ));
                             }
 
-                            let byte = self.get_byte(dist as usize);
+                            let byte = self.get_byte(dist as usize)?;
                             self.push_dict_byte(byte);
                             output.push(byte);
                             self.bytes_decoded += 1;
@@ -539,7 +572,7 @@ impl<R: Read> LzmaDecoder<R> {
                 // Copy from dictionary
                 let len = len as usize;
                 for _ in 0..len {
-                    let byte = self.get_byte(dist as usize);
+                    let byte = self.get_byte(dist as usize)?;
                     self.push_dict_byte(byte);
                     output.push(byte);
                     self.bytes_decoded += 1;
@@ -600,5 +633,20 @@ mod tests {
         assert_eq!(decoded.lc, 3);
         assert_eq!(decoded.lp, 0);
         assert_eq!(decoded.pb, 2);
+    }
+
+    /// LZMA-03 regression: out-of-range struct-literal-built properties must
+    /// be rejected with `Err` instead of aborting the process on a huge
+    /// literal-model allocation.
+    #[test]
+    fn test_decoder_rejects_invalid_struct_literal_props() {
+        let props = LzmaProperties {
+            lc: 20,
+            lp: 20,
+            pb: 4,
+        };
+        let data = vec![0u8; 16];
+        let result = LzmaDecoder::new(Cursor::new(data), props, 4096);
+        assert!(result.is_err(), "invalid props must be rejected");
     }
 }

@@ -106,6 +106,7 @@ impl StreamHistory {
 /// Coarse state of the streaming decoder (exposed via
 /// [`StreamingLzhDecoder::phase`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecoderPhase {
     /// Initial state, ready to start a new block.
     Ready,
@@ -234,6 +235,7 @@ impl StreamingLzhDecoder {
     ///
     /// The sink is called with `on_progress(bytes_decoded, Some(uncompressed_size))`
     /// at each block boundary during decoding.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -342,8 +344,23 @@ impl StreamingLzhDecoder {
                     Some(true) => self.phase = DecoderPhase::DecodeBlock,
                     Some(false) => {
                         // A 16-bit command count of 0 marks end-of-stream.
-                        self.phase = DecoderPhase::Done;
-                        return Ok(DecompressStatus::Done);
+                        // Reaching it here means the target size has not
+                        // been produced yet (a completed decode returns
+                        // `Done` at the top of the loop before reading
+                        // another header), so the stream is short: refuse
+                        // rather than return truncated data, mirroring the
+                        // serial lh4-7 decoder's exhaustion guard.
+                        if self.bytes_decoded >= self.uncompressed_size {
+                            self.phase = DecoderPhase::Done;
+                            return Ok(DecompressStatus::Done);
+                        }
+                        self.phase = DecoderPhase::Error;
+                        let msg = format!(
+                            "lzh streaming: end-of-stream marker after {} of {} bytes",
+                            self.bytes_decoded, self.uncompressed_size
+                        );
+                        self.last_error = Some(msg.clone());
+                        return Err(OxiArcError::corrupted(0, msg));
                     }
                     None => {
                         self.bit_reader.restore_state(checkpoint);
@@ -600,7 +617,14 @@ pub fn decode_lzh_streaming(
     uncompressed_size: u64,
 ) -> Result<Vec<u8>> {
     let mut decoder = StreamingLzhDecoder::new(method, uncompressed_size);
-    let mut output = Vec::with_capacity(uncompressed_size as usize);
+    // `uncompressed_size` is header-supplied and therefore untrusted: cap
+    // the up-front reservation and let the vector grow as bytes are
+    // actually produced, so a bogus multi-GiB claim cannot pre-commit the
+    // allocation.
+    let prealloc = usize::try_from(uncompressed_size)
+        .unwrap_or(usize::MAX)
+        .min(1 << 20);
+    let mut output = Vec::with_capacity(prealloc);
     let mut input_pos = 0usize;
     let mut buffer = vec![0u8; 65536];
 
@@ -612,13 +636,34 @@ pub fn decode_lzh_streaming(
         match status {
             DecompressStatus::Done => break,
             _ => {
-                // No input consumed and no output produced means the stream is
-                // exhausted/truncated — stop rather than spin.
+                // No input consumed and no output produced means the stream
+                // is exhausted before the target size was reached: refuse
+                // rather than return silently truncated data (mirrors the
+                // serial lh4-7 decoder's exhaustion guard, LZHUF-01).
                 if consumed == 0 && produced == 0 {
-                    break;
+                    return Err(OxiArcError::corrupted(
+                        input_pos as u64,
+                        format!(
+                            "lzh streaming: compressed stream exhausted after {} of {} bytes",
+                            output.len(),
+                            uncompressed_size
+                        ),
+                    ));
                 }
             }
         }
+    }
+
+    // Belt-and-braces: `Done` must coincide with exactly the target size.
+    if output.len() as u64 != uncompressed_size {
+        return Err(OxiArcError::corrupted(
+            input_pos as u64,
+            format!(
+                "lzh streaming: produced {} bytes, expected {}",
+                output.len(),
+                uncompressed_size
+            ),
+        ));
     }
 
     Ok(output)
@@ -698,6 +743,7 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
     }
 
     /// Attach a progress sink (see [`StreamingLzhDecoder::with_progress`]).
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.decoder = self.decoder.with_progress(handle);
         self
@@ -776,8 +822,24 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
                 if self.reader_eof {
                     // Flush any bits still buffered inside the decoder.
                     let status = self.drive_once(&mut out_scratch)?;
-                    if matches!(status, DecompressStatus::Done) || self.output_buf.is_empty() {
+                    if matches!(status, DecompressStatus::Done) {
                         self.finished = true;
+                    } else if self.output_buf.is_empty() {
+                        if self.decoder.is_finished() {
+                            self.finished = true;
+                        } else {
+                            // Source exhausted before the decoder reached
+                            // its target size: surface truncation as an
+                            // error instead of a silently short `Ok` read.
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "lzh stream truncated: {} of {} bytes decoded",
+                                    self.decoder.bytes_decoded(),
+                                    self.decoder.uncompressed_size()
+                                ),
+                            ));
+                        }
                     }
                     return Ok(!self.output_buf.is_empty());
                 }
@@ -997,6 +1059,106 @@ mod tests {
         }
 
         assert_eq!(output, data);
+    }
+
+    /// Truncation guard (LZHUF-01 follow-up): `decode_lzh_streaming` must
+    /// return `Err` — never a short `Ok` — when an lh5 stream is truncated
+    /// at any byte offset.
+    #[test]
+    fn test_decode_lzh_streaming_truncated_lh5_is_error() {
+        use crate::encode::LzhEncoder;
+
+        let original: Vec<u8> = b"streaming truncation guard "
+            .iter()
+            .cycle()
+            .take(4000)
+            .copied()
+            .collect();
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+        let compressed = encoder
+            .compress_to_vec(&original)
+            .expect("compression failed");
+        assert!(compressed.len() > 8, "fixture too small to truncate");
+
+        // Sweep truncation points, including deep cuts near the end.
+        let cuts = [
+            0usize,
+            1,
+            2,
+            compressed.len() / 4,
+            compressed.len() / 2,
+            compressed.len() - 2,
+            compressed.len() - 1,
+        ];
+        for &cut in &cuts {
+            let result =
+                decode_lzh_streaming(&compressed[..cut], LzhMethod::Lh5, original.len() as u64);
+            match result {
+                Err(_) => {}
+                Ok(out) => panic!(
+                    "truncation to {cut}/{} bytes must not return Ok ({} bytes produced)",
+                    compressed.len(),
+                    out.len()
+                ),
+            }
+        }
+
+        // The untruncated stream still decodes exactly.
+        let full = decode_lzh_streaming(&compressed, LzhMethod::Lh5, original.len() as u64)
+            .expect("full stream decode");
+        assert_eq!(full, original);
+    }
+
+    /// Truncated stored (`-lh0-`) input must also be an error.
+    #[test]
+    fn test_decode_lzh_streaming_truncated_stored_is_error() {
+        let data = b"stored payload for truncation";
+        let result = decode_lzh_streaming(&data[..10], LzhMethod::Lh0, data.len() as u64);
+        assert!(result.is_err(), "short stored stream must be an error");
+    }
+
+    /// A crafted stream whose block header declares a command count of 0
+    /// before the target size is produced must be rejected (previously the
+    /// decoder returned `Done` with short output).
+    #[test]
+    fn test_streaming_decoder_early_end_marker_is_error() {
+        // 16 zero bits = command count 0 straight away, target size 100.
+        let data = [0u8, 0u8];
+        let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh5, 100);
+        let mut out = vec![0u8; 256];
+        let result = decoder.decompress(&data, &mut out);
+        assert!(
+            result.is_err(),
+            "early end-of-stream marker must be an error, got {result:?}"
+        );
+        assert_eq!(decoder.phase(), DecoderPhase::Error);
+        assert!(decoder.last_error().is_some());
+    }
+
+    /// The `Read`-wrapping `LzhStreamDecoder` must surface truncation as an
+    /// I/O error from `read`, not silently end the stream short.
+    #[test]
+    fn test_lzh_stream_decoder_truncated_source_is_error() {
+        use crate::encode::LzhEncoder;
+        use std::io::{Cursor, Read};
+
+        let original: Vec<u8> = (0u16..3000).map(|i| (i % 251) as u8).collect();
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+        let compressed = encoder
+            .compress_to_vec(&original)
+            .expect("compression failed");
+
+        let truncated = compressed[..compressed.len() / 2].to_vec();
+        let cursor = Cursor::new(truncated);
+        let mut dec = LzhStreamDecoder::new(cursor, LzhMethod::Lh5, original.len() as u64);
+
+        let mut output = Vec::new();
+        let result = dec.read_to_end(&mut output);
+        assert!(
+            result.is_err(),
+            "truncated source must error, got Ok with {} bytes",
+            output.len()
+        );
     }
 
     /// A simple progress sink that counts calls and records the last `processed`.

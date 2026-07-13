@@ -154,6 +154,7 @@ impl<R: Read + Seek> TarReader<R> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -162,6 +163,7 @@ impl<R: Read + Seek> TarReader<R> {
     /// Toggle lenient-mode **extraction**. Note: this does NOT re-run
     /// the initial entry scan. If you need lenient scanning to skip
     /// corrupt header blocks, use [`TarReader::new_lenient`] instead.
+    #[must_use]
     pub fn lenient(mut self, enabled: bool) -> Self {
         self.lenient = enabled;
         self

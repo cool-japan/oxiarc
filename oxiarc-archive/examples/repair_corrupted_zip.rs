@@ -58,6 +58,9 @@ fn main() {
             RecoveryStatus::Verified => "verified (CRC OK)",
             RecoveryStatus::Recovered => "recovered (CRC unavailable/mismatched)",
             RecoveryStatus::RawOnly => "raw only (decompression failed)",
+            // `RecoveryStatus` is `#[non_exhaustive]`; report any future status
+            // kind rather than failing to build against a newer oxiarc-archive.
+            _ => "unknown recovery status",
         };
         println!(
             "  - {} @ offset {}: {} bytes, {}",

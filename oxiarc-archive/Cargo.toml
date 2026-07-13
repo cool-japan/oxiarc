@@ -30,6 +30,20 @@ async-io = ["oxiarc-core/async-io", "dep:tokio"]
 # a printed note, no failure) when `lha` is not on PATH. Never enabled by
 # default; not needed for normal library use.
 lha-oracle = []
+# Archive-level oracle tests (tests/zip_cli_interop.rs) that shell out to the
+# real Info-ZIP `zip`/`unzip` CLIs and Python's `zipfile` module to prove
+# bidirectional ZIP interop: externally-created archives (stored, deflate,
+# zip64, data-descriptor, `zip -e` ZipCrypto) are read and their encryption
+# detected correctly, and oxiarc-written archives (plain, ZipCrypto, AES)
+# pass `unzip -t` / `zipfile` inspection. Self-skips (with a printed note,
+# no failure) when a tool is not on PATH. Never enabled by default.
+zip-oracle = []
+# Archive-level oracle tests (tests/xz_cli_interop.rs) that shell out to the
+# real XZ Utils `xz` CLI: `xz -6` output (including multi-chunk LZMA2
+# blocks) must decode byte-exactly at the archive level, and oxiarc-written
+# `.xz` must pass `xz -t` and round-trip through `xz -dc`. Self-skips when
+# `xz` is not on PATH. Never enabled by default.
+xz-oracle = []
 
 [dependencies]
 oxiarc-core.workspace = true

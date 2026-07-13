@@ -46,6 +46,21 @@ pub struct Lzma2Decoder {
     state: State,
     /// Rep distances (preserved across chunks unless reset).
     rep: [u32; 4],
+    /// Total uncompressed bytes decoded since the last dictionary reset.
+    ///
+    /// LZMA seeds `pos_state` and the literal position context from the
+    /// *global* uncompressed position (`processedPos` in the reference
+    /// LzmaDec), so this must persist across chunks and reset **only** on a
+    /// dictionary reset. Resetting it per chunk desynchronizes the range
+    /// decoder on every continuation chunk whose start offset is not a
+    /// multiple of `2^pb` — which is how real `xz` output looks.
+    uncompressed_pos: u64,
+    /// The stream has not yet seen a dictionary reset; the first data chunk
+    /// must perform one (LZMA2 spec, enforced by liblzma).
+    need_dict_reset: bool,
+    /// The previous chunk was uncompressed; the next LZMA chunk must reset
+    /// the decoder state (LZMA2 spec, enforced by liblzma).
+    need_state_reset: bool,
     /// Whether decoding is finished.
     finished: bool,
     /// Optional progress sink.
@@ -77,6 +92,9 @@ impl Lzma2Decoder {
             model: None,
             state: State::new(),
             rep: [0; 4],
+            uncompressed_pos: 0,
+            need_dict_reset: true,
+            need_state_reset: false,
             finished: false,
             progress: None,
             cancel: None,
@@ -88,6 +106,7 @@ impl Lzma2Decoder {
     ///
     /// The sink's `on_progress(cumulative_decompressed_bytes, None)` is called
     /// after each chunk is decoded. `on_finish()` is called after the end-of-stream marker.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -97,12 +116,17 @@ impl Lzma2Decoder {
     ///
     /// The token is checked before each chunk is decoded.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
     }
 
     /// Decode an LZMA2 stream.
+    ///
+    /// Decodes chunks until the end-of-stream marker (`0x00`). A stream that
+    /// ends without the marker is truncated and returns an error rather than
+    /// silently yielding partial output.
     pub fn decode<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
         let mut output = Vec::new();
 
@@ -112,36 +136,14 @@ impl Lzma2Decoder {
                 token.check()?;
             }
 
-            // Read control byte
-            let mut control = [0u8; 1];
-            if reader.read_exact(&mut control).is_err() {
-                break;
-            }
-            let control = control[0];
+            let before = output.len();
 
-            if control == 0x00 {
-                // End of stream
-                self.finished = true;
+            if !self.decode_chunk(reader, &mut output)? {
+                // End-of-stream marker consumed.
                 if let Some(ref handle) = self.progress {
                     handle.on_finish();
                 }
                 break;
-            }
-
-            let before = output.len();
-
-            if control == 0x01 || control == 0x02 {
-                // Uncompressed chunk
-                let reset_dict = control == 0x01;
-                self.decode_uncompressed_chunk(reader, &mut output, reset_dict)?;
-            } else if control >= 0x80 {
-                // LZMA compressed chunk
-                self.decode_lzma_chunk(reader, &mut output, control)?;
-            } else {
-                return Err(OxiArcError::invalid_header(format!(
-                    "Invalid LZMA2 control byte: 0x{:02X}",
-                    control
-                )));
             }
 
             self.bytes_processed += (output.len() - before) as u64;
@@ -153,6 +155,51 @@ impl Lzma2Decoder {
         Ok(output)
     }
 
+    /// Decode a single LZMA2 chunk from `reader`, appending its uncompressed
+    /// bytes to `output`.
+    ///
+    /// Dictionary, probability model, LZMA state, rep distances and the
+    /// global uncompressed position all persist on `self` between calls, so
+    /// chunks may be fed one at a time (as [`crate::Lzma2StreamDecoder`]
+    /// does) with semantics identical to decoding the whole stream at once.
+    ///
+    /// Returns `Ok(true)` after a data chunk, `Ok(false)` after the
+    /// end-of-stream marker (`0x00`). A read failure on the control byte
+    /// (truncated stream) is an error.
+    pub fn decode_chunk<R: Read>(&mut self, reader: &mut R, output: &mut Vec<u8>) -> Result<bool> {
+        // Read control byte
+        let mut control = [0u8; 1];
+        if reader.read_exact(&mut control).is_err() {
+            return Err(OxiArcError::corrupted(
+                self.bytes_processed,
+                "Truncated LZMA2 stream: missing end-of-stream marker",
+            ));
+        }
+        let control = control[0];
+
+        if control == 0x00 {
+            // End of stream
+            self.finished = true;
+            return Ok(false);
+        }
+
+        if control == 0x01 || control == 0x02 {
+            // Uncompressed chunk
+            let reset_dict = control == 0x01;
+            self.decode_uncompressed_chunk(reader, output, reset_dict)?;
+        } else if control >= 0x80 {
+            // LZMA compressed chunk
+            self.decode_lzma_chunk(reader, output, control)?;
+        } else {
+            return Err(OxiArcError::invalid_header(format!(
+                "Invalid LZMA2 control byte: 0x{:02X}",
+                control
+            )));
+        }
+
+        Ok(true)
+    }
+
     /// Decode an uncompressed chunk.
     fn decode_uncompressed_chunk<R: Read>(
         &mut self,
@@ -160,6 +207,12 @@ impl Lzma2Decoder {
         output: &mut Vec<u8>,
         reset_dict: bool,
     ) -> Result<()> {
+        if self.need_dict_reset && !reset_dict {
+            return Err(OxiArcError::invalid_header(
+                "LZMA2: first chunk must reset the dictionary",
+            ));
+        }
+
         // Read size (big-endian, 16-bit) + 1
         let mut size_bytes = [0u8; 2];
         reader.read_exact(&mut size_bytes)?;
@@ -168,15 +221,23 @@ impl Lzma2Decoder {
         if reset_dict {
             self.dict_pos = 0;
             self.dict_len = 0;
+            self.uncompressed_pos = 0;
         }
+        self.need_dict_reset = false;
+        // An LZMA chunk following an uncompressed chunk must reset the state
+        // (LZMA2 spec).
+        self.need_state_reset = true;
 
         // Read uncompressed data
         let start = output.len();
         output.resize(start + size, 0);
         reader.read_exact(&mut output[start..])?;
 
-        // Update dictionary
+        // Update dictionary and advance the global uncompressed position:
+        // verbatim bytes count toward `pos_state` in later chunks exactly like
+        // LZMA-coded bytes do.
         self.update_dictionary(&output[start..]);
+        self.uncompressed_pos += size as u64;
 
         Ok(())
     }
@@ -196,6 +257,17 @@ impl Lzma2Decoder {
         let reset_state = reset >= 1;
         let new_props = reset >= 2;
         let reset_dict = reset == 3;
+
+        if self.need_dict_reset && !reset_dict {
+            return Err(OxiArcError::invalid_header(
+                "LZMA2: first chunk must reset the dictionary",
+            ));
+        }
+        if self.need_state_reset && !reset_state {
+            return Err(OxiArcError::invalid_header(
+                "LZMA2: LZMA chunk after an uncompressed chunk must reset the state",
+            ));
+        }
 
         // Read uncompressed size (high 5 bits from control + 16-bit)
         let uncompressed_hi = ((control & 0x1F) as usize) << 16;
@@ -220,7 +292,10 @@ impl Lzma2Decoder {
         if reset_dict {
             self.dict_pos = 0;
             self.dict_len = 0;
+            self.uncompressed_pos = 0;
         }
+        self.need_dict_reset = false;
+        self.need_state_reset = false;
 
         if reset_state {
             self.state = State::new();
@@ -242,8 +317,24 @@ impl Lzma2Decoder {
 
         let decompressed = self.decompress_lzma_chunk(&compressed, props, uncompressed_size)?;
 
-        // Update dictionary and output
+        // The chunk header declares the exact uncompressed size; anything
+        // else (an embedded end marker cutting the chunk short, or a match
+        // overshooting the declared size) is corruption and must never be
+        // passed through silently.
+        if decompressed.len() != uncompressed_size {
+            return Err(OxiArcError::corrupted(
+                self.uncompressed_pos + decompressed.len() as u64,
+                format!(
+                    "LZMA2 chunk decoded to {} bytes but header declared {}",
+                    decompressed.len(),
+                    uncompressed_size
+                ),
+            ));
+        }
+
+        // Update dictionary, global position and output
         self.update_dictionary(&decompressed);
+        self.uncompressed_pos += decompressed.len() as u64;
         output.extend_from_slice(&decompressed);
 
         Ok(())
@@ -265,10 +356,17 @@ impl Lzma2Decoder {
         }
 
         let mut output = Vec::with_capacity(uncompressed_size);
+        // Position of this chunk's first byte within the LZMA2 stream since
+        // the last dictionary reset. `pos_state` and the literal position
+        // context are seeded from the *global* position (reference LzmaDec's
+        // `processedPos`), not the chunk-local offset: real `xz` emits
+        // continuation chunks starting at arbitrary global offsets.
+        let chunk_start = self.uncompressed_pos;
         let mut bytes_decoded = 0u64;
 
         while bytes_decoded < uncompressed_size as u64 {
-            let pos_state = (bytes_decoded as usize) & (props.num_pos_states() - 1);
+            let global_pos = chunk_start + bytes_decoded;
+            let pos_state = (global_pos as usize) & (props.num_pos_states() - 1);
             let state_idx = self.state.value();
 
             // Get mutable reference to model
@@ -291,7 +389,7 @@ impl Lzma2Decoder {
                 } else {
                     // output is empty — try the external dictionary.
                     if self.dict_len > 0 {
-                        self.get_byte_from_dict(0, 0)
+                        self.get_byte_from_dict(0)
                     } else {
                         0
                     }
@@ -310,7 +408,7 @@ impl Lzma2Decoder {
                             output[out_len - dist - 1]
                         } else {
                             // In the external dictionary ring-buffer.
-                            self.get_byte_from_dict(dist - out_len, 0)
+                            self.get_byte_from_dict(dist - out_len)
                         }
                     } else {
                         0
@@ -319,7 +417,7 @@ impl Lzma2Decoder {
                     0
                 };
 
-                let byte = self.decode_literal(&mut rc, prev_byte, match_byte, bytes_decoded)?;
+                let byte = self.decode_literal(&mut rc, prev_byte, match_byte, global_pos)?;
 
                 output.push(byte);
                 bytes_decoded += 1;
@@ -341,19 +439,24 @@ impl Lzma2Decoder {
                     let len = decode_length(&mut rc, &mut model.match_len, pos_state)?;
                     let dist = self.decode_distance(&mut rc, len)?;
 
+                    // An end marker must never appear inside an LZMA2 chunk:
+                    // the chunk header already declares the exact sizes
+                    // (liblzma rejects this as corrupt data too).
+                    if dist == 0xFFFF_FFFF {
+                        return Err(OxiArcError::corrupted(
+                            global_pos,
+                            "Unexpected LZMA end marker inside an LZMA2 chunk",
+                        ));
+                    }
+
                     // Shift rep distances
                     self.rep[3] = self.rep[2];
                     self.rep[2] = self.rep[1];
                     self.rep[1] = self.rep[0];
                     self.rep[0] = dist;
 
-                    // Check for end marker
-                    if dist == 0xFFFF_FFFF {
-                        break;
-                    }
-
                     self.state.update_match();
-                    self.copy_from_dict(&mut output, dist as usize, len as usize, bytes_decoded)?;
+                    self.copy_from_dict(&mut output, dist as usize, len as usize, global_pos)?;
                     bytes_decoded += len as u64;
                 } else {
                     // Rep match
@@ -379,7 +482,7 @@ impl Lzma2Decoder {
 
                             if dist >= total_avail {
                                 return Err(OxiArcError::corrupted(
-                                    bytes_decoded,
+                                    global_pos,
                                     "Invalid LZMA data",
                                 ));
                             }
@@ -388,7 +491,7 @@ impl Lzma2Decoder {
                             let byte = if dist < out_len {
                                 output[out_len - dist - 1]
                             } else {
-                                self.get_byte_from_dict(dist - out_len, 0)
+                                self.get_byte_from_dict(dist - out_len)
                             };
                             output.push(byte);
                             bytes_decoded += 1;
@@ -405,7 +508,7 @@ impl Lzma2Decoder {
                             &mut output,
                             self.rep[0] as usize,
                             len as usize,
-                            bytes_decoded,
+                            global_pos,
                         )?;
                         bytes_decoded += len as u64;
                     } else {
@@ -447,12 +550,7 @@ impl Lzma2Decoder {
                             OxiArcError::corrupted(0, "LZMA model not initialized")
                         })?;
                         let len = decode_length(&mut rc, &mut model.rep_len, pos_state)?;
-                        self.copy_from_dict(
-                            &mut output,
-                            dist as usize,
-                            len as usize,
-                            bytes_decoded,
-                        )?;
+                        self.copy_from_dict(&mut output, dist as usize, len as usize, global_pos)?;
                         bytes_decoded += len as u64;
                     }
                 }
@@ -462,14 +560,13 @@ impl Lzma2Decoder {
         Ok(output)
     }
 
-    /// Get a byte from the combined dictionary + output buffer.
-    fn get_byte_from_dict(&self, dist: usize, current_output_len: u64) -> u8 {
-        // If dist is within current output, read from there
-        if dist < current_output_len as usize {
-            // This would need access to output, which we handle differently
-            // For now, we rely on the dictionary being properly populated
-        }
-
+    /// Get a byte from the dictionary ring buffer, `dist` bytes back from the
+    /// most recently written byte (`dist == 0` is the last byte written).
+    ///
+    /// Callers must validate `dist < self.dict_len` (all call sites bound the
+    /// distance against `output.len() + self.dict_len` first); out-of-range
+    /// distances fall back to `0` only as a defensive backstop.
+    fn get_byte_from_dict(&self, dist: usize) -> u8 {
         // Calculate position in dictionary ring buffer
         let total_len = self.dict_len;
         if dist >= total_len {
@@ -485,12 +582,16 @@ impl Lzma2Decoder {
     }
 
     /// Decode a literal byte.
+    ///
+    /// `global_pos` is the uncompressed position since the last dictionary
+    /// reset (not the chunk-local offset); the literal position context
+    /// (`lp` bits) is derived from it.
     fn decode_literal<R: Read>(
         &mut self,
         rc: &mut RangeDecoder<R>,
         prev_byte: u8,
         match_byte: u8,
-        bytes_decoded: u64,
+        global_pos: u64,
     ) -> Result<u8> {
         let props = self
             .props
@@ -502,7 +603,7 @@ impl Lzma2Decoder {
 
         let lit_state = model
             .literal
-            .get_state(bytes_decoded, prev_byte, props.lc, props.lp);
+            .get_state(global_pos, prev_byte, props.lc, props.lp);
 
         if self.state.is_literal() {
             // Normal literal
@@ -594,13 +695,25 @@ impl Lzma2Decoder {
     }
 
     /// Copy bytes from dictionary to output.
+    ///
+    /// `global_pos` is used only for error reporting.
     fn copy_from_dict(
         &self,
         output: &mut Vec<u8>,
         dist: usize,
         len: usize,
-        _current_len: u64,
+        global_pos: u64,
     ) -> Result<()> {
+        // The distance must lie within the data decoded so far (this chunk's
+        // output plus the persistent dictionary). Anything further back is
+        // corruption; zero-filling it would be silent data corruption.
+        if dist >= output.len() + self.dict_len {
+            return Err(OxiArcError::corrupted(
+                global_pos,
+                "Invalid LZMA data: match distance exceeds dictionary contents",
+            ));
+        }
+
         // Copy from output buffer - dist is 0-indexed from the end
         // dist=0 means copy from the last byte written
         for _ in 0..len {
@@ -609,8 +722,9 @@ impl Lzma2Decoder {
                 // Copy from within current output
                 output[out_len - dist - 1]
             } else {
-                // From external dictionary (shouldn't happen often in LZMA2)
-                self.get_byte_from_dict(dist - out_len, 0)
+                // From the persistent dictionary (back-reference into a
+                // previous chunk).
+                self.get_byte_from_dict(dist - out_len)
             };
             output.push(byte);
         }
@@ -715,6 +829,7 @@ impl Lzma2Encoder {
     ///
     /// The sink's `on_progress(bytes, None)` is called once after the full
     /// encode completes. `on_finish()` is called at the same point.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -724,6 +839,7 @@ impl Lzma2Encoder {
     ///
     /// The token is checked at the start of `encode`.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

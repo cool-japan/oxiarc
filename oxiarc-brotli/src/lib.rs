@@ -6,15 +6,52 @@
 //! combination of LZ77, Huffman coding, and a static dictionary to achieve
 //! excellent compression ratios, especially for web content.
 //!
+//! ## Interoperability
+//!
+//! The **decoder** implements the full RFC 7932 format — simple and complex
+//! prefix codes, block-type switching, literal/distance context maps and
+//! the exact Section 7.1 context tables, metadata meta-blocks, the complete
+//! distance code space (short codes, `NPOSTFIX`/`NDIRECT`), and the
+//! embedded 122,784-byte Appendix A static dictionary with all 121 word
+//! transforms. It is validated by differential tests to decode reference
+//! `brotli` CLI output byte-identically across qualities 0-11 and window
+//! sizes 10-24 (see the `brotli-oracle` cargo feature).
+//!
+//! The **encoder** emits RFC-conformant streams accepted by the reference
+//! `brotli -d`. It uses one prefix code per category per meta-block (no
+//! multi-block-type splitting, context modeling, or dictionary-reference
+//! emission yet), so compression ratios trail the reference encoder —
+//! close on typical text at q5-9, further behind at q10-11 on structured
+//! data. Incompressible input falls back to stored (uncompressed)
+//! meta-blocks, bounding worst-case expansion to a few bytes per 16 MiB.
+//!
+//! ## Strictness
+//!
+//! The decoder rejects (never silently mis-decodes): truncated streams,
+//! trailing garbage after the last meta-block, non-zero padding bits,
+//! incomplete or over-subscribed prefix codes, invalid distances, and
+//! meta-block length overruns. Note that Brotli itself carries no checksum,
+//! so corruption that yields a different *valid* stream is undetectable by
+//! design.
+//!
+//! Brotli declares no total uncompressed size, so untrusted input should be
+//! decoded with [`decompress_with_limit`] (or
+//! [`BrotliDecompressor::with_max_output`]): the budget is enforced per
+//! meta-block *while* decoding, so a decompression bomb is rejected before
+//! its expansion is ever allocated. The unbounded entry points fall back to
+//! a built-in 256 MB guard.
+//!
 //! ## Features
 //!
 //! - LZ77 compression with backward references
-//! - Context-dependent Huffman coding
-//! - Static dictionary support (RFC 7932 Appendix A)
-//! - Insert-and-copy length encoding
-//! - Distance codes with short-distance ring buffer cache
-//! - Multiple quality levels (0-11)
-//! - Streaming Write/Read API
+//! - RFC 7932 prefix coding with two-level `O(1)` decode tables
+//! - Static dictionary (RFC 7932 Appendix A, byte-exact) with all 121
+//!   transforms, including UTF-8-aware ferment casing
+//! - Insert-and-copy command alphabet with implicit distance-code-0 reuse
+//! - Distance ring buffer semantics per Section 4
+//! - Multiple quality levels (0-11); quality 0 = stored meta-blocks
+//! - Window sizes `lgwin` 10-24 (window = `(1 << lgwin) - 16` bytes)
+//! - Streaming Write/Read adapters (fully buffered; see [`streaming`])
 //!
 //! ## Example
 //!
@@ -68,6 +105,8 @@ pub mod huffman;
 pub mod lz77;
 /// Streaming compression and decompression.
 pub mod streaming;
+/// Shared RFC 7932 constant tables (lengths, commands, block counts).
+pub mod tables;
 
 /// Parallel compression and decompression (requires `parallel` feature).
 #[cfg(feature = "parallel")]
@@ -82,7 +121,7 @@ pub mod async_brotli;
 
 // Re-export primary API.
 pub use compress::{BrotliParams, compress, compress_with_params};
-pub use decompress::decompress;
+pub use decompress::{decompress, decompress_with_limit};
 pub use error::{BrotliError, BrotliResult};
 pub use pool::{BrotliPool, PoolStats};
 pub use streaming::{BrotliCompressor, BrotliDecompressor};
@@ -225,16 +264,17 @@ mod tests {
 
     #[test]
     fn test_brotli_params_window_size() {
+        // RFC 7932 Section 9.1: window size = (1 << WBITS) - 16.
         let params = BrotliParams {
             lgwin: 16,
             ..BrotliParams::default()
         };
-        assert_eq!(params.window_size(), 65536);
+        assert_eq!(params.window_size(), 65520);
 
         let params = BrotliParams {
             lgwin: 22,
             ..BrotliParams::default()
         };
-        assert_eq!(params.window_size(), 4194304);
+        assert_eq!(params.window_size(), 4194288);
     }
 }

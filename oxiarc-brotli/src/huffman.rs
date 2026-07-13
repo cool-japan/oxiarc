@@ -1,22 +1,30 @@
-//! Huffman coding for Brotli compression and decompression.
+//! Huffman (prefix) coding for Brotli compression and decompression.
 //!
-//! Brotli uses canonical prefix codes (Huffman codes) extensively.
-//! This module implements both building and decoding of these codes.
+//! Brotli uses canonical prefix codes (RFC 7932 Section 3). This module
+//! implements:
+//!
+//! - a two-level lookup-table decoder (`O(1)` per symbol, an 8-bit root
+//!   table plus sub-tables for longer codes),
+//! - reading of "simple" (Section 3.4) and "complex" (Section 3.5) prefix
+//!   code descriptors from the bitstream,
+//! - writing of RFC-exact simple/complex descriptors for the encoder,
+//! - optimal length-limited code construction via package-merge.
 //!
 //! ## RFC 7932 Prefix Code Format
 //!
-//! Prefix codes in Brotli are represented by code lengths. The canonical
-//! code assignment is: shorter codes get smaller values, and within the
-//! same length, symbols are ordered by their natural ordering.
-//!
-//! Special cases:
-//! - A single symbol uses code length 0 (no bits needed).
-//! - "Simple" prefix codes encode 1-4 symbols with fixed patterns.
-//! - "Complex" prefix codes use a two-level Huffman scheme.
+//! Prefix codes are canonical: within one code length, codes are assigned
+//! in symbol order, and shorter codes lexicographically precede longer
+//! codes. A code descriptor in the stream is either *simple* (1-4 symbols
+//! listed explicitly) or *complex* (code lengths, themselves compressed
+//! with a prefix code over the 18-symbol code-length alphabet).
 
 use crate::bit_reader::BitReader;
 use crate::bit_writer::BitWriter;
 use crate::error::{BrotliError, BrotliResult};
+use crate::tables::{
+    CODE_LENGTH_CODE_ORDER, CODE_LENGTH_PREFIX_LENGTH, CODE_LENGTH_PREFIX_VALUE,
+    CODE_LENGTH_VALUE_WRITE,
+};
 
 /// Maximum code length for Brotli Huffman codes.
 pub const MAX_HUFFMAN_CODE_LENGTH: u32 = 15;
@@ -24,222 +32,264 @@ pub const MAX_HUFFMAN_CODE_LENGTH: u32 = 15;
 /// Maximum number of symbols in any Brotli alphabet.
 pub const MAX_HUFFMAN_SYMBOLS: usize = 704;
 
-/// A Huffman tree for decoding, represented as a lookup table.
+/// Number of bits resolved by the root decode table. Codes longer than this
+/// go through one sub-table indirection.
+const ROOT_BITS: u32 = 8;
+
+/// One decode-table entry: `bits` is the total code length for direct
+/// entries (`<= ROOT_BITS` in the root, or the full length in a sub-table);
+/// root entries with `bits > ROOT_BITS` point to the sub-table starting at
+/// index `value`, sized `1 << (bits - ROOT_BITS)`.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    bits: u8,
+    value: u16,
+}
+
+/// Marker for table slots not covered by any code. Complete codes cover
+/// every slot; this only survives construction for defensive checking.
+const INVALID_BITS: u8 = 0xFE;
+
+/// A Huffman tree usable for both decoding (two-level table) and encoding
+/// (precomputed canonical codes).
 #[derive(Debug, Clone)]
 pub struct HuffmanTree {
-    /// For each symbol, its code length. 0 means the symbol is not in the alphabet.
+    /// For each symbol, its code length. 0 means the symbol is absent.
     pub code_lengths: Vec<u8>,
     /// Number of symbols in the alphabet.
     pub alphabet_size: u32,
-    /// Lookup table for fast decoding (indexed by peeked bits).
-    /// Each entry: (symbol, code_length).
-    lut: Vec<(u16, u8)>,
-    /// Number of bits used for the LUT.
-    lut_bits: u32,
+    /// Flattened root + sub-tables for decoding. Empty for degenerate trees.
+    entries: Vec<Entry>,
+    /// `Some(symbol)` for a zero-bit single-symbol tree: decoding consumes
+    /// no bits and always yields this symbol.
+    degenerate: Option<u16>,
+    /// Precomputed canonical codes, bit-reversed and ready to be written
+    /// LSB-first. Indexed by symbol; length given by `code_lengths`.
+    codes: Vec<u16>,
 }
-
-/// LUT bits for fast decoding.
-const LUT_BITS: u32 = 10;
 
 impl HuffmanTree {
     /// Create a Huffman tree from code lengths.
+    ///
+    /// The lengths must describe a *complete* canonical prefix code (Kraft
+    /// sum exactly `2^15` at the 15-bit scale), or contain exactly one
+    /// non-zero entry (a degenerate zero-bit code), or be entirely zero
+    /// (an empty tree that fails on any decode; useful as a placeholder).
     pub fn from_code_lengths(code_lengths: &[u8], alphabet_size: u32) -> BrotliResult<Self> {
+        if code_lengths.len() != alphabet_size as usize {
+            return Err(BrotliError::InvalidParameter(format!(
+                "code length table size {} != alphabet size {alphabet_size}",
+                code_lengths.len()
+            )));
+        }
         let mut tree = HuffmanTree {
             code_lengths: code_lengths.to_vec(),
             alphabet_size,
-            lut: Vec::new(),
-            lut_bits: LUT_BITS,
+            entries: Vec::new(),
+            degenerate: None,
+            codes: vec![0; alphabet_size as usize],
         };
-        tree.build_lut()?;
+        tree.build()?;
         Ok(tree)
     }
 
-    /// Create a trivial single-symbol tree.
+    /// Create a trivial single-symbol tree (zero-bit code).
     pub fn single_symbol(symbol: u16, alphabet_size: u32) -> BrotliResult<Self> {
-        let mut code_lengths = vec![0u8; alphabet_size as usize];
-        if (symbol as u32) < alphabet_size {
-            code_lengths[symbol as usize] = 0; // single symbol needs 0 bits
+        if symbol as u32 >= alphabet_size {
+            return Err(BrotliError::InvalidParameter(format!(
+                "symbol {symbol} outside alphabet of size {alphabet_size}"
+            )));
         }
         Ok(HuffmanTree {
-            code_lengths,
+            code_lengths: vec![0u8; alphabet_size as usize],
             alphabet_size,
-            lut: vec![(symbol, 0); 1 << LUT_BITS],
-            lut_bits: LUT_BITS,
+            entries: Vec::new(),
+            degenerate: Some(symbol),
+            codes: vec![0; alphabet_size as usize],
         })
     }
 
-    /// Build the lookup table for fast decoding.
-    fn build_lut(&mut self) -> BrotliResult<()> {
-        let lut_size = 1usize << self.lut_bits;
-        self.lut = vec![(0, 0); lut_size];
-
-        // Count symbols per code length.
-        let mut bl_count = vec![0u32; (MAX_HUFFMAN_CODE_LENGTH + 1) as usize];
-        let mut max_len = 0u32;
+    /// Build the two-level decode table and the canonical encode codes.
+    fn build(&mut self) -> BrotliResult<()> {
+        // Histogram of code lengths.
+        let mut count = [0u32; (MAX_HUFFMAN_CODE_LENGTH + 1) as usize];
         let mut num_codes = 0u32;
-
-        for &cl in &self.code_lengths {
-            if cl > 0 {
-                bl_count[cl as usize] += 1;
-                if cl as u32 > max_len {
-                    max_len = cl as u32;
+        let mut last_symbol = 0u16;
+        for (sym, &len) in self.code_lengths.iter().enumerate() {
+            if len > 0 {
+                if len as u32 > MAX_HUFFMAN_CODE_LENGTH {
+                    return Err(BrotliError::InvalidPrefixCode(format!(
+                        "code length {len} exceeds maximum 15"
+                    )));
                 }
+                count[len as usize] += 1;
                 num_codes += 1;
+                last_symbol = sym as u16;
             }
         }
 
-        // Handle special cases.
         if num_codes == 0 {
-            // No symbols - this shouldn't happen in valid data, but handle gracefully.
+            // Empty placeholder tree; decoding will fail.
             return Ok(());
         }
         if num_codes == 1 {
-            // Single symbol tree - find the symbol.
-            for (sym, &cl) in self.code_lengths.iter().enumerate() {
-                if cl > 0 {
-                    for entry in &mut self.lut {
-                        *entry = (sym as u16, cl);
-                    }
-                    return Ok(());
-                }
-            }
+            self.degenerate = Some(last_symbol);
+            return Ok(());
         }
 
-        // Compute first code for each length (canonical Huffman).
-        let mut next_code = vec![0u32; (max_len + 1) as usize];
+        // Kraft completeness check at the 15-bit scale.
+        let mut kraft = 0u64;
+        for (len, &n) in count.iter().enumerate().skip(1) {
+            kraft += (n as u64) << (MAX_HUFFMAN_CODE_LENGTH as usize - len);
+        }
+        if kraft != 1u64 << MAX_HUFFMAN_CODE_LENGTH {
+            return Err(BrotliError::InvalidPrefixCode(
+                "code lengths do not describe a complete prefix code".to_string(),
+            ));
+        }
+
+        // Canonical first-code per length (MSB form).
+        let mut next_code = [0u32; (MAX_HUFFMAN_CODE_LENGTH + 2) as usize];
         let mut code = 0u32;
-        for bits in 1..=max_len {
-            code = (code + bl_count[bits as usize - 1]) << 1;
-            next_code[bits as usize] = code;
+        for bits in 1..=MAX_HUFFMAN_CODE_LENGTH as usize {
+            code = (code + count[bits - 1]) << 1;
+            next_code[bits] = code;
         }
 
-        // Assign codes to symbols and fill LUT.
-        let mut symbol_codes = Vec::with_capacity(self.code_lengths.len());
-        for (sym, &cl) in self.code_lengths.iter().enumerate() {
-            if cl > 0 {
-                let c = next_code[cl as usize];
-                next_code[cl as usize] += 1;
-                symbol_codes.push((sym as u16, c, cl));
-            } else {
-                symbol_codes.push((sym as u16, 0, 0));
-            }
-        }
+        // Assign codes; fill root table for short codes, collect long codes.
+        self.entries = vec![
+            Entry {
+                bits: INVALID_BITS,
+                value: 0
+            };
+            1 << ROOT_BITS
+        ];
+        // (symbol, reversed code, length) for codes longer than ROOT_BITS.
+        let mut long_codes: Vec<(u16, u32, u8)> = Vec::new();
+        // Maximum code length per root slot among long codes.
+        let mut sub_max_len = [0u8; 1 << ROOT_BITS];
 
-        // Fill LUT: for codes that fit in lut_bits, fill all matching entries.
-        for &(sym, code_val, cl) in &symbol_codes {
-            if cl == 0 {
+        for (sym, &len) in self.code_lengths.iter().enumerate() {
+            if len == 0 {
                 continue;
             }
-            let len = cl as u32;
-            if len > self.lut_bits {
-                // For longer codes, we need a secondary lookup. For simplicity,
-                // we use a brute-force approach since LUT_BITS=10 covers most codes.
-                continue;
-            }
-            // Reverse bits for little-endian bit reader.
-            let reversed = reverse_bits(code_val, len);
-            let fill_count = 1u32 << (self.lut_bits - len);
-            for i in 0..fill_count {
-                let idx = (reversed | (i << len)) as usize;
-                if idx < self.lut.len() {
-                    self.lut[idx] = (sym, cl);
+            let len_u = len as u32;
+            let c = next_code[len as usize];
+            next_code[len as usize] += 1;
+            let rev = reverse_bits(c, len_u);
+            self.codes[sym] = rev as u16;
+            if len_u <= ROOT_BITS {
+                let step = 1u32 << len_u;
+                let mut idx = rev;
+                while idx < (1 << ROOT_BITS) {
+                    self.entries[idx as usize] = Entry {
+                        bits: len,
+                        value: sym as u16,
+                    };
+                    idx += step;
                 }
+            } else {
+                let root = (rev & ((1 << ROOT_BITS) - 1)) as usize;
+                sub_max_len[root] = sub_max_len[root].max(len);
+                long_codes.push((sym as u16, rev, len));
             }
         }
 
-        // For codes longer than LUT_BITS, store them with a special marker.
-        // We'll handle them with a slow path in decode.
-        // Store the long codes in a separate structure within the LUT.
-        // Actually, for Brotli, max code length is 15, so with LUT_BITS=10
-        // we need to handle 11-15 bit codes specially.
-        // We use a fallback linear search for these rare cases.
+        // Allocate sub-tables and point root entries at them.
+        for (root, &max_len) in sub_max_len.iter().enumerate() {
+            if max_len == 0 {
+                continue;
+            }
+            let sub_bits = max_len as u32 - ROOT_BITS;
+            let offset = self.entries.len();
+            if offset + (1usize << sub_bits) > u16::MAX as usize + 1 {
+                return Err(BrotliError::InvalidPrefixCode(
+                    "decode table overflow".to_string(),
+                ));
+            }
+            self.entries[root] = Entry {
+                bits: (ROOT_BITS + sub_bits) as u8,
+                value: offset as u16,
+            };
+            self.entries.resize(
+                offset + (1usize << sub_bits),
+                Entry {
+                    bits: INVALID_BITS,
+                    value: 0,
+                },
+            );
+        }
+
+        // Fill sub-tables.
+        for &(sym, rev, len) in &long_codes {
+            let root = (rev & ((1 << ROOT_BITS) - 1)) as usize;
+            let root_entry = self.entries[root];
+            let sub_bits = root_entry.bits as u32 - ROOT_BITS;
+            let base = root_entry.value as usize;
+            let code_sub_bits = len as u32 - ROOT_BITS;
+            let idx_in_sub = rev >> ROOT_BITS;
+            let step = 1u32 << code_sub_bits;
+            let mut idx = idx_in_sub;
+            while idx < (1 << sub_bits) {
+                self.entries[base + idx as usize] = Entry {
+                    bits: len,
+                    value: sym,
+                };
+                idx += step;
+            }
+        }
 
         Ok(())
     }
 
-    /// Decode a single symbol from the bit reader.
+    /// Decode a single symbol from the bit reader in `O(1)`.
     pub fn decode_symbol(&self, reader: &mut BitReader<'_>) -> BrotliResult<u16> {
-        // Check for single-symbol tree first (no bits needed).
-        if self.is_single_symbol() {
-            return Ok(self.lut[0].0);
-        }
-
-        // Fast path: peek LUT_BITS and lookup.
-        let peeked = reader.peek_bits(self.lut_bits)?;
-        let (sym, len) = self.lut[peeked as usize];
-        if len > 0 {
-            reader.drop_bits(len as u32);
+        if let Some(sym) = self.degenerate {
             return Ok(sym);
         }
-
-        // Slow path: codes longer than LUT_BITS.
-        self.decode_symbol_slow(reader)
+        if self.entries.is_empty() {
+            return Err(BrotliError::InvalidHuffmanCode(
+                "decode with empty prefix code".to_string(),
+            ));
+        }
+        let peeked = reader.peek_bits(ROOT_BITS)?;
+        let entry = self.entries[peeked as usize];
+        if entry.bits as u32 <= ROOT_BITS {
+            reader.drop_bits(entry.bits as u32)?;
+            return Ok(entry.value);
+        }
+        if entry.bits == INVALID_BITS {
+            return Err(BrotliError::InvalidHuffmanCode(
+                "bit pattern matches no code".to_string(),
+            ));
+        }
+        let total_bits = entry.bits as u32;
+        let peeked2 = reader.peek_bits(total_bits)?;
+        let sub_index = (peeked2 >> ROOT_BITS) as usize;
+        let entry2 = self.entries[entry.value as usize + sub_index];
+        if entry2.bits == INVALID_BITS {
+            return Err(BrotliError::InvalidHuffmanCode(
+                "bit pattern matches no code".to_string(),
+            ));
+        }
+        reader.drop_bits(entry2.bits as u32)?;
+        Ok(entry2.value)
     }
 
-    /// Check if this is a true single-symbol tree (code_length = 0, no bits consumed).
-    ///
-    /// Returns true only when the tree was created via `single_symbol()` (all code_lengths are 0,
-    /// with the LUT pre-filled). A tree with one symbol at code_length=1 is NOT single-symbol
-    /// here — it still requires reading 1 bit per symbol.
-    fn is_single_symbol(&self) -> bool {
-        // A true single-symbol tree has ALL code lengths = 0.
-        // The LUT was pre-filled by single_symbol() with (sym, 0) entries.
-        self.code_lengths.iter().all(|&cl| cl == 0) && !self.lut.is_empty() && self.lut[0].1 == 0
-    }
-
-    /// Slow path for decoding codes longer than LUT_BITS.
-    fn decode_symbol_slow(&self, reader: &mut BitReader<'_>) -> BrotliResult<u16> {
-        // Rebuild code table and decode bit by bit.
-        let mut bl_count = vec![0u32; (MAX_HUFFMAN_CODE_LENGTH + 1) as usize];
-        let mut max_len = 0u32;
-
-        for &cl in &self.code_lengths {
-            if cl > 0 {
-                bl_count[cl as usize] += 1;
-                if cl as u32 > max_len {
-                    max_len = cl as u32;
-                }
-            }
+    /// Encode a single symbol to the bit writer using the precomputed
+    /// canonical code. Degenerate (single-symbol) trees emit no bits.
+    pub fn encode_symbol(&self, writer: &mut BitWriter, symbol: u16) -> BrotliResult<()> {
+        if self.degenerate == Some(symbol) {
+            return Ok(());
         }
-
-        let mut next_code = vec![0u32; (max_len + 1) as usize];
-        let mut code = 0u32;
-        for bits in 1..=max_len {
-            code = (code + bl_count[bits as usize - 1]) << 1;
-            next_code[bits as usize] = code;
+        let sym = symbol as usize;
+        let len = *self.code_lengths.get(sym).unwrap_or(&0);
+        if len == 0 {
+            return Err(BrotliError::InvalidParameter(format!(
+                "symbol {sym} has no code in this tree"
+            )));
         }
-
-        // Build (symbol, code, length) tuples for long codes.
-        let mut long_codes: Vec<(u16, u32, u8)> = Vec::new();
-        let mut nc = next_code.clone();
-        for (sym, &cl) in self.code_lengths.iter().enumerate() {
-            if cl > 0 && cl as u32 > self.lut_bits {
-                let c = nc[cl as usize];
-                nc[cl as usize] += 1;
-                long_codes.push((sym as u16, c, cl));
-            } else if cl > 0 {
-                nc[cl as usize] += 1;
-            }
-        }
-
-        // Read bits and try to match.
-        let max_bits = max_len.min(MAX_HUFFMAN_CODE_LENGTH);
-        let bits_val = reader.peek_bits(max_bits)?;
-        // The bits we read are in reversed order (LSB first), so reverse them.
-        let reversed = reverse_bits(bits_val, max_bits);
-
-        for &(sym, code_val, cl) in &long_codes {
-            let len = cl as u32;
-            let shift = max_bits - len;
-            if (reversed >> shift) == code_val {
-                reader.drop_bits(len);
-                return Ok(sym);
-            }
-        }
-
-        Err(BrotliError::InvalidHuffmanCode(
-            "no matching code found".to_string(),
-        ))
+        writer.write_bits(self.codes[sym] as u32, len as u32)
     }
 }
 
@@ -248,246 +298,11 @@ pub fn reverse_bits(value: u32, n: u32) -> u32 {
     if n == 0 {
         return 0;
     }
-    let mut result = 0u32;
-    let mut v = value;
-    for _ in 0..n {
-        result = (result << 1) | (v & 1);
-        v >>= 1;
-    }
-    result
+    value.reverse_bits() >> (32 - n)
 }
 
-/// Read a Brotli prefix code from the bitstream.
-///
-/// Per RFC 7932 Section 3.5:
-/// - HSKIP (2 bits) determines the type:
-///   - 1: "simple" prefix code
-///   - Otherwise: "complex" prefix code with code-length codes
-pub fn read_prefix_code(
-    reader: &mut BitReader<'_>,
-    alphabet_size: u32,
-) -> BrotliResult<HuffmanTree> {
-    let hskip = reader.read_bits(2)?;
-
-    if hskip == 1 {
-        // Simple prefix code.
-        read_simple_prefix_code(reader, alphabet_size)
-    } else {
-        // Complex prefix code.
-        read_complex_prefix_code(reader, alphabet_size, hskip)
-    }
-}
-
-/// Read a simple prefix code (1-4 symbols).
-fn read_simple_prefix_code(
-    reader: &mut BitReader<'_>,
-    alphabet_size: u32,
-) -> BrotliResult<HuffmanTree> {
-    let nsym_minus_1 = reader.read_bits(2)?; // NSYM - 1
-    let nsym = nsym_minus_1 + 1;
-
-    let symbol_bits = alphabet_bits(alphabet_size);
-
-    let mut symbols = Vec::with_capacity(nsym as usize);
-    for _ in 0..nsym {
-        let sym = reader.read_bits(symbol_bits)?;
-        if sym >= alphabet_size {
-            return Err(BrotliError::InvalidPrefixCode(format!(
-                "symbol {sym} exceeds alphabet size {alphabet_size}"
-            )));
-        }
-        symbols.push(sym as u16);
-    }
-
-    let mut code_lengths = vec![0u8; alphabet_size as usize];
-
-    match nsym {
-        1 => {
-            // Single symbol: code length 0 (implicit).
-            return HuffmanTree::single_symbol(symbols[0], alphabet_size);
-        }
-        2 => {
-            // Two symbols: each gets 1 bit.
-            code_lengths[symbols[0] as usize] = 1;
-            code_lengths[symbols[1] as usize] = 1;
-        }
-        3 => {
-            // Three symbols: first gets 1 bit, other two get 2 bits.
-            code_lengths[symbols[0] as usize] = 1;
-            code_lengths[symbols[1] as usize] = 2;
-            code_lengths[symbols[2] as usize] = 2;
-        }
-        4 => {
-            // Four symbols with a tree-select bit.
-            let tree_select = reader.read_bit()?;
-            if tree_select {
-                // All four get 2 bits.
-                for &s in &symbols {
-                    code_lengths[s as usize] = 2;
-                }
-            } else {
-                // First symbol gets 1 bit, second gets 2 bits,
-                // third and fourth get 3 bits.
-                code_lengths[symbols[0] as usize] = 1;
-                code_lengths[symbols[1] as usize] = 2;
-                code_lengths[symbols[2] as usize] = 3;
-                code_lengths[symbols[3] as usize] = 3;
-            }
-        }
-        _ => {
-            return Err(BrotliError::InvalidPrefixCode(format!(
-                "invalid NSYM: {nsym}"
-            )));
-        }
-    }
-
-    HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
-}
-
-/// Code length code order per RFC 7932 Section 3.5.
-const CODE_LENGTH_CODE_ORDER: [usize; 18] =
-    [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-
-/// Read a complex prefix code using code-length Huffman.
-fn read_complex_prefix_code(
-    reader: &mut BitReader<'_>,
-    alphabet_size: u32,
-    hskip: u32,
-) -> BrotliResult<HuffmanTree> {
-    // Read code lengths for the code-length alphabet (0-17).
-    let num_code_length_codes = 18;
-    let mut cl_code_lengths = vec![0u8; num_code_length_codes];
-
-    // hskip tells us how many initial code length codes to skip (set to 0).
-    let start = hskip as usize;
-
-    // Read code lengths for code-length codes (each is 2-5 bits using a special scheme).
-    // Per the spec, we read at most (num_code_length_codes - hskip) code lengths.
-    let mut space = 32i32; // Kraft inequality tracker
-    let mut num_non_zero = 0;
-
-    for &idx in &CODE_LENGTH_CODE_ORDER[start..num_code_length_codes] {
-        if space <= 0 {
-            break;
-        }
-        // Read code length code (up to 5 bits, variable length).
-        let v = read_code_length_value(reader)?;
-        cl_code_lengths[idx] = v;
-        if v != 0 {
-            space -= 32 >> v;
-            num_non_zero += 1;
-        }
-    }
-
-    // Special case: if only one non-zero, the whole alphabet has that code length.
-    if num_non_zero == 0 {
-        return Err(BrotliError::InvalidPrefixCode(
-            "all code length codes are zero".to_string(),
-        ));
-    }
-
-    // Build Huffman tree for code lengths.
-    let cl_tree = HuffmanTree::from_code_lengths(&cl_code_lengths, num_code_length_codes as u32)?;
-
-    // Now decode the actual code lengths for the alphabet.
-    let mut code_lengths = vec![0u8; alphabet_size as usize];
-    let mut i = 0u32;
-    let mut prev_code_len = 8u8;
-    let mut repeat_count;
-
-    while i < alphabet_size {
-        let sym = cl_tree.decode_symbol(reader)?;
-
-        match sym {
-            0 => {
-                // Literal zero.
-                code_lengths[i as usize] = 0;
-                i += 1;
-            }
-            1..=15 => {
-                // Literal code length.
-                code_lengths[i as usize] = sym as u8;
-                prev_code_len = sym as u8;
-                i += 1;
-            }
-            16 => {
-                // Repeat previous code length 3-6 times.
-                let extra = reader.read_bits(2)?;
-                repeat_count = 3 + extra;
-                for _ in 0..repeat_count {
-                    if i >= alphabet_size {
-                        break;
-                    }
-                    code_lengths[i as usize] = prev_code_len;
-                    i += 1;
-                }
-            }
-            17 => {
-                // Repeat zero 3-10 times (code length 0).
-                let extra = reader.read_bits(3)?;
-                repeat_count = 3 + extra;
-                for _ in 0..repeat_count {
-                    if i >= alphabet_size {
-                        break;
-                    }
-                    code_lengths[i as usize] = 0;
-                    i += 1;
-                }
-            }
-            _ => {
-                return Err(BrotliError::InvalidPrefixCode(format!(
-                    "invalid code length symbol: {sym}"
-                )));
-            }
-        }
-    }
-
-    HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
-}
-
-/// Read a variable-length code length value (special encoding for code-length codes).
-///
-/// The encoding is:
-/// - 0: value 0 (no bits read)
-/// - 10: value stored in next 1 bit + offset
-/// - Actually, Brotli uses a fixed 2-5 bit scheme:
-///   Symbol value is read as: read some bits, small lookup.
-fn read_code_length_value(reader: &mut BitReader<'_>) -> BrotliResult<u8> {
-    // Per RFC 7932 Section 3.5, each code length code is encoded as:
-    // 0, 1, 2, 3, 4, 5 => read with up to 5 bits
-    // The encoding uses a special variable-length scheme:
-    //
-    // Value: Bit pattern
-    // 0: 00
-    // 1: 0100
-    // 2: 0110
-    // 3: 1000
-    // 4: 1010
-    // 5: 1100
-    //
-    // Simplified: read pairs of bits.
-    let v0 = reader.read_bits(2)?;
-    match v0 {
-        0 => Ok(0), // 00 => 0
-        1 => {
-            // 01 + 1 more bit
-            let v1 = reader.read_bits(1)?;
-            Ok(if v1 == 0 { 4 } else { 3 })
-        }
-        2 => {
-            // 10 + 0 or 1 => either 3-bit
-            Ok(2)
-        }
-        3 => {
-            // 11
-            let v1 = reader.read_bits(1)?;
-            Ok(if v1 == 0 { 1 } else { 5 })
-        }
-        _ => Ok(0), // unreachable but satisfies exhaustive match
-    }
-}
-
-/// Compute the number of bits needed to represent symbols in alphabet of given size.
+/// Compute the number of bits needed to represent all symbols in an
+/// alphabet of the given size (`ALPHABET_BITS` in RFC 7932 Section 3.4).
 pub fn alphabet_bits(alphabet_size: u32) -> u32 {
     if alphabet_size <= 1 {
         return 0;
@@ -495,10 +310,490 @@ pub fn alphabet_bits(alphabet_size: u32) -> u32 {
     32 - (alphabet_size - 1).leading_zeros()
 }
 
-/// Build a Huffman tree for encoding from frequency counts.
+// ─────────────────────────────────────────────────────────────────────────────
+// Reading prefix code descriptors (decoder side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read a Brotli prefix code descriptor from the bitstream
+/// (RFC 7932 Sections 3.4 and 3.5).
+pub fn read_prefix_code(
+    reader: &mut BitReader<'_>,
+    alphabet_size: u32,
+) -> BrotliResult<HuffmanTree> {
+    if alphabet_size == 0 || alphabet_size as usize > MAX_HUFFMAN_SYMBOLS {
+        return Err(BrotliError::InvalidParameter(format!(
+            "invalid alphabet size {alphabet_size}"
+        )));
+    }
+    let hskip = reader.read_bits(2)?;
+    if hskip == 1 {
+        read_simple_prefix_code(reader, alphabet_size)
+    } else {
+        read_complex_prefix_code(reader, alphabet_size, hskip)
+    }
+}
+
+/// Read a simple prefix code (1-4 symbols), RFC 7932 Section 3.4.
+fn read_simple_prefix_code(
+    reader: &mut BitReader<'_>,
+    alphabet_size: u32,
+) -> BrotliResult<HuffmanTree> {
+    let nsym = reader.read_bits(2)? + 1;
+    let symbol_bits = alphabet_bits(alphabet_size);
+
+    let mut symbols = [0u16; 4];
+    for i in 0..nsym as usize {
+        let sym = reader.read_bits(symbol_bits)?;
+        if sym >= alphabet_size {
+            return Err(BrotliError::InvalidPrefixCode(format!(
+                "simple code symbol {sym} exceeds alphabet size {alphabet_size}"
+            )));
+        }
+        // RFC: a symbol identical to a previous one makes the stream invalid.
+        for &prev in &symbols[..i] {
+            if prev == sym as u16 {
+                return Err(BrotliError::InvalidPrefixCode(format!(
+                    "duplicate symbol {sym} in simple prefix code"
+                )));
+            }
+        }
+        symbols[i] = sym as u16;
+    }
+
+    if nsym == 1 {
+        return HuffmanTree::single_symbol(symbols[0], alphabet_size);
+    }
+
+    let mut code_lengths = vec![0u8; alphabet_size as usize];
+    match nsym {
+        2 => {
+            code_lengths[symbols[0] as usize] = 1;
+            code_lengths[symbols[1] as usize] = 1;
+        }
+        3 => {
+            code_lengths[symbols[0] as usize] = 1;
+            code_lengths[symbols[1] as usize] = 2;
+            code_lengths[symbols[2] as usize] = 2;
+        }
+        _ => {
+            let tree_select = reader.read_bit()?;
+            if tree_select {
+                code_lengths[symbols[0] as usize] = 1;
+                code_lengths[symbols[1] as usize] = 2;
+                code_lengths[symbols[2] as usize] = 3;
+                code_lengths[symbols[3] as usize] = 3;
+            } else {
+                for &s in &symbols {
+                    code_lengths[s as usize] = 2;
+                }
+            }
+        }
+    }
+
+    HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
+}
+
+/// Read a complex prefix code descriptor, RFC 7932 Section 3.5.
+fn read_complex_prefix_code(
+    reader: &mut BitReader<'_>,
+    alphabet_size: u32,
+    hskip: u32,
+) -> BrotliResult<HuffmanTree> {
+    // ── Level 1: code lengths of the code-length alphabet ────────────────
+    let mut cl_lengths = [0u8; 18];
+    let mut space = 32i32;
+    let mut num_codes = 0u32;
+    let mut single_code = 0usize;
+
+    for &sym_idx in &CODE_LENGTH_CODE_ORDER[hskip as usize..] {
+        if space <= 0 {
+            break;
+        }
+        let peeked = reader.peek_bits(4)? as usize;
+        let vlc_len = CODE_LENGTH_PREFIX_LENGTH[peeked] as u32;
+        let value = CODE_LENGTH_PREFIX_VALUE[peeked];
+        reader.drop_bits(vlc_len)?;
+        cl_lengths[sym_idx] = value;
+        if value != 0 {
+            space -= 32 >> value;
+            num_codes += 1;
+            single_code = sym_idx;
+        }
+    }
+
+    if num_codes == 0 {
+        return Err(BrotliError::InvalidPrefixCode(
+            "all code length codes are zero".to_string(),
+        ));
+    }
+    if num_codes != 1 && space != 0 {
+        return Err(BrotliError::InvalidPrefixCode(format!(
+            "code length code is not complete (space {space})"
+        )));
+    }
+
+    let cl_tree = if num_codes == 1 {
+        HuffmanTree::single_symbol(single_code as u16, 18)?
+    } else {
+        HuffmanTree::from_cl_lengths(&cl_lengths)?
+    };
+
+    // ── Level 2: code lengths of the actual alphabet ─────────────────────
+    let mut code_lengths = vec![0u8; alphabet_size as usize];
+    let mut symbol = 0usize;
+    let mut space = 32768i64;
+    let mut prev_nonzero_len = 8u8;
+    // Cumulative repeat count of the current 16-run or 17-run.
+    let mut repeat = 0u32;
+    // Length being repeated: prev non-zero for 16-runs, 0 for 17-runs.
+    let mut repeat_code_len = 0u8;
+
+    while symbol < alphabet_size as usize && space > 0 {
+        let s = cl_tree.decode_symbol(reader)?;
+        match s {
+            0..=15 => {
+                code_lengths[symbol] = s as u8;
+                symbol += 1;
+                repeat = 0;
+                if s != 0 {
+                    prev_nonzero_len = s as u8;
+                    space -= 32768 >> s;
+                }
+            }
+            16 | 17 => {
+                let extra_bits = if s == 16 { 2u32 } else { 3 };
+                let new_len = if s == 16 { prev_nonzero_len } else { 0 };
+                if repeat_code_len != new_len {
+                    repeat = 0;
+                    repeat_code_len = new_len;
+                }
+                let old_repeat = repeat;
+                if repeat > 0 {
+                    repeat = (repeat - 2) << extra_bits;
+                }
+                repeat += reader.read_bits(extra_bits)? + 3;
+                let delta = (repeat - old_repeat) as usize;
+                if symbol + delta > alphabet_size as usize {
+                    return Err(BrotliError::InvalidPrefixCode(
+                        "code length repeat exceeds alphabet size".to_string(),
+                    ));
+                }
+                for slot in &mut code_lengths[symbol..symbol + delta] {
+                    *slot = new_len;
+                }
+                symbol += delta;
+                if new_len != 0 {
+                    space -= (delta as i64) << (15 - new_len as i64);
+                }
+            }
+            _ => {
+                return Err(BrotliError::InvalidPrefixCode(format!(
+                    "invalid code length symbol {s}"
+                )));
+            }
+        }
+    }
+
+    if space != 0 {
+        return Err(BrotliError::InvalidPrefixCode(format!(
+            "prefix code is not complete (space {space})"
+        )));
+    }
+
+    HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
+}
+
+impl HuffmanTree {
+    /// Build the code-length-alphabet tree (max length 5, always complete
+    /// when reached with `space == 0`).
+    fn from_cl_lengths(cl_lengths: &[u8; 18]) -> BrotliResult<Self> {
+        // The 5-bit-limited code is complete at the 5-bit scale; scale is
+        // irrelevant to construction, which checks at the 15-bit scale, so
+        // completeness carries over automatically.
+        HuffmanTree::from_code_lengths(cl_lengths, 18)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Writing prefix code descriptors (encoder side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a prefix code from symbol frequencies, write its RFC 7932
+/// descriptor to `writer`, and return the tree to use for encoding the
+/// symbols (which always matches what a conforming decoder reconstructs).
 ///
-/// Uses the classic bottom-up algorithm to assign code lengths,
-/// then generates canonical codes.
+/// Alphabets with zero used symbols emit a valid 1-symbol simple code for
+/// symbol 0 (the code is never used to encode anything, but the descriptor
+/// must still be present and well-formed).
+pub fn build_and_write_prefix_code(
+    writer: &mut BitWriter,
+    frequencies: &[u32],
+    alphabet_size: u32,
+) -> BrotliResult<HuffmanTree> {
+    let mut nonzero: Vec<(u16, u32)> = frequencies
+        .iter()
+        .take(alphabet_size as usize)
+        .enumerate()
+        .filter(|&(_, &f)| f > 0)
+        .map(|(s, &f)| (s as u16, f))
+        .collect();
+
+    match nonzero.len() {
+        0 => {
+            write_simple_descriptor(writer, &[0], alphabet_size, false)?;
+            HuffmanTree::single_symbol(0, alphabet_size)
+        }
+        1 => {
+            write_simple_descriptor(writer, &[nonzero[0].0], alphabet_size, false)?;
+            HuffmanTree::single_symbol(nonzero[0].0, alphabet_size)
+        }
+        2..=4 => {
+            // Most frequent first: the first listed symbol receives the
+            // shortest code in the 3- and 4-symbol layouts.
+            nonzero.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let symbols: Vec<u16> = nonzero.iter().map(|&(s, _)| s).collect();
+            let mut code_lengths = vec![0u8; alphabet_size as usize];
+            let tree_select = match symbols.len() {
+                2 => {
+                    code_lengths[symbols[0] as usize] = 1;
+                    code_lengths[symbols[1] as usize] = 1;
+                    false
+                }
+                3 => {
+                    code_lengths[symbols[0] as usize] = 1;
+                    code_lengths[symbols[1] as usize] = 2;
+                    code_lengths[symbols[2] as usize] = 2;
+                    false
+                }
+                _ => {
+                    // Choose the cheaper of the two four-symbol layouts.
+                    let f: Vec<u64> = nonzero.iter().map(|&(_, f)| f as u64).collect();
+                    let flat = 2 * (f[0] + f[1] + f[2] + f[3]);
+                    let skewed = f[0] + 2 * f[1] + 3 * (f[2] + f[3]);
+                    let select = skewed < flat;
+                    if select {
+                        code_lengths[symbols[0] as usize] = 1;
+                        code_lengths[symbols[1] as usize] = 2;
+                        code_lengths[symbols[2] as usize] = 3;
+                        code_lengths[symbols[3] as usize] = 3;
+                    } else {
+                        for &s in &symbols {
+                            code_lengths[s as usize] = 2;
+                        }
+                    }
+                    select
+                }
+            };
+            write_simple_descriptor(writer, &symbols, alphabet_size, tree_select)?;
+            HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
+        }
+        _ => {
+            let tree = build_huffman_tree(frequencies, alphabet_size)?;
+            write_complex_descriptor(writer, &tree.code_lengths)?;
+            Ok(tree)
+        }
+    }
+}
+
+/// Write a simple prefix code descriptor (RFC 7932 Section 3.4).
+fn write_simple_descriptor(
+    writer: &mut BitWriter,
+    symbols: &[u16],
+    alphabet_size: u32,
+    tree_select: bool,
+) -> BrotliResult<()> {
+    let nsym = symbols.len();
+    if nsym == 0 || nsym > 4 {
+        return Err(BrotliError::InvalidParameter(
+            "simple prefix code supports 1-4 symbols".to_string(),
+        ));
+    }
+    writer.write_bits(1, 2)?; // HSKIP = 1 marks a simple code.
+    writer.write_bits((nsym - 1) as u32, 2)?;
+    let sym_bits = alphabet_bits(alphabet_size);
+    for &s in symbols {
+        writer.write_bits(s as u32, sym_bits)?;
+    }
+    if nsym == 4 {
+        writer.write_bit(tree_select)?;
+    }
+    Ok(())
+}
+
+/// One token of the RLE-compressed code length sequence.
+#[derive(Debug, Clone, Copy)]
+struct ClToken {
+    /// Code length alphabet symbol (0..=17).
+    symbol: u8,
+    /// Number of extra bits (0, 2, or 3).
+    extra_bits: u8,
+    /// Extra bits value.
+    extra: u32,
+}
+
+/// Write a complex prefix code descriptor (RFC 7932 Section 3.5) for the
+/// given complete code length assignment.
+fn write_complex_descriptor(writer: &mut BitWriter, code_lengths: &[u8]) -> BrotliResult<()> {
+    writer.write_bits(0, 2)?; // HSKIP = 0: no skipped code length codes.
+
+    let tokens = tokenize_code_lengths(code_lengths);
+
+    // Histogram of code-length-alphabet symbols.
+    let mut cl_freqs = [0u32; 18];
+    for t in &tokens {
+        cl_freqs[t.symbol as usize] += 1;
+    }
+    let distinct = cl_freqs.iter().filter(|&&f| f > 0).count();
+
+    // Build the code-length code. A single distinct token symbol becomes
+    // the RFC "one non-zero code length" degenerate case (the decoder then
+    // reads that symbol with zero bits).
+    let cl_tree = if distinct == 1 {
+        let sym = cl_freqs.iter().position(|&f| f > 0).unwrap_or(0);
+        let mut cl_lengths = [0u8; 18];
+        cl_lengths[sym] = 1;
+        // Build only for the code_lengths bookkeeping; symbol emission
+        // below writes zero bits via the degenerate tree.
+        let mut t = HuffmanTree::single_symbol(sym as u16, 18)?;
+        t.code_lengths = cl_lengths.to_vec();
+        t
+    } else {
+        build_huffman_tree_limited(&cl_freqs, 18, 5)?
+    };
+
+    // Write the code-length-code lengths in the prescribed order, mirroring
+    // the decoder's stop condition exactly: stop before an entry would be
+    // read with no code space remaining.
+    let mut space = 32i32;
+    for &idx in &CODE_LENGTH_CODE_ORDER {
+        if space <= 0 {
+            break;
+        }
+        let len = cl_tree.code_lengths[idx];
+        let (pattern, nbits) = CODE_LENGTH_VALUE_WRITE[len as usize];
+        writer.write_bits(pattern, nbits)?;
+        if len != 0 {
+            space -= 32 >> len;
+        }
+    }
+
+    // Emit the token stream. For the degenerate code-length code, symbol
+    // emission is zero bits; only the extra bits appear in the stream.
+    for t in &tokens {
+        if cl_tree.degenerate != Some(t.symbol as u16) {
+            cl_tree.encode_symbol(writer, t.symbol as u16)?;
+        }
+        if t.extra_bits > 0 {
+            writer.write_bits(t.extra, t.extra_bits as u32)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a code length array into the RFC 7932 Section 3.5 token stream:
+/// literal lengths 0..=15, repeat-previous (16, 2 extra bits), and
+/// repeat-zero (17, 3 extra bits), with the multi-token accumulation rule.
+/// Trailing zeros are omitted.
+fn tokenize_code_lengths(code_lengths: &[u8]) -> Vec<ClToken> {
+    let end = code_lengths
+        .iter()
+        .rposition(|&l| l != 0)
+        .map_or(0, |p| p + 1);
+    let lengths = &code_lengths[..end];
+
+    let mut tokens = Vec::new();
+    // The decoder's "previous non-zero code length" starts at 8.
+    let mut prev_nonzero = 8u8;
+    let mut i = 0usize;
+    while i < lengths.len() {
+        let v = lengths[i];
+        let mut run = 1usize;
+        while i + run < lengths.len() && lengths[i + run] == v {
+            run += 1;
+        }
+        i += run;
+
+        if v == 0 {
+            if run < 3 {
+                for _ in 0..run {
+                    tokens.push(ClToken {
+                        symbol: 0,
+                        extra_bits: 0,
+                        extra: 0,
+                    });
+                }
+            } else {
+                push_repeat_tokens(&mut tokens, 17, 3, run as u32);
+            }
+        } else {
+            let mut remaining = run;
+            if v != prev_nonzero {
+                // A 16 token repeats the previous non-zero length, so the
+                // first occurrence of a new length must be literal.
+                tokens.push(ClToken {
+                    symbol: v,
+                    extra_bits: 0,
+                    extra: 0,
+                });
+                prev_nonzero = v;
+                remaining -= 1;
+            }
+            if remaining > 0 {
+                if remaining < 3 {
+                    for _ in 0..remaining {
+                        tokens.push(ClToken {
+                            symbol: v,
+                            extra_bits: 0,
+                            extra: 0,
+                        });
+                    }
+                } else {
+                    push_repeat_tokens(&mut tokens, 16, 2, remaining as u32);
+                }
+            }
+        }
+    }
+    tokens
+}
+
+/// Emit a sequence of repeat tokens (16 or 17) whose decoder-side
+/// accumulation yields exactly `total` repetitions.
+///
+/// Decoder recurrence for consecutive same-symbol repeats:
+/// `t1 = 3 + d1`, `t_{k+1} = ((t_k - 2) << extra_bits) + 3 + d_{k+1}`,
+/// where each digit `d` is the extra-bits value. The final `t_k` is the
+/// total count. Digits are derived by running the recurrence backwards.
+fn push_repeat_tokens(tokens: &mut Vec<ClToken>, symbol: u8, extra_bits: u8, total: u32) {
+    let base = 1u32 << extra_bits;
+    let max_single = 3 + base - 1;
+    let mut digits = Vec::new();
+    let mut t = total;
+    loop {
+        if t <= max_single {
+            digits.push(t.saturating_sub(3));
+            break;
+        }
+        let d = (t - 3) % base;
+        digits.push(d);
+        t = (t - 3 - d) / base + 2;
+    }
+    digits.reverse();
+    for d in digits {
+        tokens.push(ClToken {
+            symbol,
+            extra_bits,
+            extra: d,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code construction (encoder side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a Huffman tree for encoding from frequency counts, limited to the
+/// Brotli maximum code length of 15 bits.
 pub fn build_huffman_tree(frequencies: &[u32], alphabet_size: u32) -> BrotliResult<HuffmanTree> {
     build_huffman_tree_limited(frequencies, alphabet_size, MAX_HUFFMAN_CODE_LENGTH)
 }
@@ -550,10 +845,7 @@ pub fn build_huffman_tree_limited(
 ///
 /// Completeness is the property the Brotli decoder relies on: the canonical
 /// code it reconstructs from these lengths must cover *every* bit pattern of
-/// the maximum length, with no gaps. An incomplete code (Kraft sum strictly
-/// below the limit) leaves bit patterns that decode to no symbol, which is the
-/// "no matching code found" failure that previously struck near-uniform,
-/// all-symbols-present (high-entropy) literal distributions.
+/// the maximum length, with no gaps.
 ///
 /// The lengths are also length-*optimal* for the limit because they are
 /// produced by the package-merge algorithm (Larmore–Hirschberg), which yields
@@ -567,9 +859,7 @@ fn compute_code_lengths(
     let mut code_lengths = vec![0u8; alphabet_size];
 
     // Zero or one symbol: callers (build_huffman_tree_limited) handle the
-    // single-symbol case before reaching here, but guard anyway. A lone symbol
-    // is assigned length 1 (a one-symbol *complete* code uses a single bit; the
-    // true zero-bit single-symbol case is handled by `single_symbol`).
+    // single-symbol case before reaching here, but guard anyway.
     if num_symbols <= 1 {
         if let Some((_, sym)) = sorted_symbols.first() {
             if *sym < code_lengths.len() {
@@ -579,11 +869,8 @@ fn compute_code_lengths(
         return Ok(code_lengths);
     }
 
-    // A complete code limited to `max_length` bits exists only if the number of
-    // leaves fits the code space: num_symbols ≤ 2^max_length. Every Brotli
-    // alphabet satisfies this (256/704/64 symbols with a 15-bit limit; 18
-    // code-length symbols with a 5-bit limit), but assert it defensively so the
-    // package-merge invariants below hold.
+    // A complete code limited to `max_length` bits exists only if the number
+    // of leaves fits the code space: num_symbols ≤ 2^max_length.
     if (num_symbols as u64) > (1u64 << max_length) {
         return Err(BrotliError::InvalidParameter(format!(
             "{num_symbols} symbols cannot fit in a {max_length}-bit prefix code"
@@ -606,9 +893,8 @@ fn compute_code_lengths(
     Ok(code_lengths)
 }
 
-/// Check that `code_lengths` describe a complete prefix code under `max_length`
-/// (Kraft sum equals exactly `2^max_length`). Used by the `debug_assert!` in
-/// `compute_code_lengths`; cheap enough to always compile.
+/// Check that `code_lengths` describe a complete prefix code under
+/// `max_length` (Kraft sum equals exactly `2^max_length`).
 fn is_complete_code(code_lengths: &[u8], max_length: u32) -> bool {
     let mut kraft: u64 = 0;
     for &cl in code_lengths {
@@ -622,7 +908,8 @@ fn is_complete_code(code_lengths: &[u8], max_length: u32) -> bool {
     kraft == (1u64 << max_length)
 }
 
-/// Compute optimal length-limited code lengths via the package-merge algorithm.
+/// Compute optimal length-limited code lengths via the package-merge
+/// algorithm.
 ///
 /// `sorted_symbols` must contain ≥ 2 entries and be sorted ascending by
 /// frequency (the caller guarantees both). The returned vector is parallel to
@@ -630,32 +917,12 @@ fn is_complete_code(code_lengths: &[u8], max_length: u32) -> bool {
 /// `sorted_symbols[k]`. The resulting code is always complete (Kraft sum =
 /// `2^max_length`) and minimises `Σ freq · length` subject to every length
 /// being ≤ `max_length`.
-///
-/// ## Algorithm
-///
-/// Package-merge views the problem as the "binary coin collector" problem. For
-/// each level `l` in `1..=max_length` we conceptually have one coin per symbol
-/// of denomination `2^(−l)` and numismatic value equal to the symbol weight; we
-/// must collect coins of total denomination `num_symbols − 1` while minimising
-/// total value. The dynamic program builds, level by level, the cheapest list
-/// of items: starting from the leaves, each pass *packages* adjacent pairs of
-/// the previous list and *merges* them with that level's leaves (both kept
-/// sorted by weight). Selecting the `2·num_symbols − 2` cheapest items from the
-/// final list and counting, for each symbol, how many selected items contain it
-/// gives that symbol's code length.
-///
-/// Items are tracked by an index into a flat arena of nodes; each node stores
-/// its weight, and either a leaf symbol-slot or two child node indices. Symbol
-/// membership counts are recovered by walking the selected items' subtrees.
-/// With Brotli's small alphabets (≤ 704 symbols) and `max_length ≤ 15`, the
-/// arena stays small and the whole computation is inexpensive.
 fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Vec<u8> {
     let n = sorted_symbols.len();
 
     // Arena of package-merge nodes. A node is either a leaf (referencing the
-    // index `k` of a symbol within `sorted_symbols`) or an internal package
-    // (referencing two child node indices). We only need the weight plus enough
-    // structure to count, per symbol, how many final items cover it.
+    // index `k` of a symbol within `sorted_symbols`) or a package of two
+    // previously created nodes.
     enum Node {
         /// Leaf for `sorted_symbols[k]`.
         Leaf { k: usize },
@@ -666,7 +933,6 @@ fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Ve
     let mut arena: Vec<Node> = Vec::new();
     let mut weight: Vec<u64> = Vec::new();
 
-    // Helper to push a leaf node and return its arena index.
     let push_leaf = |arena: &mut Vec<Node>, weight: &mut Vec<u64>, k: usize| -> usize {
         let id = arena.len();
         arena.push(Node::Leaf { k });
@@ -674,22 +940,15 @@ fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Ve
         id
     };
 
-    // The list of leaf node indices for one level, in ascending weight order
-    // (identical for every level, so build it once as a template of (weight, k)).
-    // We rebuild concrete leaf nodes per level to keep node identities distinct,
-    // which matters when counting subtree membership.
-
-    // `prev` holds the previous level's list as arena indices, ascending by weight.
-    // Level 1 (the deepest, l = max_length) starts as just the leaves.
+    // `prev` holds the previous level's list as arena indices, ascending by
+    // weight. The deepest level starts as just the leaves.
     let mut prev: Vec<usize> = Vec::with_capacity(n);
     for k in 0..n {
         let id = push_leaf(&mut arena, &mut weight, k);
         prev.push(id);
     }
-    // `prev` is already ascending because `sorted_symbols` is ascending by weight.
 
-    // Perform `max_length - 1` package+merge passes. After the loop, `prev`
-    // is the list for the top level from which we select 2n-2 items.
+    // Perform `max_length - 1` package+merge passes.
     for _ in 1..max_length {
         // Package adjacent pairs of `prev` (drop a trailing odd item).
         let mut packaged: Vec<usize> = Vec::with_capacity(prev.len() / 2 + n);
@@ -712,9 +971,7 @@ fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Ve
             leaves.push(id);
         }
 
-        // Merge `leaves` and `packaged`, both ascending by weight, into `prev`.
-        // Stable on ties: leaves before packages, preserving leaf order, which
-        // keeps the selection deterministic and the result canonical.
+        // Merge `leaves` and `packaged`, both ascending by weight.
         let mut merged: Vec<usize> = Vec::with_capacity(leaves.len() + packaged.len());
         let (mut a, mut b) = (0usize, 0usize);
         while a < leaves.len() && b < packaged.len() {
@@ -731,13 +988,12 @@ fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Ve
         prev = merged;
     }
 
-    // Select the cheapest `2n - 2` items from the final list and count, for each
-    // symbol, how many selected items cover it. That count is the symbol length.
+    // Select the cheapest `2n - 2` items; each symbol's length is the number
+    // of selected items whose subtree contains it.
     let select = 2 * n - 2;
     let mut lengths = vec![0u8; n];
     let mut stack: Vec<usize> = Vec::new();
     for &item in prev.iter().take(select) {
-        // Walk the item's subtree, incrementing the length of every leaf symbol.
         stack.clear();
         stack.push(item);
         while let Some(id) = stack.pop() {
@@ -754,252 +1010,6 @@ fn package_merge_lengths(sorted_symbols: &[(u32, usize)], max_length: u32) -> Ve
     }
 
     lengths
-}
-
-/// Write a prefix code for the given set of non-zero symbols and return the Huffman tree
-/// that matches what was written to the stream (so the encoder can use it for symbol encoding).
-/// Uses simple prefix code for 1-4 symbols, complex prefix code otherwise.
-pub fn write_prefix_code_and_build_tree(
-    writer: &mut BitWriter,
-    non_zero_symbols: &[u16],
-    full_tree: &HuffmanTree,
-    alphabet_size: u32,
-) -> BrotliResult<HuffmanTree> {
-    if non_zero_symbols.len() <= 4 {
-        // Write simple prefix code and build the corresponding tree.
-        write_simple_prefix_code(writer, non_zero_symbols, alphabet_size)?;
-
-        // Build the tree that matches the simple prefix code assignment.
-        let mut code_lengths = vec![0u8; alphabet_size as usize];
-        let nsym = non_zero_symbols.len();
-        match nsym {
-            1 => {
-                return HuffmanTree::single_symbol(non_zero_symbols[0], alphabet_size);
-            }
-            2 => {
-                code_lengths[non_zero_symbols[0] as usize] = 1;
-                code_lengths[non_zero_symbols[1] as usize] = 1;
-            }
-            3 => {
-                code_lengths[non_zero_symbols[0] as usize] = 1;
-                code_lengths[non_zero_symbols[1] as usize] = 2;
-                code_lengths[non_zero_symbols[2] as usize] = 2;
-            }
-            4 => {
-                // write_simple_prefix_code always writes tree_select=true for 4 symbols,
-                // which means all 4 get 2-bit codes.
-                for &s in non_zero_symbols {
-                    code_lengths[s as usize] = 2;
-                }
-            }
-            _ => {}
-        }
-        HuffmanTree::from_code_lengths(&code_lengths, alphabet_size)
-    } else {
-        // Write complex prefix code (uses the full tree's code lengths).
-        write_complex_prefix_code(writer, full_tree)?;
-        Ok(full_tree.clone())
-    }
-}
-
-/// Encode a Huffman tree as a simple prefix code to the bit writer.
-pub fn write_simple_prefix_code(
-    writer: &mut BitWriter,
-    symbols: &[u16],
-    alphabet_size: u32,
-) -> BrotliResult<()> {
-    let nsym = symbols.len();
-    if nsym == 0 || nsym > 4 {
-        return Err(BrotliError::InvalidParameter(
-            "simple prefix code supports 1-4 symbols".to_string(),
-        ));
-    }
-
-    // Write HSKIP = 1 (simple prefix code).
-    writer.write_bits(1, 2)?;
-
-    // Write NSYM - 1.
-    writer.write_bits((nsym - 1) as u32, 2)?;
-
-    // Write symbols.
-    let sym_bits = alphabet_bits(alphabet_size);
-    for &s in symbols {
-        writer.write_bits(s as u32, sym_bits)?;
-    }
-
-    // For 4 symbols, write tree-select bit.
-    if nsym == 4 {
-        writer.write_bit(true)?; // All 2-bit codes.
-    }
-
-    Ok(())
-}
-
-/// Write a complex prefix code to the bit writer.
-pub fn write_complex_prefix_code(writer: &mut BitWriter, tree: &HuffmanTree) -> BrotliResult<()> {
-    // Count non-zero code lengths.
-    let non_zero_symbols: Vec<(usize, u8)> = tree
-        .code_lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, cl)| **cl > 0)
-        .map(|(i, cl)| (i, *cl))
-        .collect();
-
-    // If 1-4 symbols, use simple prefix code.
-    if non_zero_symbols.len() <= 4 {
-        let symbols: Vec<u16> = non_zero_symbols.iter().map(|&(s, _)| s as u16).collect();
-        return write_simple_prefix_code(writer, &symbols, tree.alphabet_size);
-    }
-
-    // Write HSKIP = 0 (complex prefix code, no skip).
-    writer.write_bits(0, 2)?;
-
-    // Build code-length frequencies.
-    let mut cl_freqs = [0u32; 18];
-    for &cl in &tree.code_lengths {
-        cl_freqs[cl as usize] += 1;
-    }
-
-    // Count distinct non-zero code-length values.
-    let distinct_cl_values: Vec<usize> = cl_freqs
-        .iter()
-        .enumerate()
-        .filter(|&(_, &f)| f > 0)
-        .map(|(v, _)| v)
-        .collect();
-
-    // Build code-length-of-code-length (cl_code_lengths) array:
-    // These are written into the bitstream as the Huffman tree for decoding code lengths.
-    // Each entry is the number of bits used to encode that code-length symbol.
-    // With max code length 5 for these meta-codes.
-    let cl_tree = if distinct_cl_values.len() == 1 {
-        // Special case: only one distinct code-length value.
-        // We cannot use a true single-symbol Huffman tree (code_length=0) because the
-        // decoder requires at least one non-zero entry. Use code_length=1 for that symbol,
-        // matching the Brotli spec for single-symbol code-length alphabets.
-        let sym = distinct_cl_values[0];
-        let mut cl_code_lengths = vec![0u8; 18];
-        cl_code_lengths[sym] = 1;
-        HuffmanTree::from_code_lengths(&cl_code_lengths, 18)?
-    } else {
-        // Build Huffman tree for code lengths (max code length 5 for code-length codes).
-        build_huffman_tree_limited(&cl_freqs, 18, 5)?
-    };
-
-    // Write code-length code lengths in the prescribed order.
-    // Mirror the decoder's early-stop logic: stop as soon as space reaches 0
-    // (Kraft inequality is satisfied), so encoder and decoder stay in sync.
-    let mut space = 32i32;
-    for &idx in &CODE_LENGTH_CODE_ORDER {
-        if space <= 0 {
-            break;
-        }
-        let cl = cl_tree.code_lengths.get(idx).copied().unwrap_or(0);
-        write_code_length_value(writer, cl)?;
-        if cl != 0 {
-            space -= 32 >> cl;
-        }
-    }
-
-    // Now encode the actual code lengths using the code-length tree.
-    for &cl in &tree.code_lengths {
-        encode_symbol(writer, &cl_tree, cl as u16)?;
-    }
-
-    Ok(())
-}
-
-/// Write a code length value in the special encoding.
-/// Per RFC 7932, code-length code lengths are encoded with a max of 5 bits.
-/// Values 0-5 are the only valid values for code-length code lengths.
-/// We clamp higher values and use the nearest valid encoding.
-fn write_code_length_value(writer: &mut BitWriter, value: u8) -> BrotliResult<()> {
-    // Clamp to valid range 0-5.
-    let clamped = value.min(5);
-    // Encoding must match read_code_length_value (LSB-first bit ordering):
-    //   0: bits(0,0)       => 0b00  (2 bits)
-    //   1: bits(1,1,0)     => 0b011 (3 bits)  [v0=3,v1=0 → reader returns 1]
-    //   2: bits(0,1)       => 0b10  (2 bits)  [v0=2 → reader returns 2]
-    //   3: bits(1,0,1)     => 0b101 (3 bits)  [v0=1,v1=1 → reader returns 3]
-    //   4: bits(1,0,0)     => 0b001 (3 bits)  [v0=1,v1=0 → reader returns 4]
-    //   5: bits(1,1,1)     => 0b111 (3 bits)  [v0=3,v1=1 → reader returns 5]
-    match clamped {
-        0 => writer.write_bits(0, 2),
-        1 => writer.write_bits(0b011, 3),
-        2 => writer.write_bits(0b10, 2),
-        3 => writer.write_bits(0b101, 3),
-        4 => writer.write_bits(0b001, 3),
-        5 => writer.write_bits(0b111, 3),
-        _ => Ok(()),
-    }
-}
-
-/// Encode a single symbol using a Huffman tree.
-pub fn encode_symbol(writer: &mut BitWriter, tree: &HuffmanTree, symbol: u16) -> BrotliResult<()> {
-    let sym = symbol as usize;
-    if sym >= tree.code_lengths.len() {
-        return Err(BrotliError::InvalidParameter(format!(
-            "symbol {sym} exceeds alphabet"
-        )));
-    }
-    let code_len = tree.code_lengths[sym];
-    if code_len == 0 {
-        // Check if this is a single-symbol tree.
-        let non_zero_count = tree.code_lengths.iter().filter(|&&cl| cl > 0).count();
-        if non_zero_count <= 1 {
-            // Single symbol tree, no bits needed.
-            return Ok(());
-        }
-        return Err(BrotliError::InvalidParameter(format!(
-            "symbol {sym} has zero code length"
-        )));
-    }
-
-    // Compute canonical code for this symbol.
-    let code = canonical_code(&tree.code_lengths, sym)?;
-    // Write in reversed bit order (LSB first for the bit writer).
-    let reversed = reverse_bits(code, code_len as u32);
-    writer.write_bits(reversed, code_len as u32)
-}
-
-/// Compute the canonical Huffman code for a given symbol.
-fn canonical_code(code_lengths: &[u8], symbol: usize) -> BrotliResult<u32> {
-    let target_len = code_lengths[symbol];
-    if target_len == 0 {
-        return Err(BrotliError::InvalidParameter(
-            "symbol has zero code length".to_string(),
-        ));
-    }
-
-    let mut bl_count = vec![0u32; (MAX_HUFFMAN_CODE_LENGTH + 1) as usize];
-    for &cl in code_lengths {
-        if cl > 0 {
-            bl_count[cl as usize] += 1;
-        }
-    }
-
-    let mut next_code = vec![0u32; (MAX_HUFFMAN_CODE_LENGTH + 1) as usize];
-    let mut code = 0u32;
-    let max_len = code_lengths.iter().copied().max().unwrap_or(0);
-    for bits in 1..=max_len {
-        code = (code + bl_count[bits as usize - 1]) << 1;
-        next_code[bits as usize] = code;
-    }
-
-    let mut result_code = next_code[target_len as usize];
-    for (i, &cl) in code_lengths.iter().enumerate() {
-        if cl == target_len {
-            if i == symbol {
-                return Ok(result_code);
-            }
-            result_code += 1;
-        }
-    }
-
-    Err(BrotliError::InvalidParameter(format!(
-        "could not compute code for symbol {symbol}"
-    )))
 }
 
 #[cfg(test)]
@@ -1020,68 +1030,195 @@ mod tests {
         assert_eq!(alphabet_bits(2), 1);
         assert_eq!(alphabet_bits(3), 2);
         assert_eq!(alphabet_bits(4), 2);
+        assert_eq!(alphabet_bits(26), 5);
         assert_eq!(alphabet_bits(256), 8);
         assert_eq!(alphabet_bits(257), 9);
+        assert_eq!(alphabet_bits(704), 10);
     }
 
     #[test]
     fn test_single_symbol_tree() {
         let tree = HuffmanTree::single_symbol(42, 256).expect("should create tree");
-        let data = [0x00]; // doesn't matter, no bits consumed
+        let data = [0x00];
         let mut reader = BitReader::new(&data);
-        let sym = tree.decode_symbol(&mut reader).expect("should decode");
-        assert_eq!(sym, 42);
+        assert_eq!(tree.decode_symbol(&mut reader).ok(), Some(42));
+        // No bits consumed.
+        assert_eq!(reader.bits_consumed(), 0);
     }
 
     #[test]
     fn test_two_symbol_tree() {
-        // Two symbols with code length 1 each.
         let mut code_lengths = vec![0u8; 256];
-        code_lengths[0] = 1; // symbol 0: code 0
-        code_lengths[1] = 1; // symbol 1: code 1
-        let tree = HuffmanTree::from_code_lengths(&code_lengths, 256).expect("should create tree");
-
-        // Need at least 2 bytes for the LUT peek (10 bits).
-        let data = [0b10, 0x00]; // bits: 0, 1, then padding zeros
+        code_lengths[0] = 1;
+        code_lengths[1] = 1;
+        let tree = HuffmanTree::from_code_lengths(&code_lengths, 256).expect("tree");
+        let data = [0b10, 0x00];
         let mut reader = BitReader::new(&data);
         assert_eq!(tree.decode_symbol(&mut reader).ok(), Some(0));
         assert_eq!(tree.decode_symbol(&mut reader).ok(), Some(1));
     }
 
     #[test]
-    fn test_build_huffman_tree() {
-        let mut freqs = vec![0u32; 4];
-        freqs[0] = 10;
-        freqs[1] = 5;
-        freqs[2] = 3;
-        freqs[3] = 1;
-        let tree = build_huffman_tree(&freqs, 4).expect("should build tree");
-        // Most frequent symbol should have shortest code.
-        assert!(tree.code_lengths[0] <= tree.code_lengths[3]);
+    fn test_incomplete_code_rejected() {
+        // A lone 2-bit code (Kraft sum 1/4) is not complete and has more
+        // than one... actually one symbol becomes degenerate; use two.
+        let mut code_lengths = vec![0u8; 8];
+        code_lengths[0] = 2;
+        code_lengths[1] = 2;
+        assert!(HuffmanTree::from_code_lengths(&code_lengths, 8).is_err());
+        // Over-subscribed: three 1-bit codes.
+        let mut code_lengths = vec![0u8; 8];
+        code_lengths[0] = 1;
+        code_lengths[1] = 1;
+        code_lengths[2] = 1;
+        assert!(HuffmanTree::from_code_lengths(&code_lengths, 8).is_err());
     }
 
+    /// Long codes (> ROOT_BITS) must decode through sub-tables correctly.
+    /// Uses a comb distribution that produces 15-bit codes, and checks
+    /// encode→decode round-trip for every symbol.
     #[test]
-    fn test_encode_decode_roundtrip() {
-        let mut freqs = vec![0u32; 8];
-        freqs[0] = 100;
-        freqs[1] = 50;
-        freqs[2] = 25;
-        freqs[3] = 10;
-        let tree = build_huffman_tree(&freqs, 8).expect("should build");
+    fn test_two_level_table_roundtrip_all_symbols() {
+        // Fibonacci-ish weights force a wide range of code lengths.
+        let mut freqs = vec![0u32; 64];
+        let (mut a, mut b) = (1u32, 1u32);
+        for f in freqs.iter_mut() {
+            *f = a;
+            let c = a.saturating_add(b);
+            a = b;
+            b = c;
+        }
+        let tree = build_huffman_tree(&freqs, 64).expect("build");
+        let max_len = tree.code_lengths.iter().copied().max().unwrap_or(0);
+        assert!(max_len as u32 > ROOT_BITS, "test must exercise sub-tables");
 
         let mut writer = BitWriter::new();
-        for sym in [0u16, 1, 2, 3, 0, 1, 0] {
-            encode_symbol(&mut writer, &tree, sym).expect("should encode");
+        for sym in 0..64u16 {
+            tree.encode_symbol(&mut writer, sym).expect("encode");
         }
-        let mut data = writer.finish();
-        // Add padding bytes so the bit reader can peek LUT_BITS ahead.
-        data.extend_from_slice(&[0u8; 4]);
-
+        let data = writer.finish();
         let mut reader = BitReader::new(&data);
-        for expected in [0u16, 1, 2, 3, 0, 1, 0] {
-            let decoded = tree.decode_symbol(&mut reader).expect("should decode");
-            assert_eq!(decoded, expected);
+        for sym in 0..64u16 {
+            assert_eq!(tree.decode_symbol(&mut reader).ok(), Some(sym), "sym {sym}");
         }
+    }
+
+    /// Randomized decode-table validation across many shapes: every
+    /// encodable symbol must round-trip.
+    #[test]
+    fn test_random_trees_roundtrip() {
+        let mut state = 0x2468_ACE0u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for &alphabet in &[18u32, 26, 64, 256, 704] {
+            for _ in 0..20 {
+                let mut freqs = vec![0u32; alphabet as usize];
+                let mut nonzero = 0;
+                for f in freqs.iter_mut() {
+                    if next() % 3 != 0 {
+                        *f = next() % 5000 + 1;
+                        nonzero += 1;
+                    }
+                }
+                if nonzero < 2 {
+                    continue;
+                }
+                let tree = build_huffman_tree(&freqs, alphabet).expect("build");
+                let symbols: Vec<u16> = (0..alphabet as u16)
+                    .filter(|&s| freqs[s as usize] > 0)
+                    .collect();
+                let mut writer = BitWriter::new();
+                for &s in &symbols {
+                    tree.encode_symbol(&mut writer, s).expect("encode");
+                }
+                let data = writer.finish();
+                let mut reader = BitReader::new(&data);
+                for &s in &symbols {
+                    assert_eq!(tree.decode_symbol(&mut reader).ok(), Some(s));
+                }
+            }
+        }
+    }
+
+    /// Writing a descriptor with `build_and_write_prefix_code` and reading
+    /// it back with `read_prefix_code` must reproduce identical code
+    /// lengths, for simple and complex codes alike.
+    #[test]
+    fn test_descriptor_write_read_roundtrip() {
+        let mut state = 0x1357_9BDFu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for &alphabet in &[26u32, 64, 256, 704] {
+            for density in [2usize, 3, 4, 8, 40, alphabet as usize] {
+                let mut freqs = vec![0u32; alphabet as usize];
+                let mut placed = 0;
+                while placed < density.min(alphabet as usize) {
+                    let s = (next() % alphabet) as usize;
+                    if freqs[s] == 0 {
+                        freqs[s] = next() % 1000 + 1;
+                        placed += 1;
+                    }
+                }
+                let mut writer = BitWriter::new();
+                let wrote =
+                    build_and_write_prefix_code(&mut writer, &freqs, alphabet).expect("write");
+                let mut data = writer.finish();
+                data.extend_from_slice(&[0u8; 4]); // peek padding
+                let mut reader = BitReader::new(&data);
+                let read = read_prefix_code(&mut reader, alphabet).expect("read");
+                assert_eq!(
+                    wrote.code_lengths, read.code_lengths,
+                    "alphabet {alphabet} density {density}"
+                );
+                assert_eq!(wrote.degenerate, read.degenerate);
+            }
+        }
+    }
+
+    /// The repeat-token digit decomposition must reproduce every total
+    /// under the decoder's accumulation rule, for both 16- and 17-codes.
+    #[test]
+    fn test_repeat_token_accumulation_exhaustive() {
+        for &(extra_bits, base) in &[(2u8, 4u32), (3u8, 8u32)] {
+            for total in 3u32..3000 {
+                let mut tokens = Vec::new();
+                push_repeat_tokens(&mut tokens, 16, extra_bits, total);
+                // Simulate the decoder accumulation.
+                let mut repeat = 0u32;
+                for t in &tokens {
+                    let old = repeat;
+                    if repeat > 0 {
+                        repeat = (repeat - 2) * base;
+                    }
+                    repeat += t.extra + 3;
+                    assert!(repeat > old, "monotone");
+                }
+                assert_eq!(repeat, total, "extra_bits {extra_bits} total {total}");
+            }
+        }
+    }
+
+    /// All-lengths-equal codes exercise the degenerate code-length-code path
+    /// ("single symbol is 16, previous length taken to be 8").
+    #[test]
+    fn test_uniform_256_roundtrips_via_descriptor() {
+        let freqs = vec![7u32; 256];
+        let mut writer = BitWriter::new();
+        let wrote = build_and_write_prefix_code(&mut writer, &freqs, 256).expect("write");
+        assert!(wrote.code_lengths.iter().all(|&l| l == 8));
+        let mut data = writer.finish();
+        data.extend_from_slice(&[0u8; 4]);
+        let mut reader = BitReader::new(&data);
+        let read = read_prefix_code(&mut reader, 256).expect("read");
+        assert_eq!(read.code_lengths, wrote.code_lengths);
     }
 
     /// Kraft sum of a code-length table under the given limit.
@@ -1089,35 +1226,24 @@ mod tests {
         let mut sum = 0u64;
         for &cl in code_lengths {
             if cl > 0 {
-                assert!(
-                    cl as u32 <= max_length,
-                    "code length {cl} exceeds {max_length}"
-                );
+                assert!(cl as u32 <= max_length);
                 sum += 1u64 << (max_length - cl as u32);
             }
         }
         sum
     }
 
-    /// The package-merge length assignment must always produce a **complete**
-    /// code (Kraft sum == 2^max_length) for the near-uniform, all-symbols-present
-    /// distribution that previously yielded an incomplete code and the
-    /// "no matching code found" decode failure.
     #[test]
     fn test_compute_code_lengths_complete_for_near_uniform() {
-        // 256 symbols with small, slightly-varying frequencies — the shape that
-        // arises from high-entropy literal data.
         let mut freqs = vec![0u32; 256];
         for (i, f) in freqs.iter_mut().enumerate() {
-            *f = 8 + ((i as u32).wrapping_mul(2654435761) % 24); // range [8, 31]
+            *f = 8 + ((i as u32).wrapping_mul(2654435761) % 24);
         }
         let tree = build_huffman_tree(&freqs, 256).expect("build");
         assert_eq!(
             kraft_sum(&tree.code_lengths, MAX_HUFFMAN_CODE_LENGTH),
-            1u64 << MAX_HUFFMAN_CODE_LENGTH,
-            "near-uniform 256-symbol code must be complete"
+            1u64 << MAX_HUFFMAN_CODE_LENGTH
         );
-        // Every present symbol must have a positive length.
         for (sym, &f) in freqs.iter().enumerate() {
             if f > 0 {
                 assert!(tree.code_lengths[sym] > 0, "symbol {sym} lost its code");
@@ -1125,9 +1251,6 @@ mod tests {
         }
     }
 
-    /// Completeness must hold across many random distributions, alphabet sizes,
-    /// and length limits (including the tight 18-symbol / 5-bit code-length
-    /// alphabet and limits that force the length-limiting path).
     #[test]
     fn test_compute_code_lengths_complete_random_sweep() {
         let mut state = 0x1357_9BDFu64;
@@ -1137,7 +1260,6 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
-
         for &(alphabet, max_len) in &[(256u32, 15u32), (704, 15), (64, 15), (18, 5), (32, 6)] {
             for _ in 0..50 {
                 let mut freqs = vec![0u32; alphabet as usize];
@@ -1162,8 +1284,6 @@ mod tests {
         }
     }
 
-    /// Highly skewed weights (Fibonacci) would naturally need > 15-bit codes;
-    /// the length-limiting path must clamp to ≤ max_length and stay complete.
     #[test]
     fn test_compute_code_lengths_complete_when_limiting() {
         let mut freqs = vec![0u32; 64];
@@ -1176,21 +1296,16 @@ mod tests {
         }
         let tree = build_huffman_tree_limited(&freqs, 64, 15).expect("build");
         let max = tree.code_lengths.iter().copied().max().unwrap_or(0);
-        assert!(max <= 15, "limiting failed: max code length {max} > 15");
-        assert_eq!(
-            kraft_sum(&tree.code_lengths, 15),
-            1u64 << 15,
-            "limited code must remain complete"
-        );
+        assert!(max <= 15);
+        assert_eq!(kraft_sum(&tree.code_lengths, 15), 1u64 << 15);
     }
 
-    /// Uniform full alphabet maps to all length-8 codes (Kraft sum exactly 2^15).
     #[test]
     fn test_compute_code_lengths_uniform_full_alphabet() {
         let freqs = vec![7u32; 256];
         let tree = build_huffman_tree(&freqs, 256).expect("build");
         for &cl in &tree.code_lengths {
-            assert_eq!(cl, 8, "uniform 256 alphabet should be all length 8");
+            assert_eq!(cl, 8);
         }
         assert_eq!(kraft_sum(&tree.code_lengths, 15), 1u64 << 15);
     }

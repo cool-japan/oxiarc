@@ -91,12 +91,14 @@ impl<R: Read> Lz4Reader<R> {
     }
 
     /// Attach a progress sink. Emitted once after decompression completes.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before decompression begins.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -170,6 +172,7 @@ impl<W: Write> Lz4Writer<W> {
     /// Attach a progress sink. Notified once per successful
     /// [`Lz4Writer::write_compressed`] call with the cumulative uncompressed
     /// byte count.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -177,6 +180,7 @@ impl<W: Write> Lz4Writer<W> {
 
     /// Attach a cancellation token. Checked at the start of each
     /// [`Lz4Writer::write_compressed`] call.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

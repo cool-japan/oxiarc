@@ -34,7 +34,10 @@ pub fn cmd_convert(
     // Detect input format
     let file = open_file(input)?;
     let mut reader = BufReader::new(file);
-    let (input_format, _) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`), which plain `detect` can
+    // only ever report as Unknown.
+    let (input_format, _) = ArchiveFormat::detect_with_path(&mut reader, input)?;
     reader.seek(SeekFrom::Start(0))?;
 
     // Determine output format — refuse extensions we cannot write (e.g. .7z)

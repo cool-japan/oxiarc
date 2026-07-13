@@ -93,7 +93,10 @@ pub fn cmd_list(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = open_input(archive)?;
 
-    let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`); `-` (stdin) has no
+    // extension, so it degrades to plain content detection.
+    let (format, _magic) = ArchiveFormat::detect_with_path(&mut reader, archive)?;
     reader.seek(SeekFrom::Start(0))?;
 
     if options.json {
@@ -176,6 +179,17 @@ pub fn cmd_list(
                 bzip2.block_size() / 1000
             );
             println!("  Use 'extract' to decompress");
+        }
+        ArchiveFormat::Brotli => {
+            // Raw Brotli carries no header at all — no magic, no size, no
+            // name. Reaching this arm at all requires the `.br` extension
+            // fallback in `detect_with_path`.
+            println!("Brotli file (RFC 7932 compressed stream)");
+            println!("  Single compressed stream - use 'extract' to decompress");
+        }
+        ArchiveFormat::Snappy => {
+            println!("Snappy file (framed compression)");
+            println!("  Single compressed stream - use 'extract' to decompress");
         }
         ArchiveFormat::SevenZip => {
             let sevenz = SevenZReader::new(reader)?;
@@ -319,6 +333,18 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
                 "method": "Bzip2",
                 "block_size": bzip2.block_size(),
                 "block_size_level": bzip2.block_size_level()
+            }));
+        }
+        ArchiveFormat::Brotli => {
+            output.metadata = Some(serde_json::json!({
+                "type": "compressed_stream",
+                "method": "Brotli"
+            }));
+        }
+        ArchiveFormat::Snappy => {
+            output.metadata = Some(serde_json::json!({
+                "type": "compressed_stream",
+                "method": "Snappy"
             }));
         }
         ArchiveFormat::SevenZip => {

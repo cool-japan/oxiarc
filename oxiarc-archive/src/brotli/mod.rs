@@ -78,12 +78,14 @@ impl BrotliReader {
     }
 
     /// Attach a progress sink forwarded to the underlying Brotli decompressor.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying Brotli decompressor.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -94,7 +96,40 @@ impl BrotliReader {
         self.data.len()
     }
 
+    /// Decompress the entire file with an output-size limit.
+    ///
+    /// Brotli declares no uncompressed size anywhere in the stream, so the
+    /// limit is enforced *during* decoding: the codec checks each
+    /// meta-block's declared length (MLEN) against the remaining budget
+    /// before decoding it, and returns [`OxiArcError::MemoryBudgetExceeded`]
+    /// without ever materialising the over-budget output. This is the hook
+    /// the CLI's `--memory-limit` routes through for `.br` input.
+    pub fn decompress_with_limit(&mut self, max_out: usize) -> Result<Vec<u8>> {
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_brotli::decompress_with_limit(&self.data, max_out)
+                .map_err(OxiArcError::from);
+        }
+
+        // With hooks attached, go through the streaming decompressor, which
+        // forwards them and threads the same per-meta-block budget check.
+        let mut decompressor = BrotliDecompressor::new(&self.data[..]).with_max_output(max_out);
+        if let Some(handle) = self.progress.clone() {
+            decompressor = decompressor.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            decompressor = decompressor.with_cancel(token);
+        }
+        let mut output = Vec::new();
+        decompressor
+            .read_to_end(&mut output)
+            .map_err(OxiArcError::Io)?;
+        Ok(output)
+    }
+
     /// Decompress the entire file.
+    ///
+    /// The output size is bounded only by the codec's built-in 256 MB guard;
+    /// use [`BrotliReader::decompress_with_limit`] for untrusted input.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
         // If neither progress nor cancel is attached, keep the previous fast-path
         // which calls the free function (preserves output-byte behaviour
@@ -161,12 +196,14 @@ impl BrotliWriter {
     }
 
     /// Attach a progress sink forwarded to the underlying Brotli compressor.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying Brotli compressor.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -210,8 +247,22 @@ impl Default for BrotliWriter {
 }
 
 /// Decompress Brotli data directly.
+///
+/// The output size is bounded only by the codec's built-in 256 MB guard;
+/// prefer [`decompress_with_limit`] for untrusted input.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     oxiarc_brotli::decompress(data).map_err(OxiArcError::from)
+}
+
+/// Decompress Brotli data with an output-size limit (the decompression-bomb
+/// guard for untrusted input).
+///
+/// Returns [`OxiArcError::MemoryBudgetExceeded`] as soon as the stream
+/// declares that it will exceed `max_out` bytes — the check runs per
+/// meta-block, before the offending block is decoded, so the expansion is
+/// never allocated.
+pub fn decompress_with_limit(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    oxiarc_brotli::decompress_with_limit(data, max_out).map_err(OxiArcError::from)
 }
 
 /// Compress data with default quality (6).

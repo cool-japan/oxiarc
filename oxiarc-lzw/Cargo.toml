@@ -15,6 +15,15 @@ exclude = ["TODO.md"]
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+# TIFF-LZW differential oracle tests (tests/tiff_lzw_oracle.rs) that shell out
+# to `python3` + Pillow (libtiff-backed) and, when present, libtiff's `tiffcp`.
+# They validate real-world interop in BOTH directions: Pillow-compressed
+# strips must decode byte-identically, and oxiarc-compressed TIFFs must be
+# accepted by Pillow/libtiff. Tests self-skip when the tools are absent.
+# Mirrors the `lha-oracle` feature pattern in `oxiarc-lzhuf`.
+tiff-oracle = []
+
 [dependencies]
 thiserror.workspace = true
 

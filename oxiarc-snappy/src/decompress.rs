@@ -113,6 +113,54 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>, SnappyError> {
     Ok(output)
 }
 
+/// Decompress Snappy block-format data, refusing to produce more than
+/// `max_output` bytes.
+///
+/// The block format is self-describing: every block begins with a varint
+/// carrying the *exact* uncompressed length, and [`decompress`] rejects a
+/// block that does not decode to exactly that many bytes. The budget is
+/// therefore checked against that declared length **before any output buffer
+/// is allocated** — an over-budget bomb is rejected without decoding a single
+/// tag, and there are no false positives.
+///
+/// Returns [`SnappyError::TotalOutputExceeded`] when the block declares more
+/// than `max_output` bytes of output.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_snappy::{compress, decompress_with_limit, SnappyError};
+///
+/// let data = vec![0u8; 100_000];
+/// let compressed = compress(&data);
+///
+/// // Generous budget: decodes normally.
+/// assert_eq!(decompress_with_limit(&compressed, 1 << 20).expect("decompress"), data);
+///
+/// // Tight budget: rejected before the 100 kB output buffer is allocated.
+/// assert!(matches!(
+///     decompress_with_limit(&compressed, 1024),
+///     Err(SnappyError::TotalOutputExceeded { .. })
+/// ));
+/// ```
+pub fn decompress_with_limit(input: &[u8], max_output: usize) -> Result<Vec<u8>, SnappyError> {
+    if input.is_empty() {
+        return Err(SnappyError::UnexpectedEof {
+            context: "empty input",
+        });
+    }
+
+    let (declared_len, _) = decompress_len(input)?;
+    if declared_len > max_output {
+        return Err(SnappyError::TotalOutputExceeded {
+            produced: declared_len as u64,
+            max: max_output as u64,
+        });
+    }
+
+    decompress(input)
+}
+
 /// Decode a literal element.
 ///
 /// The tag byte's upper 6 bits encode the literal length:

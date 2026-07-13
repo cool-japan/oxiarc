@@ -764,6 +764,7 @@ impl Lz4DictFrameEncoder {
     ///
     /// The sink's `on_progress(bytes_processed, None)` is called after each
     /// block is compressed. `on_finish()` is called when all blocks are done.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -773,6 +774,7 @@ impl Lz4DictFrameEncoder {
     ///
     /// The token is checked before each block is compressed.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -867,6 +869,7 @@ impl Lz4DictFrameDecoder {
     ///
     /// The sink's `on_progress(bytes_decompressed, None)` is called after each
     /// block is decompressed. `on_finish()` is called when all blocks are done.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -876,6 +879,7 @@ impl Lz4DictFrameDecoder {
     ///
     /// The token is checked before each block is decompressed.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

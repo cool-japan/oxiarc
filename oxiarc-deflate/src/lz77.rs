@@ -93,6 +93,7 @@ impl Default for Lz77Params {
 /// Each preset trades speed for compression ratio. `Default` reproduces the
 /// level-6 encoder's implicit parameters (same output as `Lz77Params::for_level(6)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Lz77Preset {
     /// Fastest search: small nice_length and small max_chain.
     Fast,

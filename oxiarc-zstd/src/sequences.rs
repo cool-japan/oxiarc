@@ -3,8 +3,17 @@
 //! Sequences describe LZ77-style back-references using literal lengths,
 //! match lengths, and offsets.
 
-use crate::fse::{FseBitReader, FseDecoder, FseTable, FseTableEntry, read_fse_table_description};
+use crate::fse::{FseBitReader, FseTable, FseTableEntry, read_fse_table_description};
 use oxiarc_core::error::{OxiArcError, Result};
+
+/// Maximum accuracy log for literal-length FSE tables (RFC 8878).
+const LL_MAX_ACCURACY_LOG: u8 = 9;
+/// Maximum accuracy log for offset FSE tables (RFC 8878).
+const OF_MAX_ACCURACY_LOG: u8 = 8;
+/// Maximum accuracy log for match-length FSE tables (RFC 8878).
+const ML_MAX_ACCURACY_LOG: u8 = 9;
+/// Maximum offset code (offset extra bits count; bounded so shifts are safe).
+const MAX_OFFSET_CODE: u8 = 31;
 
 /// A decoded sequence.
 #[derive(Debug, Clone, Copy)]
@@ -186,7 +195,7 @@ impl SequencesDecoder {
                 Ok(1)
             }
             CompressionMode::Fse => {
-                let (table, consumed) = read_fse_table_description(data, 35)?;
+                let (table, consumed) = read_fse_table_description(data, 35, LL_MAX_ACCURACY_LOG)?;
                 self.ll_table = Some(table);
                 Ok(consumed)
             }
@@ -220,7 +229,7 @@ impl SequencesDecoder {
                 Ok(1)
             }
             CompressionMode::Fse => {
-                let (table, consumed) = read_fse_table_description(data, 31)?;
+                let (table, consumed) = read_fse_table_description(data, 31, OF_MAX_ACCURACY_LOG)?;
                 self.of_table = Some(table);
                 Ok(consumed)
             }
@@ -254,7 +263,7 @@ impl SequencesDecoder {
                 Ok(1)
             }
             CompressionMode::Fse => {
-                let (table, consumed) = read_fse_table_description(data, 52)?;
+                let (table, consumed) = read_fse_table_description(data, 52, ML_MAX_ACCURACY_LOG)?;
                 self.ml_table = Some(table);
                 Ok(consumed)
             }
@@ -270,31 +279,16 @@ impl SequencesDecoder {
         }
     }
 
-    /// Decode sequences from bitstream.
+    /// Decode sequences from the backward bitstream (RFC 8878 §3.1.1.4).
+    ///
+    /// Read order per the specification:
+    /// 1. Initial FSE states: literal-length, offset, match-length.
+    /// 2. Per sequence: offset extra bits, then match-length extra bits, then
+    ///    literal-length extra bits (the codes come from the *current* states
+    ///    without consuming bits).
+    /// 3. State updates in order literal-length, match-length, offset — and
+    ///    **no** update after the final sequence.
     fn decode_sequences(&mut self, data: &[u8], count: usize) -> Result<Vec<Sequence>> {
-        // Check tables exist first
-        if self.ll_table.is_none() {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "missing literal length table".to_string(),
-            });
-        }
-        if self.of_table.is_none() {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "missing offset table".to_string(),
-            });
-        }
-        if self.ml_table.is_none() {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "missing match length table".to_string(),
-            });
-        }
-
-        let mut reader = FseBitReader::new(data)?;
-
-        // Initialize FSE decoders - tables checked above
         let ll_table = self
             .ll_table
             .as_ref()
@@ -308,28 +302,70 @@ impl SequencesDecoder {
             .as_ref()
             .ok_or_else(|| OxiArcError::corrupted(0, "missing match length table"))?;
 
-        let mut ll_decoder = FseDecoder::new(ll_table, &mut reader);
-        let mut of_decoder = FseDecoder::new(of_table, &mut reader);
-        let mut ml_decoder = FseDecoder::new(ml_table, &mut reader);
+        let mut reader = FseBitReader::new(data)?;
+
+        let mut ll_state = reader.read_bits(ll_table.accuracy_log()) as usize;
+        let mut of_state = reader.read_bits(of_table.accuracy_log()) as usize;
+        let mut ml_state = reader.read_bits(ml_table.accuracy_log()) as usize;
+        if reader.is_overflowed() {
+            return Err(OxiArcError::corrupted(
+                0,
+                "sequence bitstream too short for initial FSE states",
+            ));
+        }
 
         let mut sequences = Vec::with_capacity(count);
 
-        for _ in 0..count {
-            // Decode in order: offset, match length, literal length
-            let of_code = of_decoder.decode(&mut reader);
-            let ml_code = ml_decoder.decode(&mut reader);
-            let ll_code = ll_decoder.decode(&mut reader);
+        for i in 0..count {
+            let ll_entry = *ll_table.get(ll_state)?;
+            let of_entry = *of_table.get(of_state)?;
+            let ml_entry = *ml_table.get(ml_state)?;
 
-            // Convert codes to values
-            let ll_value = decode_ll_value(ll_code, &mut reader)?;
-            let ml_value = decode_ml_value(ml_code, &mut reader)?;
-            let offset = decode_offset(of_code, ll_value, &mut self.repeat_offsets, &mut reader)?;
+            // Extra bits are read offset first, then match length, then
+            // literal length.
+            let offset_and_reps = decode_offset(
+                of_entry.symbol,
+                ll_entry.symbol,
+                &mut self.repeat_offsets,
+                &mut reader,
+            )?;
+            let ml_value = decode_ml_value(ml_entry.symbol, &mut reader)?;
+            let ll_value = decode_ll_value(ll_entry.symbol, &mut reader)?;
 
             sequences.push(Sequence {
                 literal_length: ll_value,
                 match_length: ml_value,
-                offset,
+                offset: offset_and_reps,
             });
+
+            // Update states (skipped after the last sequence).
+            if i + 1 < count {
+                ll_state =
+                    ll_entry.baseline as usize + reader.read_bits(ll_entry.num_bits) as usize;
+                ml_state =
+                    ml_entry.baseline as usize + reader.read_bits(ml_entry.num_bits) as usize;
+                of_state =
+                    of_entry.baseline as usize + reader.read_bits(of_entry.num_bits) as usize;
+            }
+
+            if reader.is_overflowed() {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    "sequence bitstream exhausted early",
+                ));
+            }
+        }
+
+        // A well-formed stream is consumed exactly (reference checks
+        // `BIT_endOfDStream` after the last sequence).
+        if !reader.is_finished() {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "sequence bitstream not fully consumed ({} bits left)",
+                    reader.bits_remaining()
+                ),
+            ));
         }
 
         Ok(sequences)
@@ -341,98 +377,77 @@ impl SequencesDecoder {
     }
 }
 
-/// Decode offset with repeat offset handling.
+/// Decode offset with repeat offset handling (RFC 8878 §3.1.1.5).
 ///
-/// In Zstandard, the offset code and extra bits produce an `Offset_Value`:
+/// The offset code and extra bits produce an `Offset_Value`:
 ///   `Offset_Value = (1 << code) + readBits(code)`
 ///
-/// - `Offset_Value == 1`: repeat offset 1 (or 2 if `literal_length == 0`)
-/// - `Offset_Value == 2`: repeat offset 2 (or 3 if `literal_length == 0`)
-/// - `Offset_Value == 3`: repeat offset 3 (or `repeat[0] - 1` if `literal_length == 0`)
-/// - `Offset_Value > 3`: real offset = `Offset_Value - 3`
+/// With `ll0 = (literal_length_code == 0)`:
+/// - `Offset_Value > 3`: real offset = `Offset_Value - 3` (repeats shift down)
+/// - otherwise `index = Offset_Value - 1 + ll0` selects a repeat offset:
+///   index 0 = `repeat[0]`, 1 = `repeat[1]`, 2 = `repeat[2]`,
+///   3 = `repeat[0] - 1`; the selected value moves to the front.
 fn decode_offset(
     code: u8,
-    literal_length: usize,
+    ll_code: u8,
     repeat_offsets: &mut [usize; 3],
     reader: &mut FseBitReader,
 ) -> Result<usize> {
+    if code > MAX_OFFSET_CODE {
+        return Err(OxiArcError::corrupted(
+            0,
+            format!("offset code {} exceeds maximum {}", code, MAX_OFFSET_CODE),
+        ));
+    }
+
     // Read extra bits (always `code` bits for offset).
     let extra = reader.read_bits(code);
     let offset_value = (1usize << code) + extra as usize;
 
     if offset_value > 3 {
-        // Regular offset: subtract 3 to get real offset.
+        // Regular offset: subtract 3 to get the real offset.
         let offset = offset_value - 3;
-
-        // Update repeat offsets
         repeat_offsets[2] = repeat_offsets[1];
         repeat_offsets[1] = repeat_offsets[0];
         repeat_offsets[0] = offset;
-
-        Ok(offset)
-    } else {
-        // Repeat offset handling based on Offset_Value (1, 2, or 3)
-        // and whether literal_length is zero.
-        let idx = if literal_length > 0 {
-            // offset_value 1 -> repeat[0], 2 -> repeat[1], 3 -> repeat[2]
-            offset_value - 1
-        } else {
-            // offset_value 1 -> repeat[1], 2 -> repeat[2], 3 -> repeat[0]-1
-            offset_value
-        };
-
-        let offset = if literal_length == 0 && offset_value == 3 {
-            repeat_offsets[0].saturating_sub(1)
-        } else if idx < 3 {
-            repeat_offsets[idx]
-        } else {
-            repeat_offsets[0].saturating_sub(1)
-        };
-
-        // Rotate repeat offsets: bring the used one to front.
-        if literal_length > 0 {
-            // For offset_value 1: no rotation needed (already at [0])
-            // For offset_value 2: swap [0] and [1]
-            // For offset_value 3: rotate [2] to front
-            match offset_value {
-                1 => {} // repeat[0], no change
-                2 => {
-                    repeat_offsets.swap(1, 0);
-                }
-                3 => {
-                    let temp = repeat_offsets[2];
-                    repeat_offsets[2] = repeat_offsets[1];
-                    repeat_offsets[1] = repeat_offsets[0];
-                    repeat_offsets[0] = temp;
-                }
-                _ => {}
-            }
-        } else {
-            // literal_length == 0
-            match offset_value {
-                1 => {
-                    // Use repeat[1], swap with [0]
-                    repeat_offsets.swap(0, 1);
-                }
-                2 => {
-                    // Use repeat[2], rotate to front
-                    let temp = repeat_offsets[2];
-                    repeat_offsets[2] = repeat_offsets[1];
-                    repeat_offsets[1] = repeat_offsets[0];
-                    repeat_offsets[0] = temp;
-                }
-                3 => {
-                    // Use repeat[0]-1, push to front
-                    repeat_offsets[2] = repeat_offsets[1];
-                    repeat_offsets[1] = repeat_offsets[0];
-                    repeat_offsets[0] = offset;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(offset)
+        return Ok(offset);
     }
+
+    // Repeat-offset selection. A literal-length CODE of zero implies a
+    // literal length of zero, which shifts the repeat index by one.
+    let ll0 = usize::from(ll_code == 0);
+    let index = offset_value - 1 + ll0; // 0..=3
+
+    let offset = match index {
+        0 => repeat_offsets[0], // most recent; no reordering
+        1 => {
+            repeat_offsets.swap(0, 1);
+            repeat_offsets[0]
+        }
+        2 => {
+            let offset = repeat_offsets[2];
+            repeat_offsets[2] = repeat_offsets[1];
+            repeat_offsets[1] = repeat_offsets[0];
+            repeat_offsets[0] = offset;
+            offset
+        }
+        _ => {
+            // repeat[0] - 1; zero is invalid (input corrupted).
+            let offset = repeat_offsets[0].wrapping_sub(1);
+            if offset == 0 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    "repeat offset underflow (offset would be zero)",
+                ));
+            }
+            repeat_offsets[2] = repeat_offsets[1];
+            repeat_offsets[1] = repeat_offsets[0];
+            repeat_offsets[0] = offset;
+            offset
+        }
+    };
+
+    Ok(offset)
 }
 
 impl Default for SequencesDecoder {
@@ -574,7 +589,8 @@ mod tests {
     #[test]
     fn test_rle_table() {
         let table = rle_table(42);
-        assert_eq!(table.get(0).symbol, 42);
-        assert_eq!(table.get(0).num_bits, 0);
+        let entry = table.get(0).expect("state 0 must exist");
+        assert_eq!(entry.symbol, 42);
+        assert_eq!(entry.num_bits, 0);
     }
 }

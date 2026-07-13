@@ -89,12 +89,14 @@ impl Bzip2Reader {
     }
 
     /// Attach a progress sink forwarded to the underlying BzDecoder.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying BzDecoder.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -111,6 +113,14 @@ impl Bzip2Reader {
     }
 
     /// Decompress the entire file.
+    ///
+    /// Concatenated multi-stream input (pbzip2/lbzip2 output, `cat a.bz2
+    /// b.bz2`) is decoded in full, matching `bzip2 -d`; trailing bytes
+    /// that do not form another bzip2 stream are an error.
+    ///
+    /// The output size is unbounded (a crafted file may contain
+    /// arbitrarily many blocks); use [`Bzip2Reader::decompress_with_limit`]
+    /// when reading untrusted input under a memory budget.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
         // Fast-path when no hooks are attached: keep using the free function
         // so that output/behaviour is unchanged from before this feature.
@@ -127,6 +137,38 @@ impl Bzip2Reader {
         }
         let mut output = Vec::new();
         while let Some(block) = decoder.read_block()? {
+            output.extend_from_slice(&block);
+        }
+        Ok(output)
+    }
+
+    /// Decompress the entire file with an output-size limit.
+    ///
+    /// Behaves like [`Bzip2Reader::decompress`] (including multi-stream
+    /// support) but returns [`OxiArcError::MemoryBudgetExceeded`] as soon
+    /// as the accumulated output would exceed `max_out` bytes — the
+    /// decompression-bomb guard for untrusted input (the enforcement
+    /// happens *before* each decoded block is appended, so an oversized
+    /// result is never materialized). This is the hook the CLI's
+    /// `--memory-limit` option routes through.
+    pub fn decompress_with_limit(&mut self, max_out: usize) -> Result<Vec<u8>> {
+        if self.progress.is_none() && self.cancel.is_none() {
+            return oxiarc_bzip2::decompress_with_limit(&self.data[..], max_out);
+        }
+
+        let mut decoder = BzDecoder::new(&self.data[..])?;
+        if let Some(handle) = self.progress.clone() {
+            decoder = decoder.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            decoder = decoder.with_cancel(token);
+        }
+        let mut output = Vec::new();
+        while let Some(block) = decoder.read_block()? {
+            let projected = output.len().saturating_add(block.len());
+            if projected > max_out {
+                return Err(OxiArcError::memory_budget_exceeded(max_out, projected));
+            }
             output.extend_from_slice(&block);
         }
         Ok(output)
@@ -168,12 +210,14 @@ impl Bzip2Writer {
     }
 
     /// Attach a progress sink forwarded to the underlying BzEncoder.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token forwarded to the underlying BzEncoder.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -214,13 +258,35 @@ impl Default for Bzip2Writer {
 }
 
 /// Decompress Bzip2 data directly.
+///
+/// Multi-stream input decodes in full; trailing garbage is an error. The
+/// output size is unbounded — prefer [`decompress_with_limit`] for
+/// untrusted input.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     oxiarc_bzip2::decompress(data)
 }
 
 /// Decompress from a reader.
+///
+/// Multi-stream input decodes in full; trailing garbage is an error. The
+/// output size is unbounded — prefer [`decompress_reader_with_limit`] for
+/// untrusted input.
 pub fn decompress_reader<R: Read>(reader: R) -> Result<Vec<u8>> {
     oxiarc_bzip2::decompress(reader)
+}
+
+/// Decompress Bzip2 data with an output-size limit (decompression-bomb
+/// guard). Returns [`OxiArcError::MemoryBudgetExceeded`] once the output
+/// would exceed `max_out` bytes; the limit is enforced before each decoded
+/// block is appended.
+pub fn decompress_with_limit(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    oxiarc_bzip2::decompress_with_limit(data, max_out)
+}
+
+/// Decompress from a reader with an output-size limit (see
+/// [`decompress_with_limit`]).
+pub fn decompress_reader_with_limit<R: Read>(reader: R, max_out: usize) -> Result<Vec<u8>> {
+    oxiarc_bzip2::decompress_with_limit(reader, max_out)
 }
 
 /// Compress data with default level.
@@ -298,6 +364,95 @@ mod tests {
         let compressed = compress(empty).expect("compress empty");
         let decompressed = decompress(&compressed).expect("decompress empty");
         assert_eq!(decompressed, empty);
+    }
+
+    /// Multi-stream `.bz2` (the `cat a.bz2 b.bz2` shape produced by
+    /// pbzip2/lbzip2 and shell concatenation) must decode ALL streams via
+    /// the archive-level `Bzip2Reader`, matching `bzip2 -d` semantics.
+    #[test]
+    fn test_bzip2_reader_multi_stream_concatenation() {
+        let part_a = b"first stream payload; ".repeat(50);
+        let part_b = b"second stream payload! ".repeat(70);
+
+        let mut concatenated = compress(&part_a).expect("compress part A");
+        concatenated.extend_from_slice(&compress(&part_b).expect("compress part B"));
+
+        let mut expected = part_a.clone();
+        expected.extend_from_slice(&part_b);
+
+        // Fast path (no hooks).
+        let mut reader =
+            Bzip2Reader::new(Cursor::new(&concatenated)).expect("Bzip2Reader::new multi-stream");
+        let out = reader.decompress().expect("multi-stream decompress");
+        assert_eq!(out, expected, "both streams must be decoded");
+
+        // Hooked path (progress attached) must agree byte-for-byte.
+        let handle = oxiarc_core::progress::noop_progress();
+        let mut hooked_reader = Bzip2Reader::new(Cursor::new(&concatenated))
+            .expect("Bzip2Reader::new hooked")
+            .with_progress(handle);
+        let hooked_out = hooked_reader.decompress().expect("hooked multi-stream");
+        assert_eq!(hooked_out, expected, "hooked path must decode all streams");
+    }
+
+    /// Trailing garbage after the final stream must be rejected, not
+    /// silently ignored.
+    #[test]
+    fn test_bzip2_reader_trailing_garbage_rejected() {
+        let payload = b"payload before garbage".repeat(10);
+        let mut data = compress(&payload).expect("compress");
+        data.extend_from_slice(b"\xDE\xAD\xBE\xEFgarbage");
+
+        let mut reader = Bzip2Reader::new(Cursor::new(&data)).expect("Bzip2Reader::new");
+        assert!(
+            reader.decompress().is_err(),
+            "trailing non-bzip2 bytes must be an error"
+        );
+    }
+
+    /// The bounded variant must reject output beyond the budget (for both
+    /// the fast and hooked paths) and pass within it, including across
+    /// stream boundaries.
+    #[test]
+    fn test_bzip2_reader_decompress_with_limit() {
+        let part_a = vec![0x41u8; 60_000];
+        let part_b = vec![0x42u8; 60_000];
+        let mut concatenated = compress(&part_a).expect("compress A");
+        concatenated.extend_from_slice(&compress(&part_b).expect("compress B"));
+
+        // Generous limit: full multi-stream output.
+        let mut reader = Bzip2Reader::new(Cursor::new(&concatenated)).expect("new");
+        let ok = reader
+            .decompress_with_limit(1 << 20)
+            .expect("within budget");
+        assert_eq!(ok.len(), 120_000);
+
+        // Budget smaller than the total (but larger than stream 1): must
+        // be rejected instead of silently truncating to the first stream.
+        let mut tight_reader = Bzip2Reader::new(Cursor::new(&concatenated)).expect("new");
+        let err = tight_reader.decompress_with_limit(80_000);
+        assert!(
+            matches!(err, Err(OxiArcError::MemoryBudgetExceeded { .. })),
+            "over-budget multi-stream decode must fail, got {err:?}"
+        );
+
+        // Hooked path enforces the same budget.
+        let handle = oxiarc_core::progress::noop_progress();
+        let mut hooked = Bzip2Reader::new(Cursor::new(&concatenated))
+            .expect("new")
+            .with_progress(handle);
+        let hooked_err = hooked.decompress_with_limit(80_000);
+        assert!(
+            matches!(hooked_err, Err(OxiArcError::MemoryBudgetExceeded { .. })),
+            "hooked over-budget decode must fail, got {hooked_err:?}"
+        );
+
+        // Module-level bounded helpers behave identically.
+        let module_ok =
+            decompress_with_limit(&concatenated, 1 << 20).expect("module fn within budget");
+        assert_eq!(module_ok.len(), 120_000);
+        assert!(decompress_with_limit(&concatenated, 80_000).is_err());
+        assert!(decompress_reader_with_limit(Cursor::new(&concatenated), 80_000).is_err());
     }
 
     #[test]

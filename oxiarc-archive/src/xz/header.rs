@@ -28,6 +28,7 @@ pub const XZ_FOOTER_MAGIC: [u8; 2] = [0x59, 0x5A];
 /// Check types supported by XZ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CheckType {
     /// No check.
     None = 0x00,
@@ -107,6 +108,16 @@ impl StreamFlags {
 /// LZMA2 filter ID.
 pub const FILTER_LZMA2: u64 = 0x21;
 
+/// Maximum accepted compressed size of a single XZ block (100 MiB).
+///
+/// Both block-reading paths honor this limit: `decompress_block` enforces
+/// it while collecting self-describing LZMA2 chunks, and
+/// `decompress_block_with_size` enforces it *before* allocating a buffer
+/// for a header-declared size — the declared value is attacker-controlled
+/// (up to ~2^63) and an unchecked `vec![0u8; declared]` allowed a 28-byte
+/// crafted `.xz` to abort the process with an allocation failure.
+const MAX_BLOCK_COMPRESSED_SIZE: usize = 100 * 1024 * 1024;
+
 /// Block header flags.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -177,12 +188,14 @@ impl<R: Read> XzReader<R> {
     /// Attach a progress sink. Notified after each block is decompressed with
     /// the cumulative uncompressed byte count; `on_finish()` fires when the
     /// stream footer is read successfully.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before each block is processed.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -214,8 +227,36 @@ impl<R: Read> XzReader<R> {
             let mut header = vec![0u8; header_size - 1];
             self.reader.read_exact(&mut header)?;
 
+            // Validate the block header CRC32 *before* trusting any parsed
+            // field (xz spec §3.1.7: the last 4 bytes of the block header
+            // cover everything before them, including the size byte).
+            if header.len() < 5 {
+                return Err(OxiArcError::corrupted(0, "XZ block header too short"));
+            }
+            let crc_pos = header.len() - 4;
+            let expected_header_crc = u32::from_le_bytes([
+                header[crc_pos],
+                header[crc_pos + 1],
+                header[crc_pos + 2],
+                header[crc_pos + 3],
+            ]);
+            let mut header_crc_input = Vec::with_capacity(header_size - 4);
+            header_crc_input.push(header_size_byte[0]);
+            header_crc_input.extend_from_slice(&header[..crc_pos]);
+            let computed_header_crc = Crc32::compute(&header_crc_input);
+            if computed_header_crc != expected_header_crc {
+                return Err(OxiArcError::crc_mismatch(
+                    expected_header_crc,
+                    computed_header_crc,
+                ));
+            }
+
+            // All parsed fields (size varints, filter list) must lie before
+            // the trailing CRC32 field.
+            let header_body = &header[..crc_pos];
+
             // Parse block header flags
-            let flags = header[0];
+            let flags = header_body[0];
             let num_filters = (flags & 0x03) + 1;
             let has_compressed_size = (flags & 0x40) != 0;
             let has_uncompressed_size = (flags & 0x80) != 0;
@@ -224,14 +265,14 @@ impl<R: Read> XzReader<R> {
 
             // Read compressed size if present
             let compressed_size = if has_compressed_size {
-                self.read_multibyte_int(&header, &mut offset)?
+                self.read_multibyte_int(header_body, &mut offset)?
             } else {
                 0
             };
 
             // Read uncompressed size if present
             let _uncompressed_size = if has_uncompressed_size {
-                self.read_multibyte_int(&header, &mut offset)?
+                self.read_multibyte_int(header_body, &mut offset)?
             } else {
                 0
             };
@@ -239,32 +280,51 @@ impl<R: Read> XzReader<R> {
             // Read filters
             let mut dict_size = 1 << 20; // Default 1MB
             for _ in 0..num_filters {
-                let filter_id = self.read_multibyte_int(&header, &mut offset)?;
-                let props_size = self.read_multibyte_int(&header, &mut offset)?;
+                let filter_id = self.read_multibyte_int(header_body, &mut offset)?;
+                let props_size = self.read_multibyte_int(header_body, &mut offset)?;
+
+                // The declared properties must fit inside the block header
+                // body. `read_multibyte_int` only guarantees
+                // `offset <= header_body.len()`, so an unchecked
+                // `header_body[offset]` (or an unchecked `offset += props`)
+                // could index out of bounds on a crafted header.
+                let props_len = usize::try_from(props_size)
+                    .ok()
+                    .filter(|&len| len <= header_body.len() - offset)
+                    .ok_or_else(|| {
+                        OxiArcError::corrupted(
+                            0,
+                            "XZ filter properties exceed the block header bounds",
+                        )
+                    })?;
 
                 if filter_id == FILTER_LZMA2 {
-                    if props_size >= 1 {
-                        let dict_props = header[offset];
-                        dict_size = dict_size_from_props(dict_props);
-                        if dict_size > oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP {
-                            return Err(OxiArcError::corrupted(
-                                0,
-                                format!(
-                                    "XZ block declares LZMA2 dictionary size {dict_size} bytes, \
-                                     exceeding the maximum allowed allocation of {} bytes",
-                                    oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP
-                                ),
-                            ));
-                        }
-                        offset += props_size as usize;
+                    // xz spec §5.3.1: LZMA2 has exactly one property byte.
+                    if props_len != 1 {
+                        return Err(OxiArcError::corrupted(
+                            0,
+                            format!("XZ LZMA2 filter has invalid properties size {props_len}"),
+                        ));
                     }
-                } else {
-                    offset += props_size as usize;
+                    let dict_props = header_body[offset];
+                    dict_size = dict_size_from_props(dict_props);
+                    if dict_size > oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP {
+                        return Err(OxiArcError::corrupted(
+                            0,
+                            format!(
+                                "XZ block declares LZMA2 dictionary size {dict_size} bytes, \
+                                 exceeding the maximum allowed allocation of {} bytes",
+                                oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP
+                            ),
+                        ));
+                    }
                 }
+                offset += props_len;
             }
 
-            // Skip padding bytes (header is padded to multiple of 4)
-            // CRC32 is in the last 4 bytes of header
+            // Remaining header-body bytes are padding (header is padded to
+            // a multiple of 4); the CRC32 validated above already covers
+            // them.
 
             // Decompress block data
             let block_data = if has_compressed_size && compressed_size > 0 {
@@ -403,8 +463,27 @@ impl<R: Read> XzReader<R> {
         dict_size: u32,
         compressed_size: usize,
     ) -> Result<Vec<u8>> {
-        // Read exact compressed size
-        let mut compressed = vec![0u8; compressed_size];
+        // The declared size comes straight from the (attacker-controlled)
+        // block header. Cap it to the same limit `decompress_block`
+        // enforces, and allocate via `try_reserve_exact` so an allocation
+        // failure surfaces as an error instead of aborting the process.
+        if compressed_size > MAX_BLOCK_COMPRESSED_SIZE {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ block declares compressed size {compressed_size} bytes, \
+                     exceeding the {MAX_BLOCK_COMPRESSED_SIZE}-byte limit"
+                ),
+            ));
+        }
+        let mut compressed: Vec<u8> = Vec::new();
+        compressed.try_reserve_exact(compressed_size).map_err(|_| {
+            OxiArcError::corrupted(
+                0,
+                format!("failed to allocate {compressed_size} bytes for an XZ block"),
+            )
+        })?;
+        compressed.resize(compressed_size, 0);
         self.reader.read_exact(&mut compressed)?;
 
         // Decompress LZMA2
@@ -482,8 +561,8 @@ impl<R: Read> XzReader<R> {
                 }
             }
 
-            // Safety limit
-            if compressed.len() > 100 * 1024 * 1024 {
+            // Safety limit (same cap as `decompress_block_with_size`)
+            if compressed.len() > MAX_BLOCK_COMPRESSED_SIZE {
                 return Err(OxiArcError::corrupted(0, "Block too large"));
             }
         }
@@ -657,6 +736,7 @@ impl XzWriter {
     }
 
     /// Set the check type.
+    #[must_use]
     pub fn with_check_type(mut self, check_type: CheckType) -> Self {
         self.check_type = check_type;
         self
@@ -664,12 +744,14 @@ impl XzWriter {
 
     /// Attach a progress sink. Notified once after compression completes with
     /// the uncompressed byte count, followed by `on_finish()`.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before compression begins.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

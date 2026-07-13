@@ -73,6 +73,7 @@ impl<W: Write> TarWriter<W> {
     }
 
     /// Attach a progress callback handle.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self

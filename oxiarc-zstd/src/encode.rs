@@ -3,17 +3,22 @@
 //! This module provides Zstandard compression with multiple strategies:
 //! - **Level 0**: Raw/RLE blocks only (no LZ77 compression)
 //! - **Levels 1-22**: LZ77 compressed blocks. Increasing the level deepens the
-//!   LZ77 match search (greedy → lazy → deep). Literals are emitted as **Raw**
-//!   or **RLE** sections (Huffman literal compression is not currently produced
-//!   by the encoder), and sequences are entropy-coded with the **predefined**
-//!   FSE tables from RFC 8878 (or RLE tables when a symbol category is
-//!   constant). Custom/optimal FSE tables and Huffman literals are not emitted.
+//!   LZ77 match search (greedy → lazy → deep). Literals are emitted as
+//!   **Huffman-compressed** sections when that wins (with a self-verification
+//!   fallback to Raw), or as **Raw**/**RLE** sections otherwise; sequences are
+//!   entropy-coded with the **predefined** FSE tables from RFC 8878 (or RLE
+//!   tables when a symbol category is constant). Custom (block-optimal) FSE
+//!   sequence tables are not emitted, so the ratio on some inputs trails the
+//!   reference encoder.
 //!
-//! Creates valid Zstd frames. Small one-shot inputs use Single_Segment frames;
-//! larger inputs use an explicit bounded Window_Descriptor (see
-//! [`ZstdEncoder::compress`]) so the output stays interoperable with reference
-//! decoders whose default `windowLogMax` would otherwise reject a huge implicit
-//! single-segment window.
+//! Every emitted frame is RFC 8878-conformant and decodable by the reference
+//! `zstd` CLI; this is enforced by the live differential tests in
+//! `tests/zstd_oracle.rs` (`zstd-oracle` feature). Small one-shot inputs use
+//! Single_Segment frames; larger inputs, dictionary frames, and frames
+//! without a stored content size use an explicit bounded Window_Descriptor
+//! (see [`ZstdEncoder::compress`]) so the output stays interoperable with
+//! reference decoders whose default `windowLogMax` would otherwise reject a
+//! huge implicit single-segment window.
 
 use crate::compressed_block::encode_compressed_block;
 use crate::lz77::{LevelConfig, MatchFinder};
@@ -48,6 +53,7 @@ const WINDOW_DESCRIPTOR_8MIB: u8 = 13 << 3;
 
 /// Compression strategy for block encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum CompressionStrategy {
     /// Use raw blocks only (no compression).
     Raw,
@@ -74,10 +80,9 @@ pub struct ZstdEncoder {
     strategy: CompressionStrategy,
     /// Compression level (0 = raw/RLE, 1-22 = LZ77 compression).
     level: i32,
-    /// Optional dictionary for improved compression of small data.
+    /// Optional raw-content dictionary for improved compression of small
+    /// data. Raw-content dictionaries have no `Dictionary_ID` (RFC 8878 §5).
     dictionary: Option<Vec<u8>>,
-    /// Dictionary ID (XXH64 of dictionary data, lower 32 bits).
-    dict_id: Option<u32>,
     /// Optional progress sink. Notified after each block is written.
     progress: Option<ProgressHandle>,
     /// Optional cancellation token. Checked before each block.
@@ -103,7 +108,6 @@ impl ZstdEncoder {
             strategy: CompressionStrategy::default(),
             level: 0,
             dictionary: None,
-            dict_id: None,
             progress: None,
             cancel: None,
         }
@@ -114,6 +118,7 @@ impl ZstdEncoder {
     /// The sink's `on_progress(bytes_processed, None)` is called after each
     /// block is written to the output. `on_finish()` is called after the
     /// content checksum is written.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -123,6 +128,7 @@ impl ZstdEncoder {
     ///
     /// The token is checked before each block is encoded.
     /// If cancelled, returns [`oxiarc_core::error::OxiArcError::Cancelled`].
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -158,14 +164,17 @@ impl ZstdEncoder {
     }
 
     /// Set a pre-trained dictionary for improved compression of small data.
+    ///
+    /// Dictionaries produced by [`crate::dict::train_dictionary`] (or any
+    /// caller-supplied bytes) are *raw-content* dictionaries per RFC 8878
+    /// §5: they carry no `Dictionary_ID`, so the frame header sets
+    /// `Dictionary_ID_flag = 0` and reference `zstd -d -D <dict>` accepts
+    /// the output.
     pub fn set_dictionary(&mut self, dict: &[u8]) -> &mut Self {
         if dict.is_empty() {
             self.dictionary = None;
-            self.dict_id = None;
         } else {
-            let id = crate::xxhash::xxhash64(dict) as u32;
             self.dictionary = Some(dict.to_vec());
-            self.dict_id = Some(id);
         }
         self
     }
@@ -268,13 +277,23 @@ impl ZstdEncoder {
 
     /// Write frame header descriptor (and, when needed, a Window_Descriptor).
     ///
-    /// Small inputs (`content_size <= WINDOWED_FRAME_THRESHOLD`) use a
-    /// Single_Segment frame whose window is implied by the content size. Larger
-    /// inputs clear the Single_Segment flag and emit an explicit bounded
-    /// [`WINDOW_DESCRIPTOR_8MIB`] window instead, so the frame remains valid for
-    /// reference decoders regardless of how large the content is.
+    /// A Single_Segment frame (window implied by the content size, mandatory
+    /// 1-8 byte Frame_Content_Size) is used only when *all* of the following
+    /// hold: the content size is included, no dictionary is in use, and the
+    /// content is at most [`WINDOWED_FRAME_THRESHOLD`]. Otherwise the frame
+    /// carries an explicit Window_Descriptor:
+    ///
+    /// * omitted content size (RFC 8878 forbids Single_Segment without an
+    ///   FCS field — the old behaviour of truncating the FCS to one byte
+    ///   silently corrupted every input >= 256 bytes);
+    /// * dictionary frames, where match offsets may reach back into the
+    ///   dictionary and thus exceed a content-sized window;
+    /// * very large inputs, so reference decoders with the default
+    ///   `windowLogMax` need not allocate a content-sized window.
     fn write_frame_header(&self, output: &mut Vec<u8>, content_size: usize) {
-        let use_single_segment = content_size <= WINDOWED_FRAME_THRESHOLD;
+        let use_single_segment = self.include_content_size
+            && self.dictionary.is_none()
+            && content_size <= WINDOWED_FRAME_THRESHOLD;
 
         let mut descriptor: u8 = 0;
 
@@ -286,22 +305,20 @@ impl ZstdEncoder {
             descriptor |= 0x20; // Single_Segment_flag
         }
 
-        // Dictionary ID flag
-        let dict_id_flag = if self.dict_id.is_some() { 3u8 } else { 0u8 };
-        descriptor |= dict_id_flag;
+        // Raw-content dictionaries have no Dictionary_ID: flag stays 0 and
+        // no ID field is written, so `zstd -d -D <dict>` accepts the frame.
 
-        // Determine content size encoding.
+        // Determine the Frame_Content_Size encoding.
         //
-        // For Single_Segment frames the Frame_Content_Size is always present
-        // (a 1-byte field even when FCS_flag == 0). For windowed frames the FCS
-        // is present only when FCS_flag != 0; the windowed path is only taken
-        // for large content, which always needs a 4- or 8-byte field, so the
-        // size is preserved in practice.
+        // Single_Segment frames always carry an FCS field (1 byte even when
+        // FCS_flag == 0). Windowed frames carry one only when FCS_flag != 0;
+        // since the 2-byte format encodes `value - 256`, contents below 256
+        // bytes need the 4-byte format there.
         let (fcs_flag, fcs_bytes) = if !self.include_content_size {
-            (0u8, if use_single_segment { 1usize } else { 0usize })
+            (0u8, 0usize)
         } else if use_single_segment && content_size <= 255 {
             (0u8, 1)
-        } else if content_size <= 65535 + 256 {
+        } else if (256..=65535 + 256).contains(&content_size) {
             (1u8, 2)
         } else if content_size <= u32::MAX as usize {
             (2u8, 4)
@@ -314,17 +331,11 @@ impl ZstdEncoder {
 
         // Write Window_Descriptor (present only when Single_Segment_flag == 0).
         if !use_single_segment {
-            output.push(WINDOW_DESCRIPTOR_8MIB);
-        }
-
-        // Write Dictionary_ID (4 bytes if present)
-        if let Some(id) = self.dict_id {
-            output.extend_from_slice(&id.to_le_bytes());
+            output.push(self.window_descriptor(content_size));
         }
 
         // Write Frame_Content_Size.
         match fcs_bytes {
-            0 => {}
             1 => {
                 output.push(content_size as u8);
             }
@@ -340,6 +351,30 @@ impl ZstdEncoder {
             }
             _ => {}
         }
+    }
+
+    /// Choose the smallest Window_Descriptor byte whose window covers every
+    /// match offset this frame can produce.
+    ///
+    /// Matches never reach farther back than one block plus the dictionary
+    /// (each block is compressed independently against the dictionary), so
+    /// the window need only cover `dict_len + min(content, MAX_BLOCK_SIZE)`,
+    /// clamped to at least the RFC minimum (1 KiB) and at most 8 MiB.
+    fn window_descriptor(&self, content_size: usize) -> u8 {
+        let dict_len = self.dictionary.as_deref().map_or(0, <[u8]>::len);
+        let needed = (dict_len + content_size.min(MAX_BLOCK_SIZE))
+            .clamp(1024, crate::MAX_WINDOW_SIZE) as u64;
+
+        for exponent in 0u8..=21 {
+            let base = 1u64 << (10 + exponent as u32);
+            for mantissa in 0u8..8 {
+                let window = base + (base >> 3) * mantissa as u64;
+                if window >= needed {
+                    return (exponent << 3) | mantissa;
+                }
+            }
+        }
+        WINDOW_DESCRIPTOR_8MIB
     }
 
     /// Write data as raw/RLE blocks (level 0).
@@ -786,10 +821,15 @@ mod tests {
             0,
             "Single_Segment_flag must be clear for large inputs"
         );
-        // Window_Descriptor byte immediately follows the descriptor.
-        assert_eq!(
-            compressed[5], WINDOW_DESCRIPTOR_8MIB,
-            "explicit 8 MiB Window_Descriptor expected"
+        // Window_Descriptor byte immediately follows the descriptor and must
+        // cover at least one block (all match offsets are intra-block).
+        let wd = compressed[5];
+        let base = 1u64 << (10 + (wd >> 3) as u32);
+        let window = base + (base >> 3) * (wd & 7) as u64;
+        assert!(
+            window >= MAX_BLOCK_SIZE as u64,
+            "window {} must cover a full block",
+            window
         );
 
         let decompressed = decompress(&compressed).expect("decompression failed");

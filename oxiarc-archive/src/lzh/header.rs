@@ -654,6 +654,12 @@ impl LzhHeader {
             LzhMethod::Lh7 => CoreMethod::Lh7,
             LzhMethod::Lhd => CoreMethod::Lhd,
             LzhMethod::Unknown(_) => CoreMethod::Unknown(0),
+            // `LzhMethod` is `#[non_exhaustive]`. A method variant added by a
+            // future oxiarc-lzhuf release that this mapping does not know about
+            // must degrade to the "unknown/unsupported" core method — the same
+            // path as an unrecognised `-lhX-` ID — so extraction rejects it
+            // rather than silently decoding with the wrong codec.
+            _ => CoreMethod::Unknown(0),
         };
 
         // Prefer extension-provided Unix mtime (0x54) over the fixed-header

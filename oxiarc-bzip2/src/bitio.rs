@@ -42,18 +42,25 @@ impl<R: Read> MsbBitReader<R> {
     }
 
     /// Pull the next byte from the chunk buffer, refilling it if needed.
-    fn next_byte(&mut self) -> Result<u8> {
+    /// Returns `Ok(None)` on a clean end of input.
+    fn try_next_byte(&mut self) -> Result<Option<u8>> {
         if self.chunk_pos >= self.chunk_len {
             let n = self.reader.read(&mut self.chunk)?;
             if n == 0 {
-                return Err(OxiArcError::unexpected_eof(1));
+                return Ok(None);
             }
             self.chunk_len = n;
             self.chunk_pos = 0;
         }
         let byte = self.chunk[self.chunk_pos];
         self.chunk_pos += 1;
-        Ok(byte)
+        Ok(Some(byte))
+    }
+
+    /// Pull the next byte from the chunk buffer, refilling it if needed.
+    fn next_byte(&mut self) -> Result<u8> {
+        self.try_next_byte()?
+            .ok_or_else(|| OxiArcError::unexpected_eof(1))
     }
 
     /// Ensure at least `count` bits are buffered.
@@ -97,6 +104,34 @@ impl<R: Read> MsbBitReader<R> {
         let high = u64::from(self.read_bits(count - 32)?);
         let low = u64::from(self.read_bits(32)?);
         Ok((high << 32) | low)
+    }
+
+    /// Discard buffered bits until the read position is byte aligned with
+    /// the underlying stream.
+    ///
+    /// Bytes are pulled into the accumulator whole, so the sub-byte bit
+    /// remainder (`bits % 8`) is exactly the padding left in the byte
+    /// currently being consumed. Used at bzip2 stream boundaries: every
+    /// stream is zero-padded to a whole byte, and a concatenated follow-up
+    /// stream starts on the next byte boundary.
+    pub(crate) fn align_to_byte(&mut self) {
+        let pad = self.bits % 8;
+        self.bits -= pad;
+    }
+
+    /// Read one whole byte, or `Ok(None)` on a clean end of input.
+    ///
+    /// The reader must be byte aligned (see [`MsbBitReader::align_to_byte`]).
+    /// Unlike [`MsbBitReader::read_bits`], end of input here is not an
+    /// error: it is how the decoder distinguishes "no more concatenated
+    /// streams" from a truncated stream.
+    pub(crate) fn try_read_aligned_byte(&mut self) -> Result<Option<u8>> {
+        debug_assert_eq!(self.bits % 8, 0, "reader must be byte aligned");
+        if self.bits >= 8 {
+            self.bits -= 8;
+            return Ok(Some((self.buffer >> self.bits) as u8));
+        }
+        self.try_next_byte()
     }
 }
 
@@ -239,5 +274,31 @@ mod tests {
         let mut reader = MsbBitReader::new(Cursor::new(vec![0xFF]));
         assert_eq!(reader.read_bits(8).expect("read byte"), 0xFF);
         assert!(reader.read_bit().is_err());
+    }
+
+    #[test]
+    fn align_then_aligned_byte_reads_and_probes_eof() {
+        // 3 bits consumed, align discards the 5 pad bits, then the next two
+        // whole bytes are readable and the end of input probes as None.
+        let mut reader = MsbBitReader::new(Cursor::new(vec![0b1010_0000, 0xAB, 0xCD]));
+        assert_eq!(reader.read_bits(3).expect("read 3 bits"), 0b101);
+        reader.align_to_byte();
+        assert_eq!(
+            reader.try_read_aligned_byte().expect("read aligned byte"),
+            Some(0xAB)
+        );
+        assert_eq!(
+            reader.try_read_aligned_byte().expect("read aligned byte"),
+            Some(0xCD)
+        );
+        assert_eq!(reader.try_read_aligned_byte().expect("probe EOF"), None);
+    }
+
+    #[test]
+    fn align_on_already_aligned_reader_is_noop() {
+        let mut reader = MsbBitReader::new(Cursor::new(vec![0x12, 0x34]));
+        assert_eq!(reader.read_bits(8).expect("read byte"), 0x12);
+        reader.align_to_byte();
+        assert_eq!(reader.read_bits(8).expect("read byte"), 0x34);
     }
 }

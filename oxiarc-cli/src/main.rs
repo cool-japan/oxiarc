@@ -56,6 +56,7 @@ Examples:
   oxiarc info archive.7z
   oxiarc man ./man
 ")]
+/// Top-level parsed command line for the `oxiarc` binary.
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -50,6 +50,7 @@ pub struct LenientWarning {
 /// on this enum SHOULD include a catch-all arm to remain
 /// forward-compatible.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LenientWarningKind {
     /// The entry's stored CRC-32 (ZIP) or CRC-16 (LZH) did not match the
     /// CRC computed from the decompressed payload.

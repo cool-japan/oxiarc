@@ -16,6 +16,10 @@
 //! Bytes are read one LZMA2 chunk at a time via a state machine:
 //! `NeedChunkHeader → NeedLzmaHeader → NeedCompressedData → Done`
 //! (uncompressed path: `NeedChunkHeader → NeedUncompressedSize → NeedUncompressedData → Done`).
+//! Complete chunks are fed to a persistent [`crate::Lzma2Decoder`], so the
+//! dictionary, entropy state and global position survive chunk boundaries —
+//! continuation chunks (reset field 0, as emitted by `xz` and by
+//! [`Lzma2ChunkedEncoder`]) decode correctly.
 //!
 //! Both types respect a `memory_budget` that caps how many bytes may be
 //! buffered in-flight at once.
@@ -28,7 +32,7 @@
 //! - `snake_case` throughout.
 
 use crate::LzmaLevel;
-use crate::lzma2::decode_lzma2;
+use crate::lzma2::Lzma2Decoder;
 use crate::lzma2_chunk::{
     LZMA_CHUNK_MAX_UNCOMPRESSED, Lzma2ChunkedEncoder, Lzma2Config, UNCOMPRESSED_CHUNK_MAX, control,
 };
@@ -78,6 +82,10 @@ pub struct Lzma2StreamEncoder<W: Write> {
     writer: W,
     /// LZMA level.
     level: LzmaLevel,
+    /// Persistent chunked encoder: dictionary window and entropy state carry
+    /// across `write()` calls, so chunks after the first are continuation
+    /// chunks that can back-reference earlier data.
+    chunk_encoder: Lzma2ChunkedEncoder,
     /// Input bytes not yet encoded into a chunk.
     input_buf: Vec<u8>,
     /// Per-chunk size (clamped to `[STREAM_CHUNK_MIN, LZMA_CHUNK_MAX_UNCOMPRESSED]`).
@@ -103,9 +111,11 @@ impl<W: Write> Lzma2StreamEncoder<W> {
     /// Create a new streaming encoder wrapping `writer` at the given
     /// compression `level`.
     pub fn new(writer: W, level: LzmaLevel) -> Self {
+        let config = Lzma2Config::with_level(level).chunk_size(STREAM_DEFAULT_CHUNK_SIZE);
         Self {
             writer,
             level,
+            chunk_encoder: Lzma2ChunkedEncoder::with_config(config),
             input_buf: Vec::new(),
             chunk_size: STREAM_DEFAULT_CHUNK_SIZE,
             memory_budget: ENCODER_DEFAULT_BUDGET,
@@ -116,9 +126,14 @@ impl<W: Write> Lzma2StreamEncoder<W> {
     /// Set the chunk size in bytes.
     ///
     /// Clamped to `[STREAM_CHUNK_MIN, LZMA_CHUNK_MAX_UNCOMPRESSED]`.
+    ///
+    /// Setup-time builder: call before the first `write()` — it rebuilds the
+    /// internal chunk encoder, discarding any accumulated stream state.
     #[must_use]
     pub fn with_chunk_size(mut self, size: usize) -> Self {
         self.chunk_size = size.clamp(STREAM_CHUNK_MIN, LZMA_CHUNK_MAX_UNCOMPRESSED);
+        let config = Lzma2Config::with_level(self.level).chunk_size(self.chunk_size);
+        self.chunk_encoder = Lzma2ChunkedEncoder::with_config(config);
         self
     }
 
@@ -146,18 +161,17 @@ impl<W: Write> Lzma2StreamEncoder<W> {
     /// Encode `chunk` as a sequence of LZMA2 chunks (or uncompressed fallback)
     /// and write them to the inner writer, **without** the LZMA2 EOS byte.
     ///
-    /// Uses `Lzma2ChunkedEncoder` which produces a complete LZMA2 mini-stream
-    /// (header bytes + EOS).  We strip the trailing EOS here; the stream-level
-    /// EOS is written only in `finish()`.
+    /// The persistent `Lzma2ChunkedEncoder` carries its dictionary window and
+    /// entropy state across calls, so pieces after the first are continuation
+    /// chunks. `encode()` always appends an EOS byte per call; we strip it
+    /// here and write the single stream-level EOS in `finish()`.
     fn encode_and_write_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
 
-        let config = Lzma2Config::with_level(self.level).chunk_size(chunk.len());
-        let mut inner_encoder = Lzma2ChunkedEncoder::with_config(config);
-
-        let mut encoded = inner_encoder
+        let mut encoded = self
+            .chunk_encoder
             .encode(chunk)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -272,10 +286,10 @@ enum DecoderState {
     NeedUncompressedData {
         /// Number of raw bytes remaining to collect.
         remaining: usize,
-        /// Whether the dictionary should be reset (control byte was 0x01).
-        /// Reserved for future use when maintaining dictionary state across chunks.
-        #[allow(dead_code)]
-        reset_dict: bool,
+        /// Accumulated LZMA2 frame bytes (ctrl byte + 2 size bytes + payload
+        /// so far); fed to the persistent decoder so the dictionary and
+        /// global position stay in sync for later LZMA chunks.
+        frame_buf: Vec<u8>,
     },
     /// Need the 2-byte size field for an uncompressed chunk.
     NeedUncompressedSize {
@@ -308,8 +322,10 @@ enum DecoderState {
 pub struct Lzma2StreamDecoder<R: Read> {
     /// Inner compressed reader.
     reader: R,
-    /// LZMA2 dictionary size (passed to `decode_lzma2`).
-    dict_size: u32,
+    /// Persistent chunk decoder: dictionary, entropy state and global
+    /// position survive chunk boundaries, so continuation chunks (reset
+    /// field 0) decode correctly.
+    decoder: Lzma2Decoder,
     /// Bytes read from `reader` but not yet consumed by the state machine.
     input_buf: Vec<u8>,
     /// Decompressed bytes ready to deliver to the caller.
@@ -342,7 +358,7 @@ impl<R: Read> Lzma2StreamDecoder<R> {
     pub fn new(reader: R, dict_size: u32) -> Self {
         Self {
             reader,
-            dict_size: dict_size.max(4096),
+            decoder: Lzma2Decoder::new(dict_size),
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             output_pos: 0,
@@ -448,10 +464,10 @@ impl<R: Read> Lzma2StreamDecoder<R> {
                 Ok(true)
             }
             c if (c & control::LZMA_MASK) != 0 => {
-                let has_state_reset = (c & control::STATE_RESET) != 0;
                 // 2 bytes uncompressed size (lo 16 bits) + 2 bytes compressed size
-                // + optional 1 byte LZMA props
-                let header_bytes_needed = if has_state_reset { 5 } else { 4 };
+                // + 1 byte LZMA props when the reset field announces new
+                // properties (reset field 2 or 3).
+                let header_bytes_needed = if control::has_new_props(c) { 5 } else { 4 };
 
                 self.state = DecoderState::NeedLzmaHeader {
                     ctrl: c,
@@ -531,7 +547,7 @@ impl<R: Read> Lzma2StreamDecoder<R> {
         let take = compressed_remaining.min(self.input_buf.len());
         let payload: Vec<u8> = self.input_buf.drain(..take).collect();
 
-        match self.state {
+        let complete_frame = match self.state {
             DecoderState::NeedCompressedData {
                 ref mut frame_buf,
                 ref mut compressed_remaining,
@@ -541,31 +557,46 @@ impl<R: Read> Lzma2StreamDecoder<R> {
                 *compressed_remaining -= take;
 
                 if *compressed_remaining == 0 {
-                    // Full payload received — decode.
-                    frame_buf.push(control::EOS);
-                    let frame = frame_buf.clone();
-                    let decompressed = decode_lzma2(&frame, self.dict_size)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-                    if decompressed.len() != uncompressed_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "LZMA2 chunk size mismatch: expected {} decompressed bytes, got {}",
-                                uncompressed_size,
-                                decompressed.len()
-                            ),
-                        ));
-                    }
-
-                    self.output_buf.extend_from_slice(&decompressed);
-                    self.state = DecoderState::NeedChunkHeader;
+                    Some((std::mem::take(frame_buf), uncompressed_size))
+                } else {
+                    None
                 }
             }
             _ => unreachable!(),
+        };
+
+        if let Some((frame, uncompressed_size)) = complete_frame {
+            // Full payload received — decode this chunk on the persistent
+            // decoder (state and dictionary carry over from prior chunks).
+            let decompressed = self.decode_frame(&frame)?;
+
+            if decompressed.len() != uncompressed_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LZMA2 chunk size mismatch: expected {} decompressed bytes, got {}",
+                        uncompressed_size,
+                        decompressed.len()
+                    ),
+                ));
+            }
+
+            self.output_buf.extend_from_slice(&decompressed);
+            self.state = DecoderState::NeedChunkHeader;
         }
 
         Ok(true)
+    }
+
+    /// Decode one complete LZMA2 chunk frame (control byte + header +
+    /// payload, no EOS) on the persistent decoder.
+    fn decode_frame(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
+        let mut cursor = io::Cursor::new(frame);
+        let mut decompressed = Vec::new();
+        self.decoder
+            .decode_chunk(&mut cursor, &mut decompressed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(decompressed)
     }
 
     fn step_need_uncompressed_size(&mut self) -> io::Result<bool> {
@@ -606,10 +637,13 @@ impl<R: Read> Lzma2StreamDecoder<R> {
             ));
         }
 
-        let reset_dict = ctrl == control::UNCOMPRESSED_RESET;
+        // Rebuild the chunk frame (ctrl + 2 size bytes) so the payload can be
+        // routed through the persistent decoder once complete.
+        let mut frame_buf = Vec::with_capacity(3 + data_size);
+        frame_buf.extend_from_slice(&[ctrl, first_byte, second_byte]);
         self.state = DecoderState::NeedUncompressedData {
             remaining: data_size,
-            reset_dict,
+            frame_buf,
         };
         Ok(true)
     }
@@ -627,18 +661,30 @@ impl<R: Read> Lzma2StreamDecoder<R> {
         let take = remaining.min(self.input_buf.len());
         let raw: Vec<u8> = self.input_buf.drain(..take).collect();
 
-        match self.state {
+        let complete_frame = match self.state {
             DecoderState::NeedUncompressedData {
-                ref mut remaining, ..
+                ref mut remaining,
+                ref mut frame_buf,
             } => {
-                self.output_buf.extend_from_slice(&raw);
+                frame_buf.extend_from_slice(&raw);
                 *remaining -= take;
 
                 if *remaining == 0 {
-                    self.state = DecoderState::NeedChunkHeader;
+                    Some(std::mem::take(frame_buf))
+                } else {
+                    None
                 }
             }
             _ => unreachable!(),
+        };
+
+        if let Some(frame) = complete_frame {
+            // Route the verbatim bytes through the persistent decoder so its
+            // dictionary and global position stay in sync for later LZMA
+            // chunks that back-reference them.
+            let decompressed = self.decode_frame(&frame)?;
+            self.output_buf.extend_from_slice(&decompressed);
+            self.state = DecoderState::NeedChunkHeader;
         }
 
         Ok(true)

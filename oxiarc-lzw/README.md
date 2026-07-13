@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-08) | 79 tests passing**
+**Version: 0.3.6 (2026-07-13) | 100 tests passing (incl. libtiff/Pillow differential oracle)**
 
 ## Overview
 
@@ -23,6 +23,7 @@ LZW is a dictionary-based compression algorithm used in TIFF images, GIF animati
 - **LSB bitstream** - `bitstream_lsb` module with `LsbBitWriter`/`LsbBitReader` for GIF-compatible bit packing
 - **Configurable** - Adjustable code width (9-12 bits)
 - **Early change** - Code width increases before table full
+- **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs` and the pinned fixtures in `tests/data/`)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs
 
 All features are implemented and tested. API is stable. `LzwConfig` implements `Default` (returning the TIFF preset), and `LzwError` is `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over it need a wildcard arm.
@@ -92,7 +93,8 @@ use oxiarc_lzw::LzwConfig;
 let config = LzwConfig::TIFF;
 // MSB-first bit ordering
 // 9-12 bit codes
-// No clear code; early code change enabled
+// TIFF 6.0 clear codes (strip starts with ClearCode 256; table resets at
+// entry 4094) and early code change — libtiff/Pillow/GDAL-compatible
 ```
 
 ### GIF-flavored Mode (still MSB-first)
@@ -178,8 +180,9 @@ LZW builds a dictionary dynamically:
 
 ## Features (Cargo)
 
-This crate currently exposes no optional Cargo features (it compiles the
-same way regardless of feature selection).
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `tiff-oracle` | off | Enables differential oracle tests (`tests/tiff_lzw_oracle.rs`) that validate TIFF-LZW interop against Pillow/libtiff in both directions; tests self-skip when `python3`+Pillow are absent. Test-only — the library compiles identically either way. |
 
 ```toml
 [dependencies]

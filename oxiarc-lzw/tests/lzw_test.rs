@@ -198,7 +198,10 @@ fn test_lzw_config_tiff() {
     let config = LzwConfig::TIFF;
     assert_eq!(config.min_bits, 9);
     assert_eq!(config.max_bits, 12);
-    assert!(!config.use_clear_code);
+    assert!(
+        config.use_clear_code,
+        "TIFF 6.0 mandates ClearCode support (libtiff/Pillow interop)"
+    );
     assert!(config.early_change);
 }
 

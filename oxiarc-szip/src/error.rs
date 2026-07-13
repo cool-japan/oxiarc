@@ -6,12 +6,13 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SzipError {
-    /// The compressed input buffer is too short to decode.
-    #[error("input too short: need at least {need} bytes, have {have}")]
+    /// The input buffer holds fewer elements than the operation requires
+    /// (e.g. an encode sample buffer shorter than `SzipParams::samples`).
+    #[error("input too short: need at least {need} elements, have {have}")]
     InputTooShort {
-        /// Minimum number of bytes required to proceed.
+        /// Minimum number of elements required to proceed.
         need: usize,
-        /// Number of bytes actually available in the input buffer.
+        /// Number of elements actually available in the input buffer.
         have: usize,
     },
 
@@ -28,20 +29,37 @@ pub enum SzipError {
     #[error("invalid parameter: {0}")]
     InvalidParam(&'static str),
 
-    /// The decoded byte length does not match the expected output size.
-    #[error("output length mismatch: expected {expected} bytes, decoded {actual} bytes")]
+    /// The decoded data length does not match the expected output size
+    /// (e.g. a zero-block run claims more samples than the reference sample
+    /// interval can hold).
+    #[error("output length mismatch: expected at most {expected} samples, stream encodes {actual}")]
     LengthMismatch {
-        /// Number of bytes expected based on `SzipParams`.
+        /// Number of samples the current segment can hold based on `SzipParams`.
         expected: usize,
-        /// Number of bytes actually produced by the decoder.
+        /// Number of samples the corrupt stream claims for the segment.
         actual: usize,
     },
 
     /// An option mask bit combination that is not supported was encountered.
+    ///
+    /// Reserved for future option-mask parsing (e.g. HDF5 SZIP filter
+    /// masks); currently not produced by this crate.
     #[error("unsupported option mask bits: 0x{mask:02x}")]
     UnsupportedOption {
         /// The unsupported option mask bits that were read.
         mask: u8,
+    },
+
+    /// A sample value passed to the encoder exceeds the maximum value
+    /// representable in `bits_per_pixel` bits.
+    #[error("sample {index} out of range: value {value} exceeds max {max}")]
+    SampleOutOfRange {
+        /// Index of the offending sample in the input buffer.
+        index: usize,
+        /// The out-of-range sample value.
+        value: u64,
+        /// Maximum representable value, `(1 << bits_per_pixel) - 1`.
+        max: u64,
     },
 
     /// Attempt to read past the end of the compressed bit stream.

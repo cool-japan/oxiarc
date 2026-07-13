@@ -8,8 +8,9 @@ use super::super::name_codec;
 use super::types::{
     CENTRAL_DIR_HEADER_SIG, CompressionMethod, DataDescriptor, END_OF_CENTRAL_DIR_SIG,
     FLAG_DATA_DESCRIPTOR, FLAG_EFS, LOCAL_FILE_HEADER_SIG, LocalFileHeader,
-    ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_32,
-    get_entry_aes_encryption_info, is_entry_encrypted, is_entry_traditional_encrypted,
+    ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_32, append_entry_meta,
+    dos_date_time_to_system_time, entry_dos_mtime, entry_gp_flags, get_entry_aes_encryption_info,
+    is_entry_encrypted, is_entry_traditional_encrypted,
 };
 use crate::lenient::{LenientWarning, LenientWarningKind};
 use oxiarc_core::entry::CompressionMethod as CoreMethod;
@@ -19,7 +20,6 @@ use oxiarc_core::{Crc32, Entry, EntryType, FileAttributes};
 use oxiarc_deflate::inflate;
 use oxiarc_lzma::{LzmaProperties, decompress_raw as lzma_decompress_raw};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::time::{Duration, UNIX_EPOCH};
 
 /// ZIP archive reader.
 pub struct ZipReader<R: Read + Seek> {
@@ -56,6 +56,7 @@ impl<R: Read + Seek> ZipReader<R> {
     }
 
     /// Attach a progress handle to this reader.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -68,6 +69,7 @@ impl<R: Read + Seek> ZipReader<R> {
     /// is returned to the caller anyway. When disabled (default), a
     /// CRC-32 mismatch aborts the extraction with
     /// [`OxiArcError::CrcMismatch`].
+    #[must_use]
     pub fn lenient(mut self, enabled: bool) -> Self {
         self.lenient = enabled;
         self
@@ -482,23 +484,15 @@ impl<R: Read + Seek> ZipReader<R> {
             EntryType::File
         };
 
-        // Convert DOS time to SystemTime
-        let seconds = (mtime & 0x1F) as u64 * 2;
-        let minutes = ((mtime >> 5) & 0x3F) as u64;
-        let hours = ((mtime >> 11) & 0x1F) as u64;
-        let day = (mdate & 0x1F) as u64;
-        let month = ((mdate >> 5) & 0x0F) as u64;
-        let year = ((mdate >> 9) & 0x7F) as u64 + 1980;
-        let days = (year - 1970) * 365 + (year - 1969) / 4 + (month - 1) * 30 + day;
-        let total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
-        let modified = UNIX_EPOCH + Duration::from_secs(total_seconds);
+        // Convert DOS time to SystemTime via the shared, clamped helper
+        // (a crafted month-0 date previously underflowed and panicked here).
+        let modified = dos_date_time_to_system_time(mdate, mtime);
 
-        // Mark entries with data descriptors in the extra data
+        // Persist the general-purpose bit flags and raw DOS mtime on the
+        // entry (as a well-formed private extra record) so encryption
+        // detection and the ZipCrypto check-byte rule can consult them.
         let mut entry_extra = extra.clone();
-        if flags & FLAG_DATA_DESCRIPTOR != 0 {
-            // Add a marker so we know this entry used a data descriptor
-            entry_extra.extend_from_slice(&[0xDD, 0xDD]); // Custom marker
-        }
+        append_entry_meta(&mut entry_extra, flags, mtime);
 
         let entry = Entry {
             name: filename,
@@ -831,12 +825,20 @@ impl<R: Read + Seek> ZipReader<R> {
             *byte = cipher.decrypt_byte(*byte);
         }
 
-        // Verify the password using the check byte (last byte of header)
-        // The check byte should match the high byte of the CRC-32
-        let expected_check = entry.crc32.map(|crc| (crc >> 24) as u8).unwrap_or(0);
+        // Verify the password using the check byte (last byte of header).
+        // Per APPNOTE §6.1.6 the check byte is the high byte of the CRC-32;
+        // however, when general-purpose bit 3 (data descriptor / streamed)
+        // is set the CRC was unknown at encryption time, so Info-ZIP
+        // (`zip -e` writes flags 0x0009) uses the high byte of the DOS
+        // modification time instead. Accept either where applicable.
+        let crc_check = entry.crc32.map(|crc| (crc >> 24) as u8).unwrap_or(0);
         let actual_check = header[11];
+        let streamed = entry_gp_flags(entry).is_some_and(|f| f & FLAG_DATA_DESCRIPTOR != 0);
+        let mtime_check = entry_dos_mtime(entry).map(|mtime| (mtime >> 8) as u8);
+        let check_ok = actual_check == crc_check
+            || (streamed && mtime_check.is_some_and(|expected| expected == actual_check));
 
-        if actual_check != expected_check {
+        if !check_ok {
             return Err(OxiArcError::invalid_header(
                 "Password verification failed - incorrect password or corrupted data",
             ));
@@ -965,13 +967,19 @@ impl<R: Read + Seek> ZipReader<R> {
             }
         };
 
-        // Verify CRC (for AE-2, CRC is in header)
-        if let Some(expected_crc) = entry.crc32 {
-            if expected_crc != 0 {
-                // AE-2 stores CRC
-                let actual_crc = Crc32::compute(&decompressed);
-                if actual_crc != expected_crc {
-                    return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+        // Verify CRC. Per the WinZip AES spec, AE-2 (vendor version 2)
+        // stores 0 in the CRC-32 field — integrity comes from the HMAC
+        // verified above — so the CRC check only applies to AE-1 entries
+        // (which store the real plaintext CRC). Legacy oxiarc archives
+        // tagged AE-2 with a real CRC are still accepted: the HMAC has
+        // already authenticated the payload.
+        if aes_info.version != 2 {
+            if let Some(expected_crc) = entry.crc32 {
+                if expected_crc != 0 {
+                    let actual_crc = Crc32::compute(&decompressed);
+                    if actual_crc != expected_crc {
+                        return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
+                    }
                 }
             }
         }

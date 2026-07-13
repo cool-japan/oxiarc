@@ -9,6 +9,7 @@ use std::time::SystemTime;
 /// Compression method used for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum CompressionMethod {
     /// No compression (stored).
     #[default]
@@ -82,6 +83,7 @@ impl std::fmt::Display for CompressionMethod {
 /// Entry type (file, directory, symlink, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum EntryType {
     /// Regular file.
     #[default]

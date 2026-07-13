@@ -35,6 +35,11 @@ default = []
 # Async I/O support via Tokio - implements AsyncCompressor/AsyncDecompressor for BrotliCompressor/BrotliDecompressor
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 parallel = ["dep:rayon"]
+# Differential oracle tests (tests/brotli_oracle.rs) that shell out to the
+# reference `brotli` CLI in BOTH directions: reference-compress -> OxiArc
+# decode must be byte-identical, and OxiArc-compress -> `brotli -d` must be
+# accepted and byte-identical. Tests self-skip when `brotli` is not on PATH.
+brotli-oracle = []
 
 [lints]
 workspace = true

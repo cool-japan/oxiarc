@@ -66,6 +66,12 @@ const MAX_MATCH: usize = 65535 + MIN_MATCH;
 /// Maximum match offset (16-bit).
 const MAX_OFFSET: usize = 65535;
 
+/// Number of trailing bytes that must always be literals (LZ4 invariant).
+const LASTLITERALS: usize = 5;
+
+/// Minimum distance a match must keep from the end of the block (liblz4).
+const MFLIMIT: usize = 12;
+
 /// Hash table size (must be power of 2).
 const HASH_SIZE: usize = 1 << 16; // 64K entries
 
@@ -137,8 +143,10 @@ impl HcEncoder {
                 continue;
             }
 
-            // Compare from the beginning
-            let max_len = (input.len() - pos).min(MAX_MATCH);
+            // Compare from the beginning, but never let a match reach into
+            // the trailing LASTLITERALS bytes of the block.
+            let matchlimit = input.len().saturating_sub(LASTLITERALS);
+            let max_len = matchlimit.saturating_sub(pos).min(MAX_MATCH);
             let mut len = 0;
 
             while len < max_len && input.get(match_pos + len) == input.get(pos + len) {
@@ -199,7 +207,8 @@ impl HcEncoder {
             self.insert_position(0, input);
         }
 
-        let end = input.len().saturating_sub(5);
+        // No match may start within MFLIMIT of the block end (LZ4 invariant).
+        let end = input.len().saturating_sub(MFLIMIT - 1);
 
         while pos < end {
             // Try to find a match
@@ -281,6 +290,9 @@ impl HcEncoder {
         // Build matches for all positions
         let mut matches: Vec<Vec<(usize, usize)>> = vec![Vec::new(); input.len()];
         let search_limit = input.len().saturating_sub(MIN_MATCH);
+        // Trailing bytes must stay literals; matches may cover at most up to
+        // `matchlimit` and may only start before `input.len() - MFLIMIT`.
+        let matchlimit = input.len().saturating_sub(LASTLITERALS);
 
         for (pos, match_slot) in matches.iter_mut().enumerate().take(search_limit) {
             self.insert_position(pos, input);
@@ -291,13 +303,20 @@ impl HcEncoder {
             let mut match_pos = self.hash_table[h] as usize;
             let mut attempts = 0;
 
+            // A match starting within MFLIMIT of the end would push a
+            // non-final sequence into the decoder's end-of-block window.
+            let max_len = if pos + MFLIMIT <= input.len() {
+                matchlimit.saturating_sub(pos).min(MAX_MATCH)
+            } else {
+                0
+            };
+
             while match_pos > 0 && match_pos < pos && attempts < OPTIMAL_SEARCH_DEPTH {
                 let offset = pos - match_pos;
                 if offset > MAX_OFFSET {
                     break;
                 }
 
-                let max_len = (input.len() - pos).min(MAX_MATCH);
                 let mut len = 0;
 
                 while len < max_len && input.get(match_pos + len) == input.get(pos + len) {
@@ -518,8 +537,10 @@ impl<'a> HcDictEncoder<'a> {
             };
 
             if !skip {
-                // Measure match length in the virtual buffer vs. input
-                let max_len = (self.input.len() - input_pos).min(MAX_MATCH);
+                // Measure match length in the virtual buffer vs. input, but
+                // never reach into the trailing LASTLITERALS bytes.
+                let matchlimit = self.input.len().saturating_sub(LASTLITERALS);
+                let max_len = matchlimit.saturating_sub(input_pos).min(MAX_MATCH);
                 let mut len = 0;
                 while len < max_len {
                     match (
@@ -569,7 +590,8 @@ impl<'a> HcDictEncoder<'a> {
             self.insert_input_pos(0);
         }
 
-        let end = input.len().saturating_sub(5);
+        // No match may start within MFLIMIT of the block end (LZ4 invariant).
+        let end = input.len().saturating_sub(MFLIMIT - 1);
 
         while pos < end {
             let (match_len, offset) = self.find_best_match_with_dict(pos);

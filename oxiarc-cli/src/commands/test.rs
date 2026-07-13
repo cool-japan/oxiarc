@@ -16,7 +16,10 @@ pub fn cmd_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = open_input(archive)?;
 
-    let (format, _) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`); `-` (stdin) has no
+    // extension, so it degrades to plain content detection.
+    let (format, _) = ArchiveFormat::detect_with_path(&mut reader, archive)?;
     reader.seek(SeekFrom::Start(0))?;
 
     // Name used for single-stream (non-archive) formats that carry no internal

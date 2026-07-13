@@ -4,7 +4,8 @@
 //! to the output, either uncompressed or Huffman-encoded.
 
 use crate::LiteralsBlockType;
-use crate::huffman::{HuffmanBitReader, HuffmanTable, read_huffman_table};
+use crate::fse::FseBitReader;
+use crate::huffman::{HuffmanTable, read_huffman_table};
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Decoded literals section header.
@@ -220,6 +221,12 @@ impl LiteralsDecoder {
                 let (table, table_size) = read_huffman_table(content)?;
                 self.huffman_table = Some(table);
 
+                if table_size > header.compressed_size {
+                    return Err(OxiArcError::CorruptedData {
+                        offset: 0,
+                        message: "Huffman table exceeds compressed literals size".to_string(),
+                    });
+                }
                 let stream_data = &content[table_size..header.compressed_size];
                 let literals = self.decode_huffman_streams(
                     stream_data,
@@ -281,21 +288,44 @@ impl LiteralsDecoder {
         }
     }
 
-    /// Decode a single Huffman stream.
+    /// Decode a single Huffman stream (backward bitstream, RFC 8878 §4.2.2).
+    ///
+    /// The stream must regenerate exactly `size` bytes and be consumed
+    /// exactly to its first bit; anything else is corruption (mirrors the
+    /// reference `BIT_endOfDStream` check).
     fn decode_single_stream(
         &self,
         data: &[u8],
         size: usize,
         table: &HuffmanTable,
     ) -> Result<Vec<u8>> {
-        let mut reader = HuffmanBitReader::new(data)?;
+        let mut reader = FseBitReader::new(data)?;
         let mut output = Vec::with_capacity(size);
 
         while output.len() < size {
-            let bits = reader.peek_bits(table.max_bits());
-            let entry = table.decode(bits);
+            let prefix = reader.peek_bits(table.max_bits()) as usize;
+            let entry = table.entry(prefix)?;
+            if entry.num_bits == 0 {
+                return Err(OxiArcError::CorruptedData {
+                    offset: 0,
+                    message: "invalid Huffman code in literals stream".to_string(),
+                });
+            }
+            reader.skip_bits(entry.num_bits);
+            if reader.is_overflowed() {
+                return Err(OxiArcError::CorruptedData {
+                    offset: 0,
+                    message: "Huffman literals stream exhausted early".to_string(),
+                });
+            }
             output.push(entry.symbol);
-            reader.consume(entry.num_bits);
+        }
+
+        if !reader.is_finished() {
+            return Err(OxiArcError::CorruptedData {
+                offset: 0,
+                message: "Huffman literals stream not fully consumed".to_string(),
+            });
         }
 
         Ok(output)
@@ -316,17 +346,24 @@ impl LiteralsDecoder {
             });
         }
 
-        let jump1 = u16::from_le_bytes([data[0], data[1]]) as usize;
-        let jump2 = u16::from_le_bytes([data[2], data[3]]) as usize;
-        let jump3 = u16::from_le_bytes([data[4], data[5]]) as usize;
+        // The jump table holds the sizes of streams 1-3 (RFC 8878 §4.2.2);
+        // stream 4 occupies the remainder.
+        let size_1 = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let size_2 = u16::from_le_bytes([data[2], data[3]]) as usize;
+        let size_3 = u16::from_le_bytes([data[4], data[5]]) as usize;
 
         let stream_data = &data[6..];
 
-        // Validate jumps
-        if jump1 > stream_data.len() || jump2 > stream_data.len() || jump3 > stream_data.len() {
+        // Cumulative boundaries, validated against the available bytes so the
+        // sub-slices below are always in range (and monotonic by construction).
+        let jump1 = size_1;
+        let jump2 = jump1 + size_2;
+        let jump3 = jump2 + size_3;
+        if jump3 >= stream_data.len() {
+            // `>=`: stream 4 must be non-empty too.
             return Err(OxiArcError::CorruptedData {
                 offset: 0,
-                message: "invalid stream jump offsets".to_string(),
+                message: "invalid 4-stream jump table (streams exceed section)".to_string(),
             });
         }
 
@@ -336,12 +373,17 @@ impl LiteralsDecoder {
         let stream3 = &stream_data[jump2..jump3];
         let stream4 = &stream_data[jump3..];
 
-        // Each stream produces roughly 1/4 of the output
+        // Streams 1-3 each regenerate ceil(total/4) bytes; stream 4 the rest.
         let quarter = total_size.div_ceil(4);
         let size1 = quarter;
         let size2 = quarter;
         let size3 = quarter;
-        let size4 = total_size - size1 - size2 - size3;
+        let size4 = total_size
+            .checked_sub(size1 + size2 + size3)
+            .ok_or_else(|| OxiArcError::CorruptedData {
+                offset: 0,
+                message: "4-stream literals size too small".to_string(),
+            })?;
 
         // Decode each stream
         let mut output = Vec::with_capacity(total_size);

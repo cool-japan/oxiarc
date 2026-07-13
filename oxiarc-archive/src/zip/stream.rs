@@ -133,12 +133,14 @@ impl<R: Read> ZipStreamReader<R> {
     }
 
     /// Attach a progress sink that will be notified for each entry.
+    #[must_use]
     pub fn with_progress(mut self, progress: ProgressHandle) -> Self {
         self.progress = Some(progress);
         self
     }
 
     /// Attach a cancellation token.
+    #[must_use]
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self

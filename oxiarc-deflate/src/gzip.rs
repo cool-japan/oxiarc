@@ -18,9 +18,9 @@
 //! ```
 
 use crate::deflate::Deflater;
-use crate::inflate::inflate;
-use oxiarc_core::Crc32;
+use crate::inflate::Inflater;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::{BitReader, Crc32};
 
 /// Gzip magic bytes.
 const GZIP_ID1: u8 = 0x1f;
@@ -93,6 +93,15 @@ impl GzipDecoder {
     }
 
     /// Decompress a gzip stream from `data`, returning the original bytes.
+    ///
+    /// Handles concatenated multi-member streams per RFC 1952 §2.2: after
+    /// each member's trailer, another member may follow and all members'
+    /// decompressed contents are concatenated. This is the format produced
+    /// by `gzip -c a b`, `pigz`, and [`crate::parallel::compress_gzip_parallel`].
+    ///
+    /// Trailing zero padding after the final member is tolerated (as in the
+    /// `gzip` CLI and Python's `gzip` module, e.g. for tape-block padding);
+    /// any other trailing garbage is an error.
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < GZIP_MIN_SIZE {
             return Err(OxiArcError::InvalidHeader {
@@ -100,23 +109,63 @@ impl GzipDecoder {
             });
         }
 
-        // Validate magic bytes and CM.
-        if data[0] != GZIP_ID1 || data[1] != GZIP_ID2 {
+        let mut output = Vec::new();
+        let mut pos: usize = 0;
+
+        loop {
+            pos = self.decompress_member(data, pos, &mut output)?;
+
+            if pos >= data.len() {
+                break;
+            }
+            let rest = &data[pos..];
+            if rest.len() >= 2 && rest[0] == GZIP_ID1 && rest[1] == GZIP_ID2 {
+                // Another concatenated member follows.
+                continue;
+            }
+            if rest.iter().all(|&b| b == 0) {
+                // Trailing zero padding — tolerated like the gzip CLI.
+                break;
+            }
             return Err(OxiArcError::InvalidMagic {
                 expected: vec![GZIP_ID1, GZIP_ID2],
-                found: vec![data[0], data[1]],
-            });
-        }
-        if data[2] != GZIP_CM_DEFLATE {
-            return Err(OxiArcError::UnsupportedMethod {
-                method: format!("gzip CM={}", data[2]),
+                found: rest.iter().take(2).copied().collect(),
             });
         }
 
-        let flg = data[3];
+        Ok(output)
+    }
+
+    /// Decode one gzip member starting at `pos`, appending its decompressed
+    /// contents to `output`.
+    ///
+    /// Returns the offset of the first byte after the member's 8-byte
+    /// trailer. The DEFLATE payload length is tracked exactly via
+    /// [`Inflater::inflate_consumed`], so the trailer is read at its true
+    /// position rather than assumed to be the last 8 bytes of `data`.
+    fn decompress_member(&self, data: &[u8], start: usize, output: &mut Vec<u8>) -> Result<usize> {
+        // Validate magic bytes and CM.
+        if start + 10 > data.len() {
+            return Err(OxiArcError::InvalidHeader {
+                message: "gzip member header truncated".to_owned(),
+            });
+        }
+        if data[start] != GZIP_ID1 || data[start + 1] != GZIP_ID2 {
+            return Err(OxiArcError::InvalidMagic {
+                expected: vec![GZIP_ID1, GZIP_ID2],
+                found: vec![data[start], data[start + 1]],
+            });
+        }
+        if data[start + 2] != GZIP_CM_DEFLATE {
+            return Err(OxiArcError::UnsupportedMethod {
+                method: format!("gzip CM={}", data[start + 2]),
+            });
+        }
+
+        let flg = data[start + 3];
 
         // Parse past the fixed 10-byte header.
-        let mut pos: usize = 10;
+        let mut pos: usize = start + 10;
 
         // FLG bit 2: FEXTRA — skip extra field.
         if flg & 0x04 != 0 {
@@ -166,21 +215,30 @@ impl GzipDecoder {
             pos += 2;
         }
 
-        // The trailer occupies the last 8 bytes.
-        if pos + 8 > data.len() {
+        // Inflate the DEFLATE payload, tracking exactly how many compressed
+        // bytes it occupied so the trailer position is known even when more
+        // members follow.
+        let mut bit_reader = BitReader::new(std::io::Cursor::new(&data[pos..]));
+        let mut inflater = Inflater::new();
+        let (decompressed, consumed) = inflater.inflate_consumed(&mut bit_reader)?;
+
+        // `consumed` is bounded by the slice length handed to the BitReader,
+        // so the conversion and addition cannot overflow in practice; guard
+        // anyway rather than risk arithmetic overflow on malformed counts.
+        let trailer_start = usize::try_from(consumed)
+            .ok()
+            .and_then(|c| pos.checked_add(c))
+            .ok_or_else(|| OxiArcError::InvalidHeader {
+                message: "gzip member length overflow".to_owned(),
+            })?;
+
+        // Read and verify the 8-byte trailer: CRC-32 (LE) + ISIZE (LE).
+        if trailer_start + 8 > data.len() {
             return Err(OxiArcError::InvalidHeader {
                 message: "gzip stream missing trailer".to_owned(),
             });
         }
-
-        let deflate_end = data.len() - 8;
-        let compressed_data = &data[pos..deflate_end];
-
-        // Inflate the DEFLATE payload.
-        let decompressed = inflate(compressed_data)?;
-
-        // Read and verify the trailer.
-        let trailer = &data[deflate_end..];
+        let trailer = &data[trailer_start..trailer_start + 8];
         let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
         let stored_isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
 
@@ -202,7 +260,8 @@ impl GzipDecoder {
             });
         }
 
-        Ok(decompressed)
+        output.extend_from_slice(&decompressed);
+        Ok(trailer_start + 8)
     }
 }
 

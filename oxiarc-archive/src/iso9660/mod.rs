@@ -906,6 +906,36 @@ mod tests {
         iso
     }
 
+    /// ISO-01 end-to-end regression: an image whose root directory extent
+    /// contains a record with a non-zero LEN_DR smaller than the 34-byte
+    /// minimum must not panic when walked from `IsoReader::new` on an
+    /// untrusted image. The undersized record is treated as padding (the
+    /// walker skips to the next sector), so parsing either succeeds with
+    /// the record ignored or fails cleanly — it must never panic.
+    #[test]
+    fn test_iso_undersized_dir_record_no_panic() {
+        for bad_len in [1u8, 2, 5, 25, 26, 32, 33] {
+            let mut iso = build_minimal_iso();
+
+            // Corrupt the PVD root directory (LBA 20): overwrite the first
+            // record's LEN_DR with an undersized non-zero value and fill
+            // the rest of the old record with hostile bytes.
+            let dir_start = 20 * 2048;
+            iso[dir_start] = bad_len;
+            for b in iso[dir_start + 1..dir_start + 34].iter_mut() {
+                *b = 0xFF;
+            }
+
+            let result = std::panic::catch_unwind(|| IsoReader::new(Cursor::new(iso)));
+            let outcome = result.unwrap_or_else(|_| {
+                panic!("IsoReader::new panicked on LEN_DR={bad_len} in a directory extent")
+            });
+            // Ok (record skipped) or Err (structure rejected) are both
+            // acceptable; only a panic is a defect.
+            let _ = outcome;
+        }
+    }
+
     #[test]
     fn test_iso_cyclic_directory_reference_returns_err() {
         let iso = build_cyclic_iso();

@@ -129,6 +129,19 @@ impl BitWriter {
             self.write_bits(value, n)
         }
     }
+
+    /// Append the exact bit stream of another writer (including its partial
+    /// final byte) to this one, at the current (possibly unaligned) bit
+    /// position. Used to splice a speculatively encoded meta-block.
+    pub fn append(&mut self, other: &BitWriter) -> BrotliResult<()> {
+        for &byte in &other.output {
+            self.write_bits(byte as u32, 8)?;
+        }
+        if other.bit_count > 0 {
+            self.write_bits(other.current_byte as u32, other.bit_count)?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for BitWriter {

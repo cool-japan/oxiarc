@@ -75,12 +75,14 @@ impl ZstdReader {
     }
 
     /// Attach a progress sink. Emitted once after decompression completes.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before decompression begins.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -141,12 +143,14 @@ impl ZstdWriter {
     }
 
     /// Attach a progress sink. Emitted once after compression completes.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
     }
 
     /// Attach a cancellation token. Checked before compression begins.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self

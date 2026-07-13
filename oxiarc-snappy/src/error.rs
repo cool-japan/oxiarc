@@ -68,6 +68,42 @@ pub enum SnappyError {
         /// Description of the corruption.
         message: String,
     },
+    /// A framed-format chunk's declared (wire) or actual decoded size
+    /// exceeds the Snappy framing format's 64 KiB per-chunk maximum.
+    ///
+    /// Per the framing format spec, any content chunk's *uncompressed*
+    /// payload must not exceed 65536 bytes. This is returned both when a
+    /// chunk header declares a length that could not possibly decode within
+    /// that bound (rejected before any read/decompression is attempted) and
+    /// when a compressed chunk actually decodes to more than 65536 bytes
+    /// (a decompression-amplification attempt).
+    #[error("chunk size {size} exceeds the 64 KiB Snappy framing format maximum ({max})")]
+    ChunkTooLarge {
+        /// The chunk's declared (wire) or actual decoded size, in bytes.
+        size: usize,
+        /// The maximum allowed size, in bytes.
+        max: usize,
+    },
+    /// A bounded decode's output exceeded the caller's total-output limit.
+    ///
+    /// Returned by [`crate::decompress_with_limit`],
+    /// [`crate::decompress_frame_with_limit`] and
+    /// [`crate::frame::FrameDecoder::with_max_output_size`]. Each framed
+    /// chunk is already capped at 65536 bytes, but a stream may contain an
+    /// unbounded number of chunks, and a raw block may declare up to the
+    /// crate's 256 MiB maximum; this bounds a single decode session to the
+    /// caller's budget.
+    ///
+    /// The limit is enforced against the size each block/chunk *declares*,
+    /// so it fires before the over-budget output is decoded or allocated.
+    #[error("total decompressed output {produced} bytes exceeds configured maximum {max} bytes")]
+    TotalOutputExceeded {
+        /// Total bytes the decode would have produced, including the
+        /// block/chunk that tripped the limit.
+        produced: u64,
+        /// The configured maximum total output, in bytes.
+        max: u64,
+    },
     /// An I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -90,6 +126,10 @@ impl From<SnappyError> for oxiarc_core::error::OxiArcError {
                 Self::CrcMismatch { expected, computed }
             }
             SnappyError::UnexpectedEof { .. } => Self::UnexpectedEof { expected: 0 },
+            SnappyError::TotalOutputExceeded { produced, max } => Self::MemoryBudgetExceeded {
+                budget: usize::try_from(max).unwrap_or(usize::MAX),
+                requested: usize::try_from(produced).unwrap_or(usize::MAX),
+            },
             other => Self::CorruptedData {
                 offset: 0,
                 message: other.to_string(),

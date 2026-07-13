@@ -49,6 +49,12 @@ const MIN_MATCH: usize = 4;
 /// Maximum match offset (16-bit).
 const MAX_OFFSET: usize = 65535;
 
+/// Number of trailing bytes that must always be literals (LZ4 invariant).
+const LASTLITERALS: usize = 5;
+
+/// Minimum distance a match must keep from the end of the block (liblz4).
+const MFLIMIT: usize = 12;
+
 /// Hash table size (must be power of 2).
 const HASH_SIZE: usize = 1 << 14; // 16K entries
 
@@ -392,6 +398,7 @@ impl DictBuilder {
 
 /// Dictionary compression level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DictLevel {
     /// Fast compression (default).
     #[default]
@@ -501,7 +508,10 @@ impl<'a> DictBlockEncoder<'a> {
 
         let mut pos = 0;
         let mut anchor = 0; // Start of current literal run
-        let end = len.saturating_sub(5); // Leave room for last literals
+        // Keep the trailing LASTLITERALS bytes as literals and forbid matches
+        // from starting within MFLIMIT of the block end (LZ4 invariant).
+        let matchlimit = len.saturating_sub(LASTLITERALS);
+        let end = len.saturating_sub(MFLIMIT - 1);
         let mut misses: usize = 0;
 
         while pos < end {
@@ -522,8 +532,9 @@ impl<'a> DictBlockEncoder<'a> {
                     // Found a match! Calculate match length
                     let mut match_len = MIN_MATCH;
 
-                    // Extend match forwards
-                    while pos + match_len < len {
+                    // Extend match forwards, never into the trailing
+                    // LASTLITERALS bytes of the block.
+                    while pos + match_len < matchlimit {
                         let match_byte = self.get_byte(match_pos + match_len);
                         let cur_byte = input.get(pos + match_len);
 
@@ -679,7 +690,7 @@ impl<'a> DictBlockDecoder<'a> {
         // Note: We don't actually copy the dictionary - we handle offsets specially
         let dict_data = dict.data();
 
-        while self.pos < self.input.len() && output.len() < max_output {
+        while self.pos < self.input.len() {
             // Read token
             let token = self.read_byte()?;
             let literal_len = (token >> 4) as usize;
@@ -693,6 +704,14 @@ impl<'a> DictBlockDecoder<'a> {
                 return Err(OxiArcError::corrupted(
                     self.pos as u64,
                     "truncated literals",
+                ));
+            }
+
+            // Bound the projected output before copying literals.
+            if output.len().saturating_add(literal_len) > max_output {
+                return Err(OxiArcError::corrupted(
+                    self.pos as u64,
+                    "literals exceed max output",
                 ));
             }
 
@@ -713,6 +732,14 @@ impl<'a> DictBlockDecoder<'a> {
 
             // Extended match length
             let match_len = self.read_length(match_len_base)? + MIN_MATCH;
+
+            // Bound the projected output before copying the match.
+            if output.len().saturating_add(match_len) > max_output {
+                return Err(OxiArcError::corrupted(
+                    self.pos as u64,
+                    "match exceeds max output",
+                ));
+            }
 
             // Handle dictionary reference
             if offset > output.len() {

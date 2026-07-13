@@ -1,16 +1,24 @@
 //! Huffman coding for Zstandard literals.
 //!
 //! Zstandard uses canonical Huffman coding for literal compression.
-//! Maximum code length is 11 bits.
+//! The decoding table layout, weight validation and the implied-last-weight
+//! deduction mirror the reference `HUF_readStats` / `HUF_readDTableX1`
+//! (RFC 8878 §4.2.1).
 
 use crate::fse::{FseBitReader, FseDecoder, read_fse_table_description};
 use oxiarc_core::error::{OxiArcError, Result};
 
-/// Maximum Huffman code length in Zstandard.
+/// Maximum Huffman code length the encoder may use (RFC 8878).
 pub const MAX_CODE_LENGTH: u8 = 11;
+
+/// Maximum table log accepted when decoding (reference `HUF_TABLELOG_MAX`).
+const MAX_TABLE_LOG: u8 = 12;
 
 /// Maximum number of symbols (byte values).
 pub const MAX_SYMBOLS: usize = 256;
+
+/// Maximum accuracy log for the FSE table compressing Huffman weights.
+const WEIGHTS_MAX_ACCURACY_LOG: u8 = 6;
 
 /// Huffman decoding table entry.
 #[derive(Debug, Clone, Copy, Default)]
@@ -22,119 +30,160 @@ pub struct HuffmanEntry {
 }
 
 /// Huffman decoding table.
+///
+/// Indexed directly by the next `table_log` bits of the (backward) literals
+/// bitstream, exactly like the reference single-symbol `DTable`.
 #[derive(Debug, Clone)]
 pub struct HuffmanTable {
-    /// Decoding entries indexed by prefix.
+    /// Decoding entries indexed by bit prefix.
     entries: Vec<HuffmanEntry>,
-    /// Maximum code length used.
+    /// Table log (all lookups peek this many bits).
     max_bits: u8,
 }
 
 impl HuffmanTable {
-    /// Build Huffman table from weights (symbol counts).
-    pub fn from_weights(weights: &[u8]) -> Result<Self> {
-        if weights.is_empty() {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "empty Huffman weights".to_string(),
-            });
+    /// Build a Huffman decoding table from *stored* weights.
+    ///
+    /// `stored_weights` holds the weights for symbols `0..n`; the weight for
+    /// symbol `n` is *implied* and deduced here per RFC 8878 §4.2.1.1: the
+    /// total weight is completed to the next power of two, and the remainder
+    /// must itself be a power of two.
+    pub fn from_stored_weights(stored_weights: &[u8]) -> Result<Self> {
+        if stored_weights.is_empty() {
+            return Err(OxiArcError::corrupted(0, "empty Huffman weights"));
+        }
+        if stored_weights.len() >= MAX_SYMBOLS {
+            return Err(OxiArcError::corrupted(0, "too many Huffman weights"));
         }
 
-        // Calculate total weight
-        let mut total_weight = 0u32;
-        let mut max_weight = 0u8;
-
-        for &w in weights {
+        // Sum stored weights; every weight contributes 2^(w-1) when w > 0.
+        let mut total_weight: u64 = 0;
+        let mut rank_stats = [0u32; (MAX_TABLE_LOG + 1) as usize];
+        for &w in stored_weights {
+            if w > MAX_TABLE_LOG {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    format!("Huffman weight {} exceeds maximum {}", w, MAX_TABLE_LOG),
+                ));
+            }
             if w > 0 {
-                total_weight += 1u32 << (w - 1);
-                if w > max_weight {
-                    max_weight = w;
-                }
+                total_weight += 1u64 << (w - 1);
+                rank_stats[w as usize] += 1;
             }
         }
-
         if total_weight == 0 {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "all Huffman weights are zero".to_string(),
-            });
+            return Err(OxiArcError::corrupted(0, "all Huffman weights are zero"));
         }
 
-        // Calculate max_bits (power of 2 >= total_weight)
-        let max_bits = 32 - total_weight.leading_zeros();
-        let max_bits = max_bits.min(MAX_CODE_LENGTH as u32) as u8;
+        // Deduce table log and the implied last weight.
+        let table_log = (64 - total_weight.leading_zeros()) as u8; // highbit + 1
+        if table_log > MAX_TABLE_LOG {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!("Huffman table log {} exceeds maximum", table_log),
+            ));
+        }
+        let table_size = 1u64 << table_log;
+        let rest = table_size - total_weight;
+        if rest == 0 || !rest.is_power_of_two() {
+            return Err(OxiArcError::corrupted(
+                0,
+                "Huffman weights do not complete to a power of two",
+            ));
+        }
+        let last_weight = (63 - rest.leading_zeros()) as u8 + 1; // highbit + 1
+        rank_stats[last_weight as usize] += 1;
 
-        // Build canonical Huffman codes
-        let table_size = 1usize << max_bits;
-        let mut entries = vec![HuffmanEntry::default(); table_size];
-
-        // Assign codes by weight
-        let mut code = 0u32;
-        let mut code_lengths = vec![0u8; weights.len()];
-
-        // Convert weights to code lengths
-        // weight -> num_bits: max_bits + 1 - weight
-        for (symbol, &weight) in weights.iter().enumerate() {
-            if weight > 0 {
-                code_lengths[symbol] = max_bits + 1 - weight;
-            }
+        // Tree validity: the number of weight-1 (longest-code) symbols must be
+        // at least 2 and even (reference `HUF_readStats` check).
+        if rank_stats[1] < 2 || (rank_stats[1] & 1) != 0 {
+            return Err(OxiArcError::corrupted(
+                0,
+                "invalid Huffman tree (weight-1 symbol count must be even and >= 2)",
+            ));
         }
 
-        // Sort symbols by code length for canonical ordering
-        let mut symbols: Vec<(usize, u8)> = weights
-            .iter()
-            .enumerate()
-            .filter(|&(_, w)| *w > 0)
-            .map(|(s, _)| (s, code_lengths[s]))
-            .collect();
+        // Complete weight list: stored weights plus the implied last symbol.
+        let num_symbols = stored_weights.len() + 1;
 
-        symbols.sort_by_key(|&(_, len)| len);
+        // Compute each weight rank's starting position in the table
+        // (weight-1 symbols occupy the lowest indices).
+        let mut rank_start = [0usize; (MAX_TABLE_LOG + 2) as usize];
+        let mut next_start = 0usize;
+        for w in 1..=(table_log as usize) {
+            rank_start[w] = next_start;
+            next_start += (rank_stats[w] as usize) << (w - 1);
+        }
+        if next_start != table_size as usize {
+            return Err(OxiArcError::corrupted(
+                0,
+                "Huffman rank layout does not fill the table",
+            ));
+        }
 
-        // Assign canonical codes
-        let mut prev_len = 0u8;
-        for (symbol, len) in symbols {
-            if len > prev_len {
-                code <<= len - prev_len;
-                prev_len = len;
+        // Fill the decode table in natural symbol order.
+        let mut entries = vec![HuffmanEntry::default(); table_size as usize];
+        for symbol in 0..num_symbols {
+            let w = if symbol < stored_weights.len() {
+                stored_weights[symbol]
+            } else {
+                last_weight
+            };
+            if w == 0 {
+                continue;
             }
-
-            // Fill table entries
-            let num_entries = 1 << (max_bits - len);
-            let base_code = (code as usize) << (max_bits - len);
-
-            for i in 0..num_entries {
-                entries[base_code + i] = HuffmanEntry {
+            let length = 1usize << (w - 1);
+            let start = rank_start[w as usize];
+            let end = start + length;
+            if end > entries.len() {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    "Huffman table fill exceeds table size",
+                ));
+            }
+            let num_bits = table_log + 1 - w;
+            for entry in &mut entries[start..end] {
+                *entry = HuffmanEntry {
                     symbol: symbol as u8,
-                    num_bits: len,
+                    num_bits,
                 };
             }
-
-            code += 1;
+            rank_start[w as usize] = end;
         }
 
-        Ok(Self { entries, max_bits })
+        Ok(Self {
+            entries,
+            max_bits: table_log,
+        })
     }
 
-    /// Decode a symbol from bits.
+    /// Look up the entry for a `max_bits`-bit prefix, bounds-checked.
     #[inline]
-    pub fn decode(&self, bits: u32) -> &HuffmanEntry {
-        let idx = bits as usize & ((1 << self.max_bits) - 1);
-        &self.entries[idx]
+    pub fn entry(&self, prefix: usize) -> Result<&HuffmanEntry> {
+        self.entries.get(prefix).ok_or_else(|| {
+            OxiArcError::corrupted(
+                0,
+                format!(
+                    "Huffman prefix {} out of range (table size {})",
+                    prefix,
+                    self.entries.len()
+                ),
+            )
+        })
     }
 
-    /// Get max bits for this table.
+    /// Get the table log (bits peeked per lookup) for this table.
     pub fn max_bits(&self) -> u8 {
         self.max_bits
     }
 }
 
-/// Read Huffman table from compressed format.
+/// Read a Huffman table description from compressed literals content.
+///
+/// Returns the decoding table and the number of bytes consumed.
 pub fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize)> {
     if data.is_empty() {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: "empty Huffman table data".to_string(),
-        });
+        return Err(OxiArcError::corrupted(0, "empty Huffman table data"));
     }
 
     let header = data[0];
@@ -149,26 +198,27 @@ pub fn read_huffman_table(data: &[u8]) -> Result<(HuffmanTable, usize)> {
 }
 
 /// Read Huffman table with direct 4-bit weights.
+///
+/// `header - 127` weights are stored (4 bits each, high nibble first); the
+/// final symbol's weight is implied and reconstructed by
+/// [`HuffmanTable::from_stored_weights`].
 fn read_huffman_table_direct(data: &[u8]) -> Result<(HuffmanTable, usize)> {
     let header = data[0];
-    let num_symbols = (header - 127) as usize;
+    let num_weights = (header - 127) as usize;
 
-    if num_symbols == 0 || num_symbols > MAX_SYMBOLS {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: format!("invalid number of Huffman symbols: {}", num_symbols),
-        });
+    if num_weights == 0 || num_weights >= MAX_SYMBOLS {
+        return Err(OxiArcError::corrupted(
+            0,
+            format!("invalid number of Huffman weights: {}", num_weights),
+        ));
     }
 
-    let bytes_needed = num_symbols.div_ceil(2);
+    let bytes_needed = num_weights.div_ceil(2);
     if data.len() < 1 + bytes_needed {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: "truncated Huffman table".to_string(),
-        });
+        return Err(OxiArcError::corrupted(0, "truncated Huffman table"));
     }
 
-    let mut weights = vec![0u8; num_symbols];
+    let mut weights = vec![0u8; num_weights];
 
     for (i, weight) in weights.iter_mut().enumerate() {
         let byte_idx = 1 + i / 2;
@@ -181,135 +231,73 @@ fn read_huffman_table_direct(data: &[u8]) -> Result<(HuffmanTable, usize)> {
         };
     }
 
-    let table = HuffmanTable::from_weights(&weights)?;
+    let table = HuffmanTable::from_stored_weights(&weights)?;
     Ok((table, 1 + bytes_needed))
 }
 
 /// Read Huffman table with FSE-compressed weights.
+///
+/// Weights are decoded with **two interleaved FSE states** exactly like the
+/// reference `FSE_decompress`: symbols alternate between the states, and
+/// decoding stops when a state-transition read consumes past the start of the
+/// backward bitstream, at which point the other state contributes the final
+/// weight.
 fn read_huffman_table_fse(data: &[u8]) -> Result<(HuffmanTable, usize)> {
     let compressed_size = data[0] as usize;
 
     if compressed_size == 0 {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: "zero-length FSE Huffman table".to_string(),
-        });
+        return Err(OxiArcError::corrupted(0, "zero-length FSE Huffman table"));
     }
 
     if data.len() < 1 + compressed_size {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: "truncated FSE Huffman table".to_string(),
-        });
+        return Err(OxiArcError::corrupted(0, "truncated FSE Huffman table"));
     }
 
     let fse_data = &data[1..1 + compressed_size];
 
-    // Read FSE table for weights (max symbol is 12 for weight values 0-12)
-    let (fse_table, fse_bytes) = read_fse_table_description(fse_data, 12)?;
+    // Read FSE table for weight values (max symbol 12, accuracy log <= 6).
+    let (fse_table, fse_bytes) =
+        read_fse_table_description(fse_data, MAX_TABLE_LOG, WEIGHTS_MAX_ACCURACY_LOG)?;
 
-    // Decode weights using FSE
+    // Decode weights using two interleaved FSE states.
     let bitstream_data = &fse_data[fse_bytes..];
     let mut reader = FseBitReader::new(bitstream_data)?;
-    let mut decoder = FseDecoder::new(&fse_table, &mut reader);
-
-    let mut weights = Vec::with_capacity(MAX_SYMBOLS);
-
-    while weights.len() < MAX_SYMBOLS && !reader.is_empty() {
-        let weight = decoder.decode(&mut reader);
-        weights.push(weight);
+    let mut even = FseDecoder::new(&fse_table, &mut reader);
+    let mut odd = FseDecoder::new(&fse_table, &mut reader);
+    if reader.is_overflowed() {
+        return Err(OxiArcError::corrupted(
+            0,
+            "FSE weight bitstream too short for initial states",
+        ));
     }
 
-    if weights.is_empty() {
-        return Err(OxiArcError::CorruptedData {
-            offset: 0,
-            message: "no Huffman weights decoded".to_string(),
-        });
+    let mut weights: Vec<u8> = Vec::with_capacity(64);
+    let max_weights = MAX_SYMBOLS - 1; // at most 255 stored weights
+    loop {
+        if weights.len() >= max_weights {
+            return Err(OxiArcError::corrupted(0, "too many Huffman weights"));
+        }
+        weights.push(even.decode(&mut reader)?);
+        if reader.is_overflowed() {
+            weights.push(odd.peek()?);
+            break;
+        }
+
+        if weights.len() >= max_weights {
+            return Err(OxiArcError::corrupted(0, "too many Huffman weights"));
+        }
+        weights.push(odd.decode(&mut reader)?);
+        if reader.is_overflowed() {
+            weights.push(even.peek()?);
+            break;
+        }
+    }
+    if weights.len() > max_weights {
+        return Err(OxiArcError::corrupted(0, "too many Huffman weights"));
     }
 
-    let table = HuffmanTable::from_weights(&weights)?;
+    let table = HuffmanTable::from_stored_weights(&weights)?;
     Ok((table, 1 + compressed_size))
-}
-
-/// Huffman bitstream reader (reads backwards).
-pub struct HuffmanBitReader<'a> {
-    /// Input bytes.
-    data: &'a [u8],
-    /// Current bit position from start.
-    bit_pos: usize,
-    /// Total bits available.
-    total_bits: usize,
-}
-
-impl<'a> HuffmanBitReader<'a> {
-    /// Create a new Huffman bit reader.
-    pub fn new(data: &'a [u8]) -> Result<Self> {
-        if data.is_empty() {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "empty Huffman bitstream".to_string(),
-            });
-        }
-
-        // Find sentinel bit in last byte
-        let last_byte = data[data.len() - 1];
-        if last_byte == 0 {
-            return Err(OxiArcError::CorruptedData {
-                offset: 0,
-                message: "Huffman stream ends with zero".to_string(),
-            });
-        }
-
-        let padding = 7 - (31 - last_byte.leading_zeros()) as usize;
-        let total_bits = data.len() * 8 - padding - 1; // Exclude padding and sentinel
-
-        Ok(Self {
-            data,
-            bit_pos: 0,
-            total_bits,
-        })
-    }
-
-    /// Peek up to 16 bits without consuming.
-    pub fn peek_bits(&self, n: u8) -> u32 {
-        if n == 0 || self.bit_pos >= self.total_bits {
-            return 0;
-        }
-
-        // Calculate position from end (read backwards)
-        let read_pos = self.total_bits - self.bit_pos - 1;
-
-        let byte_pos = read_pos / 8;
-        let bit_offset = read_pos % 8;
-
-        // Read bytes
-        let mut value = 0u32;
-        for i in 0..3 {
-            if byte_pos >= i && byte_pos - i < self.data.len() {
-                value |= (self.data[byte_pos - i] as u32) << (i * 8);
-            }
-        }
-
-        // Extract bits (MSB-first for Huffman)
-        (value >> (24 - bit_offset - n as usize)) & ((1 << n) - 1)
-    }
-
-    /// Consume n bits.
-    pub fn consume(&mut self, n: u8) {
-        self.bit_pos += n as usize;
-    }
-
-    /// Check if stream is exhausted.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.bit_pos >= self.total_bits
-    }
-
-    /// Remaining bits.
-    #[allow(dead_code)]
-    pub fn remaining(&self) -> usize {
-        self.total_bits.saturating_sub(self.bit_pos)
-    }
 }
 
 #[cfg(test)]
@@ -318,42 +306,64 @@ mod tests {
 
     #[test]
     fn test_huffman_table_from_weights() {
-        // Simple test: two symbols with equal weight
-        let weights = [1u8, 1];
-        let table = HuffmanTable::from_weights(&weights).expect("valid huffman table");
-
-        assert!(table.max_bits() >= 1);
+        // One stored weight + implied last: two symbols, 1 bit each.
+        let weights = [1u8];
+        let table = HuffmanTable::from_stored_weights(&weights).expect("valid huffman table");
+        assert_eq!(table.max_bits(), 1);
+        // prefix 0 -> symbol 0, prefix 1 -> symbol 1 (implied).
+        assert_eq!(table.entry(0).expect("entry").symbol, 0);
+        assert_eq!(table.entry(1).expect("entry").symbol, 1);
     }
 
     #[test]
     fn test_huffman_table_varying_weights() {
-        // More complex: varying weights
-        let weights = [4u8, 3, 2, 1, 1, 0, 0, 0];
-        let table = HuffmanTable::from_weights(&weights).expect("valid huffman table");
-
-        // Should have valid entries
-        assert!(table.max_bits() > 0);
+        // Stored weights [3, 1, 1]: total = 4+1+1 = 6, table log = 3,
+        // rest = 8-6 = 2 -> implied last weight 2. Rank-1 count = 2 (even).
+        let weights = [3u8, 1, 1];
+        let table = HuffmanTable::from_stored_weights(&weights).expect("valid huffman table");
+        assert_eq!(table.max_bits(), 3);
+        // Weight-1 symbols occupy the lowest indices, in natural order.
+        assert_eq!(table.entry(0).expect("entry").symbol, 1);
+        assert_eq!(table.entry(0).expect("entry").num_bits, 3);
+        assert_eq!(table.entry(1).expect("entry").symbol, 2);
+        // Implied symbol 3 (weight 2) follows, then symbol 0 (weight 3).
+        assert_eq!(table.entry(2).expect("entry").symbol, 3);
+        assert_eq!(table.entry(7).expect("entry").symbol, 0);
     }
 
     #[test]
     fn test_direct_huffman_table() {
-        // Build a direct representation
-        // Header byte > 127: num_symbols = header - 127
-        // Then 4-bit weights packed into bytes
-
-        let mut data = vec![127 + 4]; // 4 symbols (header = 131)
-        data.push(0x21); // weights 2, 1
-        data.push(0x11); // weights 1, 1
-
+        // 3 stored weights (header = 130): 3, 1, 1 -> implied 4th weight 2.
+        let data = vec![127 + 3, 0x31, 0x10];
         let (table, consumed) = read_huffman_table(&data).expect("valid huffman table");
 
         assert_eq!(consumed, 3);
-        assert!(table.max_bits() > 0);
+        assert_eq!(table.max_bits(), 3);
     }
 
     #[test]
-    fn test_empty_weights_fails() {
-        let weights: [u8; 0] = [];
-        assert!(HuffmanTable::from_weights(&weights).is_err());
+    fn test_invalid_weights_rejected() {
+        // Empty weights.
+        assert!(HuffmanTable::from_stored_weights(&[]).is_err());
+        // All zero.
+        assert!(HuffmanTable::from_stored_weights(&[0, 0, 0]).is_err());
+        // Weight exceeds the maximum table log.
+        assert!(HuffmanTable::from_stored_weights(&[13, 1]).is_err());
+        // Non-Kraft-completable set: total 4 (power of two) leaves rest 4? No:
+        // total = 2^(3-1)=4, table log 3, rest = 4 -> power of two -> valid.
+        // But total = 3 (weights [2,1]) -> table log 2, rest = 1 -> last weight 1,
+        // rank1 = 2 -> valid. Use weights that leave rest = 0:
+        // impossible by construction; instead check an odd weight-1 count:
+        // weights [1,1,1] -> total 3, log 2, rest 1 -> last weight 1 ->
+        // rank1 = 4 (even, ok). Try [2,2] -> total 4, log 3, rest 4 ->
+        // last weight 3 -> rank1 = 0 -> invalid (must be >= 2).
+        assert!(HuffmanTable::from_stored_weights(&[2, 2]).is_err());
+    }
+
+    #[test]
+    fn test_direct_table_truncated() {
+        // Header says 10 weights but only 1 nibble byte present.
+        let data = vec![127 + 10, 0x21];
+        assert!(read_huffman_table(&data).is_err());
     }
 }

@@ -34,6 +34,9 @@ harness = false
 [features]
 default = []
 parallel = ["rayon"]
+# Differential interop tests against the system `bzip2` CLI. Tests behind
+# this feature self-skip (without failing) when the binary is absent.
+bzip2-oracle = []
 
 [lints]
 workspace = true

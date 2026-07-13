@@ -16,7 +16,23 @@ pub fn cmd_info(
     let size = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
 
-    let (format, _) = ArchiveFormat::detect(&mut reader)?;
+    // `detect_with_path` adds a filename-extension fallback for the magic-less
+    // formats (raw Brotli `.br`, raw Snappy `.sz`); `-` (stdin) has no
+    // extension, so it degrades to plain content detection.
+    let (format, _) = ArchiveFormat::detect_with_path(&mut reader, archive)?;
+
+    // An unrecognized input has no "archive information" to report, so fail
+    // loudly (non-zero exit) instead of printing `Format: Unknown` and exiting
+    // 0 — matching `list`/`test`. `detect` stays exempt: reporting `Unknown` is
+    // literally that command's job.
+    if format == ArchiveFormat::Unknown {
+        return Err(format!(
+            "unsupported or unrecognized archive format for {}: {}",
+            input_display_name(archive),
+            format
+        )
+        .into());
+    }
 
     // --quiet suppresses the informational report but detection above still
     // runs, so an unreadable/unrecognized input is still reported as an error.

@@ -1,30 +1,44 @@
 //! Brotli compression implementation.
 //!
-//! Implements the Brotli compression algorithm per RFC 7932, including:
-//! - LZ77 matching with backward references
-//! - Context-dependent Huffman coding
-//! - Insert-and-copy length encoding
-//! - Distance short codes
-//! - Meta-block formatting
+//! Produces RFC 7932-conformant streams that reference decoders (e.g. the
+//! `brotli` CLI) accept, using:
+//!
+//! - LZ77 matching with backward references,
+//! - one prefix code per category (literals, insert-and-copy commands,
+//!   distances) per meta-block, with RFC-exact simple/complex descriptors,
+//! - the real insert-and-copy command alphabet (Section 5), including
+//!   implicit distance-code-0 cells for repeated distances,
+//! - the Section 4 distance code space with `NPOSTFIX = 0`, `NDIRECT = 0`,
+//! - uncompressed (stored) meta-blocks for incompressible chunks and for
+//!   quality 0.
+//!
+//! Every content meta-block is emitted with `ISLAST = 0`; the stream is
+//! terminated by an empty last meta-block (2 bits), which keeps the encoder
+//! uniform and spec-exact.
+//!
+//! As a defense-in-depth guarantee against ever shipping a malformed
+//! stream, the encoder decodes its own complete output and falls back to a
+//! stored-only stream if the round-trip does not match (this should never
+//! happen and is asserted in debug builds).
 
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 
 use crate::bit_writer::BitWriter;
-use crate::context::ContextMode;
 use crate::error::{BrotliError, BrotliResult};
-use crate::huffman::{
-    build_huffman_tree, encode_symbol, write_prefix_code_and_build_tree, write_simple_prefix_code,
-};
+use crate::huffman::build_and_write_prefix_code;
 use crate::lz77::{Lz77Command, Lz77Params, lz77_compress_pooled};
 use crate::pool::BrotliPool;
+use crate::tables::{compose_command, copy_length_to_code, insert_length_to_code};
 
 /// Brotli compression parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrotliParams {
     /// Quality level (0-11). Higher = better compression, slower.
+    /// Quality 0 stores the data in uncompressed meta-blocks.
     pub quality: u32,
-    /// Log2 of the window size (10-24). Default: 22 (4MB).
+    /// Log2-ish window parameter WBITS (10-24). The sliding window size is
+    /// `(1 << lgwin) - 16` bytes, per RFC 7932 Section 9.1. Default: 22.
     pub lgwin: u32,
     /// Log2 of the maximum input block size (16-24). Default: 0 (auto).
     pub lgblock: u32,
@@ -49,13 +63,13 @@ impl BrotliParams {
                 self.quality
             )));
         }
-        if self.lgwin < 16 || self.lgwin > 24 {
+        if !(10..=24).contains(&self.lgwin) {
             return Err(BrotliError::InvalidParameter(format!(
-                "lgwin {} out of range [16, 24]",
+                "lgwin {} out of range [10, 24]",
                 self.lgwin
             )));
         }
-        if self.lgblock != 0 && (self.lgblock < 16 || self.lgblock > 24) {
+        if self.lgblock != 0 && !(16..=24).contains(&self.lgblock) {
             return Err(BrotliError::InvalidParameter(format!(
                 "lgblock {} out of range [16, 24] (or 0 for auto)",
                 self.lgblock
@@ -64,12 +78,13 @@ impl BrotliParams {
         Ok(())
     }
 
-    /// Get the window size in bytes.
+    /// Get the sliding window size in bytes: `(1 << lgwin) - 16`
+    /// (RFC 7932 Section 9.1).
     pub fn window_size(&self) -> usize {
-        1 << self.lgwin
+        (1usize << self.lgwin) - 16
     }
 
-    /// Get the effective block size.
+    /// Get the effective meta-block input size.
     pub fn block_size(&self) -> usize {
         if self.lgblock == 0 {
             // Auto: choose based on quality.
@@ -87,12 +102,9 @@ impl BrotliParams {
 /// Compress data using Brotli with the given quality level.
 ///
 /// This is the crate's primary entry point and follows the workspace-wide
-/// `compress(data, level)` convention shared by the other codec crates
-/// (e.g. `oxiarc_deflate::deflate`, `oxiarc_lz4::compress`). `quality` is a
-/// `u32` (not `u8`) for consistency with [`BrotliParams::quality`] and the
-/// reference Brotli encoder API; valid values are `0..=11`, see
-/// [`BrotliParams::validate`]. Use [`compress_with_params`] for full control
-/// over `lgwin`/`lgblock`.
+/// `compress(data, level)` convention shared by the other codec crates.
+/// Valid qualities are `0..=11`; use [`compress_with_params`] for full
+/// control over `lgwin`/`lgblock`.
 pub fn compress(data: &[u8], quality: u32) -> BrotliResult<Vec<u8>> {
     let params = BrotliParams {
         quality,
@@ -107,15 +119,6 @@ pub fn compress_with_params(data: &[u8], params: &BrotliParams) -> BrotliResult<
 }
 
 /// Compress data with optional per-meta-block progress and cancellation hooks.
-///
-/// Called by [`compress_with_params`] (with `None`/`None`) and by streaming
-/// types that carry a [`ProgressHandle`] or [`CancellationToken`].
-///
-/// Progress fires after each meta-block is written; `processed` is the
-/// approximate number of compressed bytes emitted so far, `total` is `None`
-/// because the final size is not known ahead of time.
-///
-/// Cancellation is checked at the start of each meta-block iteration.
 pub(crate) fn compress_with_hooks(
     data: &[u8],
     params: &BrotliParams,
@@ -125,12 +128,10 @@ pub(crate) fn compress_with_hooks(
     compress_with_hooks_pooled(data, params, progress, cancel, None)
 }
 
-/// Compress data with optional per-meta-block progress, cancellation hooks, and
-/// a buffer pool.
+/// Compress data with optional hooks and an optional buffer pool.
 ///
-/// This is the internal implementation behind both [`compress_with_hooks`] (no pool)
-/// and [`pool::compress_with_params_pooled`] (with pool).  All four optional
-/// parameters may be `None`.
+/// This is the internal implementation behind both [`compress_with_hooks`]
+/// (no pool) and [`crate::pool::compress_with_params_pooled`] (with pool).
 pub(crate) fn compress_with_hooks_pooled(
     data: &[u8],
     params: &BrotliParams,
@@ -140,663 +141,333 @@ pub(crate) fn compress_with_hooks_pooled(
 ) -> BrotliResult<Vec<u8>> {
     params.validate()?;
 
-    if data.is_empty() {
-        return encode_empty_stream();
+    let output = encode_stream(data, params, progress, cancel, pool)?;
+
+    // Defense in depth: the encoder must never emit a stream that does not
+    // decode back to the input. On the (never expected) mismatch, fall back
+    // to a stored-only stream, which is trivially correct.
+    match crate::decompress::decompress(&output) {
+        Ok(ref decoded) if decoded == data => Ok(output),
+        _ => {
+            debug_assert!(false, "encoder self-check failed; stored fallback used");
+            encode_stored_stream(data, params)
+        }
     }
+}
 
-    let mut writer = BitWriter::with_capacity(data.len());
+/// Encoder state that mirrors decoder state persisting across meta-blocks.
+#[derive(Clone, Copy)]
+struct EncoderState {
+    /// The decoder's "last distance" (distance ring head). Initialized to 4
+    /// at stream start (RFC 7932 Section 4).
+    last_distance: usize,
+}
 
-    // Write window size header.
+/// Encode the complete stream (header + meta-blocks + empty last block).
+fn encode_stream(
+    data: &[u8],
+    params: &BrotliParams,
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+    pool: Option<&BrotliPool>,
+) -> BrotliResult<Vec<u8>> {
+    let mut writer = BitWriter::with_capacity(data.len() / 2 + 64);
     write_window_bits(&mut writer, params.lgwin)?;
 
-    // Process data in blocks.
+    let mut state = EncoderState { last_distance: 4 };
     let block_size = params.block_size();
-    let mut offset = 0;
 
-    while offset < data.len() {
-        // Check for cancellation at each meta-block boundary.
+    for chunk in data.chunks(block_size.max(1)) {
         if let Some(token) = cancel {
             token.check().map_err(BrotliError::from)?;
         }
 
-        let end = (offset + block_size).min(data.len());
-        let block = &data[offset..end];
-        let is_last = end == data.len();
+        if params.quality == 0 {
+            write_stored_meta_blocks(&mut writer, chunk)?;
+        } else {
+            // Speculatively encode a compressed meta-block; keep it only if
+            // it beats stored size.
+            let saved_state = state;
+            let mut tmp = BitWriter::with_capacity(chunk.len() / 2 + 64);
+            encode_compressed_meta_block(&mut tmp, chunk, params, &mut state, pool)?;
+            // Stored cost upper bound: payload + per-16MB-sub-block header.
+            let stored_bits = chunk.len() * 8 + 48 * chunk.len().div_ceil(1 << 24).max(1);
+            if tmp.bits_written() < stored_bits {
+                writer.append(&tmp)?;
+            } else {
+                state = saved_state;
+                write_stored_meta_blocks(&mut writer, chunk)?;
+            }
+        }
 
-        encode_meta_block_pooled(&mut writer, block, data, offset, params, is_last, pool)?;
-        offset = end;
-
-        // Report progress: approximate compressed bytes produced so far.
         if let Some(handle) = progress {
-            let bytes_out = writer.output().len() as u64;
-            handle.on_progress(bytes_out, None);
+            handle.on_progress(writer.output().len() as u64, None);
         }
     }
 
+    // Empty last meta-block: ISLAST = 1, ISLASTEMPTY = 1.
+    writer.write_bit(true)?;
+    writer.write_bit(true)?;
     Ok(writer.finish())
 }
 
-/// Encode an empty Brotli stream (just the last-empty meta-block).
-fn encode_empty_stream() -> BrotliResult<Vec<u8>> {
-    let mut writer = BitWriter::new();
-
-    // Window bits: WBITS = 16 (value doesn't matter for empty stream).
-    write_window_bits(&mut writer, 16)?;
-
-    // ISLAST = 1
+/// Encode `data` as a stored-only stream (used by the self-check fallback).
+fn encode_stored_stream(data: &[u8], params: &BrotliParams) -> BrotliResult<Vec<u8>> {
+    let mut writer = BitWriter::with_capacity(data.len() + 64);
+    write_window_bits(&mut writer, params.lgwin)?;
+    write_stored_meta_blocks(&mut writer, data)?;
     writer.write_bit(true)?;
-    // ISEMPTY = 1
     writer.write_bit(true)?;
-
-    // Pad to byte boundary.
-    writer.flush();
-
     Ok(writer.finish())
 }
 
-/// Write the window size bits.
+/// Write the stream header WBITS field (RFC 7932 Section 9.1).
 ///
-/// Per RFC 7932 Section 9.1:
-/// - WBITS = 16: encoded as 0 (1 bit)
-/// - WBITS = 17-24: encoded as (wbits-17)<<1 | 1 (4 bits) followed by 0
-/// - WBITS = 10-14: encoded as (wbits-10)<<1 | 1 (4 bits) followed by 1
-/// - WBITS = 15: encoded as special value
-///
-/// Simplified encoding used here:
-/// - 1 bit: if 0, WBITS = 16
-/// - Otherwise 3 more bits to encode other values
+/// Encodings (bits written LSB-first):
+/// - 16: `0`
+/// - 18..=24: `1` + 3 bits of `wbits - 17`
+/// - 17: `1 000 000`
+/// - 10..=15: `1 000` + 3 bits of `wbits - 8`
 fn write_window_bits(writer: &mut BitWriter, lgwin: u32) -> BrotliResult<()> {
-    if lgwin == 16 {
-        // Single 0 bit.
-        writer.write_bit(false)?;
-    } else if (17..=24).contains(&lgwin) {
-        // RFC 7932: flag bit = 1, then 3 bits for (lgwin - 17).
-        // Encoding: flag(1) | ((lgwin-17) << 1) packed into 4 bits LSB-first.
-        let n = lgwin - 17;
-        writer.write_bits(n << 1 | 1, 4)?;
-    } else {
-        return Err(BrotliError::InvalidWindowSize(lgwin));
-    }
-    Ok(())
-}
-
-/// Encode a single meta-block, optionally drawing buffers from a pool.
-fn encode_meta_block_pooled(
-    writer: &mut BitWriter,
-    block: &[u8],
-    _full_data: &[u8],
-    _offset: usize,
-    params: &BrotliParams,
-    is_last: bool,
-    pool: Option<&BrotliPool>,
-) -> BrotliResult<()> {
-    // ISLAST
-    writer.write_bit(is_last)?;
-
-    if is_last && block.is_empty() {
-        // ISEMPTY
-        writer.write_bit(true)?;
-        return Ok(());
-    }
-
-    if is_last {
-        // ISEMPTY = 0 for non-empty last block.
-        // (ISEMPTY bit is only present when ISLAST=1)
-        writer.write_bit(false)?;
-    }
-
-    // For low quality, use uncompressed meta-blocks.
-    if params.quality == 0 {
-        encode_uncompressed_meta_block(writer, block, is_last)?;
-    } else {
-        encode_compressed_meta_block_pooled(writer, block, params, pool)?;
-    }
-
-    Ok(())
-}
-
-/// Encode an uncompressed meta-block.
-fn encode_uncompressed_meta_block(
-    writer: &mut BitWriter,
-    block: &[u8],
-    _is_last: bool,
-) -> BrotliResult<()> {
-    let mlen = block.len();
-
-    // Write MLEN (meta-block length).
-    write_meta_block_length(writer, mlen)?;
-
-    // ISUNCOMPRESSED = 1
-    writer.write_bit(true)?;
-
-    // Pad to byte boundary.
-    writer.flush();
-
-    // Write raw data.
-    writer.write_bytes(block)?;
-
-    Ok(())
-}
-
-/// Encode a compressed meta-block using LZ77 + Huffman, optionally reusing
-/// buffers from a pool.
-fn encode_compressed_meta_block_pooled(
-    writer: &mut BitWriter,
-    block: &[u8],
-    params: &BrotliParams,
-    pool: Option<&BrotliPool>,
-) -> BrotliResult<()> {
-    let mlen = block.len();
-
-    // Write MLEN.
-    write_meta_block_length(writer, mlen)?;
-
-    // ISUNCOMPRESSED = 0
-    writer.write_bit(false)?;
-
-    // Perform LZ77 compression.
-    let lz77_params = Lz77Params {
-        quality: params.quality,
-        window_size: params.window_size(),
-        min_match_len: 4,
-        max_match_len: 256,
-    };
-    let commands = lz77_compress_pooled(block, &lz77_params, pool);
-
-    // Collect literal and distance statistics.
-    let commands_ref: &[Lz77Command] = &commands;
-
-    // Acquire a Huffman scratch buffer from the pool (already zeroed, len=1024)
-    // or allocate fresh frequency vectors.  The scratch buffer layout is:
-    //   [0..256)  = literal_freqs  (256 u32s)
-    //   [256..960) = ic_freqs      (704 u32s)
-    //   [960..1024) = dist_freqs   (64 u32s — padded to 1024 total)
-    let mut scratch_guard = pool.map(|p| p.get_huffman_scratch());
-
-    // Build owned freq Vecs.  When pool is active, copy out of the scratch buf
-    // (avoiding the alloc() system call); the scratch guard is retained until
-    // function return so its buffer is returned to the pool afterwards.
-    let (mut literal_freqs, mut ic_freqs, mut dist_freqs) = if let Some(ref mut g) = scratch_guard {
-        let (lit_slice, rest) = g.buf.split_at(256);
-        let (ic_slice, _) = rest.split_at(704);
-        // All sub-slices are already zeroed by get_huffman_scratch().
-        (lit_slice.to_vec(), ic_slice.to_vec(), vec![0u32; 64])
-    } else {
-        (vec![0u32; 256], vec![0u32; 704], vec![0u32; 64])
-    };
-
-    let mut has_distances = false;
-
-    for cmd in commands_ref {
-        match cmd {
-            Lz77Command::Literal(b) => {
-                literal_freqs[*b as usize] += 1;
-            }
-            Lz77Command::Reference {
-                length: _,
-                distance: _,
-            } => {
-                has_distances = true;
-            }
+    match lgwin {
+        16 => writer.write_bit(false),
+        18..=24 => {
+            writer.write_bit(true)?;
+            writer.write_bits(lgwin - 17, 3)
         }
-    }
-
-    // Build command sequence: insert-and-copy lengths.
-    // For simplicity, we use a format where:
-    // - NBLTYPESL = 1 (one literal block type)
-    // - NBLTYPESI = 1 (one insert-and-copy block type)
-    // - NBLTYPESD = 1 (one distance block type)
-
-    // Number of block types for each category.
-    // NBLTYPESL: 1 (encoded as a single 1-bit value)
-    writer.write_bits(0, 1)?; // NBLTYPESL - 1 = 0 => 1 block type
-
-    // NBLTYPESI: 1
-    writer.write_bits(0, 1)?; // NBLTYPESI - 1 = 0
-
-    // NBLTYPESD: 1
-    writer.write_bits(0, 1)?; // NBLTYPESD - 1 = 0
-
-    // NPOSTFIX = 0
-    writer.write_bits(0, 2)?;
-
-    // NDIRECT = 0
-    writer.write_bits(0, 4)?;
-
-    // Context modes for literal block type 0.
-    writer.write_bits(ContextMode::Lsb6 as u32, 2)?;
-
-    // Literal context map: trivial (1 tree).
-    // NTREESL = 1 (no context map needed).
-
-    // Distance context map: trivial (1 tree).
-    // NTREESD = 1 (no context map needed).
-
-    // Now we need to write the prefix codes and the actual command data.
-    // Build the insert-and-copy length, literal, and distance prefix codes.
-
-    // For a simple implementation, encode each command as:
-    // - Insert length (number of literals to insert)
-    // - Copy length (from backward reference)
-    // - Literals
-    // - Distance (if copy length > 0)
-
-    // Convert commands to insert-and-copy format.
-    let ic_commands = build_insert_copy_commands(commands_ref);
-
-    // Build frequency tables for insert-and-copy length codes.
-    for ic in &ic_commands {
-        let ic_code = insert_copy_length_code(ic.insert_length, ic.copy_length);
-        if (ic_code as usize) < ic_freqs.len() {
-            ic_freqs[ic_code as usize] += 1;
+        17 => {
+            writer.write_bit(true)?;
+            writer.write_bits(0, 3)?;
+            writer.write_bits(0, 3)
         }
-        if ic.copy_length > 0 && ic.distance > 0 {
-            let dist_code = distance_code(ic.distance);
-            if (dist_code as usize) < dist_freqs.len() {
-                dist_freqs[dist_code as usize] += 1;
-            }
+        10..=15 => {
+            writer.write_bit(true)?;
+            writer.write_bits(0, 3)?;
+            writer.write_bits(lgwin - 8, 3)
         }
-    }
-
-    // Build Huffman trees from frequencies (used for complex prefix codes).
-    let literal_tree_freq = build_huffman_tree(&literal_freqs, 256)?;
-    let ic_tree_freq = build_huffman_tree(&ic_freqs, 704)?;
-
-    // Write literal prefix code and get the actual tree used for encoding.
-    let literal_non_zero: Vec<u16> = literal_freqs
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| **f > 0)
-        .map(|(i, _)| i as u16)
-        .collect();
-
-    let literal_tree =
-        write_prefix_code_and_build_tree(writer, &literal_non_zero, &literal_tree_freq, 256)?;
-
-    // Write insert-and-copy prefix code and get the actual tree used for encoding.
-    let ic_non_zero: Vec<u16> = ic_freqs
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| **f > 0)
-        .map(|(i, _)| i as u16)
-        .collect();
-
-    let ic_tree = write_prefix_code_and_build_tree(writer, &ic_non_zero, &ic_tree_freq, 704)?;
-
-    // Write distance prefix code and get the actual tree used for encoding.
-    if has_distances {
-        let dist_tree_freq = build_huffman_tree(&dist_freqs, 64)?;
-        let dist_non_zero: Vec<u16> = dist_freqs
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| **f > 0)
-            .map(|(i, _)| i as u16)
-            .collect();
-
-        let dist_tree =
-            write_prefix_code_and_build_tree(writer, &dist_non_zero, &dist_tree_freq, 64)?;
-
-        // Write the actual command data.
-        for ic in ic_commands.iter() {
-            let ic_code = insert_copy_length_code(ic.insert_length, ic.copy_length);
-            encode_symbol(writer, &ic_tree, ic_code)?;
-
-            // Write extra bits for insert length.
-            write_insert_length_extra(writer, ic.insert_length)?;
-
-            // Write extra bits for copy length.
-            write_copy_length_extra(writer, ic.copy_length)?;
-
-            // Write literals.
-            for &lit in &ic.literals {
-                encode_symbol(writer, &literal_tree, lit as u16)?;
-            }
-
-            // Write distance.
-            if ic.copy_length > 0 && ic.distance > 0 {
-                let dist_code = distance_code(ic.distance);
-                encode_symbol(writer, &dist_tree, dist_code)?;
-                write_distance_extra(writer, ic.distance)?;
-            }
-        }
-    } else {
-        // No distances needed - write a trivial distance tree.
-        write_simple_prefix_code(writer, &[0], 64)?;
-
-        // Write command data (literals only).
-        for ic in &ic_commands {
-            let ic_code = insert_copy_length_code(ic.insert_length, ic.copy_length);
-            encode_symbol(writer, &ic_tree, ic_code)?;
-
-            write_insert_length_extra(writer, ic.insert_length)?;
-
-            for &lit in &ic.literals {
-                encode_symbol(writer, &literal_tree, lit as u16)?;
-            }
-        }
-    }
-
-    // RAII: scratch_guard is dropped here, returning its buffer to the pool.
-    drop(scratch_guard);
-
-    Ok(())
-}
-
-/// An insert-and-copy command.
-#[derive(Debug, Clone)]
-struct InsertCopyCommand {
-    /// Number of literal bytes to insert.
-    insert_length: usize,
-    /// Number of bytes to copy from backward reference.
-    copy_length: usize,
-    /// Distance for backward reference.
-    distance: usize,
-    /// The literal bytes to insert.
-    literals: Vec<u8>,
-}
-
-/// Maximum copy length encodable in a single IC command's copy-cat field.
-/// Per the copy length table (cat 0-7), maximum is 17.
-const MAX_IC_COPY_LENGTH: usize = 17;
-
-/// Build insert-and-copy commands from LZ77 command sequence.
-///
-/// Long backward references (copy_length > MAX_IC_COPY_LENGTH) are split into
-/// multiple IC commands so that each copy fits within the encodable range.
-///
-/// # Copy-length minimum
-///
-/// The Brotli insert-and-copy alphabet encodes copy lengths starting at 2
-/// (category 0 maps to base 2, no extra bits).  A split chunk of `copy_length
-/// == 1` would be written with category 0 but the decoder unconditionally reads
-/// back 2, producing a one-byte content error that silently corrupts single
-/// blocks (truncated by `output.truncate(mlen)`) and causes bit-alignment
-/// drift that breaks subsequent meta-block headers in multi-block streams.
-///
-/// The fix: when the current chunk would leave exactly 1 byte for the next
-/// iteration (i.e. `remaining_copy - chunk == 1`), shrink the current chunk by
-/// one so the remainder is 2 instead of 1.  This keeps every chunk ≥ 2 without
-/// changing the total copy length.
-fn build_insert_copy_commands(commands: &[Lz77Command]) -> Vec<InsertCopyCommand> {
-    let mut result = Vec::new();
-    let mut literals = Vec::new();
-
-    for cmd in commands {
-        match cmd {
-            Lz77Command::Literal(b) => {
-                literals.push(*b);
-            }
-            Lz77Command::Reference { length, distance } => {
-                let mut remaining_copy = *length;
-                let mut first = true;
-                while remaining_copy > 0 {
-                    let mut chunk = remaining_copy.min(MAX_IC_COPY_LENGTH);
-                    // Ensure the tail chunk is never 1 (copy_length==1 is unencodable;
-                    // the minimum encodable copy length is 2). If taking `chunk` bytes
-                    // would leave exactly 1 byte remaining, reduce chunk by 1 so the
-                    // remainder becomes 2, which is safely encodable.
-                    if remaining_copy - chunk == 1 {
-                        chunk -= 1;
-                    }
-                    remaining_copy -= chunk;
-
-                    if first {
-                        // First chunk: emit all accumulated literals.
-                        result.push(InsertCopyCommand {
-                            insert_length: literals.len(),
-                            copy_length: chunk,
-                            distance: *distance,
-                            literals: std::mem::take(&mut literals),
-                        });
-                        first = false;
-                    } else {
-                        // Continuation chunks: no literals (insert_length=0).
-                        result.push(InsertCopyCommand {
-                            insert_length: 0,
-                            copy_length: chunk,
-                            distance: *distance,
-                            literals: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Remaining literals with no copy.
-    if !literals.is_empty() {
-        result.push(InsertCopyCommand {
-            insert_length: literals.len(),
-            copy_length: 0,
-            distance: 0,
-            literals,
-        });
-    }
-
-    result
-}
-
-/// Largest insert-length category the encoder will emit.
-///
-/// Category `c` maps to insert-and-copy symbols `128 + (c-16)*8 + copy_cat` for
-/// `c >= 16`; the insert-and-copy alphabet has 704 symbols, so the insert
-/// category must satisfy `128 + (c-16)*8 + 7 <= 703`, i.e. `c <= 87`. We cap
-/// well below that. Category 30 already covers inserts up to ~4 MiB (the
-/// largest meta-block this encoder produces), so 40 is a comfortable ceiling.
-pub(crate) const MAX_INSERT_LENGTH_CATEGORY: u32 = 40;
-
-/// Canonical insert-length code table: `(base, extra_bits)` for a category.
-///
-/// This is the single source of truth shared by the encoder
-/// ([`insert_length_cat`], [`write_insert_length_extra`]) and the decoder
-/// (`decompress::decode_insert_length`). A category covers the inclusive range
-/// `base ..= base + (1 << extra_bits) - 1`.
-///
-/// Categories 0–15 reproduce the original short table exactly. Categories ≥ 16
-/// extend it with a regular doubling rule so that arbitrarily large literal
-/// runs (e.g. a whole incompressible meta-block) can be represented by a single
-/// insert-and-copy command. Without this extension, inserts above 319 wrapped
-/// around in 7 bits, silently truncating the literal run — the content-mismatch
-/// half of the high-entropy round-trip bug.
-///
-/// Closed form for `cat >= 16`: `extra_bits = cat - 8`, `base = 64 + 2^(cat-8)`,
-/// which chains seamlessly onto category 15 (which ends at 319, so category 16
-/// begins at 320).
-pub(crate) fn insert_length_code_info(cat: u32) -> (usize, u32) {
-    match cat {
-        0 => (0, 0),
-        1 => (1, 0),
-        2 => (2, 0),
-        3 => (3, 0),
-        4 => (4, 1),
-        5 => (6, 1),
-        6 => (8, 2),
-        7 => (12, 2),
-        8 => (16, 3),
-        9 => (24, 3),
-        10 => (32, 4),
-        11 => (48, 4),
-        12 => (64, 5),
-        13 => (96, 5),
-        14 => (128, 6),
-        15 => (192, 7),
-        _ => {
-            let extra_bits = (cat - 8).min(24);
-            let base = 64usize + (1usize << extra_bits);
-            (base, extra_bits)
-        }
+        _ => Err(BrotliError::InvalidWindowSize(lgwin)),
     }
 }
 
-/// Compute the insert length category, extra-bit count, and base value for the
-/// given insert length. The returned `(category, extra_bits, base)` is the exact
-/// inverse of [`insert_length_code_info`] / the decoder's insert-length table.
-fn insert_length_cat(insert_length: usize) -> (u32, u32, usize) {
-    // Categories are monotonically increasing in covered length, so scan upward
-    // and pick the category whose range contains `insert_length`. The loop runs
-    // at most `MAX_INSERT_LENGTH_CATEGORY` times and only once per command.
-    let mut cat = 0u32;
-    loop {
-        let (base, extra_bits) = insert_length_code_info(cat);
-        let span = 1usize << extra_bits;
-        if insert_length < base + span || cat >= MAX_INSERT_LENGTH_CATEGORY {
-            return (cat, extra_bits, base);
-        }
-        cat += 1;
-    }
-}
-
-/// Compute the copy length category and extra-bit count for the given copy length.
-/// Returns (category, extra_bits, base_value) matching decode_copy_length_short.
-fn copy_length_cat(copy_length: usize) -> (u32, u32, usize) {
-    match copy_length {
-        0..=2 => (0, 0, 2),
-        3 => (1, 0, 3),
-        4 => (2, 0, 4),
-        5 => (3, 0, 5),
-        6..=7 => (4, 1, 6),
-        8..=9 => (5, 1, 8),
-        10..=13 => (6, 2, 10),
-        _ => (7, 2, 14),
-    }
-}
-
-/// Compute the insert-and-copy length symbol.
-///
-/// The insert-and-copy length is encoded as a single symbol from a 704-entry
-/// combined alphabet, with the insert- and copy-length extra bits appended
-/// afterward. This is the exact inverse of `decompress::decode_insert_copy_lengths`:
-///
-/// - insert category 0–15 → "short" symbols `insert_cat * 8 + copy_cat` (0–127)
-/// - insert category ≥ 16  → "extended" symbols
-///   `128 + (insert_cat - 16) * 8 + copy_cat`
-fn insert_copy_length_code(insert_length: usize, copy_length: usize) -> u16 {
-    let (insert_cat, _, _) = insert_length_cat(insert_length);
-    let (copy_cat, _, _) = copy_length_cat(copy_length);
-
-    let code = if insert_cat < 16 {
-        insert_cat * 8 + copy_cat
-    } else {
-        128 + (insert_cat - 16) * 8 + copy_cat
-    };
-    code.min(703) as u16
-}
-
-/// Write extra bits for insert length.
-/// Must match the decoder's insert-length table exactly.
-fn write_insert_length_extra(writer: &mut BitWriter, insert_length: usize) -> BrotliResult<()> {
-    let (_, extra_bits, base) = insert_length_cat(insert_length);
-    if extra_bits == 0 {
-        Ok(())
-    } else {
-        writer.write_bits((insert_length - base) as u32, extra_bits)
-    }
-}
-
-/// Write extra bits for copy length.
-/// Must match decode_copy_length_short exactly.
-fn write_copy_length_extra(writer: &mut BitWriter, copy_length: usize) -> BrotliResult<()> {
-    let (_, extra_bits, base) = copy_length_cat(copy_length);
-    if extra_bits == 0 {
-        Ok(())
-    } else {
-        writer.write_bits((copy_length - base) as u32, extra_bits)
-    }
-}
-
-/// Compute the distance code and extra bits for encoding a distance value.
-///
-/// Uses the RFC 7932 Section 4 format with npostfix=0, ndirect=0:
-/// - Codes 16+: distance is encoded with a hcode and extra bits.
-/// - The distance is NOT encoded using ring buffer references (codes 0-15).
-///
-/// Returns (dist_code, extra_bits_value, extra_bits_count).
-fn distance_encoding(distance: usize) -> (u16, u32, u32) {
-    // With ndirect=0 and npostfix=0, direct distance encoding starts at code 16.
-    // For hcode in 0..:
-    //   nbits = 1 + (hcode >> 1)
-    //   offset = ((2 + (hcode & 1)) << nbits) - 4
-    //   distance range: [offset+1, offset+(1<<nbits)]
-    //   dist_code = 16 + hcode
-    //   extra = distance - (offset + 1)
-
-    let d = distance as u64;
-    // Find the hcode:
-    let mut hcode = 0u32;
-    loop {
-        let nbits = 1 + (hcode >> 1);
-        let offset = ((2u64 + ((hcode & 1) as u64)) << nbits) - 4;
-        let low = offset + 1;
-        let high = offset + (1u64 << nbits);
-        if d >= low && d <= high {
-            let extra = (d - low) as u32;
-            let dist_code = (16 + hcode) as u16;
-            return (dist_code, extra, nbits);
-        }
-        hcode += 1;
-        if hcode > 60 {
-            // Safety: return a large code with many bits.
-            return (63u16, distance as u32, 24);
-        }
-    }
-}
-
-/// Compute the distance code for a backward reference distance.
-/// Returns the dist_code to use in the prefix code tree lookup.
-fn distance_code(distance: usize) -> u16 {
-    distance_encoding(distance).0
-}
-
-/// Write extra bits for a distance code.
-fn write_distance_extra(writer: &mut BitWriter, distance: usize) -> BrotliResult<()> {
-    let (_, extra_val, extra_bits) = distance_encoding(distance);
-    if extra_bits == 0 {
-        Ok(())
-    } else {
-        writer.write_bits(extra_val, extra_bits)
-    }
-}
-
-/// Write the meta-block length (MLEN).
-///
-/// Per RFC 7932 Section 9.2:
-/// - MNIBBLES (2 bits): number of nibbles for MLEN minus 4
-/// - MLEN (MNIBBLES*4 bits): meta-block length minus 1
+/// Write the meta-block length: MNIBBLES code (2 bits) + `MLEN - 1`
+/// (RFC 7932 Section 9.2). The nibble count is minimal, as required.
 fn write_meta_block_length(writer: &mut BitWriter, mlen: usize) -> BrotliResult<()> {
     if mlen == 0 {
         return Err(BrotliError::InvalidParameter(
             "meta-block length cannot be zero".to_string(),
         ));
     }
-
-    let mlen_minus_1 = (mlen - 1) as u32;
-
-    // Determine how many nibbles we need.
-    let nibbles = if mlen_minus_1 < (1 << 4) {
+    let value = (mlen - 1) as u32;
+    let nibbles = if value < (1 << 16) {
         4
-    } else if mlen_minus_1 < (1 << 12) {
+    } else if value < (1 << 20) {
         5
-    } else if mlen_minus_1 < (1 << 24) {
+    } else if value < (1 << 24) {
         6
     } else {
         return Err(BrotliError::InvalidParameter(format!(
             "meta-block length {mlen} too large"
         )));
     };
+    writer.write_bits(nibbles - 4, 2)?;
+    writer.write_bits(value, nibbles * 4)
+}
 
-    // MNIBBLES = nibbles - 4 (encoded in 2 bits).
-    let mnibbles = nibbles - 4;
-    writer.write_bits(mnibbles, 2)?;
-
-    // MLEN - 1 in nibbles * 4 bits.
-    writer.write_bits(mlen_minus_1, nibbles * 4)?;
-
+/// Write `chunk` as one or more uncompressed (stored) meta-blocks with
+/// `ISLAST = 0` (an uncompressed meta-block cannot be last, Section 9.2).
+fn write_stored_meta_blocks(writer: &mut BitWriter, chunk: &[u8]) -> BrotliResult<()> {
+    for sub in chunk.chunks(1 << 24) {
+        writer.write_bit(false)?; // ISLAST = 0
+        write_meta_block_length(writer, sub.len())?;
+        writer.write_bit(true)?; // ISUNCOMPRESSED = 1
+        writer.flush(); // zero padding to the byte boundary
+        writer.write_bytes(sub)?;
+    }
     Ok(())
+}
+
+/// One insert-and-copy command prepared for emission.
+struct Command {
+    /// Range of literal bytes in the chunk to insert before the copy.
+    literals: std::ops::Range<usize>,
+    /// Insert-and-copy command symbol (0..704).
+    ic_symbol: u16,
+    /// Insert length extra bits.
+    ins_extra: u32,
+    ins_extra_bits: u8,
+    /// Copy length extra bits.
+    copy_extra: u32,
+    copy_extra_bits: u8,
+    /// Explicit distance symbol and extra bits; `None` for implicit
+    /// distance-code-0 commands and for the trailing insert-only command.
+    distance: Option<(u16, u32, u32)>,
+}
+
+/// Encode one compressed meta-block (ISLAST=0) for `chunk`.
+fn encode_compressed_meta_block(
+    writer: &mut BitWriter,
+    chunk: &[u8],
+    params: &BrotliParams,
+    state: &mut EncoderState,
+    pool: Option<&BrotliPool>,
+) -> BrotliResult<()> {
+    // ── LZ77 ─────────────────────────────────────────────────────────────
+    let lz77_params = Lz77Params {
+        quality: params.quality,
+        window_size: params.window_size(),
+        min_match_len: 4,
+        max_match_len: 16 * 1024,
+    };
+    let lz_commands = lz77_compress_pooled(chunk, &lz77_params, pool);
+
+    // ── Command construction + histograms ────────────────────────────────
+    // Frequency scratch: literals (256) + insert-and-copy (704) + distance
+    // (64, NPOSTFIX=0/NDIRECT=0) = exactly the pool's 1024-u32 buffer.
+    let mut scratch_guard = pool.map(|p| p.get_huffman_scratch());
+    let (mut lit_freqs, mut ic_freqs, mut dist_freqs) = if let Some(ref mut g) = scratch_guard {
+        let (lit, rest) = g.buf.split_at(256);
+        let (ic, dist) = rest.split_at(704);
+        (lit.to_vec(), ic.to_vec(), dist[..64].to_vec())
+    } else {
+        (vec![0u32; 256], vec![0u32; 704], vec![0u32; 64])
+    };
+
+    let mut commands: Vec<Command> = Vec::new();
+    let mut lit_start = 0usize; // start of the pending literal run
+    let mut pos = 0usize; // current position in chunk
+
+    for cmd in &lz_commands {
+        match cmd {
+            Lz77Command::Literal(_) => {
+                pos += 1;
+            }
+            Lz77Command::Reference { length, distance } => {
+                let insert_len = pos - lit_start;
+                let copy_len = *length;
+                let (ins_code, ins_extra_bits, ins_base) = insert_length_to_code(insert_len as u32);
+                let (copy_code, copy_extra_bits, copy_base) = copy_length_to_code(copy_len as u32);
+
+                let implicit = *distance == state.last_distance && ins_code < 8 && copy_code < 16;
+                let ic_symbol = compose_command(ins_code, copy_code, implicit);
+
+                let distance_field = if implicit {
+                    None
+                } else {
+                    let (dsym, dextra, dbits) = distance_symbol(*distance)?;
+                    dist_freqs[dsym as usize] += 1;
+                    state.last_distance = *distance;
+                    Some((dsym, dextra, dbits))
+                };
+
+                ic_freqs[ic_symbol as usize] += 1;
+                for &b in &chunk[lit_start..pos] {
+                    lit_freqs[b as usize] += 1;
+                }
+                commands.push(Command {
+                    literals: lit_start..pos,
+                    ic_symbol,
+                    ins_extra: insert_len as u32 - ins_base,
+                    ins_extra_bits,
+                    copy_extra: copy_len as u32 - copy_base,
+                    copy_extra_bits,
+                    distance: distance_field,
+                });
+                pos += copy_len;
+                lit_start = pos;
+            }
+        }
+    }
+
+    // Trailing literals: an insert-only command. Its copy length is ignored
+    // by the decoder because the insert completes MLEN (Section 9.3); no
+    // distance is emitted.
+    if lit_start < pos || commands.is_empty() {
+        let insert_len = pos - lit_start;
+        let (ins_code, ins_extra_bits, ins_base) = insert_length_to_code(insert_len as u32);
+        let ic_symbol = compose_command(ins_code, 0, false);
+        ic_freqs[ic_symbol as usize] += 1;
+        for &b in &chunk[lit_start..pos] {
+            lit_freqs[b as usize] += 1;
+        }
+        commands.push(Command {
+            literals: lit_start..pos,
+            ic_symbol,
+            ins_extra: insert_len as u32 - ins_base,
+            ins_extra_bits,
+            copy_extra: 0,
+            copy_extra_bits: 0,
+            distance: None,
+        });
+    }
+
+    // ── Meta-block header (Section 9.2) ──────────────────────────────────
+    writer.write_bit(false)?; // ISLAST = 0
+    write_meta_block_length(writer, chunk.len())?;
+    writer.write_bit(false)?; // ISUNCOMPRESSED = 0
+    writer.write_bit(false)?; // NBLTYPESL = 1
+    writer.write_bit(false)?; // NBLTYPESI = 1
+    writer.write_bit(false)?; // NBLTYPESD = 1
+    writer.write_bits(0, 2)?; // NPOSTFIX = 0
+    writer.write_bits(0, 4)?; // NDIRECT = 0
+    writer.write_bits(0, 2)?; // context mode for literal block type 0: LSB6
+    writer.write_bit(false)?; // NTREESL = 1 (trivial literal context map)
+    writer.write_bit(false)?; // NTREESD = 1 (trivial distance context map)
+
+    let lit_tree = build_and_write_prefix_code(writer, &lit_freqs, 256)?;
+    let ic_tree = build_and_write_prefix_code(writer, &ic_freqs, 704)?;
+    let dist_tree = build_and_write_prefix_code(writer, &dist_freqs, 64)?;
+
+    // ── Meta-block data (Section 9.3) ────────────────────────────────────
+    for cmd in &commands {
+        ic_tree.encode_symbol(writer, cmd.ic_symbol)?;
+        if cmd.ins_extra_bits > 0 {
+            writer.write_bits(cmd.ins_extra, cmd.ins_extra_bits as u32)?;
+        }
+        if cmd.copy_extra_bits > 0 {
+            writer.write_bits(cmd.copy_extra, cmd.copy_extra_bits as u32)?;
+        }
+        for &b in &chunk[cmd.literals.clone()] {
+            lit_tree.encode_symbol(writer, b as u16)?;
+        }
+        if let Some((dsym, dextra, dbits)) = cmd.distance {
+            dist_tree.encode_symbol(writer, dsym)?;
+            if dbits > 0 {
+                writer.write_bits(dextra, dbits)?;
+            }
+        }
+    }
+
+    drop(scratch_guard);
+    Ok(())
+}
+
+/// Map a distance to its `(symbol, extra, extra_bits)` for the distance
+/// code space with `NPOSTFIX = 0`, `NDIRECT = 0` (RFC 7932 Section 4).
+fn distance_symbol(distance: usize) -> BrotliResult<(u16, u32, u32)> {
+    if distance == 0 {
+        return Err(BrotliError::InvalidParameter(
+            "distance cannot be zero".to_string(),
+        ));
+    }
+    let d = distance as u64;
+    for hcode in 0u64..48 {
+        let ndistbits = 1 + (hcode >> 1);
+        let offset = ((2 + (hcode & 1)) << ndistbits) - 4;
+        let low = offset + 1;
+        let high = offset + (1 << ndistbits);
+        if d >= low && d <= high {
+            return Ok(((16 + hcode) as u16, (d - low) as u32, ndistbits as u32));
+        }
+    }
+    Err(BrotliError::InvalidParameter(format!(
+        "distance {distance} exceeds the encodable range"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompress::decompress;
 
     #[test]
     fn test_params_default() {
@@ -818,6 +489,13 @@ mod tests {
         params.quality = 6;
         params.lgwin = 25;
         assert!(params.validate().is_err());
+        params.lgwin = 9;
+        assert!(params.validate().is_err());
+        // The full RFC WBITS range 10..=24 is accepted.
+        for lgwin in 10..=24 {
+            params.lgwin = lgwin;
+            assert!(params.validate().is_ok(), "lgwin {lgwin}");
+        }
 
         params.lgwin = 22;
         params.lgblock = 15;
@@ -825,69 +503,144 @@ mod tests {
     }
 
     #[test]
+    fn test_window_size_rfc_semantics() {
+        let params = BrotliParams {
+            lgwin: 16,
+            ..Default::default()
+        };
+        assert_eq!(params.window_size(), 65520);
+        let params = BrotliParams {
+            lgwin: 22,
+            ..Default::default()
+        };
+        assert_eq!(params.window_size(), (1 << 22) - 16);
+    }
+
+    #[test]
     fn test_compress_empty() {
         let result = compress(b"", 6).expect("should compress empty");
         assert!(!result.is_empty());
+        assert_eq!(decompress(&result).ok(), Some(Vec::new()));
     }
 
     #[test]
-    fn test_compress_small() {
-        let data = b"Hello, Brotli!";
-        let result = compress(data, 0);
-        assert!(result.is_ok());
-        let compressed = result.expect("should compress");
-        assert!(!compressed.is_empty());
-    }
-
-    #[test]
-    fn test_insert_copy_length_code() {
-        // Pure insert (no copy).
-        let code = insert_copy_length_code(5, 0);
-        assert!(code < 704);
-
-        // Insert + copy.
-        let code = insert_copy_length_code(3, 4);
-        assert!(code < 704);
-    }
-
-    #[test]
-    fn test_distance_code() {
-        // With ndirect=0, npostfix=0: all distances use codes >=16.
-        // hcode=0: nbits=1, offset=0, range [1,2], code=16
-        // hcode=1: nbits=1, offset=2, range [3,4], code=17
-        assert_eq!(distance_code(1), 16);
-        assert_eq!(distance_code(2), 16);
-        assert_eq!(distance_code(3), 17);
-        assert!(distance_code(100) < 64);
-
-        // Verify round-trip: encode and check distance recovery.
-        for dist in [1, 2, 3, 4, 5, 10, 51, 100, 306] {
-            let (code, extra_val, extra_bits) = distance_encoding(dist);
-            // Verify the decode formula: distance = (offset + extra) + 1
-            let hcode = (code as u32).saturating_sub(16);
-            let nbits = 1 + (hcode >> 1);
-            assert_eq!(nbits, extra_bits, "dist={dist}");
-            let offset = ((2u64 + ((hcode & 1) as u64)) << nbits) - 4;
-            let decoded = offset + extra_val as u64 + 1;
-            assert_eq!(decoded as usize, dist, "dist={dist} code={code}");
+    fn test_roundtrip_small() {
+        for quality in 0..=11 {
+            let data = b"Hello, Brotli! Hello, Brotli! Hello, Brotli!";
+            let compressed = compress(data, quality).expect("compress");
+            let decompressed = decompress(&compressed).expect("decompress");
+            assert_eq!(decompressed, data, "quality {quality}");
         }
     }
 
     #[test]
-    fn test_meta_block_length() {
-        let mut writer = BitWriter::new();
-        write_meta_block_length(&mut writer, 1).expect("should write mlen 1");
-
-        let mut writer = BitWriter::new();
-        write_meta_block_length(&mut writer, 1000).expect("should write mlen 1000");
+    fn test_roundtrip_all_window_sizes() {
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        for lgwin in 10..=24 {
+            let params = BrotliParams {
+                quality: 5,
+                lgwin,
+                lgblock: 0,
+            };
+            let compressed = compress_with_params(&data, &params).expect("compress");
+            let decompressed = decompress(&compressed).expect("decompress");
+            assert_eq!(decompressed, data, "lgwin {lgwin}");
+        }
     }
 
     #[test]
-    fn test_window_bits() {
-        for lgwin in 16..=24 {
+    fn test_repeated_distance_uses_implicit_code() {
+        // Periodic data produces repeated distances; the stream must still
+        // round-trip through the implicit distance-code-0 path.
+        let data: Vec<u8> = b"abcdefgh".repeat(500);
+        let compressed = compress(&data, 6).expect("compress");
+        let decompressed = decompress(&compressed).expect("decompress");
+        assert_eq!(decompressed, data);
+        assert!(compressed.len() < data.len() / 4, "should compress well");
+    }
+
+    #[test]
+    fn test_incompressible_falls_back_to_stored() {
+        // Pseudo-random bytes cannot be compressed; the output must stay
+        // close to the input size (stored) and round-trip exactly.
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let data: Vec<u8> = (0..100_000)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let compressed = compress(&data, 6).expect("compress");
+        assert!(compressed.len() < data.len() + 256, "stored fallback size");
+        let decompressed = decompress(&compressed).expect("decompress");
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_distance_symbol_formula() {
+        // dcode 16: distances 1..2; dcode 17: 3..4 (RFC Section 4 with
+        // NPOSTFIX=0, NDIRECT=0).
+        assert_eq!(distance_symbol(1).ok(), Some((16, 0, 1)));
+        assert_eq!(distance_symbol(2).ok(), Some((16, 1, 1)));
+        assert_eq!(distance_symbol(3).ok(), Some((17, 0, 1)));
+        assert_eq!(distance_symbol(4).ok(), Some((17, 1, 1)));
+        assert!(distance_symbol(0).is_err());
+        // Verify the full decode formula inverse over a range.
+        for dist in [1usize, 2, 5, 17, 100, 1000, 65535, 1 << 20, (1 << 24) - 16] {
+            let (sym, extra, bits) = distance_symbol(dist).expect("symbol");
+            let hcode = (sym - 16) as u64;
+            let ndistbits = 1 + (hcode >> 1);
+            assert_eq!(ndistbits as u32, bits);
+            let offset = ((2 + (hcode & 1)) << ndistbits) - 4;
+            assert_eq!((offset + extra as u64 + 1) as usize, dist);
+        }
+    }
+
+    #[test]
+    fn test_meta_block_length_minimal_nibbles() {
+        let mut writer = BitWriter::new();
+        write_meta_block_length(&mut writer, 1).expect("mlen 1");
+        assert_eq!(writer.bits_written(), 2 + 16);
+        let mut writer = BitWriter::new();
+        write_meta_block_length(&mut writer, 1 << 16).expect("mlen 2^16");
+        assert_eq!(writer.bits_written(), 2 + 16); // value 2^16 - 1 fits 4 nibbles
+        let mut writer = BitWriter::new();
+        write_meta_block_length(&mut writer, (1 << 16) + 1).expect("mlen 2^16+1");
+        assert_eq!(writer.bits_written(), 2 + 20);
+        let mut writer = BitWriter::new();
+        write_meta_block_length(&mut writer, 1 << 24).expect("mlen 2^24");
+        assert_eq!(writer.bits_written(), 2 + 24);
+        assert!(write_meta_block_length(&mut BitWriter::new(), (1 << 24) + 1).is_err());
+    }
+
+    #[test]
+    fn test_window_bits_all_values_roundtrip() {
+        use crate::bit_reader::BitReader;
+        for lgwin in 10..=24u32 {
             let mut writer = BitWriter::new();
-            let result = write_window_bits(&mut writer, lgwin);
-            assert!(result.is_ok(), "failed for lgwin={lgwin}");
+            write_window_bits(&mut writer, lgwin).expect("write");
+            let data = writer.finish();
+            let mut reader = BitReader::new(&data);
+            // Reuse the decoder's reader through a tiny local mirror of
+            // decompress::read_window_bits semantics.
+            let got = {
+                if !reader.read_bit().expect("bit") {
+                    16
+                } else {
+                    let n = reader.read_bits(3).expect("bits");
+                    if n != 0 {
+                        17 + n
+                    } else {
+                        let m = reader.read_bits(3).expect("bits");
+                        if m == 0 { 17 } else { 8 + m }
+                    }
+                }
+            };
+            assert_eq!(got, lgwin, "lgwin {lgwin}");
         }
+        assert!(write_window_bits(&mut BitWriter::new(), 9).is_err());
+        assert!(write_window_bits(&mut BitWriter::new(), 25).is_err());
     }
 }

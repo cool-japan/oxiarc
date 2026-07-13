@@ -119,7 +119,19 @@ pub(crate) mod match_finder;
 // no longer front-and-center in the default public surface.
 pub mod memory_pool;
 pub(crate) mod model;
-pub mod optimal;
+// `optimal` is an encoder-internal module: its public items (`ProbabilityModels`,
+// `OptimalParser::parse_block`) take/hold `model::{State, LengthModel}`, which live
+// in the `pub(crate)` `model` module above. While `optimal` was `pub`, those two
+// types were *reachable but unnameable* by downstream crates (rustc's
+// `unnameable_types` lint) — a leaked-internal-type API bug. `optimal` has no
+// consumer outside `encoder.rs`, so it is narrowed to `pub(crate)` rather than
+// widening the semver-frozen surface with entropy-coder internals.
+//
+// As with `match_finder` above, narrowing makes `dead_code` fire for the price/
+// parser helpers that only the (documented) module-level abstraction uses; they
+// are allowed rather than deleted so the DP parser stays a complete unit.
+#[allow(dead_code)]
+pub(crate) mod optimal;
 #[cfg(feature = "parallel")]
 pub mod parallel;
 // `range_coder` stays `pub` (unlike `match_finder`/`model` above) because
@@ -1225,5 +1237,41 @@ mod dictionary_tests {
             decompressed, input,
             "large repetitive dictionary round-trip failed"
         );
+    }
+
+    /// Regression test for a fuzz-discovered `attempt to subtract with overflow`
+    /// panic in the LZMA1 core decoder (`decoder.rs::get_byte`).
+    ///
+    /// The crash input declares a tiny dictionary size and a huge uncompressed
+    /// size, then drives the ring buffer past its wrap point and requests a
+    /// match/rep distance larger than the dictionary window. The old
+    /// `dict_size - (dist - dict_pos) - 1` index computation underflowed and
+    /// panicked. `decompress_bytes` must now reject the malformed stream with an
+    /// `Err` rather than panicking.
+    ///
+    /// Bytes are embedded inline (from
+    /// `fuzz/artifacts/fuzz_lzma_decompress/crash-eb9b303c24dad4fb22c2f967e5e3cc31ea0657e9`)
+    /// so the test is self-contained and always runs.
+    #[test]
+    fn test_fuzz_regression_match_distance_overflow() {
+        // Malformed LZMA1 streams discovered by `cargo fuzz run
+        // fuzz_lzma_decompress`. Each must return `Err`, never panic.
+        let crash_inputs: &[&[u8]] = &[&[
+            0x8a, 0x88, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00,
+            0x36, 0x00, 0x36, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0xff, 0xff, 0x00, 0x01, 0xff, 0x00,
+        ]];
+
+        for (i, input) in crash_inputs.iter().enumerate() {
+            let result = decompress_bytes(input);
+            assert!(
+                result.is_err(),
+                "crash input #{i} must be rejected with Err, got Ok"
+            );
+        }
     }
 }

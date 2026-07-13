@@ -132,13 +132,32 @@ pub struct LzmaEncoder {
     /// the match finder can discover back-references into the dictionary prefix.
     /// Only the bytes starting after the dict are actually encoded.
     preset_dict: Vec<u8>,
+    /// Global uncompressed stream position of the first input byte (stateful
+    /// LZMA2 chunk encoding).
+    ///
+    /// When set, `bytes_encoded` is seeded to this value instead of the
+    /// preset-dict length so that `pos_state` and the literal position
+    /// context match the decoder's persistent position across chunk
+    /// boundaries (the preset dict may be shorter than the true history once
+    /// the sliding window has filled).
+    stream_pos: Option<u64>,
 }
 
 impl LzmaEncoder {
     /// Create a new LZMA encoder.
     pub fn new(level: LzmaLevel, dict_size: u32) -> Self {
+        Self::with_props(level, dict_size, LzmaProperties::default())
+    }
+
+    /// Create a new LZMA encoder with explicit LZMA properties.
+    ///
+    /// Used by the LZMA2 chunked encoder so that the properties declared in
+    /// chunk headers are the ones the payload is actually coded with.
+    /// Out-of-range properties are saturated by [`LzmaProperties::new`]'s
+    /// invariants; a struct-literal-built value is additionally clamped here.
+    pub(crate) fn with_props(level: LzmaLevel, dict_size: u32, props: LzmaProperties) -> Self {
         let dict_size_usize = dict_size.max(4096) as usize;
-        let props = LzmaProperties::default();
+        let props = LzmaProperties::new(props.lc, props.lp, props.pb);
         let level_idx = (level.level() as usize).min(10);
         let chain_depth = CHAIN_DEPTH[level_idx];
 
@@ -187,7 +206,33 @@ impl LzmaEncoder {
             cancel: None,
             last_checkpoint: 0,
             preset_dict: Vec::new(),
+            stream_pos: None,
         }
+    }
+
+    /// Restore entropy-coder state carried over from a previous LZMA2 chunk.
+    ///
+    /// `model`/`state`/`rep` must be the values returned by
+    /// [`Self::compress_chunk_stateful`] for the immediately preceding chunk,
+    /// and `stream_pos` the global uncompressed position (since the last
+    /// dictionary reset) at which this chunk's data starts.
+    pub(crate) fn preload_entropy_state(
+        &mut self,
+        model: LzmaModel,
+        state: State,
+        rep: [u32; 4],
+        stream_pos: u64,
+    ) {
+        self.model = model;
+        self.state = state;
+        self.rep = rep;
+        self.stream_pos = Some(stream_pos);
+    }
+
+    /// Seed the global uncompressed stream position without carrying entropy
+    /// state (used for a state-reset chunk that continues the dictionary).
+    pub(crate) fn set_stream_pos(&mut self, stream_pos: u64) {
+        self.stream_pos = Some(stream_pos);
     }
 
     /// Construct encoder pre-loaded with a dictionary for improved compression
@@ -231,6 +276,7 @@ impl LzmaEncoder {
     /// Attach a progress sink; called for every ~4096 bytes compressed.
     ///
     /// The `on_progress` callback receives `(bytes_consumed, Some(total_input_size))`.
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -239,6 +285,7 @@ impl LzmaEncoder {
     /// Attach a cancellation token; checked every ~4096 bytes compressed.
     ///
     /// If the token is cancelled the encoder returns `Err(OxiArcError::Cancelled)`.
+    #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
@@ -679,10 +726,32 @@ impl LzmaEncoder {
         self.compress_impl(data, false)
     }
 
+    /// Compress an LZMA2 chunk payload and hand back the entropy-coder state
+    /// so a subsequent chunk can continue it (reset field 0 in the LZMA2
+    /// control byte).
+    ///
+    /// The probability model, LZMA state and rep distances survive the
+    /// per-chunk range-coder flush exactly as in liblzma's chunked encoder;
+    /// only the range coder itself restarts per chunk.
+    pub(crate) fn compress_chunk_stateful(
+        mut self,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, LzmaModel, State, [u32; 4])> {
+        let payload = self.compress_impl_inner(data, false)?;
+        Ok((payload, self.model, self.state, self.rep))
+    }
+
     /// Shared compression driver; `write_end_marker` selects between a
     /// standalone LZMA1 stream (marker present) and an LZMA2 chunk payload
     /// (marker absent).
     fn compress_impl(mut self, data: &[u8], write_end_marker: bool) -> Result<Vec<u8>> {
+        self.compress_impl_inner(data, write_end_marker)
+    }
+
+    /// `&mut self` body of [`Self::compress_impl`], allowing callers that
+    /// need the post-encode entropy state ([`Self::compress_chunk_stateful`])
+    /// to retrieve it after the range coder has been flushed.
+    fn compress_impl_inner(&mut self, data: &[u8], write_end_marker: bool) -> Result<Vec<u8>> {
         // When a preset dictionary is active, build a combined buffer and remember
         // the offset at which real data starts. The encoder loop runs over `buf`
         // starting at `data_start` so that the match finder already has the dict
@@ -729,6 +798,17 @@ impl LzmaEncoder {
             // (rep distances are relative to current position in `buf`).
             self.bytes_encoded = data_start as u64;
         }
+
+        // Stateful LZMA2 chunk encoding: seed the position contexts from the
+        // global uncompressed stream position rather than the preset-dict
+        // length (the two differ once the sliding window has filled).
+        if let Some(stream_pos) = self.stream_pos {
+            self.bytes_encoded = stream_pos;
+        }
+        // Progress is measured in bytes of *real* input consumed, relative to
+        // whatever base `bytes_encoded` starts from.
+        let progress_base = self.bytes_encoded;
+        self.last_checkpoint = progress_base;
 
         let mut i = data_start;
 
@@ -806,7 +886,7 @@ impl LzmaEncoder {
                 i += 1;
 
                 // Progress is measured in bytes of *real* input consumed.
-                let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+                let real_consumed = self.bytes_encoded.saturating_sub(progress_base);
                 self.check_progress_and_cancel_with(real_consumed, total)?;
             } else if let Some((is_rep, idx_or_dist, len)) = match_info {
                 self.rc
@@ -884,14 +964,14 @@ impl LzmaEncoder {
 
                 i += len as usize;
 
-                let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+                let real_consumed = self.bytes_encoded.saturating_sub(progress_base);
                 self.check_progress_and_cancel_with(real_consumed, total)?;
             }
         }
 
         // Final progress notification
         if let Some(ref h) = self.progress {
-            let real_consumed = self.bytes_encoded.saturating_sub(data_start as u64);
+            let real_consumed = self.bytes_encoded.saturating_sub(progress_base);
             h.on_progress(real_consumed, Some(total));
         }
 
@@ -916,7 +996,11 @@ impl LzmaEncoder {
             self.encode_distance(0xFFFF_FFFF, MATCH_LEN_MIN as u32);
         }
 
-        Ok(self.rc.finish())
+        // `RangeEncoder::finish` consumes the coder; swap in a fresh one so the
+        // encoder value stays usable (its entropy state may be carried into a
+        // following LZMA2 chunk by `compress_chunk_stateful`).
+        let rc = std::mem::take(&mut self.rc);
+        Ok(rc.finish())
     }
 
     /// Get the dictionary size.

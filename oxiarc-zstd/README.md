@@ -7,26 +7,27 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-08) | 186 tests passing**
+**Version: 0.3.6 (2026-07-08) | 195 tests passing (+6 live-oracle tests)**
 
 ## Overview
 
-Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.3.6 hardens the frame decoder against malformed/hostile headers (bounded, `try_reserve`-based output allocation instead of trusting the untrusted `Frame_Content_Size` field outright) and gives large one-shot-compressed frames an explicit, bounded `Window_Descriptor` so they stay decodable by reference decoders.
+Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.3.6 hardens the frame decoder against malformed/hostile headers (bounded, `try_reserve`-based output allocation instead of trusting the untrusted `Frame_Content_Size` field outright) and — most importantly — makes the FSE/Huffman entropy layer bit-exact with RFC 8878: the backward bitstream is now read/written with the reference `BIT_*` semantics, so real `zstd`-produced frames decode byte-identically and every oxiarc-produced frame is accepted by the reference `zstd` CLI (verified continuously by the `zstd-oracle` differential test suite).
 
 
 ## Features
 
 - **Pure Rust** - No C dependencies or unsafe FFI
-- **Excellent compression ratios** - Better than DEFLATE, competitive with BZip2
-- **Fast decompression** - Faster than BZip2, competitive with DEFLATE
+- **Reference interoperability, both directions** - frames produced by the reference `zstd` CLI (levels 1-19, `--ultra -22`, `--long`, `--no-check`, `--no-content-size`, raw-content dictionaries, multi-frame streams) decode byte-identically, and every frame this encoder emits is accepted and correctly decoded by `zstd -d`; enforced by embedded reference-frame fixtures (always on) plus a live CLI differential suite (`zstd-oracle` feature)
+- **Full RFC 8878 entropy decoding** - FSE-compressed sequence tables, 1- and 4-stream Huffman literals, repeat offsets, treeless literals, repeat table modes
+- **Huffman literals on the encode path** - literal sections are Huffman-compressed when that wins (self-verified with Raw/RLE fallback); sequences use the RFC 8878 predefined/RLE FSE tables, so the ratio on some inputs trails the reference encoder (custom block-optimal sequence tables are not emitted yet)
 - **Parallel compression** - Multi-threaded block compression with Rayon (`parallel` feature)
-- **Dictionary support** - Pre-trained dictionaries for better compression
+- **Dictionary support** - Raw-content dictionaries, interoperable with `zstd -D` in both directions
 - **Checksum support** - XXH64 checksums for data integrity
 - **Streaming API** - Incremental encoder/decoder for large data
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on encoders and stream decoder
 - **Cancellation** - `with_cancel(CancellationToken)` builder for cooperative cancellation
-- **Hardened frame decoding** - untrusted header fields (e.g. `Frame_Content_Size`) are bounds-checked and reserved with `Vec::try_reserve` rather than trusted outright, so a crafted frame header returns a clean error instead of panicking or over-allocating
-- **Reference-decoder-safe framing** - one-shot output above the internal window cap gets an explicit, bounded `Window_Descriptor` (instead of an implicit full-size window), so large frames stay decodable by reference decoders with a default `windowLogMax`
+- **Hardened frame decoding** - untrusted header fields (e.g. `Frame_Content_Size`) are bounds-checked and reserved with `Vec::try_reserve` rather than trusted outright; every FSE/Huffman table index is validated, so malformed or truncated input returns a clean error instead of panicking or over-allocating
+- **Reference-decoder-safe framing** - one-shot output above the internal window cap, dictionary frames, and frames without a stored content size get an explicit, bounded `Window_Descriptor`, so they stay decodable by reference decoders with a default `windowLogMax`
 
 All features are implemented and tested. API is stable. `BlockType`/`LiteralsBlockType` are `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over them need a wildcard arm.
 
@@ -151,6 +152,7 @@ The `with_progress` and `with_cancel` builders can be chained together.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `parallel` | no | Multi-threaded block compression via Rayon |
+| `zstd-oracle` | no | Live differential tests against the reference `zstd` CLI (`cargo test -p oxiarc-zstd --features zstd-oracle`); tests self-skip when `zstd` is not on PATH |
 
 ```toml
 [dependencies]
@@ -165,8 +167,8 @@ oxiarc-zstd = { version = "0.3.6", features = ["parallel"] }
 
 Zstandard uses a sophisticated multi-stage approach:
 1. **LZ77 matching** - Find repeated sequences (levels 1-22; deeper search at higher levels)
-2. **Raw/RLE literals** - The encoder emits literals uncompressed or run-length-encoded; Huffman literal *decoding* is fully supported (for frames produced by other encoders), but this encoder does not yet emit Huffman-compressed literals
-3. **Finite State Entropy (FSE)** - Sequences (literal/match lengths, offsets) are entropy-coded with the RFC 8878 predefined tables (or RLE tables for constant symbol categories)
+2. **Huffman literals** - The encoder emits Huffman-compressed literal sections when they beat Raw/RLE (each section is self-verified before use); the decoder supports the full 1- and 4-stream formats including FSE-compressed weight tables
+3. **Finite State Entropy (FSE)** - Sequences (literal/match lengths, offsets) are entropy-coded with the RFC 8878 predefined tables (or RLE tables for constant symbol categories); the decoder additionally handles custom `FSE_Compressed` tables and repeat modes
 4. **Block structure** - Independent blocks for parallelization
 
 ### Frame Format

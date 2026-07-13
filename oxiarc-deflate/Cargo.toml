@@ -21,6 +21,12 @@ default = []
 async-io = ["oxiarc-core/async-io", "dep:tokio"]
 # Parallel compression using rayon thread pool (pigz-style multi-member GZIP)
 parallel = ["dep:rayon"]
+# Live differential tests (tests/zlib_oracle.rs) that shell out to `python3`
+# (zlib/gzip modules) and the system `gzip` CLI as reference codecs. The
+# tests self-skip when the reference tools are absent, so enabling the
+# feature is always safe. Implies `parallel` to cover multi-member output
+# from compress_gzip_parallel.
+zlib-oracle = ["parallel"]
 
 [dependencies]
 oxiarc-core.workspace = true

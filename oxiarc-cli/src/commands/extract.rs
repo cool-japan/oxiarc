@@ -257,7 +257,10 @@ pub fn cmd_extract(
         let archive_path = Path::new(archive);
         let file = File::open(archive_path)?;
         let mut reader = BufReader::new(file);
-        let (format, _) = ArchiveFormat::detect(&mut reader)?;
+        // `detect_with_path` falls back to the filename extension for the
+        // magic-less formats (raw Brotli `.br`, raw Snappy `.sz`), which plain
+        // `detect` can only ever report as Unknown.
+        let (format, _) = ArchiveFormat::detect_with_path(&mut reader, archive_path)?;
         reader.seek(SeekFrom::Start(0))?;
 
         return extract_dry_run(
@@ -296,7 +299,7 @@ pub fn cmd_extract(
         let archive_path = Path::new(archive);
         let file = File::open(archive_path)?;
         let mut reader = BufReader::new(file);
-        let (format, _) = ArchiveFormat::detect(&mut reader)?;
+        let (format, _) = ArchiveFormat::detect_with_path(&mut reader, archive_path)?;
         reader.seek(SeekFrom::Start(0))?;
 
         // Read entire file for single-file formats when outputting to stdout
@@ -570,25 +573,156 @@ struct ExtractArchiveArgs<'a, R: Read + Seek> {
     styler: &'a Styler,
 }
 
-/// Decompress a single-file format from a byte slice.
+/// Decoded payload of a single-file compressed stream, plus any original
+/// filename recorded inside the container (only gzip carries one).
+struct SingleFileOutput {
+    data: Vec<u8>,
+    original_name: Option<String>,
+}
+
+/// Read an XZ multibyte integer (base-128, little-endian, continuation bit in
+/// the MSB — xz spec §1.2). Returns `None` for a truncated, over-long, or
+/// non-minimal encoding.
+fn xz_read_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    for i in 0..9usize {
+        let byte = *data.get(offset.checked_add(i)?)?;
+        result |= u64::from(byte & 0x7F) << (i * 7);
+        if byte & 0x80 == 0 {
+            // The spec mandates the shortest encoding: a final byte of 0x00
+            // after at least one continuation byte is non-minimal.
+            if i > 0 && byte == 0 {
+                return None;
+            }
+            *offset = offset.checked_add(i + 1)?;
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// Total uncompressed size declared by a `.xz` file's stream index.
 ///
-/// `memory_limit` is enforced up front for formats that carry a cheaply
-/// available declared output size in their frame header/trailer (gzip ISIZE,
-/// lz4/zstd frame content size). For the remaining formats (xz, bzip2, brotli,
-/// snappy) the size is not known without decompressing, so the limit is
-/// best-effort there.
-fn decompress_single_file(
+/// XZ has no single "original size" header field, but every stream ends with
+/// an Index listing `(unpadded_size, uncompressed_size)` for each block — this
+/// is the declared-size equivalent of gzip's ISIZE or zstd's frame content
+/// size, and it is what `--memory-limit` is checked against for xz.
+///
+/// Returns `None` unless `data` is exactly *one* structurally intact XZ stream
+/// (header + blocks + index + footer, sizes all agreeing). Truncated files,
+/// malformed indexes, and concatenated multi-stream files therefore yield
+/// `None` rather than an untrustworthy number — the caller must refuse to
+/// decompress under a memory limit instead of guessing.
+fn xz_declared_output_size(data: &[u8]) -> Option<u64> {
+    const STREAM_HEADER_SIZE: u64 = 12;
+    const STREAM_FOOTER_SIZE: usize = 12;
+
+    let footer_start = data.len().checked_sub(STREAM_FOOTER_SIZE)?;
+    let footer = data.get(footer_start..)?;
+    if footer.get(10..12) != Some(b"YZ") {
+        return None;
+    }
+    // Stream Footer: CRC32(4) | Backward Size(4) | Stream Flags(2) | "YZ"(2).
+    // Real index size = (stored + 1) * 4.
+    let backward_size = u64::from(u32::from_le_bytes([
+        footer[4], footer[5], footer[6], footer[7],
+    ]));
+    let index_size_u64 = backward_size.checked_add(1)?.checked_mul(4)?;
+    let index_size = usize::try_from(index_size_u64).ok()?;
+    let index_start = footer_start.checked_sub(index_size)?;
+    if (index_start as u64) < STREAM_HEADER_SIZE {
+        return None;
+    }
+    let index = data.get(index_start..footer_start)?;
+
+    // Index: Indicator(0x00) | Number of Records | Records | Padding | CRC32.
+    if index.first() != Some(&0x00) {
+        return None;
+    }
+    let mut offset = 1usize;
+    let record_count = xz_read_varint(index, &mut offset)?;
+    // Each record is at least two bytes; a count that cannot possibly fit in
+    // the index is a malformed (or hostile) header.
+    if record_count > (index.len() as u64) / 2 {
+        return None;
+    }
+
+    let mut total_uncompressed = 0u64;
+    let mut blocks_size = 0u64;
+    for _ in 0..record_count {
+        let unpadded = xz_read_varint(index, &mut offset)?;
+        let uncompressed = xz_read_varint(index, &mut offset)?;
+        total_uncompressed = total_uncompressed.checked_add(uncompressed)?;
+        // Each block is padded out to a 4-byte boundary in the stream.
+        let padded = unpadded.checked_add(3)? & !3u64;
+        blocks_size = blocks_size.checked_add(padded)?;
+    }
+
+    // Single-stream check: the sizes the index declares must account for the
+    // whole file. Anything left over means stream padding or a concatenated
+    // second stream, in which case this index does not describe everything
+    // that would be decoded.
+    let expected_len = STREAM_HEADER_SIZE
+        .checked_add(blocks_size)?
+        .checked_add(index_size_u64)?
+        .checked_add(STREAM_FOOTER_SIZE as u64)?;
+    if expected_len != data.len() as u64 {
+        return None;
+    }
+
+    Some(total_uncompressed)
+}
+
+/// Decompress a single-file format from a byte slice, enforcing `memory_limit`.
+///
+/// This is the **one** place single-file decompression happens; both the stdin
+/// path and the `oxiarc extract file.gz -o dir` path route through it so the
+/// bomb defense advertised by `--memory-limit` cannot drift between them.
+///
+/// Enforcement per format:
+///
+/// * **gzip** — the trailing ISIZE field declares the uncompressed size; it is
+///   checked before any decompression happens.
+/// * **lz4** / **zstd** — the frame header's content size (when present) is
+///   checked before decompression.
+/// * **xz** — the stream index declares the total uncompressed size (see
+///   [`xz_declared_output_size`]); it is checked before decompression, and an
+///   xz stream whose index cannot be trusted is *refused* under a memory limit
+///   rather than silently decompressed.
+/// * **bzip2** — bzip2 declares nothing, so the limit is enforced *during*
+///   decoding by `oxiarc_archive::bzip2::decompress_with_limit`, which fails
+///   before an over-budget block is ever appended.
+/// * **brotli** — the stream declares no total size, but each meta-block
+///   declares its exact length (MLEN), so
+///   `oxiarc_archive::brotli::decompress_with_limit` checks
+///   `produced + MLEN` against the budget *before* decoding that meta-block.
+///   An over-budget bomb is rejected without its expansion being allocated.
+/// * **snappy** — likewise: the frame declares no total size, but every chunk
+///   declares its own (the block varint, or the chunk length), so
+///   `oxiarc_archive::snappy::decompress_with_limit` rejects a chunk that
+///   would push the total past the budget *before* decoding it.
+///
+/// Every format additionally gets a final post-decode check, so no path can
+/// return more bytes than the caller allowed.
+///
+/// Residual caveat: the *compressed* input itself is read into memory in full
+/// by every path here (it is a `&[u8]` slice by the time it reaches this
+/// function), so `--memory-limit` bounds the decompressed payload, not the
+/// archive bytes; and a corrupt brotli stream may append at most one
+/// transformed dictionary word (< 64 bytes) past the budget before the
+/// meta-block length check rejects it.
+fn decompress_single_file_full(
     data: &[u8],
     format: ArchiveFormat,
     memory_limit: Option<u64>,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<SingleFileOutput, Box<dyn std::error::Error>> {
     let mut cursor = io::Cursor::new(data);
     let mut reader = BufReader::new(&mut cursor);
 
-    match format {
+    let (decompressed, original_name) = match format {
         ArchiveFormat::Gzip => {
             // gzip stores the uncompressed size (mod 2^32) as the trailing
-            // ISIZE field; use it as a lower-bound guard before allocating.
+            // ISIZE field; use it as a guard before allocating.
             if data.len() >= 4 {
                 let declared_size = u32::from_le_bytes([
                     data[data.len() - 4],
@@ -599,37 +733,116 @@ fn decompress_single_file(
                 check_memory_limit("gzip stream", declared_size, memory_limit)?;
             }
             let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
-            Ok(gzip.decompress()?)
+            let name = gzip.header().filename.clone();
+            (gzip.decompress()?, name)
         }
-        ArchiveFormat::Xz => Ok(oxiarc_archive::xz::decompress(&mut reader)?),
+        ArchiveFormat::Xz => {
+            if let Some(limit) = memory_limit {
+                match xz_declared_output_size(data) {
+                    Some(declared) => check_memory_limit("xz stream", declared, Some(limit))?,
+                    None => {
+                        return Err(format!(
+                            "refusing to decompress this .xz input under --memory-limit {} bytes: \
+                             its stream index (the only field declaring the uncompressed size) is \
+                             missing, malformed, or describes a concatenated multi-stream file, so \
+                             the limit cannot be enforced before decompression",
+                            limit
+                        )
+                        .into());
+                    }
+                }
+            }
+            (oxiarc_archive::xz::decompress(&mut reader)?, None)
+        }
         ArchiveFormat::Lz4 => {
             let mut lz4 = Lz4Reader::new(reader)?;
             if let Some(declared) = lz4.original_size() {
                 check_memory_limit("lz4 stream", declared, memory_limit)?;
             }
-            Ok(lz4.decompress()?)
+            (lz4.decompress()?, None)
         }
         ArchiveFormat::Zstd => {
             let mut zstd = ZstdReader::new(reader)?;
             if let Some(declared) = zstd.content_size() {
                 check_memory_limit("zstd stream", declared, memory_limit)?;
             }
-            Ok(zstd.decompress()?)
+            (zstd.decompress()?, None)
         }
         ArchiveFormat::Bzip2 => {
-            let mut bzip2 = Bzip2Reader::new(reader)?;
-            Ok(bzip2.decompress()?)
+            // bzip2 declares no output size, but the codec exposes a bounded
+            // decoder that errors *before* appending an over-budget block.
+            match memory_limit {
+                Some(limit) => {
+                    let max_out = usize::try_from(limit).unwrap_or(usize::MAX);
+                    (
+                        oxiarc_archive::bzip2::decompress_with_limit(data, max_out)?,
+                        None,
+                    )
+                }
+                None => {
+                    let mut bzip2 = Bzip2Reader::new(reader)?;
+                    (bzip2.decompress()?, None)
+                }
+            }
         }
         ArchiveFormat::Brotli => {
-            let mut brotli = BrotliReader::new(reader)?;
-            Ok(brotli.decompress()?)
+            // Brotli declares no output size, but every meta-block declares
+            // its own length, so the codec can enforce the budget *before*
+            // decoding an over-budget block.
+            match memory_limit {
+                Some(limit) => {
+                    let max_out = usize::try_from(limit).unwrap_or(usize::MAX);
+                    (
+                        oxiarc_archive::brotli::decompress_with_limit(data, max_out)?,
+                        None,
+                    )
+                }
+                None => {
+                    let mut brotli = BrotliReader::new(reader)?;
+                    (brotli.decompress()?, None)
+                }
+            }
         }
         ArchiveFormat::Snappy => {
-            let mut snappy = SnappyReader::new(reader)?;
-            Ok(snappy.decompress()?)
+            // Same for Snappy: no total size in the frame, but each chunk
+            // declares its own, so the budget is enforced per chunk before
+            // that chunk is decoded.
+            match memory_limit {
+                Some(limit) => (
+                    oxiarc_archive::snappy::decompress_with_limit(data, limit)?,
+                    None,
+                ),
+                None => {
+                    let mut snappy = SnappyReader::new(reader)?;
+                    (snappy.decompress()?, None)
+                }
+            }
         }
-        _ => Err("Unsupported format for stdin/stdout".into()),
-    }
+        _ => return Err("Unsupported format for stdin/stdout".into()),
+    };
+
+    // Backstop: whatever the container claimed, never hand back more bytes
+    // than the caller budgeted for.
+    check_memory_limit(
+        &format!("{} stream", format),
+        decompressed.len() as u64,
+        memory_limit,
+    )?;
+
+    Ok(SingleFileOutput {
+        data: decompressed,
+        original_name,
+    })
+}
+
+/// Decompress a single-file format from a byte slice, discarding any container
+/// filename. Thin wrapper over [`decompress_single_file_full`].
+fn decompress_single_file(
+    data: &[u8],
+    format: ArchiveFormat,
+    memory_limit: Option<u64>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Ok(decompress_single_file_full(data, format, memory_limit)?.data)
 }
 
 /// Extract a single-file format to a writer.
@@ -674,6 +887,13 @@ fn extract_archive_format<R: Read + Seek>(
         archive_path.display(),
         output.display()
     );
+
+    // Materialize the output directory up front. The archive formats below
+    // create it implicitly (per-entry `create_dir_all(parent)`), but the
+    // single-file formats write straight into `output`, and without this they
+    // failed with a bare `No such file or directory (os error 2)` on a
+    // not-yet-existing directory while `-o newdir` worked fine for zip/tar.
+    std::fs::create_dir_all(output).map_err(|e| format!("{}: {}", output.display(), e))?;
 
     // Helper to check if entry should be extracted
     let should_extract = |name: &str| -> bool {
@@ -778,19 +998,27 @@ fn extract_archive_format<R: Read + Seek>(
             pb.finish_with_message("Done");
             print_warnings(zip.warnings(), styler);
         }
-        ArchiveFormat::Gzip => {
+        // Single-file compressed streams (gzip, xz, lz4, zstd, bzip2, brotli,
+        // snappy). All seven share one arm so the `--memory-limit` bomb
+        // defense — enforced inside `decompress_single_file_full`, the same
+        // helper the stdin path uses — cannot drift between the two paths.
+        fmt @ (ArchiveFormat::Gzip
+        | ArchiveFormat::Xz
+        | ArchiveFormat::Lz4
+        | ArchiveFormat::Zstd
+        | ArchiveFormat::Bzip2
+        | ArchiveFormat::Brotli
+        | ArchiveFormat::Snappy) => {
             let pb = create_progress_bar(1, progress);
             pb.set_message("Decompressing");
 
-            let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
-            // Note: the gzip ISIZE trailer would allow a pre-decompress
-            // memory-limit guard, but it lives at the end of the stream and is
-            // not cheaply reachable through this streaming reader; the limit is
-            // therefore best-effort for the file-based gzip path.
-            let data = gzip.decompress()?;
+            let mut compressed = Vec::new();
+            reader.read_to_end(&mut compressed)?;
+            let decoded = decompress_single_file_full(&compressed, fmt, memory_limit)?;
 
-            // Use original filename if available, otherwise strip .gz
-            let out_name = gzip.header().filename.clone().unwrap_or_else(|| {
+            // gzip may record the original filename; every other format falls
+            // back to the archive's stem (`data.xz` -> `data`).
+            let out_name = decoded.original_name.unwrap_or_else(|| {
                 archive_path
                     .file_stem()
                     .unwrap_or_default()
@@ -798,13 +1026,16 @@ fn extract_archive_format<R: Read + Seek>(
                     .into_owned()
             });
 
-            // For GZIP, apply filter to output name
             if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
+                let out_path = resolve_output_path(output, &out_name, strict_names)?;
                 if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
+                    std::fs::write(&out_path, &decoded.data)?;
                     if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
+                        pb.println(format!(
+                            "  Extracted: {} ({} bytes)",
+                            out_name,
+                            decoded.data.len()
+                        ));
                     }
                 }
             } else if verbose {
@@ -940,185 +1171,6 @@ fn extract_archive_format<R: Read + Seek>(
             }
             pb.finish_with_message("Done");
             print_warnings(lzh.warnings(), styler);
-        }
-        ArchiveFormat::Xz => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let data = oxiarc_archive::xz::decompress(&mut reader)?;
-
-            // Use input filename without .xz extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            // For XZ, apply filter to output name
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
-        }
-        ArchiveFormat::Lz4 => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let mut lz4 = Lz4Reader::new(reader)?;
-            if let Some(declared) = lz4.original_size() {
-                let label = archive_path.display().to_string();
-                check_memory_limit(&label, declared, memory_limit)?;
-            }
-            let data = lz4.decompress()?;
-
-            // Use input filename without .lz4 extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            // For LZ4, apply filter to output name
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
-        }
-        ArchiveFormat::Zstd => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let mut zstd = ZstdReader::new(reader)?;
-            if let Some(declared) = zstd.content_size() {
-                let label = archive_path.display().to_string();
-                check_memory_limit(&label, declared, memory_limit)?;
-            }
-            let data = zstd.decompress()?;
-
-            // Use input filename without .zst extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            // For Zstd, apply filter to output name
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
-        }
-        ArchiveFormat::Bzip2 => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let mut bzip2 = Bzip2Reader::new(reader)?;
-            let data = bzip2.decompress()?;
-
-            // Use input filename without .bz2 extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            // For Bzip2, apply filter to output name
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
-        }
-        ArchiveFormat::Brotli => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let mut brotli = BrotliReader::new(reader)?;
-            let data = brotli.decompress()?;
-
-            // Use input filename without .br extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
-        }
-        ArchiveFormat::Snappy => {
-            let pb = create_progress_bar(1, progress);
-            pb.set_message("Decompressing");
-
-            let mut snappy = SnappyReader::new(reader)?;
-            let data = snappy.decompress()?;
-
-            // Use input filename without .sz extension
-            let out_name = archive_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-
-            if should_extract(&out_name) {
-                let out_path = output.join(&out_name);
-                if should_write_file(&out_path, overwrite_mode, verbose)? {
-                    std::fs::write(&out_path, &data)?;
-                    if verbose {
-                        pb.println(format!("  Extracted: {} ({} bytes)", out_name, data.len()));
-                    }
-                }
-            } else if verbose {
-                pb.println(format!("  Skipped: {} (filtered)", out_name));
-            }
-            pb.inc(1);
-            pb.finish_with_message("Done");
         }
         ArchiveFormat::SevenZip => {
             let mut sevenz = SevenZReader::new(reader)?;
@@ -1565,6 +1617,92 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The xz index parser is the load-bearing part of the xz `--memory-limit`
+    /// enforcement (xz has no other field declaring the uncompressed size), so
+    /// it is pinned directly against real `XzWriter` output.
+    #[test]
+    fn test_xz_declared_output_size_matches_reality() {
+        for size in [0usize, 1, 4096, 300_000] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let compressed = oxiarc_archive::XzWriter::new(oxiarc_lzma::LzmaLevel::new(6))
+                .compress(&payload)
+                .expect("xz compress");
+            assert_eq!(
+                xz_declared_output_size(&compressed),
+                Some(size as u64),
+                "xz index declared the wrong uncompressed size for a {size}-byte payload"
+            );
+        }
+    }
+
+    /// Anything that is not one intact XZ stream must yield `None` (the caller
+    /// then *refuses* to decompress under a memory limit rather than guessing).
+    #[test]
+    fn test_xz_declared_output_size_rejects_malformed() {
+        let compressed = oxiarc_archive::XzWriter::new(oxiarc_lzma::LzmaLevel::new(6))
+            .compress(&vec![7u8; 10_000])
+            .expect("xz compress");
+
+        assert_eq!(xz_declared_output_size(&[]), None, "empty input");
+        assert_eq!(xz_declared_output_size(b"YZ"), None, "too short");
+        // Truncated stream: the footer is gone.
+        assert_eq!(
+            xz_declared_output_size(&compressed[..compressed.len() - 1]),
+            None,
+            "truncated stream must not yield a declared size"
+        );
+        // Concatenated streams: the trailing index describes only the last one,
+        // so it must not be trusted.
+        let mut concatenated = compressed.clone();
+        concatenated.extend_from_slice(&compressed);
+        assert_eq!(
+            xz_declared_output_size(&concatenated),
+            None,
+            "concatenated multi-stream xz must not yield a declared size"
+        );
+        // Footer magic corrupted.
+        let mut bad_magic = compressed.clone();
+        let last = bad_magic.len() - 1;
+        bad_magic[last] = 0x00;
+        assert_eq!(
+            xz_declared_output_size(&bad_magic),
+            None,
+            "bad footer magic"
+        );
+    }
+
+    /// CLI-01 at the unit level: gzip, xz and bzip2 bombs must be refused by
+    /// the shared helper both paths use, rather than fully expanding.
+    #[test]
+    fn test_single_file_memory_limit_rejects_bombs() {
+        let bomb = vec![0u8; 2 * 1024 * 1024];
+        let limit = Some(64 * 1024u64);
+
+        let gz =
+            oxiarc_archive::gzip::compress_with_filename(&bomb, "bomb", 6).expect("gzip compress");
+        let xz = oxiarc_archive::XzWriter::new(oxiarc_lzma::LzmaLevel::new(6))
+            .compress(&bomb)
+            .expect("xz compress");
+        let bz2 = oxiarc_archive::Bzip2Writer::with_level(9)
+            .compress(&bomb)
+            .expect("bzip2 compress");
+
+        for (label, data, format) in [
+            ("gzip", gz, ArchiveFormat::Gzip),
+            ("xz", xz, ArchiveFormat::Xz),
+            ("bzip2", bz2, ArchiveFormat::Bzip2),
+        ] {
+            assert!(
+                decompress_single_file(&data, format, limit).is_err(),
+                "{label} bomb was NOT rejected under a 64K memory limit (CLI-01 regression)"
+            );
+            // ...and the same input must still decode fine with no limit.
+            let ok = decompress_single_file(&data, format, None)
+                .unwrap_or_else(|e| panic!("{label} failed to decompress without a limit: {e}"));
+            assert_eq!(ok.len(), bomb.len(), "{label} decoded the wrong length");
+        }
     }
 
     #[test]

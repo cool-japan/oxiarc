@@ -101,6 +101,7 @@ impl<R: Read + Seek> LzhReader<R> {
 
     /// Attach a progress callback handle (for extraction progress only;
     /// does not retroactively replay entry-scan progress).
+    #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
@@ -113,6 +114,7 @@ impl<R: Read + Seek> LzhReader<R> {
     /// is returned to the caller anyway. When disabled (default),
     /// CRC-16 mismatches abort the extraction with
     /// [`OxiArcError::CorruptedData`].
+    #[must_use]
     pub fn lenient(mut self, enabled: bool) -> Self {
         self.lenient = enabled;
         self

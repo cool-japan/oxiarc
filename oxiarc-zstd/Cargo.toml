@@ -30,6 +30,12 @@ harness = false
 [features]
 default = []
 parallel = ["rayon"]
+# Live differential tests (tests/zstd_oracle.rs) that shell out to the
+# reference `zstd` CLI and verify BOTH directions: reference-compress ->
+# oxiarc-decode (byte-identical) and oxiarc-compress -> reference-decode
+# (accepted and correct). Each test self-skips (prints a note, does not
+# fail) when `zstd` is not on PATH.
+zstd-oracle = []
 
 [lints]
 workspace = true

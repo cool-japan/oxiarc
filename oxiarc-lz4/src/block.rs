@@ -17,6 +17,20 @@ const MIN_MATCH: usize = 4;
 /// Maximum match offset (16-bit).
 const MAX_OFFSET: usize = 65535;
 
+/// Number of bytes at the end of a block that must always be literals.
+///
+/// The LZ4 block format mandates that the last `LASTLITERALS` (5) bytes of a
+/// block are encoded as literals; the reference decoder rejects blocks whose
+/// final sequence ends in a match.
+const LASTLITERALS: usize = 5;
+
+/// Minimum distance (in bytes) that a match must keep from the end of the
+/// block. No match may start within `MFLIMIT` bytes of the end, mirroring
+/// liblz4; this guarantees the trailing `LASTLITERALS` invariant and keeps a
+/// non-final sequence's literals from landing inside the reference decoder's
+/// end-of-block detection window.
+const MFLIMIT: usize = 12;
+
 /// Hash table size (must be power of 2).
 const HASH_SIZE: usize = 1 << 14; // 16K entries
 
@@ -191,7 +205,11 @@ impl<'a> BlockEncoder<'a> {
 
         let mut pos = 0;
         let mut anchor = 0; // Start of current literal run
-        let end = len.saturating_sub(5); // Leave room for last literals
+        // A match may cover at most up to `matchlimit`, keeping the trailing
+        // LASTLITERALS bytes as literals; matches may only START before `end`
+        // so no non-final sequence lands within MFLIMIT of the block end.
+        let matchlimit = len.saturating_sub(LASTLITERALS);
+        let end = len.saturating_sub(MFLIMIT - 1);
 
         let mut misses: usize = 0;
 
@@ -209,9 +227,10 @@ impl<'a> BlockEncoder<'a> {
                 // Found a match!
                 let offset = pos - match_pos;
 
-                // Extend match forwards
+                // Extend match forwards, but never into the trailing
+                // LASTLITERALS bytes (LZ4 end-of-block invariant).
                 let mut match_len = MIN_MATCH;
-                while pos + match_len < len
+                while pos + match_len < matchlimit
                     && input[match_pos + match_len] == input[pos + match_len]
                 {
                     match_len += 1;
@@ -348,8 +367,14 @@ impl<'a> BlockDecoder<'a> {
     }
 
     /// Decode the block into output.
+    ///
+    /// The projected output size is checked *before* every literal copy and
+    /// every match copy, so a single sequence can never emit past
+    /// `max_output` (mirroring liblz4's destination-capacity/`oend` guard).
+    /// This prevents a crafted sequence — whose length is attacker-controlled
+    /// via unbounded 0xFF continuations — from acting as a decompression bomb.
     fn decode(&mut self, output: &mut Vec<u8>, max_output: usize) -> Result<()> {
-        while self.pos < self.input.len() && output.len() < max_output {
+        while self.pos < self.input.len() {
             // Read token
             let token = self.read_byte()?;
             let literal_len = (token >> 4) as usize;
@@ -363,6 +388,14 @@ impl<'a> BlockDecoder<'a> {
                 return Err(OxiArcError::corrupted(
                     self.pos as u64,
                     "truncated literals",
+                ));
+            }
+
+            // Bound the projected output before copying literals.
+            if output.len().saturating_add(literal_len) > max_output {
+                return Err(OxiArcError::corrupted(
+                    self.pos as u64,
+                    "literals exceed max output",
                 ));
             }
 
@@ -389,6 +422,14 @@ impl<'a> BlockDecoder<'a> {
                 return Err(OxiArcError::corrupted(
                     self.pos as u64,
                     "offset exceeds output",
+                ));
+            }
+
+            // Bound the projected output before copying the match.
+            if output.len().saturating_add(match_len) > max_output {
+                return Err(OxiArcError::corrupted(
+                    self.pos as u64,
+                    "match exceeds max output",
                 ));
             }
 

@@ -31,6 +31,20 @@ pub enum BrotliError {
     /// Output size exceeded expected limit.
     #[error("output size {0} exceeds limit")]
     OutputTooLarge(usize),
+    /// The stream would produce more output than the caller's memory budget.
+    ///
+    /// Returned only by the bounded entry points
+    /// ([`crate::decompress_with_limit`], [`crate::BrotliDecompressor::with_max_output`]).
+    /// The check happens *during* decoding — before the over-budget bytes are
+    /// produced — so a decompression bomb is rejected without ever being
+    /// materialised.
+    #[error("memory budget exceeded: budget={budget} bytes, requested={requested} bytes")]
+    MemoryBudgetExceeded {
+        /// The caller-supplied budget, in bytes.
+        budget: usize,
+        /// Total output the stream declared it would need, in bytes.
+        requested: usize,
+    },
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -73,6 +87,9 @@ impl From<BrotliError> for OxiArcError {
                 max_distance,
             } => OxiArcError::invalid_distance(distance, max_distance),
             BrotliError::InvalidHuffmanCode(msg) => OxiArcError::corrupted(0, msg),
+            BrotliError::MemoryBudgetExceeded { budget, requested } => {
+                OxiArcError::memory_budget_exceeded(budget, requested)
+            }
             BrotliError::Cancelled => OxiArcError::Cancelled,
             other => OxiArcError::corrupted(0, other.to_string()),
         }

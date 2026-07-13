@@ -17,11 +17,16 @@ BZip2 is a high-compression algorithm based on the Burrows-Wheeler Transform (BW
 ## Features
 
 - **Pure Rust** - No C dependencies or unsafe FFI
+- **Reference interop** - Multi-table Huffman encoding (libbz2's `sendMTFValues` clustering: 2-6 tables, real per-group selectors); output verified byte-for-byte against `bzip2 -d`
+- **Multi-stream decode** - Concatenated `.bz2` files (pbzip2, lbzip2, `cat a.bz2 b.bz2`) decode in full, like `bzip2 -d`; trailing garbage is an error, never silent loss
+- **Legacy randomised blocks** - Streams from bzip2 <= 0.9.0 with the randomised bit set are de-randomised (libbz2 `BZ2_rNums` schedule)
+- **Bomb guard** - `decompress_with_limit` caps output size for untrusted input
 - **Parallel compression** - Multi-threaded block compression with Rayon
 - **Compression levels 1-9** - Adjustable block sizes (100KB-900KB)
-- **Streaming API** - Process data in chunks
+- **Streaming API** - Process data in chunks; the encoder buffers small writes into full-size blocks
 - **One-shot API** - Convenient functions for simple cases
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs and every compression level
+- **Oracle-tested** - Differential suite against the system `bzip2` CLI in both directions (feature `bzip2-oracle`; self-skips when the binary is absent)
 
 All features are implemented and tested. API is stable.
 
@@ -70,6 +75,7 @@ BZip2 uses a multi-stage pipeline:
 |---------|---------|-------------|
 | `default` | yes | Core BZip2 compression/decompression |
 | `parallel` | no | Multi-threaded block compression via Rayon |
+| `bzip2-oracle` | no | Differential tests against the system `bzip2` CLI (tests self-skip if absent) |
 
 ## Examples
 

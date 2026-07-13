@@ -333,3 +333,156 @@ fn decode_lh1_corrupted_prefix_never_panics() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LZHUF-01 regression: lh4/lh5/lh6/lh7 silent-truncation guard.
+//
+// The dynamic-Huffman decoder (`decode.rs::decode_compressed`) reads a 16-bit
+// per-block command count and, when it is zero, stops. Because `MsbBitReader`
+// synthesizes zero bits past the physical end of input, a truncated stream used
+// to read a *fabricated* zero count, break out of the loop, and return `Ok`
+// with fewer than `uncompressed_size` bytes — silent truncation of untrusted
+// input. (Confirmed by the audit: 9,626 Ok-with-wrong-length results across
+// 52,524 lh4-7 truncation trials, and `decode_lzh(&[], Lh5, 100)` -> `Ok([])`.)
+//
+// The fix mirrors lh1's exhaustion guard: after the block-header read, the
+// table reads, and each symbol/offset decode it checks `reader.padding_bits()`
+// and returns `CorruptedData` if any bit was drawn from past-EOF padding, and
+// after the loop it errors when the produced length is short instead of
+// truncating. These tests lock that behavior in for every lh4-7 method.
+// ---------------------------------------------------------------------------
+
+/// Every lh4/lh5/lh6/lh7 method: a stream truncated at points spanning the
+/// block-count field, the three Huffman tables, and deep into the command run
+/// must NEVER decode to a short (or otherwise wrong) buffer with `Ok`.
+///
+/// The only acceptable `Ok` is a byte-exact full decode (theoretically possible
+/// if a truncation dropped only bytes the decoder never needed). In practice
+/// these single-entry fixtures byte-align their final bits inside the last
+/// physical byte, so every partial truncation removes genuinely-needed data and
+/// is rejected — but the assertion is written as the exact LZHUF-01 contract
+/// (never a short/wrong `Ok`) so it can never be flaky.
+#[test]
+fn decode_lzh_lh4_lh7_truncation_never_returns_short_ok() {
+    let data = sample_data();
+    for method in [
+        LzhMethod::Lh4,
+        LzhMethod::Lh5,
+        LzhMethod::Lh6,
+        LzhMethod::Lh7,
+    ] {
+        let encoded =
+            encode_lzh(&data, method).unwrap_or_else(|e| panic!("{method}: encode failed: {e}"));
+        assert!(
+            encoded.len() > 200,
+            "{method}: fixture must be a multi-block stream (got {} bytes)",
+            encoded.len()
+        );
+
+        let mut offsets: Vec<usize> = vec![0, 1, 2, 3, 4, 6, 8, 12, 20, 40, 80];
+        for frac in [16usize, 8, 4, 3, 2] {
+            offsets.push(encoded.len() / frac);
+            offsets.push(encoded.len() - encoded.len() / frac);
+        }
+        offsets.push(encoded.len().saturating_sub(1));
+        offsets.retain(|&o| o < encoded.len());
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        for &offset in &offsets {
+            let truncated = &encoded[..offset];
+            let result =
+                std::panic::catch_unwind(|| decode_lzh(truncated, method, data.len() as u64));
+            let result = result.unwrap_or_else(|_| {
+                panic!("{method}: decode_lzh must not panic truncated to {offset}")
+            });
+            match result {
+                Err(_) => {} // correct: truncation detected
+                Ok(v) => {
+                    assert_eq!(
+                        v.len(),
+                        data.len(),
+                        "{method}: LZHUF-01 regression — decode returned SHORT Ok ({} bytes) \
+                         for a stream truncated to {offset}/{} (silent truncation)",
+                        v.len(),
+                        encoded.len()
+                    );
+                    assert_eq!(
+                        v,
+                        data,
+                        "{method}: decode returned a full-length but mismatched buffer for a \
+                         stream truncated to {offset}/{}",
+                        encoded.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Ironclad-`Err` truncations for every lh4-7 method: the empty prefix and a
+/// single-byte prefix cannot possibly hold a full 16-bit block header, so the
+/// count is read (partly) from past-EOF zero padding and the decoder MUST
+/// reject them regardless of stream content. This proves the padding guard is
+/// actually reached (not merely that short output is trimmed after the fact).
+#[test]
+fn decode_lzh_lh4_lh7_tiny_prefix_is_rejected() {
+    let data = sample_data();
+    for method in [
+        LzhMethod::Lh4,
+        LzhMethod::Lh5,
+        LzhMethod::Lh6,
+        LzhMethod::Lh7,
+    ] {
+        let encoded =
+            encode_lzh(&data, method).unwrap_or_else(|e| panic!("{method}: encode failed: {e}"));
+        for &prefix in &[0usize, 1] {
+            let result = decode_lzh(&encoded[..prefix], method, data.len() as u64);
+            assert!(
+                matches!(
+                    result,
+                    Err(oxiarc_core::error::OxiArcError::CorruptedData { .. })
+                ),
+                "{method}: a {prefix}-byte prefix must be rejected as CorruptedData, got {result:?}"
+            );
+        }
+    }
+}
+
+/// The exact case called out in the audit: an EMPTY payload declaring a
+/// non-zero uncompressed size must be an error, not `Ok([])`.
+#[test]
+fn decode_lzh_lh5_empty_input_nonzero_size_is_err() {
+    let result = decode_lzh(&[], LzhMethod::Lh5, 100);
+    assert!(
+        matches!(
+            result,
+            Err(oxiarc_core::error::OxiArcError::CorruptedData { .. })
+        ),
+        "decode_lzh(&[], Lh5, 100) must be Err (was the reported Ok([]) silent-truncation bug), \
+         got {result:?}"
+    );
+}
+
+/// Guard against a false-positive regression: the padding-exhaustion checks
+/// must NOT reject valid, untruncated streams. Every lh4-7 method must still
+/// round-trip the full fixture byte-for-byte.
+#[test]
+fn decode_lzh_lh4_lh7_full_stream_still_roundtrips() {
+    let data = sample_data();
+    for method in [
+        LzhMethod::Lh4,
+        LzhMethod::Lh5,
+        LzhMethod::Lh6,
+        LzhMethod::Lh7,
+    ] {
+        let encoded =
+            encode_lzh(&data, method).unwrap_or_else(|e| panic!("{method}: encode failed: {e}"));
+        let decoded = decode_lzh(&encoded, method, data.len() as u64)
+            .unwrap_or_else(|e| panic!("{method}: valid stream must decode, got {e}"));
+        assert_eq!(
+            decoded, data,
+            "{method}: full untruncated round-trip must be byte-exact"
+        );
+    }
+}
