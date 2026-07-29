@@ -93,7 +93,7 @@ impl Adler32 {
     /// compiler can auto-vectorise, exactly as zlib's own `DO16` unrolling
     /// does. The result is bit-identical to the byte-at-a-time version.
     ///
-    /// Blocks stay at or below [`NMAX`] bytes so the 32-bit accumulators
+    /// Blocks stay at or below `NMAX` bytes so the 32-bit accumulators
     /// cannot overflow before the modulo reduction (RFC 1950 / zlib's
     /// classic bound `255n(n+1)/2 + (n+1)(BASE-1) < 2^32`).
     pub fn update(&mut self, data: &[u8]) {

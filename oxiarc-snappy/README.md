@@ -8,7 +8,7 @@ Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.0 (2026-07-13) | 140 tests passing**
+**Version: 0.4.0 (2026-07-30) | 140 tests passing**
 
 ## Features
 

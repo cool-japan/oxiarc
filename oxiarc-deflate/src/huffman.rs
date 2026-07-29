@@ -61,14 +61,14 @@ const MAX_TABLE_INDEX: usize = ENTRY_PAYLOAD_MASK as usize;
 /// |---------|-------------------------|------------------------------|
 /// | 0..8    | code length (1..=15)    | sub-table index width        |
 /// | 8..24   | symbol                  | sub-table offset in `table`  |
-/// | 31      | 0                       | 1 ([`ENTRY_SUBTABLE`])       |
+/// | 31      | 0                       | 1 (`ENTRY_SUBTABLE`)         |
 ///
 /// An all-zero entry means "no code here": either an unused slot of a
 /// legitimately incomplete code, or a hole in a sub-table. Those decode to
 /// a length of 0, which callers must reject.
 ///
 /// The canonical per-length tables (`symbols` / `base_codes` /
-/// `symbol_offsets`) are retained for [`HuffmanTree::decode_slow`], the
+/// `symbol_offsets`) are retained for `HuffmanTree::decode_slow`, the
 /// bit-at-a-time fallback used when fewer bits are buffered than the code
 /// might need (end of stream, or an exact-mode [`BitReader`] that must not
 /// read ahead).

@@ -7,7 +7,9 @@ Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.0** (2026-07-13) — 260 tests passing.
+**Version 0.4.0** (2026-07-30) — 293 tests passing.
+
+**What's new in 0.4.0**: DEFLATE/zlib decoder performance rewrite — no wire-format change, no public API removed. New `inflate_into(src, dst) -> Result<usize>` decompresses a raw DEFLATE stream directly into a caller-supplied buffer with no intermediate `Vec` and no output-size guessing (`BufferTooSmall` if the stream would overflow `dst`, never silently truncated; `InvalidDistance` if a back-reference reaches before the start of `dst` — use `Inflater::with_dictionary` when history before `dst` is needed instead). `zlib::zlib_decompress_into` is the zlib-wrapper equivalent — validates the header, decodes via `inflate_into`, and verifies the trailing Adler-32. New `Inflater::with_output_capacity(size_hint)` pre-sizes the output buffer from a size hint (clamped to the new `MAX_OUTPUT_CAPACITY_HINT` = 64 MiB, since the hint is untrusted); GZIP decoding now seeds this automatically from the trailing ISIZE field. Internally (no API change): `HuffmanTree` now decodes through a two-level root+sub-table (root widened from a 9-bit to a 10-bit table, zlib/libdeflate style); the LZ77 history is now the output buffer itself (`InflateWindow`, via `Vec::extend_from_within`) rather than a separate ring buffer that wrote every decoded byte twice; `Adler32::update` now folds 32-byte groups through a closed-form reduction instead of one add-pair per byte so the compiler can auto-vectorize it. These decoders build on `oxiarc-core`'s new buffered `BitReader`/`BitCache`. New differential test suite `tests/inflate_differential.rs` proves the buffered fast path, the exact-mode path, and `inflate_into`/`zlib_decompress_into` all agree byte-for-byte, including hostile/truncated/corrupted input, plus a new `fuzz_inflate_into` fuzz target.
 
 **What's new in 0.3.6**: New `gzip_streaming` and `parallel_gzip` runnable examples; `#[must_use]` added to the LZ77-heuristics builder setters (`with_nice_length`, `with_min_match_length`, `with_max_chain`, `with_good_length`, `with_lz77_params`) and to `ParallelGzipEncoder`'s builder setters (`level`, `chunk_size`, `num_threads`), so a discarded builder return value now warns; new `proptest`-based round-trip test suite (`tests/proptest_roundtrip.rs`); a decoder-only regression test for a hand-built fixed-Huffman length-258 back-reference closes a coverage gap. `oxiarc-core::FlushMode` (used by `Deflater`) is now `#[non_exhaustive]` as part of a pre-1.0 API freeze — the internal flush-mode dispatch already carries a forward-compatible wildcard arm.
 
@@ -237,6 +239,27 @@ let compressed = gzip_compress(data, 6)?;
 // Decode GZIP data
 let decompressed = gzip_decompress(&compressed)?;
 ```
+
+### Zero-Copy Decode (`inflate_into`)
+
+Decompress directly into a caller-supplied buffer — no intermediate `Vec`
+and no output-size guessing. Returns the number of bytes written; a stream
+that would overflow `dst` is rejected with `BufferTooSmall` rather than
+truncated silently.
+
+```rust
+use oxiarc_deflate::{deflate, inflate_into};
+
+let original = b"Hello, World! Hello, World!";
+let compressed = deflate(original, 6)?;
+
+let mut out = vec![0u8; original.len()];
+let n = inflate_into(&compressed, &mut out)?;
+assert_eq!(&out[..n], original);
+```
+
+`zlib::zlib_decompress_into` is the zlib-wrapped equivalent, additionally
+verifying the trailing Adler-32 checksum.
 
 ### Async DEFLATE (requires `async-io` feature)
 

@@ -5,7 +5,64 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-07-30
+
+**DEFLATE/zlib decoder performance rewrite.** No archive/stream wire format
+changed and no public API was removed — every addition below is opt-in or
+internal; existing callers of `inflate`, `Inflater::new`, `zlib_decompress`,
+etc. see only a speed-up.
+
+### Added
+- `oxiarc_deflate::inflate_into(src, dst) -> Result<usize>` and
+  `zlib::zlib_decompress_into` — decompress DEFLATE/zlib payloads directly
+  into a caller-supplied buffer with no intermediate `Vec` and no
+  output-size guessing; a stream that would overflow `dst` is rejected with
+  `BufferTooSmall` rather than truncated.
+- `oxiarc_core::BitReader::buffered` / `with_buffer_capacity` — a
+  buffered/prefetch reader mode that refills the bit accumulator with bulk
+  64-bit little-endian loads instead of one `Read::read` per few bits.
+  `BitReader::new` (exact mode) is unchanged and still required wherever the
+  reader must not advance past the bits actually consumed (e.g. ZIP's
+  byte-aligned data descriptor immediately following a DEFLATE member).
+- `oxiarc_core::BitCache`, plus `BitReader::detach` / `reattach` /
+  `refill_cache` — a register-resident bit accumulator a decoder's inner
+  loop can detach, decode many symbols against, and reattach, removing the
+  store/load-forwarding stall a memory-resident accumulator costs on every
+  symbol.
+- `BitReader::into_parts` / `buffered_len` — recover prefetched-but-unconsumed
+  bytes so a buffered `BitReader` can hand a shared stream back to other code
+  without losing data.
+- `Inflater::with_output_capacity(size_hint)` and `MAX_OUTPUT_CAPACITY_HINT`
+  — pre-size the decoder's output buffer from an untrusted size hint
+  (clamped to 64 MiB); GZIP decoding now seeds this automatically from the
+  trailing ISIZE field.
+- Fuzz target `fuzz_inflate_into`, cross-checking the growable-`Vec` and
+  slice-sink decode paths byte-for-byte against each other.
+- `oxiarc-deflate/tests/inflate_differential.rs` — a differential suite
+  proving the buffered fast path, the exact-mode path, and
+  `inflate_into`/`zlib_decompress_into` all agree across stored/fixed/dynamic
+  blocks, maximum-distance (32 KiB) back-references, and
+  hostile/truncated/corrupted input; adds an optional CPython `zlib` oracle
+  comparison behind the pre-existing `zlib-oracle` feature.
+
+### Changed
+- **DEFLATE/zlib decoding rewritten for throughput.** `HuffmanTree` now
+  decodes through a two-level root+sub-table layout (root widened from a
+  single-level 9-bit table to a 10-bit root table), in the style of zlib's
+  `inflate_table`/libdeflate. The LZ77 history is now the output buffer
+  itself (`InflateWindow`, backed by `Vec::extend_from_within`) rather than
+  a separate ring buffer that required writing every decoded byte twice.
+  Combined with the buffered `BitReader`/`BitCache` above, this is a
+  substantial decode speed-up with unchanged output.
+- `Adler32::update` now folds 32-byte groups through a closed-form reduction
+  (`b' = b + 32*a + Σ(32-i)·xᵢ`) instead of one add-pair per byte, letting
+  the compiler auto-vectorize it — matching zlib's `DO16` unrolling. Output
+  is bit-identical to the previous byte-at-a-time version.
+- `zlib_decompress` internals split into `zlib_payload` (header validation)
+  and `verify_zlib_trailer` (Adler-32 check), now shared with
+  `zlib_decompress_into`.
+- The Huffman fast-decode path's last `unsafe`/`get_unchecked` table access
+  is now safe, bounds-checked code.
 
 ## [0.3.6] - 2026-07-13
 
@@ -1034,7 +1091,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
-[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/cool-japan/oxiarc/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/cool-japan/oxiarc/compare/v0.3.3...v0.3.4

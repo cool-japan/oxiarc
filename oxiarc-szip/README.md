@@ -7,7 +7,7 @@ Pure Rust implementation of CCSDS-121.0-B-2 / libaec-compatible AEC (Adaptive En
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.0** (2026-07-13) — 47 tests passing.
+**Version 0.4.0** (2026-07-30) — 47 tests passing.
 
 **What's new in 0.3.6**:
 

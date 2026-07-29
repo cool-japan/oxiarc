@@ -112,8 +112,8 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~5,573 | 187 |
-| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip (multi-member) + true streaming (GzipStream/ZlibStream) | ~8,756 | 260 |
+| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~6,043 | 196 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip (multi-member) + true streaming (GzipStream/ZlibStream) | ~9,893 | 293 |
 | `oxiarc-lzhuf` | LZH compression (lh0, lh1, lh4, lh5, lh6, lh7, lhd) with LZSS + Huffman + custom dictionaries | ~6,606 | 188 |
 | `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + multi-table Huffman, multi-stream decode, de-randomisation | ~3,303 | 108 |
 | `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~5,971 | 166 |
@@ -125,9 +125,9 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~4,304 | 140 |
 | `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): encode/decode/encode_bytes, SzipParams, libaec-interoperable | ~1,902 | 47 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, man pages | ~6,897 | 92 |
-| **Total** | **Pure Rust archive/compression library** | **~90,686 code lines (317 Rust files; 336 workspace-wide incl. fuzz)** | **2,426** |
+| **Total** | **Pure Rust archive/compression library** | **~92,598 code lines (339 Rust files; 394 workspace-wide incl. fuzz/docs/scripts)** | **2,468** |
 
-Lines are tokei Rust code lines per crate (src + tests + examples); tests are nextest tests + doctests, measured 2026-07-13.
+Lines are tokei Rust code lines per crate (src + tests + examples); tests are nextest tests + doctests, measured 2026-07-30.
 
 ## Installation
 
@@ -295,22 +295,22 @@ Adaptive entropy coding for scientific data:
 
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
-| oxiarc-core     | Stable  | 228        | 187           |
-| oxiarc-deflate  | Stable  | 168        | 260           |
+| oxiarc-core     | Stable  | 228        | 196           |
+| oxiarc-deflate  | Stable  | 168        | 293           |
 | oxiarc-lzhuf    | Stable  | 106        | 188           |
 | oxiarc-bzip2    | Stable  | 56         | 108           |
 | oxiarc-lz4      | Stable  | 126        | 166           |
 | oxiarc-zstd     | Stable  | 161        | 208           |
-| oxiarc-lzma     | Stable  | 188        | 186           |
+| oxiarc-lzma     | Stable  | 188        | 187           |
 | oxiarc-archive  | Stable  | 438        | 524           |
 | oxiarc-lzw      | Stable  | 67         | 100           |
 | oxiarc-brotli   | Stable  | 101        | 219           |
 | oxiarc-snappy   | Stable  | 35         | 140           |
 | oxiarc-szip     | Stable  | 27         | 47            |
 | oxiarc-cli      | Stable  | 45         | 92            |
-| **Total**       |         | **1,746**  | **2,426**     |
+| **Total**       |         | **1,746**  | **2,468**     |
 
-Test counts measured 2026-07-13 (nextest tests + doctests, all features, 0 failed, 0 ignored); public-API item counts are the v0.3.6 snapshot. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions. Ahead of a 1.0 release, 18 public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
+Test counts measured 2026-07-30 (nextest tests + doctests, all features, 0 failed, 0 ignored); public-API item counts are the v0.3.6 snapshot. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions. Ahead of a 1.0 release, 18 public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -382,7 +382,7 @@ cargo nextest run -p oxiarc-archive --features zip-oracle,xz-oracle,lha-oracle
 cargo nextest run --workspace --all-features
 ```
 
-Verified interop snapshot (2026-07-13, live tools): zstd 64/64 corpus + 101/101 wide frames decode byte-identical, 85/85 oxiarc frames accepted by `zstd -d`; brotli 608/608 decode / 588/588 accepted; xz 5.8.3 60/60 decode / 8/8 encode; bzip2 1.0.8 324/324 both directions; lz4 1.10.0 11/11 + 44/44 + 3/3 linked; TIFF-LZW 125/125 vs Pillow/libtiff (encoder byte-identical to libtiff); libaec 1.1.4 2450/2450 decode + 4900/4900 encode; DEFLATE/zlib/gzip bit-exact vs CPython + gzip CLI.
+Verified interop snapshot (last full run 2026-07-13, live tools; unchanged in 0.4.0 — this release's DEFLATE/zlib decoder rewrite changed no wire format or output, so the DEFLATE/zlib/gzip result below still holds): zstd 64/64 corpus + 101/101 wide frames decode byte-identical, 85/85 oxiarc frames accepted by `zstd -d`; brotli 608/608 decode / 588/588 accepted; xz 5.8.3 60/60 decode / 8/8 encode; bzip2 1.0.8 324/324 both directions; lz4 1.10.0 11/11 + 44/44 + 3/3 linked; TIFF-LZW 125/125 vs Pillow/libtiff (encoder byte-identical to libtiff); libaec 1.1.4 2450/2450 decode + 4900/4900 encode; DEFLATE/zlib/gzip bit-exact vs CPython + gzip CLI.
 
 ## Performance
 
@@ -817,7 +817,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all tests (2,289 via nextest + 137 doctests = 2,426)
+# Run all tests (2,329 via nextest + 139 doctests = 2,468)
 cargo nextest run --workspace --all-features
 cargo test --doc --workspace --all-features
 
