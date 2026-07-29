@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.3.6, 2026-07-08)
+# oxiarc-deflate - Development Status (v0.4.0, 2026-07-30)
 
 ## Completed Features (COMPLETE)
 
@@ -137,7 +137,7 @@
     - Concurrent pool: 8 rayon threads each compress a 1 MiB input via the same pool; total allocations < 16 buffers.
     - Pool boundary: per-bucket cap respected (cap of 2 → third buffer beyond cap is dropped, not returned).
   - **Risk:** stale buffer contents being read as uninitialized data. Mitigation: `PooledBuf::get_mut` zeroes the slice before handing back to caller.
-- [ ] Pre-allocated output buffers
+- [x] Pre-allocated output buffers (done 2026-07-30) — `Inflater::with_output_capacity(size_hint)` pre-sizes the decompressor's output buffer from a size hint (clamped to the new `MAX_OUTPUT_CAPACITY_HINT` = 64 MiB); GZIP decoding seeds this automatically from the trailing ISIZE field. Encoder-side (`Deflater`) output is still a plain growable `Vec`.
 
 ### Features
 - [x] Zlib wrapper (RFC 1950)

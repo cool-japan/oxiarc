@@ -218,8 +218,20 @@ impl GzipDecoder {
         // Inflate the DEFLATE payload, tracking exactly how many compressed
         // bytes it occupied so the trailer position is known even when more
         // members follow.
-        let mut bit_reader = BitReader::new(std::io::Cursor::new(&data[pos..]));
-        let mut inflater = Inflater::new();
+        let mut bit_reader = BitReader::buffered(std::io::Cursor::new(&data[pos..]));
+        // Pre-size the output from the trailing ISIZE field. The value is
+        // attacker-controlled, so it is only ever a capacity hint: it is
+        // clamped by `with_output_capacity` and the buffer still grows
+        // normally if the member decodes to more. For a multi-member stream
+        // this is the *last* member's ISIZE, which is still a far better
+        // starting point than the 64 KiB default.
+        let size_hint = data
+            .len()
+            .checked_sub(4)
+            .and_then(|t| data.get(t..))
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map_or(0, |b| u32::from_le_bytes(b) as usize);
+        let mut inflater = Inflater::with_output_capacity(size_hint);
         let (decompressed, consumed) = inflater.inflate_consumed(&mut bit_reader)?;
 
         // `consumed` is bounded by the slice length handed to the BitReader,

@@ -3,12 +3,12 @@
 
 Pure Rust Snappy compression library, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.3.6-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![Tests](https://img.shields.io/badge/tests-114%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.3.6 (2026-07-13) | 140 tests passing**
+**Version: 0.4.0 (2026-07-30) | 140 tests passing**
 
 ## Features
 
@@ -28,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-snappy = "0.3.6"
+oxiarc-snappy = "0.4.0"
 ```
 
 ### Block Format
@@ -91,10 +91,10 @@ All other functionality — block format, framing format, CRC32C (with SSE 4.2 h
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-snappy = "0.3.6"
+oxiarc-snappy = "0.4.0"
 
 # With parallel compression
-oxiarc-snappy = { version = "0.3.6", features = ["parallel"] }
+oxiarc-snappy = { version = "0.4.0", features = ["parallel"] }
 ```
 
 ## CRC32C

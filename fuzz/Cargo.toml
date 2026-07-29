@@ -38,6 +38,12 @@ name = "fuzz_inflate"
 path = "fuzz_targets/fuzz_inflate.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_inflate_into"
+path = "fuzz_targets/fuzz_inflate_into.rs"
+test = false
+doc = false
 bench = false
 
 [[bin]]

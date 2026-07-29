@@ -63,6 +63,7 @@ pub mod optimal;
 pub mod pool;
 pub mod streaming;
 pub mod tables;
+mod window;
 pub mod zlib;
 
 #[cfg(feature = "async-io")]
@@ -87,12 +88,12 @@ pub use parallel::{
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
 pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
-pub use inflate::{Inflater, inflate};
+pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};
 pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
 pub use optimal::OptimalParser;
 pub use pool::{DeflatePool, PoolStats};
 pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
 pub use zlib::{
     Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
-    zlib_decompress, zlib_decompress_with_dict, zlib_requires_dictionary,
+    zlib_decompress, zlib_decompress_into, zlib_decompress_with_dict, zlib_requires_dictionary,
 };

@@ -86,7 +86,7 @@ pub mod async_io;
 pub mod mmap;
 
 // Re-exports for convenience
-pub use bitstream::{BitReader, BitWriter};
+pub use bitstream::{BitCache, BitReader, BitWriter};
 pub use cancel::CancellationToken;
 pub use crc::{Crc16, Crc32, Crc64};
 pub use entry::{CompressionMethod, Entry, EntryBuilder, EntryType, FileAttributes};
@@ -134,7 +134,7 @@ pub mod prelude {
     pub use crate::async_io::{
         AsyncCompressor, AsyncCompressorWrapper, AsyncDecompressor, AsyncDecompressorWrapper,
     };
-    pub use crate::bitstream::{BitReader, BitWriter};
+    pub use crate::bitstream::{BitCache, BitReader, BitWriter};
     pub use crate::crc::{Crc16, Crc32};
     pub use crate::entry::{CompressionMethod, Entry, EntryBuilder, EntryType};
     pub use crate::error::{OxiArcError, Result};
