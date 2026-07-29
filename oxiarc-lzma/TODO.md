@@ -1,5 +1,5 @@
 
-# oxiarc-lzma - Development Status (v0.4.0, 2026-07-30)
+# oxiarc-lzma - Development Status (v0.4.1, 2026-07-30)
 
 ## Completed Features (COMPLETE)
 
@@ -93,7 +93,7 @@
   - Configurable nice_length (8-273)
   - Level 8: 128 nice length
   - Level 9: 273 nice length
-- [x] Full dynamic programming optimal parser — forward DP already in optimal.rs; multi-variant/backward refinement deferred to v0.4.0
+- [x] Full dynamic programming optimal parser — forward DP already in optimal.rs; multi-variant/backward refinement deferred to v0.4.1
 - [x] Binary tree match finder — Bt4MatchFinder with h2/h3/h4 tables, cyclic BST son[] array, cut_value depth limit; MatchFinder trait dispatch; level 9 uses BT4 (done 2026-05-16)
 
 ### Performance
