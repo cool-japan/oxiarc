@@ -11,8 +11,8 @@
 //! - **Distance**: 0-29 (back-reference distances)
 //! - **Code Length**: 0-18 (for encoding dynamic Huffman trees)
 
-use oxiarc_core::BitReader;
 use oxiarc_core::error::{OxiArcError, Result};
+use oxiarc_core::{BitCache, BitReader};
 use std::io::Read;
 
 /// Maximum code length in DEFLATE (15 bits).
@@ -30,21 +30,59 @@ pub const CODELEN_ALPHABET_SIZE: usize = 19;
 /// End of block symbol.
 pub const END_OF_BLOCK: u16 = 256;
 
+/// Marks a root-table entry as a pointer to a sub-table rather than a symbol.
+const ENTRY_SUBTABLE: u32 = 1 << 31;
+
+/// Mask for the code-length field (or sub-table index width) of an entry.
+const ENTRY_LEN_MASK: u32 = 0xFF;
+
+/// Bit position of the symbol field (or sub-table offset) of an entry.
+const ENTRY_PAYLOAD_SHIFT: u32 = 8;
+
+/// Mask (post-shift) for the symbol field / sub-table offset of an entry.
+const ENTRY_PAYLOAD_MASK: u32 = 0xFFFF;
+
+/// Largest table index representable in an entry's payload field.
+const MAX_TABLE_INDEX: usize = ENTRY_PAYLOAD_MASK as usize;
+
 /// A Huffman tree for decoding.
 ///
-/// This uses a table-based approach for fast decoding. For codes up to
-/// `FAST_BITS` length, we use a direct lookup table. For longer codes,
-/// we fall back to bit-by-bit traversal.
+/// Decoding is table driven, in the two-level layout used by zlib's
+/// `inflate_table` and by libdeflate: a *root* table indexed by the next
+/// [`HuffmanTree::ROOT_BITS`] bits of the stream resolves every code that
+/// short in a single load; longer codes select a *sub-table* which is
+/// indexed by the remaining bits. The root table and all sub-tables live in
+/// one contiguous `Vec<u32>` so a decode costs at most two dependent L1
+/// loads and never walks the stream bit by bit.
+///
+/// Each entry is packed into a `u32`:
+///
+/// | bits    | symbol entry            | sub-table entry              |
+/// |---------|-------------------------|------------------------------|
+/// | 0..8    | code length (1..=15)    | sub-table index width        |
+/// | 8..24   | symbol                  | sub-table offset in `table`  |
+/// | 31      | 0                       | 1 ([`ENTRY_SUBTABLE`])       |
+///
+/// An all-zero entry means "no code here": either an unused slot of a
+/// legitimately incomplete code, or a hole in a sub-table. Those decode to
+/// a length of 0, which callers must reject.
+///
+/// The canonical per-length tables (`symbols` / `base_codes` /
+/// `symbol_offsets`) are retained for [`HuffmanTree::decode_slow`], the
+/// bit-at-a-time fallback used when fewer bits are buffered than the code
+/// might need (end of stream, or an exact-mode [`BitReader`] that must not
+/// read ahead).
 #[derive(Debug, Clone)]
 pub struct HuffmanTree {
-    /// Direct lookup table for fast decoding.
-    /// Entry format: (symbol, code_length) or (subtable_index | 0x8000, bits_to_skip)
-    fast_table: Vec<(u16, u8)>,
-    /// Number of bits for fast lookup.
-    fast_bits: u8,
+    /// Root table (`1 << root_bits` entries) followed by all sub-tables.
+    table: Vec<u32>,
+    /// Number of bits indexing the root table.
+    root_bits: u8,
+    /// `(1 << root_bits) - 1`.
+    root_mask: u32,
     /// Maximum code length in this tree.
     max_code_length: u8,
-    /// Symbol lookup for codes longer than fast_bits.
+    /// Symbol lookup for the bit-at-a-time fallback.
     /// Indexed by (code - base_code) for each length.
     symbols: Vec<u16>,
     /// Base codes for each length.
@@ -54,8 +92,13 @@ pub struct HuffmanTree {
 }
 
 impl HuffmanTree {
-    /// Number of bits for fast lookup table.
-    const FAST_BITS: u8 = 9;
+    /// Number of bits indexing the root lookup table.
+    ///
+    /// 10 bits (a 4 KiB root table) resolves essentially every literal of a
+    /// real DEFLATE stream in one load while keeping the per-block table
+    /// build cheap. Trees whose longest code is shorter use a
+    /// correspondingly smaller root table.
+    pub const ROOT_BITS: u8 = 10;
 
     /// Build a Huffman tree from code lengths.
     ///
@@ -115,8 +158,9 @@ impl HuffmanTree {
             // Special case: no symbols (all zeros)
             // Create a dummy tree that always returns error
             return Ok(Self {
-                fast_table: vec![(0, 0); 1 << Self::FAST_BITS],
-                fast_bits: Self::FAST_BITS,
+                table: vec![0u32; 1],
+                root_bits: 0,
+                root_mask: 0,
                 max_code_length: 0,
                 symbols: Vec::new(),
                 base_codes: [0; MAX_CODE_LENGTH + 1],
@@ -184,32 +228,104 @@ impl HuffmanTree {
             }
         }
 
-        // Build fast lookup table
-        let fast_bits = Self::FAST_BITS.min(max_length);
-        let fast_table_size = 1 << fast_bits;
-        let mut fast_table = vec![(0u16, 0u8); fast_table_size];
+        // ── Build the two-level decode table ────────────────────────────────
+        let root_bits = Self::ROOT_BITS.min(max_length);
+        let root_size = 1usize << root_bits;
+        let root_mask = (root_size - 1) as u32;
+        let mut table = vec![0u32; root_size];
 
-        // Fill fast table
+        // Pass 1: size the sub-tables. For every code longer than
+        // `root_bits`, the first `root_bits` bits (in stream order, i.e. the
+        // low bits of the reversed canonical code) select a root slot; that
+        // slot needs a sub-table wide enough for the longest code sharing the
+        // prefix.
+        let mut sub_max_len = vec![0u8; root_size];
+        let mut assign = next_code;
         for (symbol, &len) in code_lengths.iter().enumerate() {
-            if len > 0 && len <= fast_bits {
-                let len = len as usize;
-                let code = Self::reverse_bits(next_code[len] as u16, len as u8);
-                next_code[len] += 1;
+            let _ = symbol;
+            if len == 0 {
+                continue;
+            }
+            let len_us = len as usize;
+            let reversed = Self::reverse_bits(assign[len_us] as u16, len);
+            assign[len_us] += 1;
+            if len > root_bits {
+                let slot = (reversed as u32 & root_mask) as usize;
+                if let Some(cur) = sub_max_len.get_mut(slot)
+                    && *cur < len
+                {
+                    *cur = len;
+                }
+            }
+        }
 
-                // Fill all entries that match this prefix
-                let fill_count = 1 << (fast_bits - len as u8);
-                for i in 0..fill_count {
-                    let index = code as usize | (i << len);
-                    if index < fast_table_size {
-                        fast_table[index] = (symbol as u16, len as u8);
+        // Allocate the sub-tables contiguously after the root table and
+        // install the pointer entries.
+        let mut sub_offset = vec![0u32; root_size];
+        for slot in 0..root_size {
+            let longest = sub_max_len.get(slot).copied().unwrap_or(0);
+            if longest == 0 {
+                continue;
+            }
+            let sub_bits = longest - root_bits;
+            let offset = table.len();
+            if offset > MAX_TABLE_INDEX {
+                return Err(OxiArcError::invalid_header(
+                    "Huffman decode table too large",
+                ));
+            }
+            table.resize(offset + (1usize << sub_bits), 0u32);
+            if let Some(slot_entry) = table.get_mut(slot) {
+                *slot_entry =
+                    ENTRY_SUBTABLE | ((offset as u32) << ENTRY_PAYLOAD_SHIFT) | (sub_bits as u32);
+            }
+            if let Some(off) = sub_offset.get_mut(slot) {
+                *off = offset as u32;
+            }
+        }
+
+        // Pass 2: fill in the symbol entries, replaying the same canonical
+        // code assignment.
+        let mut assign = next_code;
+        for (symbol, &len) in code_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let len_us = len as usize;
+            let reversed = Self::reverse_bits(assign[len_us] as u16, len) as u32;
+            assign[len_us] += 1;
+            let entry = ((symbol as u32) << ENTRY_PAYLOAD_SHIFT) | (len as u32);
+
+            if len <= root_bits {
+                // Replicate over every root index sharing this prefix.
+                let step = 1usize << len;
+                let mut index = reversed as usize;
+                while index < root_size {
+                    if let Some(slot) = table.get_mut(index) {
+                        *slot = entry;
                     }
+                    index += step;
+                }
+            } else {
+                let slot = (reversed & root_mask) as usize;
+                let longest = sub_max_len.get(slot).copied().unwrap_or(0);
+                let base = sub_offset.get(slot).copied().unwrap_or(0) as usize;
+                let sub_size = 1usize << (longest - root_bits);
+                let step = 1usize << (len - root_bits);
+                let mut index = (reversed >> root_bits) as usize;
+                while index < sub_size {
+                    if let Some(slot_entry) = table.get_mut(base + index) {
+                        *slot_entry = entry;
+                    }
+                    index += step;
                 }
             }
         }
 
         Ok(Self {
-            fast_table,
-            fast_bits,
+            table,
+            root_bits,
+            root_mask,
             max_code_length: max_length,
             symbols,
             base_codes,
@@ -227,6 +343,78 @@ impl HuffmanTree {
         reversed
     }
 
+    /// Longest code this tree can produce.
+    #[inline(always)]
+    pub fn max_code_length(&self) -> u8 {
+        self.max_code_length
+    }
+
+    /// Look up the packed table entry for the bits currently buffered in
+    /// `reader`, **without** refilling or consuming anything.
+    ///
+    /// The returned entry's length field is `0` when no code matches (either
+    /// the slot is unused or too few bits were buffered). Callers must reject
+    /// a length of `0` and any length exceeding
+    /// [`BitReader::available_bits`] — only then are all the consumed bits
+    /// known to be real stream bits rather than the zero padding
+    /// [`BitReader::peek_bits_prefilled`] supplies past the end.
+    ///
+    /// This returns a plain `u32` rather than a `Result` on purpose: the
+    /// crate's error type is 48 bytes, so a `Result` return in the innermost
+    /// decode loop costs an indirect store per symbol.
+    #[inline(always)]
+    pub fn lookup<R: Read>(&self, reader: &BitReader<R>) -> u32 {
+        let entry = self.root_entry(reader.peek_bits_prefilled(self.root_bits));
+        if entry & ENTRY_SUBTABLE == 0 {
+            return entry;
+        }
+        self.lookup_subtable(reader.peek_bits_prefilled(self.max_code_length), entry)
+    }
+
+    /// Same as [`HuffmanTree::lookup`] but against a detached
+    /// [`BitCache`] — the form used by the decoder's inner loop.
+    ///
+    /// The common case costs a single mask and a single load; the wider peek
+    /// needed to index a sub-table is done only on the rare long-code path.
+    #[inline(always)]
+    pub fn lookup_cached(&self, cache: &BitCache) -> u32 {
+        let entry = self.root_entry(cache.peek_mask(self.root_mask));
+        if entry & ENTRY_SUBTABLE == 0 {
+            return entry;
+        }
+        self.lookup_subtable(cache.peek_bits(self.max_code_length), entry)
+    }
+
+    /// Root-table entry for `bits` (zero padded past the end of the stream).
+    #[inline(always)]
+    fn root_entry(&self, bits: u32) -> u32 {
+        self.table
+            .get((bits & self.root_mask) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Second-level lookup for codes longer than [`HuffmanTree::ROOT_BITS`].
+    #[inline]
+    fn lookup_subtable(&self, bits: u32, entry: u32) -> u32 {
+        let sub_bits = (entry & ENTRY_LEN_MASK) as u8;
+        let base = ((entry >> ENTRY_PAYLOAD_SHIFT) & ENTRY_PAYLOAD_MASK) as usize;
+        let index = ((bits >> self.root_bits) & ((1u32 << sub_bits) - 1)) as usize;
+        self.table.get(base + index).copied().unwrap_or(0)
+    }
+
+    /// Code length encoded in a table entry (`0` when the entry is unused).
+    #[inline(always)]
+    pub fn entry_length(entry: u32) -> u8 {
+        (entry & ENTRY_LEN_MASK) as u8
+    }
+
+    /// Symbol encoded in a table entry.
+    #[inline(always)]
+    pub fn entry_symbol(entry: u32) -> u16 {
+        ((entry >> ENTRY_PAYLOAD_SHIFT) & ENTRY_PAYLOAD_MASK) as u16
+    }
+
     /// Decode a symbol from the bit stream.
     /// This is a hot path - inline for better performance.
     #[inline]
@@ -235,28 +423,24 @@ impl HuffmanTree {
             return Err(OxiArcError::invalid_huffman(reader.bit_position()));
         }
 
-        // Try fast lookup (handles 90%+ of symbols)
-        // If peek_bits fails (not enough bits remaining), fall back to slow decoding
-        match reader.peek_bits(self.fast_bits) {
-            Ok(bits) => {
-                let (symbol, len) = unsafe {
-                    // SAFETY: bits is masked to fast_bits range, guaranteed to be valid index
-                    *self.fast_table.get_unchecked(bits as usize)
-                };
-
-                if len > 0 {
-                    reader.skip_bits(len)?;
-                    return Ok(symbol);
-                }
-
-                // Slow path for longer codes (rare)
-                self.decode_slow(reader)
-            }
-            Err(_) => {
-                // Not enough bits for fast lookup, use slow path
-                self.decode_slow(reader)
-            }
+        // Top up the accumulator so a whole code is present. `try_fill`
+        // reports end of stream as `Ok(false)` rather than an error; a short
+        // tail is handled by the length check below.
+        if reader.available_bits() < self.max_code_length {
+            reader.try_fill(self.max_code_length)?;
         }
+
+        let entry = self.lookup(reader);
+        let len = Self::entry_length(entry);
+        if len != 0 && len <= reader.available_bits() {
+            reader.consume_bits(len);
+            return Ok(Self::entry_symbol(entry));
+        }
+
+        // Too few bits buffered for the code the table selected, or no code
+        // at all: fall back to the bit-at-a-time canonical decoder, which
+        // reads exactly what it needs and reports EOF precisely.
+        self.decode_slow(reader)
     }
 
     /// Slow decoding path for codes longer than fast_bits.

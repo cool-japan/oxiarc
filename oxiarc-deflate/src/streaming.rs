@@ -340,7 +340,7 @@ impl<R: Read> GzipStreamDecoder<R> {
         }
 
         let cursor = Cursor::new(compressed);
-        let mut bit_reader = BitReader::new(cursor);
+        let mut bit_reader = BitReader::buffered(cursor);
         let mut all_decompressed = Vec::new();
 
         loop {
@@ -859,7 +859,7 @@ impl<R: Read> ZlibStreamDecoder<R> {
 
             // Inflate the member's DEFLATE payload, tracking the exact
             // number of compressed bytes consumed.
-            let mut bit_reader = BitReader::new(Cursor::new(&remaining[2..]));
+            let mut bit_reader = BitReader::buffered(Cursor::new(&remaining[2..]));
             let mut inflater = Inflater::new();
             let (decompressed, consumed) =
                 inflater.inflate_consumed(&mut bit_reader).map_err(|e| {

@@ -11,19 +11,33 @@ use crate::tables::{
     CODE_LENGTH_ORDER, DISTANCE_EXTRA_BITS, LENGTH_EXTRA_BITS, decode_distance, decode_length,
     fixed_distance_tree, fixed_litlen_tree,
 };
+use crate::window::{DecodeSink, InflateWindow, SliceSink};
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::traits::{DecompressStatus, Decompressor};
-use oxiarc_core::{BitReader, OutputRingBuffer};
+use oxiarc_core::{BitCache, BitReader};
 use std::io::Read;
 
 /// Maximum dictionary size for DEFLATE (32KB).
 pub const MAX_DICTIONARY_SIZE: usize = 32768;
 
+/// Output capacity a fresh [`Inflater`] starts with when no size hint is
+/// supplied.
+const DEFAULT_OUTPUT_CAPACITY: usize = 65536;
+
+/// Upper bound applied to a caller-supplied output size hint.
+///
+/// A hint originates from data the decoder has not verified (a GZIP `ISIZE`
+/// field, a container's declared tile size, ...), so it is clamped rather
+/// than trusted: 64 MiB is far above any realistic single DEFLATE member yet
+/// small enough that a crafted hint cannot be turned into a memory
+/// exhaustion primitive.
+pub const MAX_OUTPUT_CAPACITY_HINT: usize = 64 * 1024 * 1024;
+
 /// DEFLATE decompressor.
 #[derive(Debug)]
 pub struct Inflater {
-    /// Output ring buffer.
-    output: OutputRingBuffer,
+    /// Decoded output plus the LZ77 history window.
+    output: InflateWindow,
     /// Whether we've seen the final block.
     final_block: bool,
     /// Whether decompression is complete.
@@ -44,8 +58,21 @@ pub struct Inflater {
 impl Inflater {
     /// Create a new DEFLATE decompressor.
     pub fn new() -> Self {
+        Self::with_output_capacity(DEFAULT_OUTPUT_CAPACITY)
+    }
+
+    /// Create a new DEFLATE decompressor that pre-allocates room for
+    /// `size_hint` decompressed bytes.
+    ///
+    /// This only avoids repeated reallocation while decoding; it is **not**
+    /// trusted as an authoritative output size. The hint is clamped to
+    /// [`MAX_OUTPUT_CAPACITY_HINT`] so a hostile container header (a GZIP
+    /// `ISIZE`, a TIFF tile size, ...) cannot turn into a huge speculative
+    /// allocation, and the buffer still grows normally if the real output is
+    /// larger.
+    pub fn with_output_capacity(size_hint: usize) -> Self {
         Self {
-            output: OutputRingBuffer::with_capacity(32768, 65536),
+            output: InflateWindow::with_capacity(size_hint.min(MAX_OUTPUT_CAPACITY_HINT)),
             final_block: false,
             finished: false,
             expected_dict_checksum: None,
@@ -156,8 +183,14 @@ impl Inflater {
     }
 
     /// Decompress data from a reader.
+    ///
+    /// The `BitReader` created here owns `reader` for the duration of the
+    /// call, so it uses the fast buffered refill mode. Bytes prefetched past
+    /// the end of the DEFLATE stream are *not* returned to `reader`; use
+    /// [`Inflater::inflate_consumed`] with a caller-owned
+    /// [`BitReader::new`] when the same stream must be read on afterwards.
     pub fn inflate_reader<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
-        let mut bit_reader = BitReader::new(reader);
+        let mut bit_reader = BitReader::buffered(reader);
         self.inflate(&mut bit_reader)
     }
 
@@ -203,204 +236,16 @@ impl Inflater {
         Ok(self.output.output().to_vec())
     }
 
-    /// Decompress a single block.
+    /// Decompress a single block into this inflater's window.
     fn inflate_block<R: Read>(&mut self, reader: &mut BitReader<R>) -> Result<()> {
-        // Read block header
-        let bfinal = reader.read_bit()?;
-        let btype = reader.read_bits(2)?;
-
-        self.final_block = bfinal;
-
-        match btype {
-            0 => self.inflate_stored(reader),
-            1 => self.inflate_fixed(reader),
-            2 => self.inflate_dynamic(reader),
-            3 => Err(OxiArcError::invalid_header("Reserved block type 3")),
-            _ => unreachable!(),
-        }
-    }
-
-    /// Decompress a stored (uncompressed) block.
-    fn inflate_stored<R: Read>(&mut self, reader: &mut BitReader<R>) -> Result<()> {
-        // Align to byte boundary
-        reader.align_to_byte();
-
-        // Read LEN and NLEN
-        let len = reader.read_bits(16)? as u16;
-        let nlen = reader.read_bits(16)? as u16;
-
-        // Validate
-        if len != !nlen {
-            return Err(OxiArcError::corrupted(
-                reader.bit_position() / 8,
-                format!("LEN/NLEN mismatch: {} vs {}", len, !nlen),
-            ));
-        }
-
-        // Detect sync-flush: empty stored block (LEN=0).
-        self.last_empty_stored = len == 0;
-
-        // Copy bytes
-        let mut buf = vec![0u8; len as usize];
-        reader.read_bytes(&mut buf)?;
-        self.output.write_literals(&buf);
-
-        Ok(())
-    }
-
-    /// Decompress a block with fixed Huffman codes.
-    fn inflate_fixed<R: Read>(&mut self, reader: &mut BitReader<R>) -> Result<()> {
-        let litlen_tree = fixed_litlen_tree()?;
-        let dist_tree = fixed_distance_tree()?;
-
-        self.inflate_huffman(reader, litlen_tree, dist_tree)
-    }
-
-    /// Decompress a block with dynamic Huffman codes.
-    fn inflate_dynamic<R: Read>(&mut self, reader: &mut BitReader<R>) -> Result<()> {
-        // Read code counts
-        let hlit = reader.read_bits(5)? as usize + 257; // literal/length codes
-        let hdist = reader.read_bits(5)? as usize + 1; // distance codes
-        let hclen = reader.read_bits(4)? as usize + 4; // code length codes
-
-        // Read code length code lengths
-        let mut code_length_lengths = [0u8; 19];
-        for i in 0..hclen {
-            code_length_lengths[CODE_LENGTH_ORDER[i]] = reader.read_bits(3)? as u8;
-        }
-
-        // Build code length tree. The code-length (19-symbol) alphabet MUST be
-        // a complete Huffman code per RFC 1951 §3.2.7, so use the strict
-        // constructor that rejects an incomplete set (as zlib does). This is
-        // the exact class of corruption a buggy dynamic-Huffman encoder produces
-        // and it must not be silently accepted.
-        let code_length_tree = HuffmanTree::from_code_length_code(&code_length_lengths)?;
-
-        // Read literal/length and distance code lengths
-        let mut all_lengths = vec![0u8; hlit + hdist];
-        let mut i = 0;
-
-        while i < all_lengths.len() {
-            let code = code_length_tree.decode(reader)?;
-
-            match code {
-                0..=15 => {
-                    all_lengths[i] = code as u8;
-                    i += 1;
-                }
-                16 => {
-                    // Copy previous length 3-6 times
-                    if i == 0 {
-                        return Err(OxiArcError::corrupted(
-                            reader.bit_position() / 8,
-                            "Code 16 at start of lengths",
-                        ));
-                    }
-                    let repeat = reader.read_bits(2)? as usize + 3;
-                    let prev = all_lengths[i - 1];
-                    for _ in 0..repeat {
-                        if i >= all_lengths.len() {
-                            return Err(OxiArcError::corrupted(
-                                reader.bit_position() / 8,
-                                "Code length overflow",
-                            ));
-                        }
-                        all_lengths[i] = prev;
-                        i += 1;
-                    }
-                }
-                17 => {
-                    // Repeat 0 for 3-10 times
-                    let repeat = reader.read_bits(3)? as usize + 3;
-                    for _ in 0..repeat {
-                        if i >= all_lengths.len() {
-                            return Err(OxiArcError::corrupted(
-                                reader.bit_position() / 8,
-                                "Code length overflow",
-                            ));
-                        }
-                        all_lengths[i] = 0;
-                        i += 1;
-                    }
-                }
-                18 => {
-                    // Repeat 0 for 11-138 times
-                    let repeat = reader.read_bits(7)? as usize + 11;
-                    for _ in 0..repeat {
-                        if i >= all_lengths.len() {
-                            return Err(OxiArcError::corrupted(
-                                reader.bit_position() / 8,
-                                "Code length overflow",
-                            ));
-                        }
-                        all_lengths[i] = 0;
-                        i += 1;
-                    }
-                }
-                _ => {
-                    return Err(OxiArcError::invalid_huffman(reader.bit_position()));
-                }
-            }
-        }
-
-        // Split into literal/length and distance lengths
-        let litlen_lengths = &all_lengths[..hlit];
-        let dist_lengths = &all_lengths[hlit..];
-
-        // Build trees
-        let litlen_tree = HuffmanTree::from_code_lengths(litlen_lengths)?;
-        let dist_tree = HuffmanTree::from_code_lengths(dist_lengths)?;
-
-        self.inflate_huffman(reader, &litlen_tree, &dist_tree)
-    }
-
-    /// Decompress using Huffman codes.
-    fn inflate_huffman<R: Read>(
-        &mut self,
-        reader: &mut BitReader<R>,
-        litlen_tree: &HuffmanTree,
-        dist_tree: &HuffmanTree,
-    ) -> Result<()> {
-        loop {
-            let code = litlen_tree.decode(reader)?;
-
-            if code < 256 {
-                // Literal byte
-                self.output.write_literal(code as u8);
-            } else if code == 256 {
-                // End of block
-                break;
-            } else if code <= 285 {
-                // Length code
-                let length_idx = (code - 257) as usize;
-                let extra_bits = LENGTH_EXTRA_BITS[length_idx];
-                let extra = reader.read_bits(extra_bits)? as u16;
-                let length = decode_length(code, extra);
-
-                // Read distance
-                let dist_code = dist_tree.decode(reader)?;
-                if dist_code >= 30 {
-                    return Err(OxiArcError::corrupted(
-                        reader.bit_position() / 8,
-                        format!("Invalid distance code: {}", dist_code),
-                    ));
-                }
-
-                let dist_extra_bits = DISTANCE_EXTRA_BITS[dist_code as usize];
-                let dist_extra = reader.read_bits(dist_extra_bits)? as u16;
-                let distance = decode_distance(dist_code, dist_extra);
-
-                // Copy from history
-                self.output.copy_match(distance as usize, length as usize)?;
-            } else {
-                return Err(OxiArcError::corrupted(
-                    reader.bit_position() / 8,
-                    format!("Invalid literal/length code: {}", code),
-                ));
-            }
-        }
-
-        Ok(())
+        let mut state = BlockState {
+            final_block: self.final_block,
+            last_empty_stored: self.last_empty_stored,
+        };
+        let result = inflate_block_into(reader, &mut self.output, &mut state);
+        self.final_block = state.final_block;
+        self.last_empty_stored = state.last_empty_stored;
+        result
     }
 
     /// Get the decompressed output.
@@ -433,11 +278,13 @@ impl Inflater {
         input: &[u8],
     ) -> oxiarc_core::error::Result<Option<(Vec<u8>, usize)>> {
         // Snapshot before any work so we can roll back on partial-delivery EOF.
-        let ring_snap = self.output.ring_snapshot();
+        let ring_snap = self.output.snapshot();
         let out_len_before = self.output.output_len();
 
         let cursor = std::io::Cursor::new(input);
-        let mut br = oxiarc_core::BitReader::new(cursor);
+        // The BitReader owns the cursor and `bits_read()` stays exact, so the
+        // fast buffered refill mode is safe here.
+        let mut br = oxiarc_core::BitReader::buffered(cursor);
 
         loop {
             self.last_empty_stored = false;
@@ -449,7 +296,7 @@ impl Inflater {
                         let bytes_consumed = usize::try_from(br.bits_read())
                             .unwrap_or(usize::MAX)
                             .div_ceil(8);
-                        let decompressed = self.output.drain_output();
+                        let decompressed = self.output.drain();
                         return Ok(Some((decompressed, bytes_consumed)));
                     }
                     // Non-empty block; continue to next block.
@@ -459,12 +306,12 @@ impl Inflater {
                 {
                     // Input exhausted before sync flush — need more data.
                     // Fully restore to pre-call state so the caller can retry.
-                    self.output.restore_ring(&ring_snap, out_len_before);
+                    self.output.restore(&ring_snap, out_len_before);
                     self.last_empty_stored = false;
                     return Ok(None);
                 }
                 Err(oxiarc_core::error::OxiArcError::UnexpectedEof { .. }) => {
-                    self.output.restore_ring(&ring_snap, out_len_before);
+                    self.output.restore(&ring_snap, out_len_before);
                     self.last_empty_stored = false;
                     return Ok(None);
                 }
@@ -544,9 +391,16 @@ impl Decompressor for Inflater {
             return Ok((0, 0, DecompressStatus::Done));
         }
 
-        let mut cursor = std::io::Cursor::new(input);
-        let result = self.inflate_reader(&mut cursor)?;
-        let consumed = cursor.position() as usize;
+        // Track consumption through the BitReader rather than the cursor: in
+        // buffered mode the cursor is advanced past the end of the DEFLATE
+        // stream by the prefetch, so `cursor.position()` would over-report.
+        // `bits_read()` counts only bits the decoder actually consumed.
+        let cursor = std::io::Cursor::new(input);
+        let mut bit_reader = BitReader::buffered(cursor);
+        let (result, consumed_u64) = self.inflate_consumed(&mut bit_reader)?;
+        let consumed = usize::try_from(consumed_u64)
+            .unwrap_or(input.len())
+            .min(input.len());
 
         self.trait_pending = result;
         self.trait_pending_pos = 0;
@@ -798,4 +652,417 @@ mod tests {
             plain2
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Block decoder
+//
+// The block decoding routines are free functions generic over
+// [`DecodeSink`] so that the growable-`Vec` path ([`Inflater`]) and the
+// decompress-into-a-slice path ([`inflate_into`]) share one implementation —
+// in particular one copy of the symbol loop, which is the only place where a
+// subtle decoding bug could hide.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Per-stream block flags carried across [`inflate_block_into`] calls.
+#[derive(Debug, Default, Clone, Copy)]
+struct BlockState {
+    /// Set once the block just decoded had `BFINAL = 1`.
+    final_block: bool,
+    /// Set when the block just decoded was an empty stored block (a
+    /// sync flush).
+    last_empty_stored: bool,
+}
+
+/// Decompress one DEFLATE block into `sink`.
+fn inflate_block_into<R: Read, S: DecodeSink>(
+    reader: &mut BitReader<R>,
+    sink: &mut S,
+    state: &mut BlockState,
+) -> Result<()> {
+    // Read block header
+    let bfinal = reader.read_bit()?;
+    let btype = reader.read_bits(2)?;
+
+    state.final_block = bfinal;
+
+    match btype {
+        0 => inflate_stored_into(reader, sink, state),
+        1 => {
+            state.last_empty_stored = false;
+            let litlen_tree = fixed_litlen_tree()?;
+            let dist_tree = fixed_distance_tree()?;
+            inflate_huffman_into(reader, sink, litlen_tree, dist_tree)
+        }
+        2 => {
+            state.last_empty_stored = false;
+            inflate_dynamic_into(reader, sink)
+        }
+        3 => Err(OxiArcError::invalid_header("Reserved block type 3")),
+        _ => Err(OxiArcError::invalid_header("Invalid block type")),
+    }
+}
+
+/// Decompress a stored (uncompressed) block.
+fn inflate_stored_into<R: Read, S: DecodeSink>(
+    reader: &mut BitReader<R>,
+    sink: &mut S,
+    state: &mut BlockState,
+) -> Result<()> {
+    // Align to byte boundary
+    reader.align_to_byte();
+
+    // Read LEN and NLEN
+    let len = reader.read_bits(16)? as u16;
+    let nlen = reader.read_bits(16)? as u16;
+
+    // Validate
+    if len != !nlen {
+        return Err(OxiArcError::corrupted(
+            reader.bit_position() / 8,
+            format!("LEN/NLEN mismatch: {} vs {}", len, !nlen),
+        ));
+    }
+
+    // Detect sync-flush: empty stored block (LEN=0).
+    state.last_empty_stored = len == 0;
+
+    // Copy bytes
+    let mut buf = vec![0u8; len as usize];
+    reader.read_bytes(&mut buf)?;
+    sink.write_literals(&buf)
+}
+
+/// Decompress a block with dynamic Huffman codes.
+fn inflate_dynamic_into<R: Read, S: DecodeSink>(
+    reader: &mut BitReader<R>,
+    sink: &mut S,
+) -> Result<()> {
+    // Read code counts
+    let hlit = reader.read_bits(5)? as usize + 257; // literal/length codes
+    let hdist = reader.read_bits(5)? as usize + 1; // distance codes
+    let hclen = reader.read_bits(4)? as usize + 4; // code length codes
+
+    // Read code length code lengths
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        let order = CODE_LENGTH_ORDER.get(i).copied().unwrap_or(0);
+        let bits = reader.read_bits(3)? as u8;
+        if let Some(slot) = code_length_lengths.get_mut(order) {
+            *slot = bits;
+        }
+    }
+
+    // Build code length tree. The code-length (19-symbol) alphabet MUST be
+    // a complete Huffman code per RFC 1951 §3.2.7, so use the strict
+    // constructor that rejects an incomplete set (as zlib does). This is
+    // the exact class of corruption a buggy dynamic-Huffman encoder produces
+    // and it must not be silently accepted.
+    let code_length_tree = HuffmanTree::from_code_length_code(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = vec![0u8; hlit + hdist];
+    let mut i = 0;
+
+    while i < all_lengths.len() {
+        let code = code_length_tree.decode(reader)?;
+
+        match code {
+            0..=15 => {
+                if let Some(slot) = all_lengths.get_mut(i) {
+                    *slot = code as u8;
+                }
+                i += 1;
+            }
+            16 => {
+                // Copy previous length 3-6 times
+                if i == 0 {
+                    return Err(OxiArcError::corrupted(
+                        reader.bit_position() / 8,
+                        "Code 16 at start of lengths",
+                    ));
+                }
+                let repeat = reader.read_bits(2)? as usize + 3;
+                let prev = all_lengths.get(i - 1).copied().unwrap_or(0);
+                if i + repeat > all_lengths.len() {
+                    return Err(OxiArcError::corrupted(
+                        reader.bit_position() / 8,
+                        "Code length overflow",
+                    ));
+                }
+                for _ in 0..repeat {
+                    if let Some(slot) = all_lengths.get_mut(i) {
+                        *slot = prev;
+                    }
+                    i += 1;
+                }
+            }
+            17 | 18 => {
+                // Repeat 0 for 3-10 (code 17) or 11-138 (code 18) times
+                let repeat = if code == 17 {
+                    reader.read_bits(3)? as usize + 3
+                } else {
+                    reader.read_bits(7)? as usize + 11
+                };
+                if i + repeat > all_lengths.len() {
+                    return Err(OxiArcError::corrupted(
+                        reader.bit_position() / 8,
+                        "Code length overflow",
+                    ));
+                }
+                for _ in 0..repeat {
+                    if let Some(slot) = all_lengths.get_mut(i) {
+                        *slot = 0;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(OxiArcError::invalid_huffman(reader.bit_position()));
+            }
+        }
+    }
+
+    // Split into literal/length and distance lengths
+    let (litlen_lengths, dist_lengths) = all_lengths.split_at(hlit);
+
+    // Build trees
+    let litlen_tree = HuffmanTree::from_code_lengths(litlen_lengths)?;
+    let dist_tree = HuffmanTree::from_code_lengths(dist_lengths)?;
+
+    inflate_huffman_into(reader, sink, &litlen_tree, &dist_tree)
+}
+
+/// Decompress a Huffman-coded block.
+///
+/// The bit accumulator is detached into a [`BitCache`] local so the compiler
+/// can keep it in registers: the dependency chain
+/// `accumulator -> table lookup -> shift -> accumulator` runs once per
+/// symbol, and forcing it through memory adds a store-to-load forwarding
+/// stall to every single one. The accumulator is refilled once per symbol
+/// group rather than once per symbol — a worst-case length/distance pair
+/// needs 15 + 5 + 15 + 13 = 48 bits, which always fits in the >= 56 bits a
+/// refill provides.
+///
+/// Table entries are consumed as packed `u32`s so the innermost path never
+/// materialises the crate's 48-byte `Result`. Whenever fewer bits are
+/// buffered than a code might need — end of stream, or an exact-mode reader
+/// where speculative refills are deliberately disabled — the cache is handed
+/// back and [`HuffmanTree::decode`] takes over, reading exactly what it
+/// needs and reporting errors precisely.
+fn inflate_huffman_into<R: Read, S: DecodeSink>(
+    reader: &mut BitReader<R>,
+    sink: &mut S,
+    litlen_tree: &HuffmanTree,
+    dist_tree: &HuffmanTree,
+) -> Result<()> {
+    let cache = reader.detach();
+    // The cache is handed over and back **by value**: taking `&mut BitCache`
+    // across a non-inlined call would let its address escape, and the
+    // compiler would then have to keep the accumulator in memory for the
+    // whole loop.
+    let (result, cache) = inflate_huffman_cached(reader, cache, sink, litlen_tree, dist_tree);
+    reader.reattach(cache);
+    result
+}
+
+fn inflate_huffman_cached<R: Read, S: DecodeSink>(
+    reader: &mut BitReader<R>,
+    mut cache: BitCache,
+    sink: &mut S,
+    litlen_tree: &HuffmanTree,
+    dist_tree: &HuffmanTree,
+) -> (Result<()>, BitCache) {
+    // Widest single code either tree can produce.
+    let litlen_max = litlen_tree.max_code_length();
+    // A length/distance tail needs at most 5 length-extra + 15 distance +
+    // 13 distance-extra bits.
+    let match_tail_bits = 5 + dist_tree.max_code_length() + 13;
+
+    loop {
+        if let Err(e) = reader.refill_cache(&mut cache, litlen_max) {
+            return (Err(e), cache);
+        }
+
+        // ── literal / length symbol ─────────────────────────────────────
+        let entry = litlen_tree.lookup_cached(&cache);
+        let bits = HuffmanTree::entry_length(entry);
+        let code = if bits != 0 && bits <= cache.available() {
+            cache.consume(bits);
+            HuffmanTree::entry_symbol(entry)
+        } else {
+            match decode_detached(reader, cache, litlen_tree) {
+                Ok((symbol, c)) => {
+                    cache = c;
+                    symbol
+                }
+                Err((e, c)) => return (Err(e), c),
+            }
+        };
+
+        if code < 256 {
+            // Literal byte
+            if let Err(e) = sink.write_literal(code as u8) {
+                return (Err(e), cache);
+            }
+            continue;
+        }
+        if code == 256 {
+            // End of block
+            break;
+        }
+        if code > 285 {
+            let at = (reader.bit_position() + cache.consumed()) / 8;
+            return (
+                Err(OxiArcError::corrupted(
+                    at,
+                    format!("Invalid literal/length code: {}", code),
+                )),
+                cache,
+            );
+        }
+
+        // Top up once for the whole length/distance tail.
+        if let Err(e) = reader.refill_cache(&mut cache, match_tail_bits) {
+            return (Err(e), cache);
+        }
+
+        // ── length extra bits ───────────────────────────────────────────
+        let length_idx = (code - 257) as usize;
+        let extra_bits = LENGTH_EXTRA_BITS
+            .get(length_idx)
+            .copied()
+            .unwrap_or_default();
+        let extra = match read_extra(reader, &mut cache, extra_bits) {
+            Ok(v) => v,
+            Err(e) => return (Err(e), cache),
+        };
+        let length = decode_length(code, extra);
+
+        // ── distance symbol ─────────────────────────────────────────────
+        let dist_entry = dist_tree.lookup_cached(&cache);
+        let dist_bits = HuffmanTree::entry_length(dist_entry);
+        let dist_code = if dist_bits != 0 && dist_bits <= cache.available() {
+            cache.consume(dist_bits);
+            HuffmanTree::entry_symbol(dist_entry)
+        } else {
+            match decode_detached(reader, cache, dist_tree) {
+                Ok((symbol, c)) => {
+                    cache = c;
+                    symbol
+                }
+                Err((e, c)) => return (Err(e), c),
+            }
+        };
+        if dist_code >= 30 {
+            let at = (reader.bit_position() + cache.consumed()) / 8;
+            return (
+                Err(OxiArcError::corrupted(
+                    at,
+                    format!("Invalid distance code: {}", dist_code),
+                )),
+                cache,
+            );
+        }
+
+        // ── distance extra bits ─────────────────────────────────────────
+        let dist_extra_bits = DISTANCE_EXTRA_BITS
+            .get(dist_code as usize)
+            .copied()
+            .unwrap_or_default();
+        let dist_extra = match read_extra(reader, &mut cache, dist_extra_bits) {
+            Ok(v) => v,
+            Err(e) => return (Err(e), cache),
+        };
+        let distance = decode_distance(dist_code, dist_extra);
+
+        // Copy from history
+        if let Err(e) = sink.copy_match(distance as usize, length as usize) {
+            return (Err(e), cache);
+        }
+    }
+
+    (Ok(()), cache)
+}
+
+/// Read `count` extra bits, falling back to the reader when the detached
+/// cache does not hold enough (end of stream, or exact mode).
+#[inline(always)]
+fn read_extra<R: Read>(reader: &mut BitReader<R>, cache: &mut BitCache, count: u8) -> Result<u16> {
+    if count <= cache.available() {
+        let value = cache.peek_bits(count);
+        cache.consume(count);
+        return Ok(value as u16);
+    }
+    reader.reattach(*cache);
+    let value = reader.read_bits(count);
+    *cache = reader.detach();
+    Ok(value? as u16)
+}
+
+/// Decode one symbol through the general (cache-free) path.
+///
+/// Used when too few bits are buffered for the table lookup to be trusted;
+/// the cache is reattached first so `decode` sees the true bit position.
+#[inline]
+fn decode_detached<R: Read>(
+    reader: &mut BitReader<R>,
+    cache: BitCache,
+    tree: &HuffmanTree,
+) -> core::result::Result<(u16, BitCache), (OxiArcError, BitCache)> {
+    reader.reattach(cache);
+    let symbol = tree.decode(reader);
+    let cache = reader.detach();
+    match symbol {
+        Ok(symbol) => Ok((symbol, cache)),
+        Err(e) => Err((e, cache)),
+    }
+}
+
+/// Decompress a raw DEFLATE stream straight into a caller-supplied buffer.
+///
+/// No output `Vec` is allocated and no capacity is guessed: literals and
+/// matches are written directly into `dst`. This is the lowest-overhead
+/// entry point when the decompressed size is known in advance (a GeoTIFF
+/// tile, a PNG scanline block, a fixed-size record).
+///
+/// # Returns
+///
+/// The number of bytes written to `dst`.
+///
+/// # Errors
+///
+/// * [`OxiArcError::BufferTooSmall`] if the stream decodes to more than
+///   `dst.len()` bytes — the excess is never written and never silently
+///   dropped.
+/// * [`OxiArcError::InvalidDistance`] if a back-reference reaches behind the
+///   start of `dst`. Because no history precedes `dst`, a preset dictionary
+///   is not supported here; use [`Inflater::with_dictionary`] for that.
+/// * The usual header/EOF/Huffman errors for a corrupt stream.
+///
+/// Nothing about `dst` is trusted to the input: a hostile stream can neither
+/// over-allocate (nothing is allocated), nor write outside `dst`, nor loop
+/// forever (every block consumes input and every match is bounded).
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::{deflate, inflate_into};
+///
+/// let original = b"Hello, World! Hello, World!";
+/// let compressed = deflate(original, 6).unwrap();
+///
+/// let mut out = vec![0u8; original.len()];
+/// let n = inflate_into(&compressed, &mut out).unwrap();
+/// assert_eq!(&out[..n], original);
+/// ```
+pub fn inflate_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    let cursor = std::io::Cursor::new(src);
+    let mut reader = BitReader::buffered(cursor);
+    let mut sink = SliceSink::new(dst);
+    let mut state = BlockState::default();
+    while !state.final_block {
+        inflate_block_into(&mut reader, &mut sink, &mut state)?;
+    }
+    Ok(sink.written())
 }

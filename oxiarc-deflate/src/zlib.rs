@@ -79,18 +79,50 @@ impl Adler32 {
     }
 
     /// Update the checksum with more data.
+    ///
+    /// The naive form (`a += x; b += a;`) is a serial dependency chain of two
+    /// adds per byte and cannot be vectorised. Processing a fixed 32-byte
+    /// group instead uses the closed form
+    ///
+    /// ```text
+    /// b' = b + 32*a + sum_i (32 - i) * x_i
+    /// a' = a + sum_i x_i
+    /// ```
+    ///
+    /// which turns the per-byte work into two independent reductions the
+    /// compiler can auto-vectorise, exactly as zlib's own `DO16` unrolling
+    /// does. The result is bit-identical to the byte-at-a-time version.
+    ///
+    /// Blocks stay at or below [`NMAX`] bytes so the 32-bit accumulators
+    /// cannot overflow before the modulo reduction (RFC 1950 / zlib's
+    /// classic bound `255n(n+1)/2 + (n+1)(BASE-1) < 2^32`).
     pub fn update(&mut self, data: &[u8]) {
+        /// Bytes per vectorised group.
+        const GROUP: usize = 32;
+        /// Largest multiple of `GROUP` that is still within `NMAX`.
+        const BLOCK: usize = NMAX - (NMAX % GROUP);
+
         let mut a = self.a;
         let mut b = self.b;
 
         let mut remaining = data;
-
-        // Process in chunks to avoid overflow
-        while remaining.len() >= NMAX {
-            let (chunk, rest) = remaining.split_at(NMAX);
+        while !remaining.is_empty() {
+            let take = remaining.len().min(BLOCK);
+            let (block, rest) = remaining.split_at(take);
             remaining = rest;
 
-            for &byte in chunk {
+            let mut groups = block.chunks_exact(GROUP);
+            for group in &mut groups {
+                let mut sum = 0u32;
+                let mut weighted = 0u32;
+                for (i, &byte) in group.iter().enumerate() {
+                    sum += byte as u32;
+                    weighted += (GROUP - i) as u32 * byte as u32;
+                }
+                b += a * GROUP as u32 + weighted;
+                a += sum;
+            }
+            for &byte in groups.remainder() {
                 a += byte as u32;
                 b += a;
             }
@@ -99,14 +131,8 @@ impl Adler32 {
             b %= ADLER_MOD;
         }
 
-        // Process remaining bytes
-        for &byte in remaining {
-            a += byte as u32;
-            b += a;
-        }
-
-        self.a = a % ADLER_MOD;
-        self.b = b % ADLER_MOD;
+        self.a = a;
+        self.b = b;
     }
 
     /// Finalize and return the checksum.
@@ -282,6 +308,14 @@ pub fn zlib_compress_with_dict(input: &[u8], level: u8, dictionary: &[u8]) -> Re
 /// assert_eq!(decompressed, data);
 /// ```
 pub fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
+    let deflate_data = zlib_payload(input)?;
+    let decompressed = inflate(deflate_data)?;
+    verify_zlib_trailer(input, &decompressed)?;
+    Ok(decompressed)
+}
+
+/// Validate a zlib header and return the raw DEFLATE payload it wraps.
+fn zlib_payload(input: &[u8]) -> Result<&[u8]> {
     if input.len() < 6 {
         return Err(OxiArcError::invalid_header("zlib data too short"));
     }
@@ -318,18 +352,17 @@ pub fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    // Decompress DEFLATE data
-    let deflate_data = &input[2..input.len() - 4];
-    let decompressed = inflate(deflate_data)?;
+    Ok(&input[2..input.len() - 4])
+}
 
-    // Verify Adler-32 checksum
-    let stored_checksum = u32::from_be_bytes([
-        input[input.len() - 4],
-        input[input.len() - 3],
-        input[input.len() - 2],
-        input[input.len() - 1],
-    ]);
-    let computed_checksum = Adler32::checksum(&decompressed);
+/// Verify the trailing big-endian Adler-32 of a zlib stream against the
+/// bytes that were decoded from it.
+fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
+    let Some(trailer) = input.get(input.len() - 4..) else {
+        return Err(OxiArcError::invalid_header("zlib data too short"));
+    };
+    let stored_checksum = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let computed_checksum = Adler32::checksum(decompressed);
 
     if stored_checksum != computed_checksum {
         return Err(OxiArcError::crc_mismatch(
@@ -337,8 +370,45 @@ pub fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
             stored_checksum,
         ));
     }
+    Ok(())
+}
 
-    Ok(decompressed)
+/// Decompress zlib format data straight into a caller-supplied buffer.
+///
+/// The zlib wrapper of [`inflate_into`](crate::inflate_into): the header is
+/// validated, the DEFLATE payload is decoded directly into `output` with no
+/// intermediate `Vec`, and the trailing Adler-32 is verified against the
+/// bytes written.
+///
+/// # Returns
+///
+/// The number of bytes written to `output`.
+///
+/// # Errors
+///
+/// [`OxiArcError::BufferTooSmall`] when the stream decodes to more than
+/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] when the Adler-32
+/// does not match, plus the usual header/EOF/Huffman errors. Preset
+/// dictionaries are not supported on this path (no history precedes
+/// `output`); use [`zlib_decompress_with_dict`] for those.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress_into};
+///
+/// let data = b"Hello, World! Hello, World!";
+/// let compressed = zlib_compress(data, 6).unwrap();
+/// let mut out = vec![0u8; data.len()];
+/// let n = zlib_decompress_into(&compressed, &mut out).unwrap();
+/// assert_eq!(&out[..n], data);
+/// ```
+pub fn zlib_decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let deflate_data = zlib_payload(input)?;
+    let written = crate::inflate_into(deflate_data, output)?;
+    let decoded = output.get(..written).unwrap_or_default();
+    verify_zlib_trailer(input, decoded)?;
+    Ok(written)
 }
 
 /// Decompress zlib format data with a preset dictionary.
@@ -927,5 +997,79 @@ mod tests {
             .expect("inflate failed");
 
         assert_eq!(&decompressed[..], &data[..]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod adler_reference_tests {
+    use super::{ADLER_MOD, Adler32};
+
+    /// Byte-at-a-time reference implementation (RFC 1950 §9).
+    fn adler32_reference(data: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for &byte in data {
+            a = (a + byte as u32) % ADLER_MOD;
+            b = (b + a) % ADLER_MOD;
+        }
+        (b << 16) | a
+    }
+
+    #[test]
+    fn matches_reference_over_many_shapes() {
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        // Every length across the group / block boundaries, plus long runs.
+        let mut lengths: Vec<usize> = (0..200).collect();
+        lengths.extend([
+            5519, 5520, 5521, 5535, 5536, 5537, 5551, 5552, 5553, 11071, 11072, 11073, 70000,
+        ]);
+
+        for len in lengths {
+            for pattern in 0..3 {
+                let data: Vec<u8> = (0..len)
+                    .map(|i| match pattern {
+                        0 => 0xFF,
+                        1 => (i % 251) as u8,
+                        _ => next() as u8,
+                    })
+                    .collect();
+                assert_eq!(
+                    Adler32::checksum(&data),
+                    adler32_reference(&data),
+                    "len={len} pattern={pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_updates_match_single_shot() {
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(31)) as u8).collect();
+        for split in [0usize, 1, 7, 31, 32, 33, 5535, 5536, 12345, 39_999, 40_000] {
+            let mut incremental = Adler32::new();
+            incremental.update(&data[..split]);
+            incremental.update(&data[split..]);
+            assert_eq!(
+                incremental.finish(),
+                Adler32::checksum(&data),
+                "split={split}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_vectors() {
+        assert_eq!(Adler32::checksum(b""), 1);
+        assert_eq!(Adler32::checksum(b"a"), 0x0062_0062);
+        assert_eq!(Adler32::checksum(b"abc"), 0x024d_0127);
+        assert_eq!(Adler32::checksum(b"Wikipedia"), 0x11E6_0398);
     }
 }
