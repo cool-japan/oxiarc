@@ -354,6 +354,27 @@ pub fn read_fse_table_description(
     max_symbol: u8,
     max_log: u8,
 ) -> Result<(FseTable, usize)> {
+    let (probabilities, accuracy_log, bytes_consumed) = read_ncount(data, max_symbol, max_log)?;
+    let table = FseTable::new(accuracy_log, &probabilities)?;
+    Ok((table, bytes_consumed))
+}
+
+/// Read only the *normalized counts* of an FSE table description, without
+/// building a decoding table.
+///
+/// Split out of [`read_fse_table_description`] so the encoder-side table
+/// writer can be validated against the exact parser that reads real `zstd`
+/// output: comparing a written description to the counts this returns proves
+/// the two agree bit for bit, which building a table and comparing entry
+/// counts could not (a count of `1` and the "less than one" marker `-1` both
+/// occupy a single table slot).
+///
+/// Returns `(normalized_counts, accuracy_log, header_bytes_consumed)`.
+pub(crate) fn read_ncount(
+    data: &[u8],
+    max_symbol: u8,
+    max_log: u8,
+) -> Result<(Vec<i16>, u8, usize)> {
     if data.is_empty() {
         return Err(OxiArcError::corrupted(0, "empty FSE table description"));
     }
@@ -459,9 +480,7 @@ pub fn read_fse_table_description(
         ));
     }
 
-    let table = FseTable::new(accuracy_log, &probabilities)?;
-
-    Ok((table, bytes_consumed))
+    Ok((probabilities, accuracy_log, bytes_consumed))
 }
 
 /// Read bits from forward bitstream.

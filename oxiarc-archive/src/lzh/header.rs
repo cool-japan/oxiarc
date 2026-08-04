@@ -648,11 +648,17 @@ impl LzhHeader {
         let method = match self.method {
             LzhMethod::Lh0 => CoreMethod::Lh0,
             LzhMethod::Lh1 => CoreMethod::Lh1,
+            LzhMethod::Lh2 => CoreMethod::Lh2,
+            LzhMethod::Lh3 => CoreMethod::Lh3,
             LzhMethod::Lh4 => CoreMethod::Lh4,
             LzhMethod::Lh5 => CoreMethod::Lh5,
             LzhMethod::Lh6 => CoreMethod::Lh6,
             LzhMethod::Lh7 => CoreMethod::Lh7,
             LzhMethod::Lhd => CoreMethod::Lhd,
+            LzhMethod::Lzs => CoreMethod::Lzs,
+            LzhMethod::Lz4 => CoreMethod::Lz4,
+            LzhMethod::Lz5 => CoreMethod::Lz5,
+            LzhMethod::Pm0 => CoreMethod::Pm0,
             LzhMethod::Unknown(_) => CoreMethod::Unknown(0),
             // `LzhMethod` is `#[non_exhaustive]`. A method variant added by a
             // future oxiarc-lzhuf release that this mapping does not know about

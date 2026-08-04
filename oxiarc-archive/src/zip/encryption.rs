@@ -5,10 +5,20 @@
 //!   key schedules per FIPS 197, wire-compatible with WinZip/7-Zip/WinRAR)
 //! - PBKDF2-SHA1 key derivation
 //! - HMAC-SHA1 authentication, verified in constant time
-//! - Salts sourced from the operating system CSPRNG
+//! - Salts sourced from the operating system CSPRNG (`/dev/urandom` on
+//!   Unix-like targets, `BCryptGenRandom` on Windows) — see the internal
+//!   `zip::csprng` module.
+//!   Salt generation is fallible and has no software fallback: when the OS
+//!   source cannot be reached, [`generate_salt`] returns an error instead of
+//!   producing predictable key-derivation material.
 //!
 //! All implementations are pure Rust with no external dependencies.
+//!
+//! The AES core (`SubBytes`, `SubWord` and the GF(2^8) doubling used by
+//! `MixColumns`) is constant time — see the `super::aes_ct` module for the
+//! bitsliced S-box circuit and the reasoning behind it.
 
+use super::aes_ct;
 use oxiarc_core::error::{OxiArcError, Result};
 
 // ===========================================================================
@@ -239,26 +249,6 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> 
 // AES-256 Implementation (FIPS 197)
 // ===========================================================================
 
-/// AES S-Box (Substitution Box).
-const SBOX: [u8; 256] = [
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
-    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
-    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
-    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
-    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
-    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
-    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
-    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
-    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
-    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
-    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
-];
-
 /// Round constants for AES key expansion.
 const RCON: [u32; 10] = [
     0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000, 0x80000000,
@@ -273,6 +263,15 @@ const RCON: [u32; 10] = [
 /// round count and key schedule follow the standard exactly for every strength,
 /// the resulting ciphertext is wire-compatible with WinZip / 7-Zip / WinRAR for
 /// AES-128, AES-192 and AES-256 alike.
+///
+/// # Side channels
+///
+/// `SubBytes`, `SubWord` and the GF(2^8) doubling inside `MixColumns` all run
+/// in constant time via the bitsliced circuit in `super::aes_ct`: no lookup
+/// table is indexed with key- or plaintext-derived data and no branch is taken
+/// on it, so the cipher's cache-access pattern and instruction trace carry no
+/// information about the key. See that module for why a table-based `SubBytes`
+/// is a cache-timing liability.
 pub struct Aes {
     /// Expanded round keys (`nr + 1` blocks of 16 bytes each).
     round_keys: Vec<[u8; 16]>,
@@ -313,25 +312,25 @@ impl Aes {
             w[i] = [key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]];
         }
 
-        // Key expansion.
+        // Key expansion. `SubWord` goes through the constant-time bitsliced
+        // S-box: the key schedule indexes the substitution with raw key bytes,
+        // so a table lookup here would leak the key just as directly as one in
+        // `SubBytes` would.
         for i in nk..total_words {
             let mut temp = w[i - 1];
             if i % nk == 0 {
                 // RotWord + SubWord + Rcon
+                let rotated = [temp[1], temp[2], temp[3], temp[0]];
+                let substituted = aes_ct::sub_word(rotated);
                 temp = [
-                    SBOX[temp[1] as usize] ^ ((RCON[i / nk - 1] >> 24) as u8),
-                    SBOX[temp[2] as usize],
-                    SBOX[temp[3] as usize],
-                    SBOX[temp[0] as usize],
+                    substituted[0] ^ ((RCON[i / nk - 1] >> 24) as u8),
+                    substituted[1],
+                    substituted[2],
+                    substituted[3],
                 ];
             } else if nk > 6 && i % nk == 4 {
                 // Additional SubWord, applied only for 256-bit keys (Nk = 8).
-                temp = [
-                    SBOX[temp[0] as usize],
-                    SBOX[temp[1] as usize],
-                    SBOX[temp[2] as usize],
-                    SBOX[temp[3] as usize],
-                ];
+                temp = aes_ct::sub_word(temp);
             }
             w[i] = [
                 w[i - nk][0] ^ temp[0],
@@ -376,11 +375,9 @@ impl Aes {
         state
     }
 
-    /// SubBytes transformation.
+    /// SubBytes transformation (constant time, see [`super::aes_ct`]).
     fn sub_bytes(state: &mut [u8; 16]) {
-        for byte in state.iter_mut() {
-            *byte = SBOX[*byte as usize];
-        }
+        aes_ct::sub_bytes(state);
     }
 
     /// ShiftRows transformation.
@@ -420,18 +417,14 @@ impl Aes {
         }
     }
 
-    /// Multiply by 2 in GF(2^8).
+    /// Multiply by 2 in GF(2^8), branchlessly (see [`super::aes_ct::xtime`]).
     fn gf_mul2(x: u8) -> u8 {
-        let mut result = x << 1;
-        if x & 0x80 != 0 {
-            result ^= 0x1b; // AES irreducible polynomial
-        }
-        result
+        aes_ct::xtime(x)
     }
 
-    /// Multiply by 3 in GF(2^8).
+    /// Multiply by 3 in GF(2^8), branchlessly.
     fn gf_mul3(x: u8) -> u8 {
-        Self::gf_mul2(x) ^ x
+        aes_ct::xtime3(x)
     }
 
     /// AddRoundKey transformation.
@@ -832,98 +825,21 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Fill `buf` with bytes from the operating system's CSPRNG.
-///
-/// On Unix-like systems this reads from `/dev/urandom`, which is a
-/// cryptographically secure, non-blocking source seeded by the kernel entropy
-/// pool. Returns `true` on success and `false` if the source could not be
-/// opened or fully read (in which case the caller falls back to
-/// `fill_from_entropy_fallback`).
-fn fill_from_os_csprng(buf: &mut [u8]) -> bool {
-    #[cfg(unix)]
-    {
-        use std::fs::File;
-        use std::io::Read;
-
-        if let Ok(mut file) = File::open("/dev/urandom") {
-            return file.read_exact(buf).is_ok();
-        }
-        false
-    }
-
-    #[cfg(not(unix))]
-    {
-        // No dependency-free OS CSPRNG binding is available on this platform;
-        // the caller falls back to the runtime-entropy path below.
-        let _ = buf;
-        false
-    }
-}
-
-/// Best-effort entropy fallback used only when the OS CSPRNG is unavailable.
-///
-/// This mixes several runtime entropy sources (high-resolution wall clock, the
-/// process id, a monotonically increasing per-process counter, a stack address,
-/// a heap address and the current thread id) and expands them into the output
-/// buffer with SHA-1 in counter mode. It is deliberately not relied upon as the
-/// primary path — [`fill_from_os_csprng`] is tried first — but it guarantees
-/// non-deterministic, non-repeating salts even if `/dev/urandom` cannot be
-/// opened, which the previous clock-only xorshift generator did not.
-fn fill_from_entropy_fallback(out: &mut [u8]) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let mut seed: Vec<u8> = Vec::with_capacity(64);
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    seed.extend_from_slice(&nanos.to_le_bytes());
-    seed.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
-    seed.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-
-    let stack_marker = 0u8;
-    seed.extend_from_slice(&(&stack_marker as *const u8 as usize as u64).to_le_bytes());
-
-    let heap_marker = Box::new(0u8);
-    seed.extend_from_slice(&(heap_marker.as_ref() as *const u8 as usize as u64).to_le_bytes());
-
-    let mut hasher = DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    seed.extend_from_slice(&hasher.finish().to_le_bytes());
-
-    // Expand the seed material into the output using SHA-1 in counter mode.
-    let mut offset = 0;
-    let mut block_index: u64 = 0;
-    while offset < out.len() {
-        let mut block_hasher = Sha1::new();
-        block_hasher.update(&seed);
-        block_hasher.update(&block_index.to_le_bytes());
-        let digest = block_hasher.finalize();
-        let take = (out.len() - offset).min(digest.len());
-        out[offset..offset + take].copy_from_slice(&digest[..take]);
-        offset += take;
-        block_index += 1;
-    }
-}
-
 /// Generate a cryptographically random salt of `len` bytes.
 ///
-/// The salt is drawn from the operating system CSPRNG (`/dev/urandom` on
-/// Unix-like systems). If that source is unavailable, a best-effort
-/// runtime-entropy fallback is used (see `fill_from_entropy_fallback`); the
-/// salt is never derived from a fixed or clock-only seed.
-pub fn generate_salt(len: usize) -> Vec<u8> {
-    let mut salt = vec![0u8; len];
-    if !fill_from_os_csprng(&mut salt) {
-        fill_from_entropy_fallback(&mut salt);
-    }
-    salt
+/// The salt is drawn from the operating system CSPRNG via
+/// the internal `zip::csprng` module (`/dev/urandom` on Unix-like systems,
+/// `BCryptGenRandom` on Windows). There is no software fallback: if the OS
+/// source cannot be reached the call fails rather than returning low-entropy
+/// bytes, because the salt is the only value that differentiates PBKDF2-SHA1
+/// key derivation between archives.
+///
+/// # Errors
+///
+/// Returns [`OxiArcError::Io`] when the platform CSPRNG is unavailable or the
+/// target has no supported entropy source.
+pub fn generate_salt(len: usize) -> Result<Vec<u8>> {
+    super::csprng::random_bytes(len)
 }
 
 // ===========================================================================
@@ -1099,6 +1015,203 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    /// Decode a compile-time hex literal into a fixed-size byte array.
+    ///
+    /// Keeps the NIST vectors below in the exact textual form they appear in
+    /// SP 800-38A, so they can be compared against the publication character by
+    /// character instead of against a hand-transposed byte array.
+    fn hex<const N: usize>(text: &str) -> [u8; N] {
+        assert_eq!(text.len(), N * 2, "hex literal has the wrong length");
+        let mut out = [0u8; N];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+                .expect("test vector is valid hex");
+        }
+        out
+    }
+
+    /// NIST SP 800-38A F.1.1 `ECB-AES128.Encrypt` known-answer vectors.
+    ///
+    /// FIPS 197 Appendix C uses the key `000102...`, whose bytes are the same
+    /// as their own indices; that structure can hide key-schedule bugs (a
+    /// mis-rotated `RotWord`, a `SubWord` applied to the wrong lane). These
+    /// vectors use an unstructured key and four different plaintexts, so they
+    /// exercise the constant-time `SubWord`/`SubBytes` path against inputs with
+    /// no exploitable symmetry.
+    #[test]
+    fn test_aes128_nist_sp800_38a_ecb_vectors() {
+        let key: [u8; 16] = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        let cases: [(&str, &str); 4] = [
+            (
+                "6bc1bee22e409f96e93d7e117393172a",
+                "3ad77bb40d7a3660a89ecaf32466ef97",
+            ),
+            (
+                "ae2d8a571e03ac9c9eb76fac45af8e51",
+                "f5d3d58503b9699de785895a96fdbaaf",
+            ),
+            (
+                "30c81c46a35ce411e5fbc1191a0a52ef",
+                "43b1cd7f598ece23881b00e3ed030688",
+            ),
+            (
+                "f69f2445df4f9b17ad2b417be66c3710",
+                "7b0c785e27e8ad3f8223207104725dd4",
+            ),
+        ];
+        let cipher = Aes::new(&key).expect("valid 16-byte key");
+        for (plaintext, ciphertext) in cases {
+            let block: [u8; 16] = hex(plaintext);
+            let want: [u8; 16] = hex(ciphertext);
+            assert_eq!(
+                cipher.encrypt_block(&block),
+                want,
+                "AES-128 ECB mismatch for plaintext {plaintext}"
+            );
+        }
+    }
+
+    /// NIST SP 800-38A F.1.3 `ECB-AES192.Encrypt` known-answer vectors.
+    ///
+    /// AES-192 is the strength that no `oxicrypto` primitive covers, so it is
+    /// the one most in need of its own known-answer gate. `Nk = 6` also takes
+    /// the `i % nk == 0` key-schedule branch on a different cadence than
+    /// AES-128/256, which is exactly where an off-by-one would hide.
+    #[test]
+    fn test_aes192_nist_sp800_38a_ecb_vectors() {
+        let key: [u8; 24] = hex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
+        let cases: [(&str, &str); 4] = [
+            (
+                "6bc1bee22e409f96e93d7e117393172a",
+                "bd334f1d6e45f25ff712a214571fa5cc",
+            ),
+            (
+                "ae2d8a571e03ac9c9eb76fac45af8e51",
+                "974104846d0ad3ad7734ecb3ecee4eef",
+            ),
+            (
+                "30c81c46a35ce411e5fbc1191a0a52ef",
+                "ef7afd2270e2e60adce0ba2face6444e",
+            ),
+            (
+                "f69f2445df4f9b17ad2b417be66c3710",
+                "9a4b41ba738d6c72fb16691603c18e0e",
+            ),
+        ];
+        let cipher = Aes::new(&key).expect("valid 24-byte key");
+        for (plaintext, ciphertext) in cases {
+            let block: [u8; 16] = hex(plaintext);
+            let want: [u8; 16] = hex(ciphertext);
+            assert_eq!(
+                cipher.encrypt_block(&block),
+                want,
+                "AES-192 ECB mismatch for plaintext {plaintext}"
+            );
+        }
+    }
+
+    /// NIST SP 800-38A F.1.5 `ECB-AES256.Encrypt` known-answer vectors.
+    ///
+    /// `Nk = 8` is the only key length that takes the extra `i % nk == 4`
+    /// `SubWord` branch in the schedule, which now routes through the
+    /// bitsliced S-box.
+    #[test]
+    fn test_aes256_nist_sp800_38a_ecb_vectors() {
+        let key: [u8; 32] = hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let cases: [(&str, &str); 4] = [
+            (
+                "6bc1bee22e409f96e93d7e117393172a",
+                "f3eed1bdb5d2a03c064b5a7e3db181f8",
+            ),
+            (
+                "ae2d8a571e03ac9c9eb76fac45af8e51",
+                "591ccb10d410ed26dc5ba74a31362870",
+            ),
+            (
+                "30c81c46a35ce411e5fbc1191a0a52ef",
+                "b6ed21b99ca6f4f9f153e7b1beafed1d",
+            ),
+            (
+                "f69f2445df4f9b17ad2b417be66c3710",
+                "23304b7a39f9f3ff067d8d8f9e24ecc7",
+            ),
+        ];
+        let cipher = Aes::new(&key).expect("valid 32-byte key");
+        for (plaintext, ciphertext) in cases {
+            let block: [u8; 16] = hex(plaintext);
+            let want: [u8; 16] = hex(ciphertext);
+            assert_eq!(
+                cipher.encrypt_block(&block),
+                want,
+                "AES-256 ECB mismatch for plaintext {plaintext}"
+            );
+        }
+    }
+
+    /// The WinZip counter convention, pinned against the block cipher.
+    ///
+    /// WinZip AES uses a little-endian counter that starts at 1, not the
+    /// big-endian SP 800-38A counter, so the published CTR vectors do not apply
+    /// directly. This derives the expected keystream from the (now
+    /// NIST-verified) block cipher instead: encrypting an all-zero buffer must
+    /// reproduce `AES(key, LE(1)) || AES(key, LE(2))` exactly.
+    #[test]
+    fn test_aes_ctr_keystream_uses_winzip_le_counter_from_one() {
+        let key: [u8; 16] = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        let cipher = Aes::new(&key).expect("valid 16-byte key");
+
+        let mut counter_one = [0u8; 16];
+        counter_one[0] = 1;
+        let mut counter_two = [0u8; 16];
+        counter_two[0] = 2;
+        let mut expected = Vec::with_capacity(32);
+        expected.extend_from_slice(&cipher.encrypt_block(&counter_one));
+        expected.extend_from_slice(&cipher.encrypt_block(&counter_two));
+
+        let mut keystream = vec![0u8; 32];
+        let mut ctr = AesCtr::new(&key).expect("valid 16-byte key");
+        ctr.process(&mut keystream);
+        assert_eq!(keystream, expected);
+    }
+
+    /// The little-endian counter must carry across byte boundaries.
+    ///
+    /// The counter starts at 1, so the 255th keystream block after the first
+    /// uses counter value 256 — the point where the low byte wraps to 0 and the
+    /// second byte must become 1. A broken carry would repeat keystream, which
+    /// under CTR mode is a total loss of confidentiality.
+    #[test]
+    fn test_aes_ctr_counter_carries_across_bytes() {
+        let key: [u8; 16] = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        let cipher = Aes::new(&key).expect("valid 16-byte key");
+
+        // Counter value 256 is little-endian bytes 00 01 00 ... 00.
+        let mut counter_256 = [0u8; 16];
+        counter_256[1] = 1;
+        let expected = cipher.encrypt_block(&counter_256);
+
+        let mut ctr = AesCtr::new(&key).expect("valid 16-byte key");
+        // Consume the blocks that use counters 1..=255.
+        let mut buffer = vec![0u8; 16 * 255];
+        ctr.process(&mut buffer);
+        let mut block_at_256 = [0u8; 16];
+        ctr.process(&mut block_at_256);
+        assert_eq!(
+            block_at_256, expected,
+            "counter did not carry from 255 to 256"
+        );
+
+        // No 16-byte keystream block may repeat across the wrap point.
+        let mut seen = std::collections::HashSet::new();
+        for chunk in buffer.chunks_exact(16) {
+            assert!(seen.insert(chunk.to_vec()), "CTR keystream block repeated");
+        }
+        assert!(
+            seen.insert(block_at_256.to_vec()),
+            "keystream block after the carry repeated an earlier block"
+        );
+    }
+
     #[test]
     fn test_aes_rejects_invalid_key_length() {
         // Only 16, 24 and 32-byte keys are valid AES key sizes.
@@ -1138,7 +1251,7 @@ mod tests {
             AesStrength::Aes256,
         ] {
             let password = b"correct horse battery staple";
-            let salt = generate_salt(strength.salt_len());
+            let salt = generate_salt(strength.salt_len()).expect("OS CSPRNG must be available");
             let plaintext = b"WinZip AE-2 genuine AES round-trip payload \x00\x01\x02\xff";
 
             let (mut encryptor, pw_enc) =
@@ -1211,7 +1324,8 @@ mod tests {
     #[test]
     fn test_zip_aes_encrypt_decrypt() {
         let password = b"secret123";
-        let salt = generate_salt(AesStrength::Aes256.salt_len());
+        let salt =
+            generate_salt(AesStrength::Aes256.salt_len()).expect("OS CSPRNG must be available");
         let plaintext = b"This is secret data that needs encryption!";
 
         // Encrypt
@@ -1248,7 +1362,8 @@ mod tests {
     fn test_zip_aes_wrong_password() {
         let password = b"secret123";
         let wrong_password = b"wrong";
-        let salt = generate_salt(AesStrength::Aes256.salt_len());
+        let salt =
+            generate_salt(AesStrength::Aes256.salt_len()).expect("OS CSPRNG must be available");
 
         let (_, pw_verification_correct) =
             ZipAesEncryptor::new(password, &salt, AesStrength::Aes256)
@@ -1264,13 +1379,44 @@ mod tests {
 
     #[test]
     fn test_generate_salt() {
-        let salt1 = generate_salt(16);
-        let salt2 = generate_salt(16);
+        let salt1 = generate_salt(16).expect("OS CSPRNG must be available");
+        let salt2 = generate_salt(16).expect("OS CSPRNG must be available");
 
         assert_eq!(salt1.len(), 16);
         assert_eq!(salt2.len(), 16);
         // Salts should be different (with very high probability)
-        // Note: This test might rarely fail due to timing, but is unlikely
+        assert_ne!(salt1, salt2);
+    }
+
+    /// Regression test for the low-entropy salt fallback.
+    ///
+    /// `generate_salt` used to return `Vec<u8>` with no failure channel: when
+    /// `/dev/urandom` could not be opened — and unconditionally on every
+    /// non-Unix target — it silently expanded a clock/PID/ASLR-derived seed with
+    /// SHA-1 and returned that as a WinZip-AES salt. The fix makes the function
+    /// fallible and deletes the fallback entirely, so the only two outcomes are
+    /// OS-CSPRNG bytes or a typed error.
+    ///
+    /// This test pins the fallible signature (the old infallible one would not
+    /// compile here) and asserts the salt is not a degenerate constant pattern.
+    #[test]
+    fn test_generate_salt_is_fallible_and_os_sourced() {
+        let salt: Result<Vec<u8>> = generate_salt(32);
+        let salt = salt.expect("OS CSPRNG must be available on this target");
+        assert_eq!(salt.len(), 32);
+        assert!(
+            salt.iter().any(|&byte| byte != salt[0]),
+            "salt must not be a constant byte pattern"
+        );
+
+        // Draw a batch and require all-distinct values: the deleted fallback
+        // derived every byte from a per-process counter and the clock, which is
+        // exactly the kind of structure a CSPRNG must not have.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let draw = generate_salt(16).expect("OS CSPRNG must be available on this target");
+            assert!(seen.insert(draw), "CSPRNG repeated a 16-byte salt");
+        }
     }
 
     #[test]

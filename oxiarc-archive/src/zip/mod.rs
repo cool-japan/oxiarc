@@ -28,7 +28,9 @@
 //! writer.finish().unwrap();
 //! ```
 
+pub(crate) mod aes_ct;
 pub mod crypto;
+pub(crate) mod csprng;
 pub mod encryption;
 mod header;
 pub(crate) mod name_codec;

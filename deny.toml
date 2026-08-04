@@ -22,6 +22,34 @@ allow = [
 multiple-versions = "warn"
 wildcards = "deny"
 
+# COOLJAPAN policy: oxiarc-* crates exist specifically to replace these
+# formats/algorithms in pure Rust. A member crate depending on any of them
+# would defeat the point of this workspace, so ban them outright rather than
+# relying on convention. See ~/.claude/CLAUDE.md "Dependency Replacements".
+deny = [
+    # Compression / archive formats this workspace implements natively.
+    { name = "zip", use-instead = "oxiarc-archive" },
+    { name = "flate2", use-instead = "oxiarc-deflate" },
+    { name = "miniz_oxide", use-instead = "oxiarc-deflate" },
+    { name = "zstd", use-instead = "oxiarc-zstd" },
+    { name = "zstd-safe", use-instead = "oxiarc-zstd" },
+    { name = "zstd-sys", use-instead = "oxiarc-zstd" },
+    { name = "bzip2", use-instead = "oxiarc-bzip2" },
+    { name = "bzip2-sys", use-instead = "oxiarc-bzip2" },
+    { name = "lz4", use-instead = "oxiarc-lz4" },
+    { name = "lz4-sys", use-instead = "oxiarc-lz4" },
+    { name = "lz4_flex", use-instead = "oxiarc-lz4" },
+    { name = "tar", use-instead = "oxiarc-archive" },
+    { name = "snap", use-instead = "oxiarc-snappy" },
+    { name = "brotli", use-instead = "oxiarc-brotli" },
+    { name = "brotli-decompressor", use-instead = "oxiarc-brotli" },
+    # Wider COOLJAPAN ecosystem bans that also apply to this workspace.
+    { name = "bincode", use-instead = "oxicode" },
+    { name = "rustfft", use-instead = "oxifft" },
+    { name = "quick-xml", use-instead = "oxixml (no XML usage in oxiarc; keep it that way)" },
+    { name = "openblas-src", use-instead = "oxiblas" },
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

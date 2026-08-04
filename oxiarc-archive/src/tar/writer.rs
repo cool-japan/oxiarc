@@ -1,6 +1,6 @@
 //! TAR archive writer.
 
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
 use std::io::Write;
 
@@ -43,7 +43,13 @@ const TAR_LINKNAME_MAX: usize = 100;
 /// assert!(!buf.is_empty());
 /// ```
 pub struct TarWriter<W: Write> {
-    writer: W,
+    /// Underlying writer. `None` only in the instant between `into_inner`
+    /// taking it and the enclosing `self` finishing its (now-skipped) drop;
+    /// no other method can observe `None` here, since every method other
+    /// than `into_inner` takes `&self`/`&mut self` and `into_inner` consumes
+    /// `self` by value, so the type system rules out any further call on the
+    /// same `TarWriter` afterward.
+    writer: Option<W>,
     finished: bool,
     /// Optional progress handle.
     progress: Option<ProgressHandle>,
@@ -65,7 +71,7 @@ impl<W: Write> TarWriter<W> {
     /// ```
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: Some(writer),
             finished: false,
             progress: None,
             entry_index: 0,
@@ -77,6 +83,31 @@ impl<W: Write> TarWriter<W> {
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
         self
+    }
+
+    /// Build the error used when `writer` is unexpectedly `None`.
+    ///
+    /// Centralized so the (unreachable-via-the-public-API) message is
+    /// written once rather than duplicated at every call site.
+    #[cold]
+    fn writer_taken_error() -> OxiArcError {
+        OxiArcError::Io(std::io::Error::other(
+            "TarWriter: writer accessed after into_inner (unreachable via the public API)",
+        ))
+    }
+
+    /// Fallibly borrow the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Never, in practice: the only way `writer` becomes `None` is
+    /// `into_inner`, which consumes `self` by value and therefore makes this
+    /// method uncallable afterward. `Result` (rather than a panic) so every
+    /// call site propagates with a plain `?` instead of adding a new
+    /// `.expect()`.
+    #[inline]
+    fn writer_mut(&mut self) -> Result<&mut W> {
+        self.writer.as_mut().ok_or_else(Self::writer_taken_error)
     }
 
     /// Add a file to the archive.
@@ -427,18 +458,18 @@ impl<W: Write> TarWriter<W> {
     /// Write a header block.
     fn write_header(&mut self, header: &TarHeader) -> Result<()> {
         let block = header.to_block()?;
-        self.writer.write_all(&block)?;
+        self.writer_mut()?.write_all(&block)?;
         Ok(())
     }
 
     /// Write data blocks.
     fn write_data(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data)?;
+        self.writer_mut()?.write_all(data)?;
 
         // Pad to block boundary
         let padding = (BLOCK_SIZE - (data.len() % BLOCK_SIZE)) % BLOCK_SIZE;
         if padding > 0 {
-            self.writer.write_all(&vec![0u8; padding])?;
+            self.writer_mut()?.write_all(&vec![0u8; padding])?;
         }
 
         Ok(())
@@ -462,9 +493,9 @@ impl<W: Write> TarWriter<W> {
     /// ```
     pub fn finish(&mut self) -> Result<()> {
         if !self.finished {
-            self.writer.write_all(&[0u8; BLOCK_SIZE])?;
-            self.writer.write_all(&[0u8; BLOCK_SIZE])?;
-            self.writer.flush()?;
+            self.writer_mut()?.write_all(&[0u8; BLOCK_SIZE])?;
+            self.writer_mut()?.write_all(&[0u8; BLOCK_SIZE])?;
+            self.writer_mut()?.flush()?;
             self.finished = true;
             if let Some(ref handle) = self.progress {
                 handle.on_finish();
@@ -475,30 +506,26 @@ impl<W: Write> TarWriter<W> {
 
     /// Consume the writer and return the inner writer.
     /// Finishes the archive first.
-    pub fn into_inner(self) -> Result<W> {
-        // Use ManuallyDrop to prevent the Drop impl from running (it would
-        // otherwise try to finish the archive a second time).
-        let mut this = std::mem::ManuallyDrop::new(self);
-        let write_result: std::io::Result<()> = if this.finished {
+    pub fn into_inner(mut self) -> Result<W> {
+        let write_result: Result<()> = if self.finished {
             Ok(())
         } else {
-            this.writer
-                .write_all(&[0u8; BLOCK_SIZE])
-                .and_then(|_| this.writer.write_all(&[0u8; BLOCK_SIZE]))
-                .and_then(|_| this.writer.flush())
+            (|| {
+                self.writer_mut()?.write_all(&[0u8; BLOCK_SIZE])?;
+                self.writer_mut()?.write_all(&[0u8; BLOCK_SIZE])?;
+                self.writer_mut()?.flush()?;
+                Ok(())
+            })()
         };
 
-        // SAFETY: `this` is `ManuallyDrop`, so none of its fields have been
-        // dropped yet. Read `writer` out without dropping it — it becomes
-        // either the returned value, or an ordinary local that drops
-        // normally if `write_result` turns out to be an error below — then
-        // explicitly drop `progress`, the only other field owning a
-        // resource (an `Arc` clone), so it is never leaked. `finished` and
-        // `entry_index` are `Copy` and own nothing.
-        let writer = unsafe { std::ptr::read(&this.writer) };
-        unsafe {
-            std::ptr::drop_in_place(&mut this.progress);
-        }
+        // `writer_mut()` above only ever borrows `self.writer`, never takes
+        // it, so it is still `Some` here regardless of `write_result`. Taking
+        // it now (rather than only on the `Ok` path) matches the original
+        // behavior: the caller gets the writer back either way, and `self`'s
+        // remaining fields — notably `progress`, an `Arc` clone — drop
+        // normally through the ordinary (non-`unsafe`) path below instead of
+        // needing to be enumerated and dropped by hand.
+        let writer = self.writer.take().ok_or_else(Self::writer_taken_error)?;
 
         write_result?;
         Ok(writer)
@@ -507,8 +534,12 @@ impl<W: Write> TarWriter<W> {
 
 impl<W: Write> Drop for TarWriter<W> {
     fn drop(&mut self) {
-        // Attempt to finish on drop, ignore errors
-        let _ = self.finish();
+        // `into_inner` takes `writer`, leaving `None`, right before this
+        // `self` finishes its own (now-skipped) drop; every other path still
+        // has `Some` and gets the usual best-effort finish.
+        if self.writer.is_some() {
+            let _ = self.finish();
+        }
     }
 }
 

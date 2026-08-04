@@ -29,7 +29,7 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 ### Compression Algorithms (11 implemented)
 - **DEFLATE** (RFC 1951) - LZ77 + Huffman, levels 0-9, async deflate support
 - **LZMA/LZMA2** - Range coding with context modeling
-- **LZH** - LZSS + Huffman (lh0, lh4, lh5, lh6, lh7) plus lh1 (LZHUF adaptive Huffman) and lhd directory entries; lh2/lh3 are not implemented
+- **LZH** - LZSS + Huffman (lh0, lh4, lh5, lh6, lh7) plus lh1/lh2/lh3 (LHarc 1.x/2.x adaptive and block-static Huffman), the LArc methods lzs/lz4/lz5, PMarc pm0, and lhd directory entries; pm1/pm2 are not implemented
 - **Bzip2** - BWT + MTF + RLE + Huffman
 - **LZ4** - Ultra-fast LZ77 variant with LZ4-HC
 - **Zstandard** (RFC 8878) - Full decoder (FSE + 1/4-stream Huffman literals); encoder emits Huffman-compressed literals with predefined/RLE FSE sequence coding
@@ -230,7 +230,7 @@ The standard compression used in ZIP, GZIP, and PNG:
 Japanese archive format compression:
 - LZSS with configurable window sizes (4KB-64KB)
 - Static Huffman coding with dual trees (codes + offsets)
-- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh4, lh5, lh6, lh7, lhd (directory); lh2/lh3 are not implemented; unknown methods (including lh2/lh3) are listed and skipped per entry
+- Methods: lh0 (stored), lh1 (4KB window + adaptive Huffman), lh2 (8KB + adaptive Huffman), lh3 (8KB + block-static Huffman), lh4, lh5, lh6, lh7, lhd (directory), lzs/lz5 (LArc LZSS), lz4/pm0 (stored); pm1/pm2 are not implemented; unknown methods are listed and skipped per entry
 - Shift_JIS filenames and level-2 headers (LHA 2.x standard) on write
 
 ### LZMA/LZMA2
@@ -321,9 +321,9 @@ Streaming compression/decompression support in `oxiarc-deflate`:
 | Format | Read | Write | Compression | Checksums | Notes |
 |--------|------|-------|-------------|-----------|-------|
 | **ZIP** | ✅ | ✅ | DEFLATE, Store | CRC-32 | Zip64 support, data descriptors, async ZIP (async-io feature), AES-128/192/256 + ZipCrypto encryption (external encrypted archives detected via general-purpose bit 0); spanned/multi-volume ZIP unsupported (rejected) |
-| **TAR** | ✅ | ✅ | N/A (container only) | None | UStar, PAX, GNU long names, GNU sparse (old-format 'S' + PAX 0.1, both readers; PAX 1.0 sparse unsupported) |
+| **TAR** | ✅ | ✅ | N/A (container only) | None | UStar, PAX, GNU long names, GNU sparse read support for all three variants — old-format 'S', PAX 0.1, and PAX 1.0 — in both the seekable and streaming readers (writer-side sparse emission unsupported; sparse-source files are written as regular dense entries) |
 | **GZIP** | ✅ | ✅ | DEFLATE | CRC-32 | RFC 1952 compliant |
-| **LZH** | ✅ | ✅ | lh0, lh1, lh4, lh5, lh6, lh7 | CRC-16 | Shift_JIS support, all header levels; lh2/lh3 not implemented |
+| **LZH** | ✅ | ✅ | lh0-lh7, lzs, lz4, lz5, pm0 | CRC-16 | Shift_JIS support, all header levels; pm1/pm2 not implemented |
 | **XZ** | ✅ | ✅ | LZMA2 | CRC-64 | Block checksums |
 | **7z** | ✅ | ❌ | LZMA/LZMA2 | CRC-32 | Read-only, partial support |
 | **CAB** | ✅ | ❌ | None, MSZIP | CFDATA checksums | Microsoft Cabinet, read-only; MSZIP window carried across CFDATA blocks, per-block checksums validated; Quantum/LZX unsupported (clean error, never silent raw copy) |

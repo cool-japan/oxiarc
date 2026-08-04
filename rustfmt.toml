@@ -1,0 +1,10 @@
+# rustfmt configuration for the oxiarc workspace.
+#
+# Deliberately minimal: every setting below is already rustfmt's default and
+# is written out only to pin it explicitly (so `cargo fmt --check` behavior
+# does not silently drift if a future rustfmt release changes a default).
+# The existing codebase already conforms to stable-rustfmt defaults at
+# max_width = 100, so this file intentionally does NOT introduce any
+# style-changing overrides that would trigger a repo-wide reformat.
+edition = "2024"
+max_width = 100

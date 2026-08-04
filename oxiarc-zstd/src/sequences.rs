@@ -181,7 +181,7 @@ impl SequencesDecoder {
     fn setup_ll_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.ll_table = Some(predefined_ll_table());
+                self.ll_table = Some(predefined_ll_table()?);
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -215,7 +215,7 @@ impl SequencesDecoder {
     fn setup_of_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.of_table = Some(predefined_of_table());
+                self.of_table = Some(predefined_of_table()?);
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -249,7 +249,7 @@ impl SequencesDecoder {
     fn setup_ml_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.ml_table = Some(predefined_ml_table());
+                self.ml_table = Some(predefined_ml_table()?);
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -516,34 +516,52 @@ fn rle_table(symbol: u8) -> FseTable {
 }
 
 /// Create predefined literal length FSE table.
-fn predefined_ll_table() -> FseTable {
+///
+/// # Errors
+///
+/// The RFC 8878 predefined distribution below is a compile-time constant that
+/// `FseTable::new` always accepts; this returns `Result` (rather than
+/// `.expect`-ing internally) purely so that guarantee is enforced by the
+/// caller's own error handling instead of an internal panic if it were ever
+/// violated by a future edit to the table.
+fn predefined_ll_table() -> Result<FseTable> {
     // Predefined distribution for literal lengths (accuracy log 6)
     let probs = [
         4i16, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1,
         1, 1, 1, -1, -1, -1, -1,
     ];
-    FseTable::new(6, &probs).expect("Predefined literal length FSE table should always be valid")
+    FseTable::new(6, &probs)
 }
 
 /// Create predefined offset FSE table.
-fn predefined_of_table() -> FseTable {
+///
+/// # Errors
+///
+/// See [`predefined_ll_table`]; the same "always valid, but not `.expect`-ed"
+/// reasoning applies.
+fn predefined_of_table() -> Result<FseTable> {
     // Predefined distribution for offsets (accuracy log 5, 29 symbols 0-28)
     // Per RFC 8878 Section 3.1.1.3.2.2.1
     let probs = [
         1i16, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
         -1,
     ];
-    FseTable::new(5, &probs).expect("Predefined offset FSE table should always be valid")
+    FseTable::new(5, &probs)
 }
 
 /// Create predefined match length FSE table.
-fn predefined_ml_table() -> FseTable {
+///
+/// # Errors
+///
+/// See [`predefined_ll_table`]; the same "always valid, but not `.expect`-ed"
+/// reasoning applies.
+fn predefined_ml_table() -> Result<FseTable> {
     // Predefined distribution for match lengths (accuracy log 6)
     let probs = [
         1i16, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
     ];
-    FseTable::new(6, &probs).expect("Predefined match length FSE table should always be valid")
+    FseTable::new(6, &probs)
 }
 
 #[cfg(test)]
@@ -577,9 +595,9 @@ mod tests {
 
     #[test]
     fn test_predefined_tables() {
-        let ll = predefined_ll_table();
-        let of = predefined_of_table();
-        let ml = predefined_ml_table();
+        let ll = predefined_ll_table().expect("predefined LL table is always valid");
+        let of = predefined_of_table().expect("predefined OF table is always valid");
+        let ml = predefined_ml_table().expect("predefined ML table is always valid");
 
         assert_eq!(ll.accuracy_log(), 6);
         assert_eq!(of.accuracy_log(), 5);

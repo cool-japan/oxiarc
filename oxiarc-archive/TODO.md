@@ -123,6 +123,7 @@
 
 ### TAR Improvements
 - [x] TAR sparse file support (GNU old-format + PAX GNU.sparse.*) (planned 2026-04-20) — materializes logical content with zero-fill; hole-preservation on disk is out of scope
+- [x] TAR PAX 1.0 sparse format (`GNU.sparse.major=1`/`.minor=0`) (done 2026-08-03) — the previously-missing variant: unlike 0.1, the offset/numbytes map is not pax-attribute text but a newline-terminated decimal-ASCII preamble at the start of the data entry's own payload (`SparseMap::parse_pax_1_0_preamble` in `tar/sparse.rs`), consumed directly off the stream (no `Seek` required, so both `TarReader` and `TarStreamReader` support it identically to the existing variants); `GNU.sparse.realsize`/`GNU.sparse.name` are shared with 0.1. A non-1.0 archive is unaffected — detection requires both `GNU.sparse.major == "1"` and `GNU.sparse.minor == "0"` pax attributes to be present. 10 new tests (8 unit tests in `tar/sparse.rs` covering the round-trip, zero-entry, exact-padding-consumption, and five malformed-input cases; 2 end-to-end tests, one per reader, differentially cross-checked against each other).
 
 ### LZH Improvements
 - [x] Level 3 headers (planned 2026-04-20)
@@ -222,33 +223,41 @@
 
 ## Test Coverage
 
-Unit tests (in-module `#[cfg(test)]`), by area:
+Unit tests (in-module `#[cfg(test)]`), by area (recounted 2026-08-03 via
+`cargo nextest list -p oxiarc-archive --all-features`; the previous table
+predated several rounds of hardening work — CSPRNG-sourced ZIP crypto, 7z
+coder-chain budgeting, repair-module regression tests, and TAR PAX 1.0
+sparse support among them):
 
-- zip: 100 (headers, reader, writer, Zip64, data descriptors, streaming, encryption)
-- tar: 54 (PAX, GNU long names, sparse)
-- lzh: 52
-- iso9660: 23 (including cyclic-directory and depth/size-bound DoS guards)
+- zip: 109 (headers, reader, writer, Zip64, data descriptors, streaming, encryption)
+- tar: 69 (PAX 0.1/1.0 sparse, GNU old-format sparse, GNU long names)
+- lzh: 55
+- iso9660: 26 (including cyclic-directory and depth/size-bound DoS guards)
 - xz: 20
+- sevenz (7z): 16
 - repair: 16
-- detect: 14
+- detect: 16
+- cab: 14
 - brotli: 14
 - snappy: 12
-- sevenz (7z): 11
+- bzip2: 11
 - zstd: 9
 - gzip: 8
-- bzip2: 8
 - lz4: 6
-- cab: 5
+- repair_zip / repair_tar: 4 / 3
 - async_zip / async_tar / async_lzh: 4 / 3 / 3
 
-Integration-test suites under `tests/` (82 tests across 14 files), including
-two added in 0.3.6 — `cab_interop` and `iso9660_interop` — plus
-`lzh_corpus_reader`, `lzh_ext_headers`, `lzh_japanese_names`,
-`lzh_large_payload`, `lzh_lha_oracle`, `lzh_lhd_lh1`, `sevenz_interop`,
-`tar_pax_japanese`, `test_multifile_bug`, `test_simple_deflate`,
-`zip_encryption_e2e`, `zip_name_encoding`.
+Integration-test suites under `tests/` (110 tests across 19 files):
+`cab_interop`, `iso9660_interop`, `iso_sevenz_mutation`, `lzh_corpus_reader`,
+`lzh_ext_headers`, `lzh_japanese_names`, `lzh_large_payload`,
+`lzh_lha_oracle`, `lzh_lhd_lh1`, `sevenz_interop`, `tar_pax_japanese`,
+`tar_sparse_stream`, `test_multifile_bug`, `test_simple_deflate`,
+`xz_cli_interop`, `zip_cli_interop`, `zip_encryption_e2e`,
+`zip_name_encoding`, `zip_xz_sevenz_hardening`.
 
-**Total: 444 tests** (`cargo nextest run -p oxiarc-archive --all-features`).
+**Total: 528 tests** (`cargo nextest run -p oxiarc-archive --all-features`;
+497 with default features — the difference is the opt-in oracle-gated tests
+that shell out to reference tools).
 
 ## Code Statistics
 
@@ -291,8 +300,12 @@ two added in 0.3.6 — `cab_interop` and `iso9660_interop` — plus
    detected and explicitly rejected with an error rather than silently
    misread).
 2. TAR sparse: read support lands hole-preserving extraction via in-memory
-   materialization (GNU old-format + PAX `GNU.sparse.*`); writer-side sparse
-   emission and on-disk hole-punching during extraction remain out of scope.
+   materialization for all three GNU sparse variants — old-format ('S'),
+   PAX 0.1 (`GNU.sparse.*` pax-attribute map), and PAX 1.0
+   (`GNU.sparse.major=1`/`.minor=0`, in-data-stream decimal-ASCII preamble
+   map) — in both the seekable `TarReader` and the streaming
+   `TarStreamReader`. Writer-side sparse emission and on-disk hole-punching
+   during extraction remain out of scope.
 3. No RAR format support.
 4. 7z and CAB are read-only (no create/write).
 5. Async I/O provides whole-entry/metadata access for ZIP, TAR, and LZH via

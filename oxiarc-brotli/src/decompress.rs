@@ -153,6 +153,55 @@ pub(crate) fn decompress_with_hooks(
     cancel: Option<&CancellationToken>,
     max_output: Option<usize>,
 ) -> BrotliResult<Vec<u8>> {
+    decompress_instrumented(data, progress, cancel, max_output, None)
+}
+
+/// The block-splitting and context-modeling shape of one decoded meta-block.
+///
+/// This is what the decoder *actually parsed*, recorded as a side effect of a
+/// normal decode. Its purpose is to let tests assert that an encoder change
+/// really reached the wire — "the stream round-trips" is true of a stream that
+/// silently declined to split, so without this a feature test can pass
+/// vacuously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MetaBlockShape {
+    /// `NBLTYPESL`: literal block types.
+    pub literal_types: u32,
+    /// `NBLTYPESI`: insert-and-copy block types.
+    pub insert_and_copy_types: u32,
+    /// `NBLTYPESD`: distance block types.
+    pub distance_types: u32,
+    /// `NTREESL`: distinct literal prefix codes.
+    pub literal_trees: u32,
+    /// `NTREESD`: distinct distance prefix codes.
+    pub distance_trees: u32,
+}
+
+/// Decompress `data`, additionally reporting the shape of every compressed
+/// meta-block it contained.
+///
+/// Intended for tests and diagnostics; the returned bytes are exactly what
+/// [`decompress`] produces.
+///
+/// # Errors
+///
+/// The same errors as [`decompress`].
+pub fn decompress_reporting_shapes(data: &[u8]) -> BrotliResult<(Vec<u8>, Vec<MetaBlockShape>)> {
+    let mut shapes = Vec::new();
+    let output = decompress_instrumented(data, None, None, None, Some(&mut shapes))?;
+    Ok((output, shapes))
+}
+
+/// The shared decode driver. `shapes`, when present, collects one entry per
+/// compressed meta-block.
+fn decompress_instrumented(
+    data: &[u8],
+    progress: Option<&ProgressHandle>,
+    cancel: Option<&CancellationToken>,
+    max_output: Option<usize>,
+    mut shapes: Option<&mut Vec<MetaBlockShape>>,
+) -> BrotliResult<Vec<u8>> {
     if data.is_empty() {
         return Err(BrotliError::UnexpectedEof);
     }
@@ -233,7 +282,10 @@ pub(crate) fn decompress_with_hooks(
             }
         }
 
-        decode_compressed_meta_block(&mut reader, &mut output, mlen, &mut state)?;
+        let shape = decode_compressed_meta_block(&mut reader, &mut output, mlen, &mut state)?;
+        if let Some(ref mut collected) = shapes {
+            collected.push(shape);
+        }
 
         if let Some(handle) = progress {
             handle.on_progress(output.len() as u64, None);
@@ -314,7 +366,7 @@ fn skip_metadata_block(reader: &mut BitReader<'_>) -> BrotliResult<()> {
 
 /// Read an NBLTYPES / NTREES count with the Section 9.2 variable-length
 /// code (result in 1..=256).
-fn read_block_type_count(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
+pub(crate) fn read_block_type_count(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
     if !reader.read_bit()? {
         return Ok(1);
     }
@@ -491,13 +543,14 @@ fn inverse_move_to_front(data: &mut [u8]) {
     }
 }
 
-/// Decode one compressed meta-block (RFC 7932 Sections 9.2/9.3).
+/// Decode one compressed meta-block (RFC 7932 Sections 9.2/9.3), reporting the
+/// block-splitting shape its header declared.
 fn decode_compressed_meta_block(
     reader: &mut BitReader<'_>,
     output: &mut Vec<u8>,
     mlen: usize,
     state: &mut DecoderState,
-) -> BrotliResult<()> {
+) -> BrotliResult<MetaBlockShape> {
     let block_start = output.len();
     let target_len = block_start + mlen;
 
@@ -676,7 +729,13 @@ fn decode_compressed_meta_block(
         }
     }
 
-    Ok(())
+    Ok(MetaBlockShape {
+        literal_types: cat_l.num_types,
+        insert_and_copy_types: cat_i.num_types,
+        distance_types: cat_d.num_types,
+        literal_trees: ntreesl,
+        distance_trees: ntreesd,
+    })
 }
 
 /// Convert a distance symbol into a distance (RFC 7932 Section 4).

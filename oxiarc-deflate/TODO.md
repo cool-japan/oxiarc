@@ -157,7 +157,7 @@
 ### Compliance
 - [x] Round-trip testing (zlib/gzip format compliance, 2026-05-17)
 - [x] `proptest`-based round-trip test suite (`tests/proptest_roundtrip.rs`: `roundtrip`, `inflate_never_panics`) (done 2026-07-08)
-- [ ] Fuzzing tests (cargo-fuzz style; proptest round-trip suite above is a related but distinct property-based check)
+- [x] Fuzzing tests (cargo-fuzz style; proptest round-trip suite above is a related but distinct property-based check) — `fuzz/fuzz_targets/fuzz_inflate.rs` (4.1M corpus), `fuzz_inflate_into.rs` (1.9M corpus, added in the 0.4.0 cycle), `fuzz_zlib_header.rs` (3.4M corpus), and `fuzz_gzip_header.rs` (5.0M corpus) at the workspace `fuzz/` root
 - [x] Edge case handling (empty input, max length matches) (completed 2026-07-07) — both cases already correct (empty-input special case in write_stored_blocks; length 258→code 285 in length_to_code); added decoder-only hand-built length-258 vector to close the coverage gap.
 
 ## Test Coverage

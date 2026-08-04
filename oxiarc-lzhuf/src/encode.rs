@@ -279,15 +279,31 @@ impl LzhEncoder {
             return Ok(());
         }
 
-        if self.method == LzhMethod::Lh1 {
-            // lh1 uses an adaptive coder whose state cannot be resumed
-            // across calls in this API — require single-shot encoding.
+        if matches!(
+            self.method,
+            LzhMethod::Lh1 | LzhMethod::Lh2 | LzhMethod::Lh3 | LzhMethod::Lzs | LzhMethod::Lz5
+        ) {
+            // These codecs carry state (adaptive trees, per-block tables, a
+            // pre-seeded ring) that cannot be resumed across calls in this
+            // API — require single-shot encoding.
             if !finish {
-                return Err(OxiArcError::unsupported_method(
-                    "lh1 encoding requires a single call with finish=true",
-                ));
+                return Err(OxiArcError::unsupported_method(format!(
+                    "{} encoding requires a single call with finish=true",
+                    self.method.name()
+                )));
             }
-            let encoded = crate::lh1::encode_lh1(data);
+            let encoded = match self.method {
+                LzhMethod::Lh1 => crate::lh1::encode_lh1(data),
+                LzhMethod::Lh2 => crate::legacy::encode_lh2(data)?,
+                LzhMethod::Lh3 => crate::legacy::encode_lh3(data)?,
+                LzhMethod::Lzs => crate::legacy::encode_lzs(data)?,
+                LzhMethod::Lz5 => crate::legacy::encode_lz5(data)?,
+                other => {
+                    return Err(OxiArcError::unsupported_method(
+                        String::from_utf8_lossy(&other.id()).into_owned(),
+                    ));
+                }
+            };
             writer.write_all(&encoded)?;
             self.finished = true;
             return Ok(());

@@ -290,10 +290,12 @@ impl ZipCrypto {
     /// Generate an encryption header using the operating system CSPRNG.
     ///
     /// The 11 random header bytes are drawn from the same OS CSPRNG used for AES
-    /// salts (`/dev/urandom` on Unix-like systems, with a runtime-entropy
-    /// fallback). This is the recommended way to build a traditional-encryption
-    /// header for real archives, since it does not rely on a predictable,
-    /// caller-supplied seed the way [`ZipCrypto::generate_header_seeded`] does.
+    /// salts (`/dev/urandom` on Unix-like targets, `BCryptGenRandom` on Windows;
+    /// see the internal `zip::csprng` module). There is no software fallback — if the OS source
+    /// is unavailable this fails instead of emitting predictable header bytes.
+    /// This is the recommended way to build a traditional-encryption header for
+    /// real archives, since it does not rely on a predictable, caller-supplied
+    /// seed the way [`ZipCrypto::generate_header_seeded`] does.
     ///
     /// # Arguments
     ///
@@ -302,11 +304,18 @@ impl ZipCrypto {
     /// # Returns
     ///
     /// A 12-byte encrypted header.
-    pub fn generate_header_random(&mut self, crc32: u32) -> [u8; ENCRYPTION_HEADER_SIZE] {
-        let random_bytes = super::encryption::generate_salt(11);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::Io`] when the operating-system CSPRNG cannot be
+    /// reached.
+    pub fn generate_header_random(&mut self, crc32: u32) -> Result<[u8; ENCRYPTION_HEADER_SIZE]> {
+        // Fill the fixed-size array directly: no intermediate Vec, so there is
+        // no length-dependent `copy_from_slice` that a future refactor could
+        // turn into a panic.
         let mut random = [0u8; 11];
-        random.copy_from_slice(&random_bytes);
-        self.generate_header(crc32, &random)
+        super::csprng::fill_random(&mut random)?;
+        Ok(self.generate_header(crc32, &random))
     }
 
     /// Verify and consume the encryption header during decryption.
@@ -470,8 +479,13 @@ impl<W: Write> ZipCryptoWriter<W> {
     /// # Returns
     ///
     /// The number of bytes written (always 12).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::Io`] when the operating-system CSPRNG cannot be
+    /// reached, or when the underlying writer fails.
     pub fn write_header_secure(&mut self, crc32: u32) -> Result<usize> {
-        let header = self.cipher.generate_header_random(crc32);
+        let header = self.cipher.generate_header_random(crc32)?;
         self.inner.write_all(&header)?;
         Ok(ENCRYPTION_HEADER_SIZE)
     }
@@ -742,9 +756,13 @@ mod tests {
         let password = b"testpassword";
 
         let mut cipher = ZipCrypto::new(password);
-        let header1 = cipher.generate_header_random(crc32);
+        let header1 = cipher
+            .generate_header_random(crc32)
+            .expect("OS CSPRNG must be available");
         let mut cipher = ZipCrypto::new(password);
-        let header2 = cipher.generate_header_random(crc32);
+        let header2 = cipher
+            .generate_header_random(crc32)
+            .expect("OS CSPRNG must be available");
 
         // The encrypted random portion should differ between headers.
         assert_ne!(header1[..11], header2[..11]);

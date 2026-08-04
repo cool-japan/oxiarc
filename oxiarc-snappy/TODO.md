@@ -66,7 +66,7 @@
 
 ### Compatibility
 - [x] Interop testing with Google Snappy reference — 16 integration tests against Google Snappy wire-format golden vectors (empty, single-byte, 64 KiB boundary, 64 KiB+1, `max_compress_len` invariant, arbitrary-data roundtrip, crafted-stream decode, truncated/oversized-varint rejection) (done 2026-05-30)
-- [ ] Fuzzing tests
+- [x] Fuzzing tests — `fuzz/fuzz_targets/fuzz_snappy_decompress.rs` (808K corpus) and `fuzz_snappy_crc32c.rs` (116K corpus) at the workspace `fuzz/` root (`cargo fuzz run fuzz_snappy_decompress` from there)
 - [x] Edge case handling (max-size blocks) — already correct; MAX_UNCOMPRESSED_CHUNK_SIZE=65536 enforced exactly at chunk boundaries, exhaustively covered by existing 64KiB/65537/128KiB/all-zeros/all-ones/incremental tests across block and frame APIs. (done 2026-07-07)
 
 ## Test Coverage

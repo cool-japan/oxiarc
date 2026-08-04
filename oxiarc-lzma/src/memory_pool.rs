@@ -160,10 +160,16 @@ impl Default for LzmaPool {
     }
 }
 
-// SAFETY: LzmaPool only accesses its contents through a Mutex, so it is safe
-// to share across threads.
-unsafe impl Send for LzmaPool {}
-unsafe impl Sync for LzmaPool {}
+// `LzmaPool` (`Mutex<HashMap<usize, Vec<Vec<u8>>>>` + `usize`) is already
+// auto-Send + Sync — every field is. A manual `unsafe impl` here would add no
+// capability today, but it would permanently suppress the compiler's
+// auto-trait derivation, so a future field (e.g. a `Cell` or raw pointer)
+// could silently make the type unsound with no diagnostic. Assert the
+// property instead: this is a compile-time check, not a grant of one.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<LzmaPool>();
+};
 
 /// A byte buffer borrowed from an [`LzmaPool`].
 ///

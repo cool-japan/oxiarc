@@ -54,10 +54,41 @@
 
 ### Additional Methods
 - [x] lh1 (LZHUF: 4 KB window + adaptive Huffman) — decoder and spec-conformant greedy encoder (done 2026-07-06)
-- [ ] lh2, lh3 (legacy methods)
-- [ ] lzs (LZSS without Huffman)
-- [ ] lz4, lz5 (LZ methods)
-- [ ] pm0, pm2 (PMarc methods)
+- [x] lh2, lh3 (LHarc 2.x legacy methods) — done 2026-08-04. `-lh2-` is an 8 KiB
+  LZSS with the `dhuf.c` adaptive Huffman (flat frequency-sorted node array,
+  equal-frequency blocks, a position tree that grows one 64-distance group per
+  64 output bytes); `-lh3-` is the same window with `shuf.c` block-static
+  tables (16-bit block size, 286 x 1+4-bit literal/length lengths, optional
+  128 x 4-bit position table, both with the three-1-lengths degenerate escape,
+  plus LArc's built-in `ready_made` fallback table). Decode **and** encode.
+  **Verification:** neither Lhasa nor `delharc` implements these two, so there
+  is no oracle on PATH. Conformance was established against the canonical LHa
+  `dhuf.c`/`shuf.c` decode path compiled standalone (10 payloads x 2 methods =
+  20 streams, all byte-identical; a further 10 with the `ready_made` position
+  table forced). Five payloads x 2 methods are frozen into
+  `tests/lzh_legacy_vectors.rs` so the in-repo gate stays hermetic — see that
+  file's header for how to refresh them.
+- [x] lzs (LZSS without Huffman) — done 2026-08-04, decode + encode. 2 KiB
+  space-filled ring, 11-bit **absolute** history index + 4-bit length biased
+  by 2. Gated by the real `lha` CLI (`oxiarc-archive`'s `lha-oracle`).
+- [x] lz4, lz5 (LArc LZ methods) — done 2026-08-04. `-lz4-` is stored (the
+  reference decoders route it to a null decoder) and now decodes/encodes as
+  such instead of being reported unknown; `-lz5-` is a byte-oriented LZSS with
+  an LSB-first bitmap byte per eight commands, a 12-bit absolute index and a
+  4-bit length biased by 3, over a 4 KiB history pre-seeded with LArc's run/
+  ramp/padding image. Both gated by the real `lha` CLI.
+- [x] pm0 (PMarc stored) — done 2026-08-04, decode + encode, `lha`-gated.
+- [ ] pm1, pm2 (PMarc compressed) — **deferred, format-spec gap.** Unlike every
+  other method here, PMarc's compressed variants have no published format
+  description; the only specification is Lhasa's `pm2_decoder.c`/`pm1_decoder.c`
+  themselves, which are GPL-2.0 and therefore cannot be ported into this
+  Apache-2.0/MIT crate. The algorithm is also substantially larger than the
+  others (a 5-tree scheme with its own history-copy state machine and an
+  8-entry LRU of recent match offsets). Reimplementing it would require a
+  clean-room derivation from observed behaviour, since `lha` can decode `-pm2-`
+  but cannot create it — leaving no way to generate the fixtures a clean-room
+  effort would need. Entries using pm1/pm2 remain listed with a typed
+  `unsupported_method` error at extraction time, never a silent mis-decode.
 
 ### Performance
 - [x] Better hash function — 4-byte multiplicative hash with improved avalanche (done 2026-05-16)
@@ -139,6 +170,10 @@ Code lines per file (`tokei oxiarc-lzhuf/src`, code lines only, verified 2026-07
 | Method | Window | Bits | Typical Ratio |
 |--------|--------|------|---------------|
 | lh0 | - | - | 0% (stored) |
+| lzs | 2048 | 11 | ~20-35% |
+| lz5 | 4096 | 12 | ~25-40% |
+| lh2 | 8192 | 13 | ~50-60% |
+| lh3 | 8192 | 13 | ~50-60% |
 | lh4 | 4096 | 12 | ~40-50% |
 | lh5 | 8192 | 13 | ~50-60% |
 | lh6 | 32768 | 15 | ~55-65% |
@@ -146,5 +181,7 @@ Code lines per file (`tokei oxiarc-lzhuf/src`, code lines only, verified 2026-07
 
 ## Known Limitations
 
-1. Legacy methods lh2/lh3 not implemented (lh1 implemented since 0.3.4)
+1. PMarc `-pm1-`/`-pm2-` not implemented (see the Additional Methods section
+   for the licensing/spec reason). Every other LZH-container method — lh0-lh7,
+   lhd, lzs, lz4, lz5, pm0 — decodes and encodes.
 2. Single-threaded only (batch path; parallel feature available for multi-entry archives)

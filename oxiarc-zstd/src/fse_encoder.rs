@@ -1,939 +1,668 @@
-//! FSE (Finite State Entropy) encoding for Zstandard sequences.
+//! FSE table construction for the Zstandard *encoder* (RFC 8878 §4.1.1).
 //!
-//! This module provides FSE table building and encoding for the three sequence
-//! components in Zstandard compressed blocks: literal lengths, match lengths,
-//! and offsets. Each component is encoded using a Finite State Entropy table
-//! that maps symbol frequencies to a state machine for entropy coding.
+//! A compressed block's Sequences Section describes each of its three symbol
+//! streams (literal lengths, offsets, match lengths) with one of four modes.
+//! `Predefined` and `RLE` need no table description at all, which is why they
+//! are the easy modes to emit — and why an encoder that only emits those is
+//! RFC-valid but leaves compression ratio on the table whenever the block's
+//! real symbol distribution differs from the RFC's fixed one.
 //!
-//! FSE encoding works backwards (last symbol encoded first, decoded last).
-//! The encoding table is the inverse of the decoding table: given a symbol
-//! and the current state, it determines how many bits to output and the new state.
+//! This module supplies the two pieces needed for `FSE_Compressed_Mode`:
+//!
+//! 1. [`normalize_counts`] — turn raw symbol frequencies into a *normalized*
+//!    distribution whose entries sum to exactly `1 << table_log`, which is what
+//!    an FSE table is built from.
+//! 2. [`write_ncount`] — serialize that distribution into the bit-packed
+//!    "FSE Table Description" the decoder parses back.
+//!
+//! Both are faithful ports of the reference implementation
+//! (`FSE_normalizeCount` / `FSE_writeNCount` in `zstd/lib/common/fse.h` and
+//! `entropy_common.c`), including the `FSE_normalizeM2` fallback, because the
+//! bit-level format has no slack: a distribution that sums to the wrong total,
+//! or a header written with an off-by-one threshold, produces a stream that
+//! `zstd -d` rejects outright.
+//!
+//! [`estimate_encoded_bits`] rounds this out with the cost model the encoder
+//! uses to decide whether a custom table is actually *worth* its header bytes.
 
-/// FSE encoding table entry.
+use oxiarc_core::error::{OxiArcError, Result};
+
+/// Smallest accuracy log the format permits (`FSE_MIN_TABLELOG`).
+pub(crate) const MIN_TABLE_LOG: u8 = 5;
+
+/// Index of the most significant set bit (`BIT_highbit32`).
 ///
-/// Each entry stores the information needed to encode a symbol occurrence:
-/// the delta to find the next state, and the number of bits to output.
-#[derive(Debug, Clone, Copy)]
-pub struct FseEncodeEntry {
-    /// Delta to find next state from state index.
-    pub delta_find_state: i32,
-    /// Delta to number of bits (packed: nb_bits in low 16, delta_nb in high 16).
-    pub delta_nb_bits: u32,
-}
-
-/// FSE encoding table.
-///
-/// Built from symbol frequencies, this table enables FSE encoding of a stream
-/// of symbols by maintaining a state machine. Each symbol may have multiple
-/// entries corresponding to its probability share.
-pub struct FseEncodeTable {
-    /// Entries indexed by state value. Each entry encodes one state transition.
-    /// The table is organized as a flat array of size `1 << accuracy_log`.
-    /// For each state, we store the symbol it represents and encoding info.
-    state_symbols: Vec<u8>,
-    /// For each state: (nb_bits, new_state_base)
-    state_encoding: Vec<(u8, u16)>,
-    /// Symbol-to-state mapping: for each symbol, the list of states that emit it.
-    /// Used during encoding to find the initial state for a symbol.
-    symbol_states: Vec<Vec<u16>>,
-    /// Per-symbol occurrence counter for encoding (tracks which state to use next).
-    symbol_counters: Vec<usize>,
-    /// Accuracy log.
-    accuracy_log: u8,
-    /// Symbol probabilities (for serialization).
-    probabilities: Vec<i16>,
-    /// Number of symbols.
-    num_symbols: usize,
-}
-
-impl FseEncodeTable {
-    /// Build an FSE encoding table from symbol frequencies.
-    ///
-    /// The frequencies are normalized to sum to `1 << accuracy_log`, then the
-    /// encoding table (inverse of the decoding table) is constructed using the
-    /// same spread algorithm as the decoder.
-    ///
-    /// Returns `None` if only one distinct symbol exists (use RLE mode instead).
-    pub fn from_frequencies(frequencies: &[u32], accuracy_log: u8) -> Option<Self> {
-        if frequencies.is_empty() {
-            return None;
-        }
-
-        let total: u64 = frequencies.iter().map(|&f| f as u64).sum();
-        if total == 0 {
-            return None;
-        }
-
-        // Count distinct symbols
-        let distinct = frequencies.iter().filter(|&&f| f > 0).count();
-        if distinct <= 1 {
-            return None;
-        }
-
-        let table_size = 1usize << accuracy_log;
-
-        // Normalize frequencies to sum to table_size
-        let probabilities = Self::normalize_frequencies(frequencies, table_size);
-
-        // Verify normalization
-        let prob_sum: i32 = probabilities
-            .iter()
-            .map(|&p| if p == -1 { 1 } else { p.max(0) as i32 })
-            .sum();
-        if prob_sum != table_size as i32 {
-            return None;
-        }
-
-        let num_symbols = probabilities.len();
-
-        // Build the decoding table (same spread algorithm as decoder) to derive
-        // the encoding table from it.
-        let mut state_symbols = vec![0u8; table_size];
-        let table_mask = table_size - 1;
-        let step = (table_size >> 1) + (table_size >> 3) + 3;
-        let mut position = 0usize;
-
-        for (symbol, &prob) in probabilities.iter().enumerate() {
-            let count = if prob == -1 { 1 } else { prob.max(0) as usize };
-            for _ in 0..count {
-                state_symbols[position] = symbol as u8;
-                loop {
-                    position = (position + step) & table_mask;
-                    if position < table_size {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Build symbol_next (same as decoder's second pass)
-        let mut symbol_next = vec![0u16; num_symbols];
-        let mut cumulative = 0u16;
-        for (symbol, &prob) in probabilities.iter().enumerate() {
-            if prob == -1 {
-                symbol_next[symbol] = (table_size - 1) as u16;
-            } else if prob > 0 {
-                symbol_next[symbol] = cumulative;
-                cumulative += prob as u16;
-            }
-        }
-
-        // Build state encoding info: for each state, compute (nb_bits, new_state_base)
-        let mut state_encoding = vec![(0u8, 0u16); table_size];
-        let mut symbol_next_copy = symbol_next.clone();
-
-        for state in 0..table_size {
-            let symbol = state_symbols[state] as usize;
-            let prob = probabilities[symbol];
-
-            if prob == -1 {
-                state_encoding[state] = (accuracy_log, 0);
-            } else if prob > 0 {
-                let prob_val = prob as u16;
-                let nb_bits = accuracy_log - highest_bit_set_u16(prob_val);
-                let next = symbol_next_copy[symbol];
-                symbol_next_copy[symbol] += 1;
-                let baseline = (next << nb_bits).wrapping_sub(prob_val);
-                state_encoding[state] = (nb_bits, baseline);
-            }
-        }
-
-        // Build symbol_states: for each symbol, collect all states that correspond to it
-        let mut symbol_states: Vec<Vec<u16>> = vec![Vec::new(); num_symbols];
-        for (state, &sym) in state_symbols.iter().enumerate() {
-            symbol_states[sym as usize].push(state as u16);
-        }
-
-        let symbol_counters = vec![0usize; num_symbols];
-
-        Some(Self {
-            state_symbols,
-            state_encoding,
-            symbol_states,
-            symbol_counters,
-            accuracy_log,
-            probabilities,
-            num_symbols,
-        })
-    }
-
-    /// Normalize frequencies to sum to `table_size`.
-    ///
-    /// Uses proportional scaling with a "less than 1" marker (-1) for very
-    /// rare symbols that still need at least one state allocated.
-    fn normalize_frequencies(frequencies: &[u32], table_size: usize) -> Vec<i16> {
-        let total: u64 = frequencies.iter().map(|&f| f as u64).sum();
-        let mut probabilities = Vec::with_capacity(frequencies.len());
-        let mut assigned = 0i32;
-        let mut num_nonzero = 0usize;
-
-        for &freq in frequencies {
-            if freq == 0 {
-                probabilities.push(0);
-            } else {
-                num_nonzero += 1;
-                let prob = ((freq as u64 * table_size as u64) / total) as i16;
-                if prob == 0 {
-                    // Symbol is too rare for a full slot - mark as "less than 1"
-                    probabilities.push(-1);
-                    assigned += 1;
-                } else {
-                    probabilities.push(prob);
-                    assigned += prob as i32;
-                }
-            }
-        }
-
-        // Distribute any remainder to the most probable symbols
-        let remainder = table_size as i32 - assigned;
-        if remainder != 0 {
-            // Find the symbol with highest frequency that has prob > 0
-            let mut best_idx = None;
-            let mut best_freq = 0u32;
-            for (i, &freq) in frequencies.iter().enumerate() {
-                if probabilities[i] > 0 && freq > best_freq {
-                    best_freq = freq;
-                    best_idx = Some(i);
-                }
-            }
-            if let Some(idx) = best_idx {
-                probabilities[idx] += remainder as i16;
-                // Ensure it doesn't go to zero or negative
-                if probabilities[idx] <= 0 {
-                    // Fallback: spread across all nonzero symbols
-                    probabilities[idx] -= remainder as i16; // undo
-                    Self::spread_remainder(&mut probabilities, frequencies, remainder, num_nonzero);
-                }
-            }
-        }
-
-        probabilities
-    }
-
-    /// Spread remainder across multiple symbols when a single adjustment would fail.
-    fn spread_remainder(
-        probabilities: &mut [i16],
-        frequencies: &[u32],
-        mut remainder: i32,
-        _num_nonzero: usize,
-    ) {
-        // Sort indices by frequency descending
-        let mut indices: Vec<usize> = (0..frequencies.len())
-            .filter(|&i| probabilities[i] > 0)
-            .collect();
-        indices.sort_by(|&a, &b| frequencies[b].cmp(&frequencies[a]));
-
-        let direction = if remainder > 0 { 1i16 } else { -1i16 };
-        let mut idx = 0;
-        while remainder != 0 && !indices.is_empty() {
-            let i = indices[idx % indices.len()];
-            let new_val = probabilities[i] + direction;
-            if new_val > 0 {
-                probabilities[i] = new_val;
-                remainder -= direction as i32;
-            }
-            idx += 1;
-            // Safety: prevent infinite loop
-            if idx > indices.len() * (remainder.unsigned_abs() as usize + 1) {
-                break;
-            }
-        }
-    }
-
-    /// Serialize the FSE table description (probabilities).
-    ///
-    /// Format: accuracy_log - 5 (4 bits) followed by variable-length probability
-    /// encoding using the Zstandard FSE table description format.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut bits: Vec<bool> = Vec::new();
-
-        // Write accuracy_log - 5 in 4 bits (LSB first)
-        let al_val = (self.accuracy_log - 5) as u32;
-        for bit_idx in 0..4 {
-            bits.push((al_val >> bit_idx) & 1 == 1);
-        }
-
-        let table_size = 1usize << self.accuracy_log;
-        let mut remaining = table_size as i32;
-
-        for &prob in &self.probabilities {
-            if remaining <= 0 {
-                break;
-            }
-
-            // Variable-length encoding of probability value
-            // The value to encode is: if prob == -1 then 0, else prob + 1
-            let value = if prob == -1 {
-                0u32
-            } else if prob == 0 {
-                // Zero probability: encode and then handle repeat-zero
-                1u32 // value 1 means probability 0
-            } else {
-                (prob as u32) + 1
-            };
-
-            let max_bits_needed = highest_bit_set_u32((remaining + 1) as u32) + 1;
-            let low_bits = max_bits_needed - 1;
-            let threshold = ((1u32 << max_bits_needed) - 1).wrapping_sub((remaining + 1) as u32);
-
-            if value < threshold {
-                // Write low_bits bits
-                for bit_idx in 0..low_bits {
-                    bits.push((value >> bit_idx) & 1 == 1);
-                }
-            } else {
-                // Write low_bits + 1 bits
-                let adjusted = value + threshold;
-                for bit_idx in 0..low_bits {
-                    bits.push(((adjusted >> 1) >> bit_idx) & 1 == 1);
-                }
-                bits.push(adjusted & 1 == 1);
-            }
-
-            if prob != 0 {
-                remaining -= if prob == -1 { 1 } else { prob as i32 };
-            }
-
-            // Handle repeat zeros (we don't emit repeat-zero sequences in serialization
-            // for simplicity; each zero is encoded individually)
-            if prob == 0 {
-                // Write a 2-bit repeat count of 0 (meaning no additional zeros)
-                bits.push(false);
-                bits.push(false);
-            }
-        }
-
-        // Convert bits to bytes (LSB first within each byte)
-        let num_bytes = bits.len().div_ceil(8);
-        let mut output = Vec::with_capacity(num_bytes);
-        for chunk_start in (0..bits.len()).step_by(8) {
-            let mut byte = 0u8;
-            for bit_idx in 0..8 {
-                if chunk_start + bit_idx < bits.len() && bits[chunk_start + bit_idx] {
-                    byte |= 1 << bit_idx;
-                }
-            }
-            output.push(byte);
-        }
-
-        output
-    }
-
-    /// Get accuracy log.
-    pub fn accuracy_log(&self) -> u8 {
-        self.accuracy_log
-    }
-
-    /// Get the probabilities (for external inspection or debugging).
-    pub fn probabilities(&self) -> &[i16] {
-        &self.probabilities
-    }
-
-    /// Get the number of symbols.
-    pub fn num_symbols(&self) -> usize {
-        self.num_symbols
-    }
-
-    /// Reset symbol occurrence counters (call before encoding a new block).
-    pub fn reset_counters(&mut self) {
-        for c in &mut self.symbol_counters {
-            *c = 0;
-        }
-    }
-
-    /// Find the initial state for a given symbol.
-    ///
-    /// Returns the first state associated with the symbol, cycling through
-    /// available states on repeated calls.
-    pub(crate) fn initial_state_for(&mut self, symbol: u8) -> u16 {
-        let sym = symbol as usize;
-        if sym >= self.symbol_states.len() || self.symbol_states[sym].is_empty() {
-            return 0;
-        }
-        let states = &self.symbol_states[sym];
-        let counter = self.symbol_counters[sym];
-        let state = states[counter % states.len()];
-        self.symbol_counters[sym] = counter + 1;
-        state
-    }
-
-    /// Get encoding info for a state: returns (nb_bits, new_state_base).
-    pub(crate) fn get_encoding_info(&self, state: u16) -> (u8, u16) {
-        self.state_encoding[state as usize]
-    }
-
-    /// Get the symbol at a given state.
-    pub(crate) fn state_symbol(&self, state: u16) -> u8 {
-        self.state_symbols[state as usize]
-    }
-
-    /// Encode a symbol transition: output bits from current state, then find
-    /// a new state for the given symbol.
-    ///
-    /// Returns (nb_bits_to_output, bits_value, new_state).
-    /// The bits should be written to the backward bitstream before the state update.
-    pub(crate) fn encode_symbol(&mut self, state: u16, symbol: u8) -> (u8, u32, u16) {
-        // Output bits from the current state
-        let table_size = 1usize << self.accuracy_log;
-        let (nb_bits, _baseline) = self.state_encoding[state as usize];
-        let bits_to_output = (state as u32) & ((1u32 << nb_bits) - 1);
-
-        // Find a new state for the given symbol
-        let new_state = self.initial_state_for(symbol);
-
-        // Ensure the new state is within bounds
-        debug_assert!((new_state as usize) < table_size);
-
-        (nb_bits, bits_to_output, new_state)
+/// Returns 0 for an input of 0, matching the reference's behaviour on the
+/// paths where it is called with a guaranteed-nonzero value.
+fn highest_bit(value: u32) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        31 - value.leading_zeros()
     }
 }
 
-/// FSE state encoder.
-///
-/// Maintains the FSE state machine during backward encoding of a symbol stream.
-/// Symbols are encoded in reverse order; the decoder will read them forward.
-pub struct FseStateEncoder<'a> {
-    /// Mutable reference to the encoding table (needed for state counter tracking).
-    table: &'a mut FseEncodeTable,
-    /// Current state.
-    state: u16,
+/// Reference `FSE_minTableLog`: the smallest accuracy log that can still
+/// represent every symbol value in the alphabet.
+fn min_table_log(src_size: usize, max_symbol: u8) -> u8 {
+    let min_bits_src = highest_bit(src_size as u32) + 1;
+    let min_bits_symbols = highest_bit(u32::from(max_symbol)) + 2;
+    min_bits_src.min(min_bits_symbols) as u8
 }
 
-impl<'a> FseStateEncoder<'a> {
-    /// Initialize with first symbol.
-    ///
-    /// The first symbol sets the initial state without outputting any bits.
-    pub fn init(table: &'a mut FseEncodeTable, symbol: u8) -> Self {
-        let state = table.initial_state_for(symbol);
-        Self { table, state }
+/// Reference `FSE_optimalTableLog`: pick an accuracy log for `src_size`
+/// symbols drawn from an alphabet of `0..=max_symbol`.
+///
+/// A larger table models the distribution more precisely but costs more header
+/// bytes and more bits per state transition, so the reference caps it by the
+/// input size (`maxBitsSrc`) as well as by the per-table format maximum.
+pub(crate) fn optimal_table_log(max_table_log: u8, src_size: usize, max_symbol: u8) -> u8 {
+    debug_assert!(src_size > 1, "RLE mode handles single-symbol inputs");
+    let max_bits_src = highest_bit(src_size.saturating_sub(1) as u32).saturating_sub(2) as u8;
+    let mut table_log = max_table_log;
+    let min_bits = min_table_log(src_size, max_symbol);
+    if max_bits_src < table_log {
+        table_log = max_bits_src;
     }
-
-    /// Encode a symbol: compute bits to output and update state.
-    ///
-    /// Returns the (nb_bits, bits_value) that should be written to the backward
-    /// bitstream. The caller is responsible for writing these bits.
-    pub fn encode(&mut self, symbol: u8) -> (u8, u32) {
-        let (nb_bits, bits_value, new_state) = self.table.encode_symbol(self.state, symbol);
-        self.state = new_state;
-        (nb_bits, bits_value)
+    if min_bits > table_log {
+        table_log = min_bits;
     }
-
-    /// Flush final state bits.
-    ///
-    /// After all symbols have been encoded, the final state value must be written
-    /// to the bitstream so the decoder can initialize its state.
-    pub fn flush(&self) -> (u8, u32) {
-        (self.table.accuracy_log(), self.state as u32)
-    }
-
-    /// Get the current state.
-    pub fn state(&self) -> u16 {
-        self.state
-    }
+    table_log.clamp(MIN_TABLE_LOG, max_table_log)
 }
 
-/// Literal length code table.
+/// Rounding thresholds from the reference `FSE_normalizeCount` (`rtbTable`).
 ///
-/// Maps a literal length value to (code, extra_bits, extra_value).
-/// Codes 0-15 map directly; codes 16-35 use extra bits for larger values.
-pub fn ll_code(literal_length: usize) -> (u8, u8, u32) {
-    /// Literal length baselines for codes 0-35.
-    const LL_BASELINE: [usize; 36] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
-        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-    ];
-    /// Extra bits for each literal length code.
-    const LL_EXTRA: [u8; 36] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
-        11, 12, 13, 14, 15, 16,
-    ];
+/// For small probabilities the plain truncated scaling loses too much mass;
+/// these are the fractional cut-offs above which a probability is rounded up
+/// instead of down.
+const RTB_TABLE: [u64; 8] = [
+    0, 473_195, 504_333, 520_860, 550_000, 700_000, 750_000, 830_000,
+];
 
-    // Direct mapping for 0-15
-    if literal_length <= 15 {
-        return (literal_length as u8, 0, 0);
-    }
-
-    // Search for the right code bracket
-    for code in (16..36).rev() {
-        if literal_length >= LL_BASELINE[code] {
-            let extra_value = (literal_length - LL_BASELINE[code]) as u32;
-            return (code as u8, LL_EXTRA[code], extra_value);
-        }
-    }
-
-    // Fallback (should not happen for valid input)
-    (35, 16, (literal_length - 65536) as u32)
-}
-
-/// Match length code table.
+/// Normalize raw `frequencies` into a distribution summing to `1 << table_log`.
 ///
-/// Maps a match length value (minimum 3) to (code, extra_bits, extra_value).
-/// Codes 0-31 map to match lengths 3-34; codes 32-52 use extra bits.
-pub fn ml_code(match_length: usize) -> (u8, u8, u32) {
-    /// Match length baselines for codes 0-52.
-    const ML_BASELINE: [usize; 53] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
-        1027, 2051, 4099, 8195, 16387, 32771, 65539,
-    ];
-    /// Extra bits for each match length code.
-    const ML_EXTRA: [u8; 53] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    ];
-
-    // Direct mapping for match lengths 3-34 (codes 0-31)
-    if (3..=34).contains(&match_length) {
-        return ((match_length - 3) as u8, 0, 0);
-    }
-
-    // Search for the right code bracket
-    for code in (32..53).rev() {
-        if match_length >= ML_BASELINE[code] {
-            let extra_value = (match_length - ML_BASELINE[code]) as u32;
-            return (code as u8, ML_EXTRA[code], extra_value);
-        }
-    }
-
-    // Fallback (should not happen for valid input >= 3)
-    (52, 16, (match_length - 65539) as u32)
-}
-
-/// Offset code.
+/// `low_prob_count` is the value assigned to symbols too rare for a full slot:
+/// `1` for a plain single slot, or `-1` for the format's "less than one"
+/// marker (which the decoder places at the top of the state table). The
+/// reference picks `-1` only for blocks with many sequences, where the extra
+/// precision pays for itself.
 ///
-/// Maps an offset value to (code, extra_bits, extra_value).
-/// `code = floor(log2(offset))`, `extra_bits = code`, `extra_value = offset - (1 << code)`.
+/// # Errors
 ///
-/// Note: offset must be >= 1 for valid Zstandard offsets.
-pub fn of_code(offset: usize) -> (u8, u8, u32) {
-    if offset == 0 {
-        return (0, 0, 0);
-    }
-
-    // code = floor(log2(offset)) = position of highest set bit
-    let code = highest_bit_position(offset);
-
-    if code == 0 {
-        // offset == 1: code=0, no extra bits
-        return (0, 0, 0);
-    }
-
-    let extra_bits = code;
-    let extra_value = (offset - (1usize << code)) as u32;
-
-    (code as u8, extra_bits as u8, extra_value)
-}
-
-/// Choose the best compression mode for a symbol distribution.
-///
-/// Analyzes the frequency distribution to select between predefined tables,
-/// RLE encoding, or custom FSE tables.
-pub fn choose_mode(frequencies: &[u32], total: u32) -> SequenceCompressionMode {
+/// Returns [`OxiArcError::EncodingError`] when the frequencies cannot be
+/// normalized at the requested accuracy — for example when the alphabet has
+/// more distinct symbols than the table has slots. Callers treat that as
+/// "custom table not usable" and fall back to a predefined table rather than
+/// emitting an invalid description.
+pub(crate) fn normalize_counts(
+    frequencies: &[u32],
+    total: u32,
+    table_log: u8,
+    low_prob_count: i16,
+) -> Result<Vec<i16>> {
     if total == 0 {
-        return SequenceCompressionMode::Predefined;
+        return Err(OxiArcError::encoding_error(
+            "cannot normalize an empty symbol distribution",
+        ));
+    }
+    if !(MIN_TABLE_LOG..=crate::fse::MAX_ACCURACY_LOG).contains(&table_log) {
+        return Err(OxiArcError::encoding_error(format!(
+            "FSE accuracy log {table_log} outside the representable range"
+        )));
+    }
+    let table_size = 1i32 << table_log;
+    if (frequencies.iter().filter(|&&f| f > 0).count() as i32) > table_size {
+        return Err(OxiArcError::encoding_error(
+            "more distinct symbols than FSE table slots",
+        ));
     }
 
-    // Count distinct symbols
-    let mut distinct_count = 0usize;
-    let mut single_symbol = 0u8;
-    for (i, &freq) in frequencies.iter().enumerate() {
-        if freq > 0 {
-            distinct_count += 1;
-            single_symbol = i as u8;
+    let mut norm = vec![0i16; frequencies.len()];
+    let total64 = u64::from(total);
+    let scale = 62 - u32::from(table_log);
+    let step = (1u64 << 62) / total64;
+    let v_step = 1u64 << (scale - 20);
+    let low_threshold = total >> table_log;
+
+    let mut still_to_distribute = table_size;
+    let mut largest = 0usize;
+    let mut largest_p = 0i16;
+
+    for (symbol, &count) in frequencies.iter().enumerate() {
+        if count == total {
+            return Err(OxiArcError::encoding_error(
+                "single-symbol distribution must use RLE mode",
+            ));
+        }
+        if count == 0 {
+            continue;
+        }
+        if count <= low_threshold {
+            norm[symbol] = low_prob_count;
+            still_to_distribute -= 1;
+            continue;
+        }
+        let scaled = u64::from(count) * step;
+        let mut proba = (scaled >> scale) as i16;
+        if proba < 8 {
+            // Round up when the discarded fraction exceeds the reference's
+            // per-probability threshold. `proba` is in 0..8 here, so the index
+            // is always inside `RTB_TABLE`.
+            let rest_to_beat = v_step * RTB_TABLE[proba as usize];
+            if scaled - ((proba as u64) << scale) > rest_to_beat {
+                proba += 1;
+            }
+        }
+        if proba > largest_p {
+            largest_p = proba;
+            largest = symbol;
+        }
+        norm[symbol] = proba;
+        still_to_distribute -= i32::from(proba);
+    }
+
+    if -still_to_distribute >= i32::from(norm[largest] >> 1) {
+        // Handing the whole deficit to the most probable symbol would halve it
+        // (or worse); the reference switches to a second, slower method that
+        // re-derives every weight from the remaining mass.
+        normalize_m2(&mut norm, frequencies, total, table_log, low_prob_count)?;
+    } else {
+        norm[largest] += still_to_distribute as i16;
+    }
+
+    validate_normalized(&norm, frequencies, table_size)?;
+    Ok(norm)
+}
+
+/// Reference `FSE_normalizeM2`: the fallback used when proportional scaling
+/// leaves too large a deficit to absorb into the most probable symbol.
+fn normalize_m2(
+    norm: &mut [i16],
+    frequencies: &[u32],
+    total: u32,
+    table_log: u8,
+    low_prob_count: i16,
+) -> Result<()> {
+    /// Sentinel for "weight not decided yet" (the reference uses -2, which can
+    /// never be a legal normalized count).
+    const NOT_YET_ASSIGNED: i16 = -2;
+
+    let mut remaining_total = u64::from(total);
+    let mut distributed = 0i32;
+    let low_threshold = total >> table_log;
+    let mut low_one = ((u64::from(total) * 3) >> (u32::from(table_log) + 1)) as u32;
+
+    for (symbol, &count) in frequencies.iter().enumerate() {
+        if count == 0 {
+            norm[symbol] = 0;
+            continue;
+        }
+        if count <= low_threshold {
+            norm[symbol] = low_prob_count;
+            distributed += 1;
+            remaining_total -= u64::from(count);
+            continue;
+        }
+        if count <= low_one {
+            norm[symbol] = 1;
+            distributed += 1;
+            remaining_total -= u64::from(count);
+            continue;
+        }
+        norm[symbol] = NOT_YET_ASSIGNED;
+    }
+
+    let table_size = 1i32 << table_log;
+    let mut to_distribute = table_size - distributed;
+    if to_distribute == 0 {
+        return validate_normalized(norm, frequencies, table_size);
+    }
+
+    if to_distribute > 0 && remaining_total / (to_distribute as u64) > u64::from(low_one) {
+        // Risk of scaling a symbol down to zero: re-classify more symbols as
+        // single-slot before the proportional pass.
+        low_one = ((remaining_total * 3) / (to_distribute as u64 * 2)) as u32;
+        for (symbol, &count) in frequencies.iter().enumerate() {
+            if norm[symbol] == NOT_YET_ASSIGNED && count <= low_one {
+                norm[symbol] = 1;
+                distributed += 1;
+                remaining_total -= u64::from(count);
+            }
+        }
+        to_distribute = table_size - distributed;
+    }
+
+    if distributed as usize == frequencies.len() {
+        // Every symbol was rare: give the leftover slots to the most frequent
+        // one (the reference's "probably incompressible" branch).
+        let mut max_symbol = 0usize;
+        let mut max_count = 0u32;
+        for (symbol, &count) in frequencies.iter().enumerate() {
+            if count > max_count {
+                max_count = count;
+                max_symbol = symbol;
+            }
+        }
+        norm[max_symbol] += to_distribute as i16;
+        return validate_normalized(norm, frequencies, table_size);
+    }
+
+    if remaining_total == 0 {
+        // All mass was consumed by the low-probability classes; hand the
+        // remaining slots out round-robin to symbols that already have one.
+        let mut symbol = 0usize;
+        while to_distribute > 0 {
+            if norm[symbol] > 0 {
+                norm[symbol] += 1;
+                to_distribute -= 1;
+            }
+            symbol = (symbol + 1) % frequencies.len();
+        }
+        return validate_normalized(norm, frequencies, table_size);
+    }
+
+    let v_step_log = 62 - u32::from(table_log);
+    let mid = (1u64 << (v_step_log - 1)) - 1;
+    let r_step = ((1u64 << v_step_log) * to_distribute as u64 + mid) / remaining_total;
+    let mut running = mid;
+    for (symbol, &count) in frequencies.iter().enumerate() {
+        if norm[symbol] != NOT_YET_ASSIGNED {
+            continue;
+        }
+        let end = running + u64::from(count) * r_step;
+        let weight = (end >> v_step_log) - (running >> v_step_log);
+        if weight < 1 {
+            return Err(OxiArcError::encoding_error(
+                "FSE normalization assigned a zero weight to a used symbol",
+            ));
+        }
+        norm[symbol] = weight as i16;
+        running = end;
+    }
+
+    validate_normalized(norm, frequencies, table_size)
+}
+
+/// Check the two invariants an FSE table builder relies on: the counts sum to
+/// the table size, and no symbol that actually occurs was given zero slots.
+fn validate_normalized(norm: &[i16], frequencies: &[u32], table_size: i32) -> Result<()> {
+    let mut sum = 0i32;
+    for (symbol, &probability) in norm.iter().enumerate() {
+        if probability < -1 {
+            return Err(OxiArcError::encoding_error(
+                "FSE normalization produced an out-of-range count",
+            ));
+        }
+        if frequencies[symbol] > 0 && probability == 0 {
+            return Err(OxiArcError::encoding_error(
+                "FSE normalization dropped a symbol that occurs in the block",
+            ));
+        }
+        if frequencies[symbol] == 0 && probability != 0 {
+            return Err(OxiArcError::encoding_error(
+                "FSE normalization allocated slots to an unused symbol",
+            ));
+        }
+        sum += if probability == -1 {
+            1
+        } else {
+            i32::from(probability)
+        };
+    }
+    if sum != table_size {
+        return Err(OxiArcError::encoding_error(format!(
+            "FSE normalized counts sum to {sum}, expected {table_size}"
+        )));
+    }
+    Ok(())
+}
+
+/// Serialize a normalized distribution as an RFC 8878 §4.1.1 FSE Table
+/// Description.
+///
+/// This is a port of `FSE_writeNCount_generic`. The encoding is a forward,
+/// little-endian bit stream: 4 bits of `Accuracy_Log - 5`, then one
+/// variable-width field per symbol whose width shrinks as the remaining
+/// probability mass shrinks, with runs of zero-probability symbols coded as
+/// 2-bit repeat flags.
+///
+/// # Errors
+///
+/// Returns [`OxiArcError::EncodingError`] if `table_log` is out of range or the
+/// distribution does not sum to `1 << table_log` (which would make the header
+/// undecodable).
+pub(crate) fn write_ncount(norm: &[i16], table_log: u8) -> Result<Vec<u8>> {
+    if !(MIN_TABLE_LOG..=crate::fse::MAX_ACCURACY_LOG).contains(&table_log) {
+        return Err(OxiArcError::encoding_error(format!(
+            "FSE accuracy log {table_log} outside the representable range"
+        )));
+    }
+    let table_size = 1i32 << table_log;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut bit_stream: u32 = 0;
+    let mut bit_count: u32 = 0;
+
+    // Header: Accuracy_Log - 5, four bits.
+    bit_stream |= u32::from(table_log - MIN_TABLE_LOG) << bit_count;
+    bit_count += 4;
+
+    // `remaining` carries one extra unit of accuracy, exactly as the reference
+    // does, so that the "value + 1" encoding below stays in range.
+    let mut remaining = table_size + 1;
+    let mut threshold = table_size;
+    let mut nb_bits = u32::from(table_log) + 1;
+    let mut symbol = 0usize;
+    let mut previous_is_zero = false;
+    let alphabet = norm.len();
+
+    while symbol < alphabet && remaining > 1 {
+        if previous_is_zero {
+            // Skip a run of zero-probability symbols, coding its length in
+            // base-3 chunks of two bits (3 = "another chunk follows"), with a
+            // 24-symbol fast path that emits eight consecutive 3s at once.
+            let mut start = symbol;
+            while symbol < alphabet && norm[symbol] == 0 {
+                symbol += 1;
+            }
+            if symbol == alphabet {
+                break;
+            }
+            while symbol >= start + 24 {
+                start += 24;
+                bit_stream |= 0xFFFFu32 << bit_count;
+                out.push(bit_stream as u8);
+                out.push((bit_stream >> 8) as u8);
+                bit_stream >>= 16;
+            }
+            while symbol >= start + 3 {
+                start += 3;
+                bit_stream |= 3u32 << bit_count;
+                bit_count += 2;
+            }
+            bit_stream |= ((symbol - start) as u32) << bit_count;
+            bit_count += 2;
+            if bit_count > 16 {
+                out.push(bit_stream as u8);
+                out.push((bit_stream >> 8) as u8);
+                bit_stream >>= 16;
+                bit_count -= 16;
+            }
+            // The reference clears `previousIs0` here; this port does not need
+            // to, because the symbol block below assigns it unconditionally
+            // before the next iteration reads it.
+        }
+
+        let probability = norm[symbol];
+        symbol += 1;
+        let max = (2 * threshold - 1) - remaining;
+        remaining -= i32::from(probability.abs());
+        // "+1 for extra accuracy": the wire value is probability + 1, so the
+        // "less than one" marker (-1) encodes as 0 and probability 0 as 1.
+        let mut value = i32::from(probability) + 1;
+        if value >= threshold {
+            value += max;
+        }
+        bit_stream |= (value as u32) << bit_count;
+        bit_count += nb_bits;
+        if value < max {
+            bit_count -= 1;
+        }
+        previous_is_zero = value == 1;
+        if remaining < 1 {
+            return Err(OxiArcError::encoding_error(
+                "FSE table description overran the table size",
+            ));
+        }
+        while remaining < threshold {
+            nb_bits -= 1;
+            threshold >>= 1;
+        }
+
+        if bit_count > 16 {
+            out.push(bit_stream as u8);
+            out.push((bit_stream >> 8) as u8);
+            bit_stream >>= 16;
+            bit_count -= 16;
         }
     }
 
-    if distinct_count == 0 {
-        return SequenceCompressionMode::Predefined;
+    if remaining != 1 {
+        return Err(OxiArcError::encoding_error(format!(
+            "FSE table description ended with {remaining} units undistributed"
+        )));
     }
 
-    if distinct_count == 1 {
-        return SequenceCompressionMode::Rle(single_symbol);
-    }
+    // Flush: write two bytes, but only advance by the bits actually used.
+    out.push(bit_stream as u8);
+    out.push((bit_stream >> 8) as u8);
+    out.truncate(out.len() - 2 + (bit_count as usize).div_ceil(8));
 
-    // Check if the distribution is close enough to predefined to not warrant
-    // a custom table. Use a simple heuristic: if the number of distinct symbols
-    // is small and total count is low, predefined may suffice.
-    if total < 16 && distinct_count <= 4 {
-        return SequenceCompressionMode::Predefined;
-    }
-
-    // Choose accuracy log based on total count
-    let accuracy_log = choose_accuracy_log(total, distinct_count);
-
-    match FseEncodeTable::from_frequencies(frequencies, accuracy_log) {
-        Some(table) => SequenceCompressionMode::Fse(table),
-        None => SequenceCompressionMode::Predefined,
-    }
+    Ok(out)
 }
 
-/// Choose an appropriate accuracy log for FSE table based on data characteristics.
+/// Estimate, in bits, what it costs to encode `frequencies` with the FSE table
+/// described by `norm` at `table_log`.
 ///
-/// Higher accuracy logs give better compression but larger tables.
-/// Zstandard limits: LL max 9, ML max 9, OF max 8.
-fn choose_accuracy_log(total: u32, distinct: usize) -> u8 {
-    // Ensure at least 2^accuracy_log >= 2 * distinct for good symbol spread
-    let min_log = if distinct <= 2 {
-        5
-    } else {
-        let needed = (distinct * 2).next_power_of_two().trailing_zeros() as u8;
-        needed.max(5)
-    };
-
-    // Scale with data size
-    let size_log = if total < 64 {
-        5
-    } else if total < 256 {
-        6
-    } else if total < 1024 {
-        7
-    } else if total < 4096 {
-        8
-    } else {
-        9
-    };
-
-    min_log.max(size_log).min(9)
-}
-
-/// Sequence compression mode.
+/// An FSE state that holds `p` of the table's `1 << table_log` slots spends
+/// about `log2(table_size / p)` bits per occurrence, so the total is
+/// `sum(freq[s] * log2(table_size / norm[s]))`. This is the same cost model the
+/// reference uses in `ZSTD_fseBitCost`, and it is what lets the encoder decide
+/// honestly whether a custom table earns back its header bytes.
 ///
-/// Determines how a sequence component (literal length, match length, or offset)
-/// will be encoded in the compressed block.
-pub enum SequenceCompressionMode {
-    /// Use predefined FSE table.
-    Predefined,
-    /// Use RLE (all same symbol).
-    Rle(u8),
-    /// Use custom FSE table.
-    Fse(FseEncodeTable),
-}
-
-/// Find the position of the highest set bit (0-indexed from LSB) for u16.
-#[inline]
-fn highest_bit_set_u16(value: u16) -> u8 {
-    if value == 0 {
-        0
-    } else {
-        15 - value.leading_zeros() as u8
+/// Returns `None` when `norm` cannot encode the given frequencies at all (a
+/// symbol occurs but has no slots), so the caller must not use that table.
+pub(crate) fn estimate_encoded_bits(
+    frequencies: &[u32],
+    norm: &[i16],
+    table_log: u8,
+) -> Option<f64> {
+    let table_size = f64::from(1u32 << table_log);
+    let mut bits = 0.0f64;
+    for (symbol, &count) in frequencies.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let probability = *norm.get(symbol)?;
+        let slots = if probability == -1 {
+            // A "less than one" symbol behaves like a single slot but costs the
+            // full accuracy log, since its state always spans the whole table.
+            1.0
+        } else if probability > 0 {
+            f64::from(probability)
+        } else {
+            return None;
+        };
+        bits += f64::from(count) * (table_size / slots).log2();
     }
-}
-
-/// Find the position of the highest set bit (0-indexed from LSB) for u32.
-#[inline]
-fn highest_bit_set_u32(value: u32) -> u8 {
-    if value == 0 {
-        0
-    } else {
-        31 - value.leading_zeros() as u8
-    }
-}
-
-/// Find the position of the highest set bit for usize.
-#[inline]
-fn highest_bit_position(value: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        (usize::BITS - 1 - value.leading_zeros()) as usize
-    }
+    Some(bits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fse::read_ncount;
 
-    // --- ll_code tests ---
+    /// Round the description through the crate's own reference-verified parser.
+    ///
+    /// The parser in `fse.rs` is the code path that decodes real `zstd` output
+    /// (64/64 reference frames), so agreeing with it is a meaningful check —
+    /// unlike agreeing with a second writer we also wrote.
+    fn parse_back(bytes: &[u8], max_symbol: u8, max_log: u8) -> (Vec<i16>, u8, usize) {
+        read_ncount(bytes, max_symbol, max_log).expect("written FSE table description must parse")
+    }
 
+    /// The RFC 8878 predefined literal-length distribution must survive a
+    /// write/parse round trip — including its four trailing `-1` entries.
     #[test]
-    fn test_ll_code_direct() {
-        for i in 0..=15 {
-            let (code, extra_bits, extra_value) = ll_code(i);
-            assert_eq!(code, i as u8, "ll_code({}) code mismatch", i);
-            assert_eq!(extra_bits, 0, "ll_code({}) should have 0 extra bits", i);
-            assert_eq!(extra_value, 0, "ll_code({}) should have 0 extra value", i);
+    fn writes_predefined_ll_distribution() {
+        let norm: Vec<i16> = vec![
+            4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1,
+            1, 1, 1, -1, -1, -1, -1,
+        ];
+        let bytes = write_ncount(&norm, 6).expect("predefined LL distribution is writable");
+        let (parsed, log, consumed) = parse_back(&bytes, 35, 9);
+        assert_eq!(log, 6);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed, norm);
+    }
+
+    /// The predefined offset distribution uses accuracy log 5, the format
+    /// minimum, which exercises the `Accuracy_Log - 5 == 0` header value.
+    #[test]
+    fn writes_predefined_offset_distribution() {
+        let norm: Vec<i16> = vec![
+            1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
+            -1,
+        ];
+        let bytes = write_ncount(&norm, 5).expect("predefined OF distribution is writable");
+        let (parsed, log, _) = parse_back(&bytes, 31, 8);
+        assert_eq!(log, 5);
+        assert_eq!(parsed, norm);
+    }
+
+    /// A distribution with long interior runs of zeros exercises both the
+    /// 3-symbol and the 24-symbol repeat-flag paths of the writer.
+    #[test]
+    fn writes_long_zero_runs() {
+        let mut norm = vec![0i16; 53];
+        norm[0] = 30;
+        norm[1] = 20;
+        norm[40] = 8;
+        norm[52] = 6;
+        let bytes = write_ncount(&norm, 6).expect("sparse distribution is writable");
+        let (mut parsed, log, _) = parse_back(&bytes, 52, 9);
+        assert_eq!(log, 6);
+        parsed.resize(norm.len(), 0);
+        assert_eq!(parsed, norm);
+    }
+
+    /// A leading zero-probability symbol is the trickiest repeat-flag case:
+    /// the run starts before any symbol has been written.
+    #[test]
+    fn writes_leading_zero_run() {
+        let mut norm = vec![0i16; 36];
+        norm[5] = 40;
+        norm[6] = 16;
+        norm[35] = 8;
+        let bytes = write_ncount(&norm, 6).expect("leading-zero distribution is writable");
+        let (mut parsed, _, _) = parse_back(&bytes, 35, 9);
+        parsed.resize(norm.len(), 0);
+        assert_eq!(parsed, norm);
+    }
+
+    /// Every accuracy log the format allows must round-trip.
+    #[test]
+    fn writes_every_accuracy_log() {
+        for table_log in MIN_TABLE_LOG..=crate::fse::MAX_ACCURACY_LOG {
+            let table_size = 1i16 << table_log;
+            let norm = vec![table_size - 3, 1, 1, 1];
+            let bytes = write_ncount(&norm, table_log)
+                .unwrap_or_else(|e| panic!("log {table_log} must be writable: {e}"));
+            let (mut parsed, log, _) = parse_back(&bytes, 3, crate::fse::MAX_ACCURACY_LOG);
+            assert_eq!(log, table_log);
+            parsed.resize(norm.len(), 0);
+            assert_eq!(parsed, norm, "mismatch at accuracy log {table_log}");
         }
     }
 
+    /// Normalization must always produce something the table builder accepts:
+    /// the counts sum to the table size and every observed symbol keeps a slot.
     #[test]
-    fn test_ll_code_with_extra_bits() {
-        // Code 16: baseline 16, 1 extra bit -> covers 16-17
-        let (code, extra_bits, extra_value) = ll_code(16);
-        assert_eq!(code, 16);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 0);
-
-        let (code, extra_bits, extra_value) = ll_code(17);
-        assert_eq!(code, 16);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 1);
-
-        // Code 17: baseline 18, 1 extra bit -> covers 18-19
-        let (code, extra_bits, extra_value) = ll_code(18);
-        assert_eq!(code, 17);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 0);
-
-        // Code 20: baseline 24, 2 extra bits -> covers 24-27
-        let (code, extra_bits, extra_value) = ll_code(24);
-        assert_eq!(code, 20);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 0);
-
-        let (code, extra_bits, extra_value) = ll_code(27);
-        assert_eq!(code, 20);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 3);
-    }
-
-    #[test]
-    fn test_ll_code_large_values() {
-        // Code 35: baseline 65536, 16 extra bits
-        let (code, extra_bits, _) = ll_code(65536);
-        assert_eq!(code, 35);
-        assert_eq!(extra_bits, 16);
-    }
-
-    // --- ml_code tests ---
-
-    #[test]
-    fn test_ml_code_direct() {
-        for ml in 3..=34 {
-            let (code, extra_bits, extra_value) = ml_code(ml);
-            assert_eq!(code, (ml - 3) as u8, "ml_code({}) code mismatch", ml);
-            assert_eq!(extra_bits, 0, "ml_code({}) should have 0 extra bits", ml);
-            assert_eq!(extra_value, 0, "ml_code({}) should have 0 extra value", ml);
-        }
-    }
-
-    #[test]
-    fn test_ml_code_with_extra_bits() {
-        // Code 32: baseline 35, 1 extra bit -> covers 35-36
-        let (code, extra_bits, extra_value) = ml_code(35);
-        assert_eq!(code, 32);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 0);
-
-        let (code, extra_bits, extra_value) = ml_code(36);
-        assert_eq!(code, 32);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 1);
-
-        // Code 36: baseline 43, 2 extra bits -> covers 43-46
-        let (code, extra_bits, extra_value) = ml_code(43);
-        assert_eq!(code, 36);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 0);
-    }
-
-    // --- of_code tests ---
-
-    #[test]
-    fn test_of_code_small() {
-        // offset=1: code=0, no extra bits
-        let (code, extra_bits, extra_value) = of_code(1);
-        assert_eq!(code, 0);
-        assert_eq!(extra_bits, 0);
-        assert_eq!(extra_value, 0);
-
-        // offset=2: code=1, 1 extra bit, extra=0
-        let (code, extra_bits, extra_value) = of_code(2);
-        assert_eq!(code, 1);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 0);
-
-        // offset=3: code=1, 1 extra bit, extra=1
-        let (code, extra_bits, extra_value) = of_code(3);
-        assert_eq!(code, 1);
-        assert_eq!(extra_bits, 1);
-        assert_eq!(extra_value, 1);
-    }
-
-    #[test]
-    fn test_of_code_powers_of_two() {
-        // offset=4: code=2, 2 extra bits, extra=0
-        let (code, extra_bits, extra_value) = of_code(4);
-        assert_eq!(code, 2);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 0);
-
-        // offset=8: code=3, 3 extra bits, extra=0
-        let (code, extra_bits, extra_value) = of_code(8);
-        assert_eq!(code, 3);
-        assert_eq!(extra_bits, 3);
-        assert_eq!(extra_value, 0);
-
-        // offset=1024: code=10, 10 extra bits, extra=0
-        let (code, extra_bits, extra_value) = of_code(1024);
-        assert_eq!(code, 10);
-        assert_eq!(extra_bits, 10);
-        assert_eq!(extra_value, 0);
-    }
-
-    #[test]
-    fn test_of_code_non_power() {
-        // offset=5: code=2, 2 extra bits, extra=1
-        let (code, extra_bits, extra_value) = of_code(5);
-        assert_eq!(code, 2);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 1);
-
-        // offset=7: code=2, 2 extra bits, extra=3
-        let (code, extra_bits, extra_value) = of_code(7);
-        assert_eq!(code, 2);
-        assert_eq!(extra_bits, 2);
-        assert_eq!(extra_value, 3);
-    }
-
-    // --- FseEncodeTable tests ---
-
-    #[test]
-    fn test_fse_table_empty_returns_none() {
-        assert!(FseEncodeTable::from_frequencies(&[], 5).is_none());
-    }
-
-    #[test]
-    fn test_fse_table_all_zero_returns_none() {
-        assert!(FseEncodeTable::from_frequencies(&[0, 0, 0], 5).is_none());
-    }
-
-    #[test]
-    fn test_fse_table_single_symbol_returns_none() {
-        assert!(FseEncodeTable::from_frequencies(&[100, 0, 0], 5).is_none());
-    }
-
-    #[test]
-    fn test_fse_table_two_equal_symbols() {
-        let freqs = [50, 50];
-        let table = FseEncodeTable::from_frequencies(&freqs, 5);
-        assert!(table.is_some());
-        let tbl = table.as_ref().expect("table should exist");
-        assert_eq!(tbl.accuracy_log(), 5);
-        assert_eq!(tbl.num_symbols(), 2);
-    }
-
-    #[test]
-    fn test_fse_table_serialize_nonempty() {
-        let freqs = [100, 50, 25];
-        let table = FseEncodeTable::from_frequencies(&freqs, 6);
-        assert!(table.is_some());
-        let tbl = table.as_ref().expect("table should exist");
-        let serialized = tbl.serialize();
-        assert!(!serialized.is_empty());
-        // First nibble (4 bits) should encode accuracy_log - 5
-        let al_val = serialized[0] & 0x0F;
-        assert_eq!(al_val, tbl.accuracy_log() - 5);
-    }
-
-    #[test]
-    fn test_fse_table_multiple_symbols() {
-        let freqs = [100, 80, 60, 40, 20, 10, 5, 1];
-        let table = FseEncodeTable::from_frequencies(&freqs, 8);
-        assert!(table.is_some());
-        let tbl = table.as_ref().expect("table should exist");
-        assert_eq!(tbl.num_symbols(), 8);
-
-        // Check probabilities sum to table_size
-        let table_size = 1usize << tbl.accuracy_log();
-        let prob_sum: i32 = tbl
-            .probabilities()
-            .iter()
-            .map(|&p| if p == -1 { 1 } else { p.max(0) as i32 })
-            .sum();
-        assert_eq!(prob_sum, table_size as i32);
-    }
-
-    // --- choose_mode tests ---
-
-    #[test]
-    fn test_choose_mode_empty() {
-        match choose_mode(&[0, 0, 0], 0) {
-            SequenceCompressionMode::Predefined => {}
-            _ => panic!("expected Predefined"),
-        }
-    }
-
-    #[test]
-    fn test_choose_mode_single_symbol() {
-        match choose_mode(&[0, 100, 0], 100) {
-            SequenceCompressionMode::Rle(sym) => assert_eq!(sym, 1),
-            _ => panic!("expected Rle"),
-        }
-    }
-
-    #[test]
-    fn test_choose_mode_fse() {
-        let mut freqs = [0u32; 36];
-        freqs[0] = 500;
-        freqs[1] = 300;
-        freqs[2] = 100;
-        freqs[3] = 50;
-        freqs[4] = 30;
-        freqs[5] = 20;
-        match choose_mode(&freqs, 1000) {
-            SequenceCompressionMode::Fse(table) => {
-                assert!(table.accuracy_log() >= 5);
+    fn normalizes_skewed_distribution() {
+        let frequencies = [1000u32, 500, 1, 1, 1, 0, 0, 3];
+        let total: u32 = frequencies.iter().sum();
+        for low_prob in [1i16, -1] {
+            let norm = normalize_counts(&frequencies, total, 6, low_prob)
+                .expect("skewed distribution normalizes");
+            let sum: i32 = norm
+                .iter()
+                .map(|&p| if p == -1 { 1 } else { i32::from(p) })
+                .sum();
+            assert_eq!(sum, 64, "low_prob={low_prob}");
+            for (symbol, &count) in frequencies.iter().enumerate() {
+                if count > 0 {
+                    assert_ne!(norm[symbol], 0, "symbol {symbol} lost its slot");
+                } else {
+                    assert_eq!(norm[symbol], 0, "unused symbol {symbol} got slots");
+                }
             }
-            _ => panic!("expected Fse"),
+            let bytes = write_ncount(&norm, 6).expect("normalized table is writable");
+            let (mut parsed, _, _) = parse_back(&bytes, 7, 9);
+            parsed.resize(norm.len(), 0);
+            assert_eq!(parsed, norm);
         }
     }
 
-    // --- FseStateEncoder tests ---
-
+    /// A near-uniform distribution over many symbols forces the deficit into
+    /// the `FSE_normalizeM2` fallback rather than the fast path.
     #[test]
-    fn test_fse_state_encoder_init() {
-        let freqs = [50, 50];
-        let mut table = FseEncodeTable::from_frequencies(&freqs, 5).expect("table should exist");
-        let encoder = FseStateEncoder::init(&mut table, 0);
-        // State should be a valid state index
-        assert!(encoder.state() < (1 << 5));
+    fn normalizes_uniform_wide_alphabet() {
+        let frequencies: Vec<u32> = (0..52).map(|i| 7 + (i % 3) as u32).collect();
+        let total: u32 = frequencies.iter().sum();
+        let norm =
+            normalize_counts(&frequencies, total, 6, 1).expect("uniform distribution normalizes");
+        let sum: i32 = norm
+            .iter()
+            .map(|&p| if p == -1 { 1 } else { i32::from(p) })
+            .sum();
+        assert_eq!(sum, 64);
+        let bytes = write_ncount(&norm, 6).expect("normalized table is writable");
+        let (mut parsed, _, _) = parse_back(&bytes, 51, 9);
+        parsed.resize(norm.len(), 0);
+        assert_eq!(parsed, norm);
     }
 
+    /// A single-symbol distribution has no FSE representation; the caller must
+    /// be told to use RLE mode instead of getting a silently broken table.
     #[test]
-    fn test_fse_state_encoder_encode_and_flush() {
-        let freqs = [60, 40];
-        let mut table = FseEncodeTable::from_frequencies(&freqs, 5).expect("table should exist");
-        let mut encoder = FseStateEncoder::init(&mut table, 0);
-        let (_nb_bits, _bits_val) = encoder.encode(1);
-        let (flush_bits, flush_val) = encoder.flush();
-        assert_eq!(flush_bits, 5);
-        // The flush value represents the final state which should be a valid
-        // table index (0..2^accuracy_log)
-        let table_size = 1u32 << 5;
+    fn rejects_single_symbol_distribution() {
+        let frequencies = [0u32, 0, 42, 0];
+        let err = normalize_counts(&frequencies, 42, 6, 1)
+            .expect_err("single-symbol input must be rejected");
         assert!(
-            flush_val < table_size,
-            "flush_val {} should be < table_size {}",
-            flush_val,
-            table_size
+            format!("{err}").contains("RLE"),
+            "error should point at RLE mode, got: {err}"
         );
     }
 
-    // --- Helper function tests ---
-
+    /// More distinct symbols than table slots cannot be represented.
     #[test]
-    fn test_highest_bit_set_u16() {
-        assert_eq!(highest_bit_set_u16(0), 0);
-        assert_eq!(highest_bit_set_u16(1), 0);
-        assert_eq!(highest_bit_set_u16(2), 1);
-        assert_eq!(highest_bit_set_u16(4), 2);
-        assert_eq!(highest_bit_set_u16(255), 7);
-        assert_eq!(highest_bit_set_u16(256), 8);
+    fn rejects_alphabet_larger_than_table() {
+        let frequencies: Vec<u32> = (0..40).map(|_| 1u32).collect();
+        let total: u32 = frequencies.iter().sum();
+        assert!(normalize_counts(&frequencies, total, 5, 1).is_err());
     }
 
+    /// The accuracy-log heuristic must stay inside the format's bounds and
+    /// grow with the amount of data being modelled.
     #[test]
-    fn test_highest_bit_position() {
-        assert_eq!(highest_bit_position(0), 0);
-        assert_eq!(highest_bit_position(1), 0);
-        assert_eq!(highest_bit_position(2), 1);
-        assert_eq!(highest_bit_position(8), 3);
-        assert_eq!(highest_bit_position(1024), 10);
+    fn optimal_table_log_is_bounded_and_monotonic() {
+        let small = optimal_table_log(9, 4, 35);
+        let large = optimal_table_log(9, 100_000, 35);
+        assert!((MIN_TABLE_LOG..=9).contains(&small), "small log {small}");
+        assert!((MIN_TABLE_LOG..=9).contains(&large), "large log {large}");
+        assert!(small <= large);
+        assert!(optimal_table_log(8, 100_000, 28) <= 8);
     }
 
+    /// The cost model must prefer a table that matches the data over one that
+    /// does not, and must refuse a table with no slots for an observed symbol.
     #[test]
-    fn test_choose_accuracy_log() {
-        assert_eq!(choose_accuracy_log(10, 2), 5);
-        assert_eq!(choose_accuracy_log(100, 3), 6);
-        assert_eq!(choose_accuracy_log(500, 5), 7);
-        assert!(choose_accuracy_log(5000, 10) <= 9);
+    fn cost_model_prefers_matching_table() {
+        let frequencies = [90u32, 5, 5, 0];
+        let matching = [58i16, 3, 3, 0];
+        let uniform = [16i16, 16, 16, 16];
+        let matching_bits =
+            estimate_encoded_bits(&frequencies, &matching, 6).expect("matching table is usable");
+        let uniform_bits =
+            estimate_encoded_bits(&frequencies, &uniform, 6).expect("uniform table is usable");
+        assert!(
+            matching_bits < uniform_bits,
+            "matching {matching_bits} should beat uniform {uniform_bits}"
+        );
+
+        let missing = [64i16, 0, 0, 0];
+        assert!(estimate_encoded_bits(&frequencies, &missing, 6).is_none());
     }
 }

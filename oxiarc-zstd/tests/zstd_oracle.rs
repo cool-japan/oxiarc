@@ -343,3 +343,260 @@ fn oracle_streaming_writer_frames() {
     let out = zstd_decompress(&buffer).expect("reference zstd rejected streaming output");
     assert_eq!(out, payload, "streaming frames: wrong content");
 }
+
+// ---------------------------------------------------------------------------
+// FSE_Compressed_Mode sequence tables
+// ---------------------------------------------------------------------------
+
+/// Sequence-section compression modes of one compressed block, as the 2-bit
+/// codes RFC 8878 §3.1.1.3.2.1.1 defines (0 predefined, 1 RLE, 2 FSE, 3 repeat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockSequenceModes {
+    literal_length: u8,
+    offset: u8,
+    match_length: u8,
+}
+
+/// Walk a zstd frame and report the sequence compression modes of every
+/// compressed block it contains.
+///
+/// This exists so the oracle test can prove it is *actually* exercising
+/// `FSE_Compressed_Mode` rather than passing vacuously on predefined-table
+/// frames. It is an independent re-reading of the frame layout from RFC 8878
+/// §3.1.1, deliberately not sharing code with the encoder or the decoder.
+///
+/// Returns `Err` with a description if the frame does not parse.
+fn sequence_modes(frame: &[u8]) -> Result<Vec<BlockSequenceModes>, String> {
+    let read_u24 = |data: &[u8], at: usize| -> Result<u32, String> {
+        let bytes = data
+            .get(at..at + 3)
+            .ok_or_else(|| format!("truncated at {at}"))?;
+        Ok(u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16))
+    };
+
+    if frame.len() < 6 || frame[..4] != [0x28, 0xB5, 0x2F, 0xFD] {
+        return Err("not a zstd frame".into());
+    }
+    let descriptor = frame[4];
+    let fcs_flag = descriptor >> 6;
+    let single_segment = (descriptor >> 5) & 1 == 1;
+    let has_checksum = (descriptor >> 2) & 1 == 1;
+    let dict_id_flag = descriptor & 3;
+
+    let mut pos = 5;
+    if !single_segment {
+        pos += 1; // Window_Descriptor
+    }
+    pos += match dict_id_flag {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    pos += match fcs_flag {
+        0 if single_segment => 1,
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+
+    let mut modes = Vec::new();
+    loop {
+        let header = read_u24(frame, pos)?;
+        pos += 3;
+        let last_block = header & 1 == 1;
+        let block_type = (header >> 1) & 3;
+        let block_size = (header >> 3) as usize;
+
+        if block_type == 2 {
+            let block = frame
+                .get(pos..pos + block_size)
+                .ok_or_else(|| format!("compressed block at {pos} runs past the frame"))?;
+            if let Some(found) = block_sequence_modes(block)? {
+                modes.push(found);
+            }
+        }
+        if block_type == 1 {
+            pos += 1; // RLE block stores a single byte
+        } else {
+            pos += block_size;
+        }
+        if last_block {
+            break;
+        }
+    }
+    if has_checksum {
+        pos += 4;
+    }
+    if pos != frame.len() {
+        return Err(format!("frame has {} trailing bytes", frame.len() - pos));
+    }
+    Ok(modes)
+}
+
+/// Parse one Compressed_Block's literals section (to learn its length) and
+/// then the sequences-section header. Returns `None` when the block has zero
+/// sequences, which carries no modes byte.
+fn block_sequence_modes(block: &[u8]) -> Result<Option<BlockSequenceModes>, String> {
+    let first = *block.first().ok_or("empty compressed block")?;
+    let literals_type = first & 3;
+    let size_format = (first >> 2) & 3;
+
+    let byte = |at: usize| -> Result<usize, String> {
+        block
+            .get(at)
+            .map(|&b| usize::from(b))
+            .ok_or_else(|| format!("literals header truncated at {at}"))
+    };
+
+    let literals_len = match literals_type {
+        // Raw_Literals_Block / RLE_Literals_Block
+        0 | 1 => {
+            let (header_len, regenerated) = match size_format {
+                0 | 2 => (1, usize::from(first) >> 3),
+                1 => (2, (usize::from(first) >> 4) | (byte(1)? << 4)),
+                _ => (
+                    3,
+                    (usize::from(first) >> 4) | (byte(1)? << 4) | (byte(2)? << 12),
+                ),
+            };
+            header_len + if literals_type == 0 { regenerated } else { 1 }
+        }
+        // Compressed_Literals_Block / Treeless_Literals_Block
+        _ => {
+            let (header_len, compressed) = match size_format {
+                0 | 1 => {
+                    let value = usize::from(first) >> 4 | (byte(1)? << 4) | (byte(2)? << 12);
+                    (3, (value >> 10) & 0x3FF)
+                }
+                2 => {
+                    let value = usize::from(first) >> 4
+                        | (byte(1)? << 4)
+                        | (byte(2)? << 12)
+                        | (byte(3)? << 20);
+                    (4, (value >> 14) & 0x3FFF)
+                }
+                _ => {
+                    let value = usize::from(first) >> 4
+                        | (byte(1)? << 4)
+                        | (byte(2)? << 12)
+                        | (byte(3)? << 20)
+                        | (byte(4)? << 28);
+                    (5, (value >> 18) & 0x3FFFF)
+                }
+            };
+            header_len + compressed
+        }
+    };
+
+    let sequences = block
+        .get(literals_len..)
+        .ok_or("literals section runs past the block")?;
+    let count_first = *sequences.first().ok_or("missing sequence count")?;
+    let (count, count_len) = if count_first < 128 {
+        (usize::from(count_first), 1)
+    } else if count_first < 255 {
+        let second = *sequences.get(1).ok_or("truncated sequence count")?;
+        (
+            ((usize::from(count_first) - 128) << 8) + usize::from(second),
+            2,
+        )
+    } else {
+        let low = *sequences.get(1).ok_or("truncated sequence count")?;
+        let high = *sequences.get(2).ok_or("truncated sequence count")?;
+        (usize::from(low) + (usize::from(high) << 8) + 0x7F00, 3)
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    let modes_byte = *sequences.get(count_len).ok_or("missing modes byte")?;
+    Ok(Some(BlockSequenceModes {
+        literal_length: (modes_byte >> 6) & 3,
+        offset: (modes_byte >> 4) & 3,
+        match_length: (modes_byte >> 2) & 3,
+    }))
+}
+
+/// The frame walker must agree with the reference on frames the reference
+/// produced, so a bug in the walker cannot make the FSE assertion below pass
+/// or fail for the wrong reason.
+#[test]
+fn oracle_frame_walker_parses_reference_frames() {
+    if find_zstd().is_none() {
+        skip_note("oracle_frame_walker_parses_reference_frames");
+        return;
+    }
+    for (name, data) in test_inputs() {
+        if data.is_empty() {
+            continue;
+        }
+        for level in ["-1", "-9", "-19"] {
+            let frame = zstd_compress(&data, &[level])
+                .unwrap_or_else(|e| panic!("reference compress {name} {level}: {e}"));
+            sequence_modes(&frame).unwrap_or_else(|e| {
+                panic!("frame walker failed on reference frame {name} {level}: {e}")
+            });
+        }
+    }
+}
+
+/// Encode direction, `FSE_Compressed_Mode`: oxiarc must emit custom sequence
+/// tables on data whose symbol distribution warrants them, and the reference
+/// `zstd` must accept those frames and reproduce the input byte for byte.
+///
+/// Without the mode assertion this test would pass on predefined-table frames
+/// and prove nothing about the feature it is named for.
+#[test]
+fn oracle_encode_fse_compressed_sequence_tables() {
+    if find_zstd().is_none() {
+        skip_note("oracle_encode_fse_compressed_sequence_tables");
+        return;
+    }
+
+    // Highly structured records: long runs of repeated field values separated
+    // by short varying keys. This produces many sequences whose literal-length,
+    // match-length and offset codes cluster tightly, which is exactly the case
+    // the RFC's flat predefined distributions model badly.
+    let mut data = Vec::new();
+    for record in 0u32..24_000 {
+        data.extend_from_slice(b"id=");
+        data.extend_from_slice(format!("{:06}", record % 4096).as_bytes());
+        data.extend_from_slice(b";name=alpha;state=ACTIVE;region=eu-north-1;score=");
+        data.extend_from_slice(format!("{:03}", record % 97).as_bytes());
+        data.extend_from_slice(b";\n");
+    }
+
+    let mut saw_fse = false;
+    for level in [1i32, 3, 9, 19] {
+        let frame = oxiarc_zstd::encode_all(&data, level)
+            .unwrap_or_else(|e| panic!("oxiarc compress L{level}: {e}"));
+
+        let modes = sequence_modes(&frame)
+            .unwrap_or_else(|e| panic!("oxiarc frame L{level} does not parse: {e}"));
+        if modes
+            .iter()
+            .any(|m| m.literal_length == 2 || m.offset == 2 || m.match_length == 2)
+        {
+            saw_fse = true;
+        }
+
+        let decoded = zstd_decompress(&frame)
+            .unwrap_or_else(|e| panic!("reference zstd REJECTED oxiarc L{level} frame: {e}"));
+        assert_eq!(
+            decoded.len(),
+            data.len(),
+            "reference decoded the wrong length at L{level}"
+        );
+        assert!(
+            decoded == data,
+            "reference decode differs from the input at L{level}"
+        );
+    }
+
+    assert!(
+        saw_fse,
+        "no block used FSE_Compressed_Mode; the oracle check would be vacuous"
+    );
+    eprintln!("[zstd-oracle] FSE_Compressed_Mode sequence tables accepted by reference zstd");
+}

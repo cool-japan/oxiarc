@@ -56,48 +56,51 @@ const CRC32_TABLE_SLICE: [[u32; 256]; 8] = {
     tables
 };
 
-/// Pre-computed constants for CRC-32 IEEE (ISO 3309) using PCLMULQDQ
+/// Bit-reflected CRC-32 (ISO 3309) fold and reduction constants.
 ///
-/// These constants are derived from the CRC-32 IEEE polynomial 0x04C11DB7
-/// using the reflected (LSB-first) representation (0xEDB88320).
+/// Shared by the x86_64 PCLMULQDQ and the aarch64 PMULL paths so the two
+/// implementations can never drift apart. They are 33-bit pre-shifted values
+/// for the reflected polynomial 0xEDB88320, taken from
+/// [crc32fast](https://github.com/srijs/rust-crc32fast) and verified in this
+/// crate against the scalar slicing-by-8 path (see the tests at the bottom of
+/// this file).
 ///
-/// The fold constants are computed as x^n mod P(x) for various bit positions n.
+/// * `K3` = x^(128+64) mod P(x) — fold-by-1, low lane
+/// * `K4` = x^128 mod P(x)      — fold-by-1, high lane
+/// * `K5` = x^96 mod P(x)       — 128 → 64 reduction
+/// * `P_X` = P(x) with the x^32 term
+/// * `U_PRIME` = floor(x^64 / P(x))
 ///
-/// NOTE: These constants have been verified against known test vectors.
-#[cfg(target_arch = "x86_64")]
-mod x86_constants {
-    /// Fold constants for 128-bit to 64-bit reduction
-    /// k1 = x^128 mod P = 0xE95C1271
-    /// k2 = x^192 mod P = 0xCE3371CB
-    pub const K1_K2: [u64; 2] = [0xE95C1271, 0xCE3371CB];
-
-    /// Fold constants for further reduction
-    /// k3 = x^64 mod P = 0x910EEEC1
-    /// k4 = x^128 mod P = 0xE95C1271
-    pub const K3_K4: [u64; 2] = [0x910EEEC1, 0xE95C1271];
-
-    /// Final reduction constants
-    /// k5 = x^32 mod P = 0x0CBEC0ED
-    /// k6 = x^64 mod P = 0x910EEEC1
-    pub const K5_K6: [u64; 2] = [0x0CBEC0ED, 0x910EEEC1];
-
-    /// Barrett reduction constants for CRC-32 IEEE
-    /// mu = floor(x^64 / P') where P' = x^32 + P = 0x1_04C11DB7
-    /// poly = P' (polynomial with x^32 term)
-    ///
-    /// For reflected algorithm:
-    /// mu = 0x1_04D101DF
-    /// poly = 0x1_04C11DB7
-    pub const MU_POLY: [u64; 2] = [0x104D101DF, 0x104C11DB7];
+/// An earlier revision of the x86 path used the *non-reflected* Intel
+/// whitepaper constants (0xE95C1271 / 0x104C11DB7 and friends) together with
+/// reflected-style code and no input byte-swap, which produced wrong CRC-32
+/// values; that is why the path was shipped disabled. It is now the same
+/// arithmetic as the validated aarch64 path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod reflected_constants {
+    /// Fold-by-1 low lane constant: K3 = x^(128+64) mod P(x) reflected
+    pub const K3: u64 = 0x1751997d0;
+    /// Fold-by-1 high lane constant: K4 = x^128 mod P(x) reflected
+    pub const K4: u64 = 0x0ccaa009e;
+    /// 128→64 reduction constant: K5 = x^96 mod P(x) reflected
+    pub const K5: u64 = 0x163cd6124;
+    /// Barrett polynomial: P(x) with x^32 term
+    pub const P_X: u64 = 0x1db710641;
+    /// Barrett mu: floor(x^64 / P(x)), reflected
+    pub const U_PRIME: u64 = 0x1f7011641;
 }
 
 /// x86_64 SIMD CRC-32 implementation using PCLMULQDQ
+///
+/// This is a direct translation of the validated aarch64 PMULL path
+/// (`arm::crc32_pmull`) — same reflected constants, same fold-by-1 and Barrett
+/// reduction steps, with `_mm_clmulepi64_si128` in place of `vmull_p64`.
 #[cfg(target_arch = "x86_64")]
 pub mod x86 {
     use super::CRC32_TABLE_SLICE;
     use core::arch::x86_64::*;
 
-    use super::x86_constants::*;
+    use super::reflected_constants::{K3, K4, K5, P_X, U_PRIME};
 
     /// Minimum data size for SIMD acceleration
     /// Below this threshold, software implementation is faster
@@ -137,94 +140,101 @@ pub mod x86 {
             return crc32_slice8_fallback(crc, data);
         }
 
-        unsafe {
-            let mut ptr = data.as_ptr();
-            let end = ptr.add(data.len());
+        let mut ptr = data.as_ptr();
+        // SAFETY: ptr + data.len() is within the slice bounds (data is a valid slice)
+        let end = unsafe { ptr.add(data.len()) };
 
-            // Load fold constants
-            let k1k2 = _mm_loadu_si128(K1_K2.as_ptr().cast());
-            let _k3k4 = _mm_loadu_si128(K3_K4.as_ptr().cast());
-            let k5k6 = _mm_loadu_si128(K5_K6.as_ptr().cast());
-            let mu_poly = _mm_loadu_si128(MU_POLY.as_ptr().cast());
+        // Fold-by-1 constants: lane 0 = K3, lane 1 = K4 (matches fold_128_arm,
+        // which multiplies the low lane by K3 and the high lane by K4).
+        let k3k4 = _mm_set_epi64x(K4 as i64, K3 as i64);
 
-            // Initialize with first 16 bytes XORed with CRC
-            let mut x0 = _mm_loadu_si128(ptr.cast());
-            x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(crc as i32));
-            ptr = ptr.add(16);
+        // Initialize with the first 16 bytes XORed with the CRC in the low
+        // 32 bits only (`_mm_cvtsi32_si128` zero-extends).
+        // SAFETY: at least SIMD_THRESHOLD (>= 64) bytes are available.
+        let mut x0 = unsafe { _mm_loadu_si128(ptr.cast()) };
+        x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(crc as i32));
+        // SAFETY: advancing by 16 is valid since data.len() >= SIMD_THRESHOLD
+        ptr = unsafe { ptr.add(16) };
 
-            // Process 16-byte blocks using fold operation
-            // SAFETY-FIX: avoid speculative ptr.add(16) in the loop guard (same class of
-            // bug as the aarch64 crc32_pmull loop and crc32_slice8_fallback below).
-            while (end as usize) - (ptr as usize) >= 16 {
-                let next_block = _mm_loadu_si128(ptr.cast());
-                x0 = fold_128(x0, next_block, k1k2);
-                ptr = ptr.add(16);
-            }
-
-            // Handle remaining bytes (less than 16)
-            let tail_len = end.offset_from(ptr) as usize;
-            if tail_len > 0 {
-                // Process remaining bytes with software fallback
-                let mut result = barrett_reduce(x0, k5k6, mu_poly);
-                // Apply remaining bytes to the partial result
-                let remaining = core::slice::from_raw_parts(ptr, tail_len);
-                result = crc32_slice8_fallback(result, remaining);
-                return result;
-            }
-
-            // Final reduction from 128-bit to 32-bit CRC
-            barrett_reduce(x0, k5k6, mu_poly)
+        // Process 16-byte blocks using the fold-by-1 operation.
+        // SAFETY-FIX: avoid speculative ptr.add(16) in the loop guard (same class of
+        // bug as the aarch64 crc32_pmull loop and crc32_slice8_fallback below):
+        // computing an out-of-bounds pointer is UB even if it is never dereferenced.
+        while (end as usize) - (ptr as usize) >= 16 {
+            // SAFETY: the loop guard proves 16 readable bytes remain at ptr.
+            let next_block = unsafe { _mm_loadu_si128(ptr.cast()) };
+            // SAFETY: fold_128 needs pclmulqdq, guaranteed by #[target_feature].
+            x0 = unsafe { fold_128(x0, next_block, k3k4) };
+            // SAFETY: within bounds, checked by the loop guard before the body ran.
+            ptr = unsafe { ptr.add(16) };
         }
+
+        // Handle remaining bytes (fewer than 16) after Barrett reduction.
+        // SAFETY: both pointers come from the same allocation (`data`).
+        let tail_len = unsafe { end.offset_from(ptr) } as usize;
+        if tail_len > 0 {
+            // SAFETY: barrett_reduce needs pclmulqdq+sse4.1, both enabled here.
+            let mut result = unsafe { barrett_reduce(x0, k3k4) };
+            // SAFETY: ptr is valid for tail_len bytes inside the original slice.
+            let remaining = unsafe { core::slice::from_raw_parts(ptr, tail_len) };
+            result = crc32_slice8_fallback(result, remaining);
+            return result;
+        }
+
+        // Final reduction from 128-bit to 32-bit CRC
+        // SAFETY: barrett_reduce needs pclmulqdq+sse4.1, both enabled here.
+        unsafe { barrett_reduce(x0, k3k4) }
     }
 
-    /// Fold one 128-bit value into another using carryless multiplication
+    /// Fold one 128-bit value into another using carryless multiplication.
+    ///
+    /// Computes `result = (a_low × K3) XOR (a_high × K4) XOR b`, the SSE
+    /// counterpart of `fold_128_arm`.
     #[inline]
     #[target_feature(enable = "pclmulqdq")]
-    unsafe fn fold_128(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
-        // Result = a_lo * k_lo + a_hi * k_hi + b
-        let lo = _mm_clmulepi64_si128(a, k, 0x00); // a[0] * k[0]
-        let hi = _mm_clmulepi64_si128(a, k, 0x11); // a[1] * k[1]
+    unsafe fn fold_128(a: __m128i, b: __m128i, k3k4: __m128i) -> __m128i {
+        let lo = _mm_clmulepi64_si128(a, k3k4, 0x00); // a[63:0]   × K3
+        let hi = _mm_clmulepi64_si128(a, k3k4, 0x11); // a[127:64] × K4
         _mm_xor_si128(_mm_xor_si128(lo, hi), b)
     }
 
-    /// Barrett reduction: reduce 128-bit value to 32-bit CRC
+    /// Barrett reduction: reduce a 128-bit fold accumulator to the 32-bit CRC.
+    ///
+    /// Step-for-step translation of `barrett_reduce_arm` (whose doc comment
+    /// transcribes this very SSE sequence from crc32fast):
+    ///
+    /// ```text
+    /// x = clmul(x, k3k4, 0x10) XOR srli(x, 8)          // 128 -> 64
+    /// x = clmul(x[31:0], K5, 0x00) XOR srli(x, 4)      // fold last 32 bits
+    /// t1 = x[31:0]  × U_PRIME
+    /// t2 = t1[31:0] × P_X
+    /// crc = extract_epi32(x XOR t2, 1)                 // bits [63:32]
+    /// ```
     #[inline]
     #[target_feature(enable = "pclmulqdq", enable = "sse4.1")]
-    unsafe fn barrett_reduce(x: __m128i, k5k6: __m128i, mu_poly: __m128i) -> u32 {
-        // Step 1: Fold 128-bit to 64-bit
-        // x_64 = x_hi * k5 + x_lo
-        let x_fold = {
-            let hi = _mm_srli_si128(x, 8);
-            let mul = _mm_clmulepi64_si128(hi, k5k6, 0x00);
-            _mm_xor_si128(x, mul)
-        };
+    unsafe fn barrett_reduce(x: __m128i, k3k4: __m128i) -> u32 {
+        // Mask keeping only the low 32 bits of the 128-bit register.
+        let mask32 = _mm_set_epi32(0, 0, 0, -1);
 
-        // Extract lower 64 bits for further reduction
-        let x_64 = {
-            // Fold bits 64-95 with k6
-            let hi_32 = _mm_srli_si128(x_fold, 4);
-            let hi_masked = _mm_and_si128(hi_32, _mm_set_epi32(0, 0, 0, -1));
-            let mul = _mm_clmulepi64_si128(hi_masked, k5k6, 0x10);
-            let lo_masked = _mm_and_si128(x_fold, _mm_set_epi32(0, 0, 0, -1));
-            _mm_xor_si128(lo_masked, _mm_srli_si128(mul, 4))
-        };
+        // --- Step 1: 128-bit -> 64-bit fold ---
+        // (x_lo × K4) XOR (x_hi moved into the low 64 bits)
+        let x = _mm_xor_si128(_mm_clmulepi64_si128(x, k3k4, 0x10), _mm_srli_si128(x, 8));
 
-        // Step 2: Barrett reduction from 64-bit to 32-bit
-        // T1 = floor(R / x^32) * mu
-        let t1 = {
-            let x_hi = _mm_srli_si128(x_64, 4);
-            _mm_clmulepi64_si128(x_hi, mu_poly, 0x00)
-        };
+        // --- Step 2: fold the remaining 32 bits with K5 ---
+        let k5 = _mm_set_epi64x(0, K5 as i64);
+        let x = _mm_xor_si128(
+            _mm_clmulepi64_si128(_mm_and_si128(x, mask32), k5, 0x00),
+            _mm_srli_si128(x, 4),
+        );
 
-        // T2 = floor(T1 / x^32) * P
-        let t2 = {
-            let t1_hi = _mm_srli_si128(t1, 4);
-            _mm_clmulepi64_si128(t1_hi, mu_poly, 0x10)
-        };
+        // --- Step 3: Barrett reduction 64-bit -> 32-bit ---
+        // Lane 0 = U_PRIME (mu), lane 1 = P_X (polynomial).
+        let pu = _mm_set_epi64x(P_X as i64, U_PRIME as i64);
+        let t1 = _mm_clmulepi64_si128(_mm_and_si128(x, mask32), pu, 0x00); // x[31:0]  × U_PRIME
+        let t2 = _mm_clmulepi64_si128(_mm_and_si128(t1, mask32), pu, 0x10); // t1[31:0] × P_X
 
-        // Result = x XOR T2 (mod x^32)
-        let result = _mm_xor_si128(x_64, t2);
-        _mm_cvtsi128_si32(result) as u32
+        // Bits [63:32] of (x XOR t2) — dword lane 1, not lane 0.
+        _mm_extract_epi32(_mm_xor_si128(x, t2), 1) as u32
     }
 
     /// Slicing-by-8 software fallback
@@ -265,36 +275,6 @@ pub mod x86 {
     }
 }
 
-/// Pre-computed constants for CRC-32 IEEE using NEON PMULL (aarch64)
-///
-/// These are 33-bit pre-shifted constants for the bit-reflected ISO 3309
-/// polynomial (0xEDB88320), derived from Intel's CRC white paper and verified
-/// against crc32fast (<https://github.com/srijs/rust-crc32fast>).
-///
-/// Fold-by-1 constants (for folding 16-byte blocks):
-///   K3 = x^(128+64) mod P = 0x1751997d0
-///   K4 = x^128 mod P      = 0x0ccaa009e
-///
-/// 128→64 reduction constant:
-///   K5 = x^96 mod P        = 0x163cd6124
-///
-/// Barrett reduction constants:
-///   P_X     = 0x1db710641 (polynomial P with x^32 term)
-///   U_PRIME = 0x1f7011641 (floor(x^64 / P))
-#[cfg(target_arch = "aarch64")]
-mod arm_constants {
-    /// Fold-by-1 low lane constant: K3 = x^(128+64) mod P(x) reflected
-    pub const K3: u64 = 0x1751997d0;
-    /// Fold-by-1 high lane constant: K4 = x^128 mod P(x) reflected
-    pub const K4: u64 = 0x0ccaa009e;
-    /// 128→64 reduction constant: K5 = x^96 mod P(x) reflected
-    pub const K5: u64 = 0x163cd6124;
-    /// Barrett polynomial: P(x) with x^32 term
-    pub const P_X: u64 = 0x1db710641;
-    /// Barrett mu: floor(x^64 / P(x)), reflected
-    pub const U_PRIME: u64 = 0x1f7011641;
-}
-
 /// aarch64 SIMD CRC-32 implementation using PMULL
 ///
 /// Algorithm: "Fast CRC Computation for Generic Polynomials Using PCLMULQDQ"
@@ -303,7 +283,7 @@ mod arm_constants {
 #[cfg(target_arch = "aarch64")]
 pub mod arm {
     use super::CRC32_TABLE_SLICE;
-    use super::arm_constants::{K3, K4, K5, P_X, U_PRIME};
+    use super::reflected_constants::{K3, K4, K5, P_X, U_PRIME};
     use core::arch::aarch64::*;
 
     /// Minimum data size for SIMD acceleration
@@ -515,66 +495,80 @@ pub mod arm {
 
 /// Runtime dispatcher for SIMD CRC-32
 ///
-/// ## Acceleration status (2026-05-06)
+/// ## Acceleration status
+///
+/// Both SIMD paths use the same bit-reflected ISO 3309 constants
+/// (`reflected_constants`: K3/K4/K5/P_X/U_PRIME, 33-bit pre-shifted values
+/// derived from [crc32fast](https://github.com/srijs/rust-crc32fast)) and the
+/// same fold-by-1 plus Barrett reduction shape.
 ///
 /// **aarch64 (Apple Silicon / Cortex-A):** PMULL path is **enabled** when
 /// `is_aarch64_feature_detected!("aes")` returns true at runtime (AES implies
-/// PMULL on all known aarch64 microarchitectures).  Fold constants
-/// (K3/K4/K5/P_X/U_PRIME) are 33-bit pre-shifted values derived from
-/// [crc32fast](https://github.com/srijs/rust-crc32fast), verified against the
-/// scalar slicing-by-8 path for all lengths 0–4096 bytes and 100 random inputs.
+/// PMULL on all known aarch64 microarchitectures). Verified against the scalar
+/// slicing-by-8 path for all lengths 0–4096 bytes and 100 random inputs.
 ///
-/// **x86_64 (PCLMULQDQ):** Path compiles but dispatch still returns `false`
-/// pending empirical verification on an x86_64 host with PCLMULQDQ support.
-/// The `test_pclmulqdq_matches_scalar_vectors` test remains `#[ignore]` until
-/// a CI x86_64 runner is available.
+/// **x86_64 (PCLMULQDQ):** **enabled** when `pclmulqdq` and `sse4.1` are
+/// detected at runtime. The path was corrected and validated in 0.4.1: it
+/// previously combined non-reflected constants with reflected-mode code and
+/// returned the wrong dword lane, which is why dispatch used to be hardcoded
+/// off. Verification was performed by executing the `x86_64-apple-darwin`
+/// test suite under Rosetta 2 translation (which provides PCLMULQDQ/SSE4.1)
+/// and comparing against the scalar path over the fixed ISO 3309 check
+/// vectors, the 1 MiB stress buffers, every length 0–4096, and 100 random
+/// inputs with both zero and non-zero seed CRCs — see
+/// `test_pclmulqdq_matches_scalar_vectors`, `test_pclmulqdq_length_sweep` and
+/// `test_pclmulqdq_random_inputs`. It has not been run on native x86_64
+/// silicon in this repository.
 ///
 /// **Other architectures:** always use slicing-by-8 software fallback.
 pub struct SimdCrc32Dispatcher {
     #[cfg(target_arch = "x86_64")]
-    _use_pclmulqdq: bool,
+    use_pclmulqdq: bool,
     #[cfg(target_arch = "aarch64")]
-    _use_pmull: bool,
+    use_pmull: bool,
 }
 
 impl SimdCrc32Dispatcher {
     /// Create a new dispatcher, enabling SIMD acceleration when available.
     ///
     /// On aarch64, enables PMULL if `is_aarch64_feature_detected!("aes")` returns true.
-    /// On x86_64, PCLMULQDQ detection is present but dispatch remains disabled pending
-    /// verification on a CI x86_64 host.
+    /// On x86_64, enables PCLMULQDQ if both `pclmulqdq` and `sse4.1` are detected.
     pub fn new() -> Self {
         Self {
             #[cfg(target_arch = "x86_64")]
-            _use_pclmulqdq: x86::is_supported(),
+            use_pclmulqdq: x86::is_supported(),
             #[cfg(target_arch = "aarch64")]
-            _use_pmull: arm::is_supported(),
+            use_pmull: arm::is_supported(),
         }
     }
 
-    /// Create a dispatcher with SIMD disabled (for testing/benchmarking)
+    /// Create a dispatcher with SIMD disabled (for testing/benchmarking).
     ///
-    /// This is currently equivalent to `new()` since SIMD is disabled.
+    /// Always uses the slicing-by-8 software path, regardless of what the CPU
+    /// supports.
     pub fn software_only() -> Self {
         Self {
             #[cfg(target_arch = "x86_64")]
-            _use_pclmulqdq: false,
+            use_pclmulqdq: false,
             #[cfg(target_arch = "aarch64")]
-            _use_pmull: false,
+            use_pmull: false,
         }
     }
 
-    /// Check if SIMD acceleration is available and enabled
+    /// Check if SIMD acceleration is available and enabled for this dispatcher.
+    ///
+    /// This reflects what [`Self::update`] will actually do, so it differs from
+    /// [`Self::is_simd_supported`] only for a dispatcher built by
+    /// [`Self::software_only`].
     #[inline]
     pub fn is_simd_available(&self) -> bool {
         #[cfg(target_arch = "aarch64")]
         {
-            self._use_pmull
+            self.use_pmull
         }
         #[cfg(target_arch = "x86_64")]
         {
-            // x86_64 PCLMULQDQ path pending verification; disabled for now
-            false
+            self.use_pclmulqdq
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -587,11 +581,11 @@ impl SimdCrc32Dispatcher {
     pub fn is_simd_supported(&self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            self._use_pclmulqdq
+            self.use_pclmulqdq
         }
         #[cfg(target_arch = "aarch64")]
         {
-            self._use_pmull
+            self.use_pmull
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -602,7 +596,7 @@ impl SimdCrc32Dispatcher {
     /// Compute CRC-32 using best available implementation.
     ///
     /// On aarch64 with AES/PMULL extensions, uses `arm::crc32_pmull`.
-    /// On x86_64 (PCLMULQDQ path not yet verified), falls back to slicing-by-8.
+    /// On x86_64 with PCLMULQDQ + SSE4.1, uses `x86::crc32_pclmulqdq`.
     /// On other architectures, always uses slicing-by-8.
     ///
     /// # Arguments
@@ -617,10 +611,18 @@ impl SimdCrc32Dispatcher {
     pub fn update(&self, crc: u32, data: &[u8]) -> u32 {
         #[cfg(target_arch = "aarch64")]
         {
-            if self._use_pmull {
-                // SAFETY: _use_pmull is only true when `arm::is_supported()` returned true,
+            if self.use_pmull {
+                // SAFETY: use_pmull is only true when `arm::is_supported()` returned true,
                 // which requires the AES (and therefore PMULL) CPU feature to be present.
                 return unsafe { arm::crc32_pmull(crc, data) };
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.use_pclmulqdq {
+                // SAFETY: use_pclmulqdq is only true when `x86::is_supported()` returned
+                // true, which requires both the PCLMULQDQ and SSE4.1 CPU features.
+                return unsafe { x86::crc32_pclmulqdq(crc, data) };
             }
         }
         software_crc32(crc, data)
@@ -869,23 +871,16 @@ mod tests {
     ///
     /// Compiled on x86_64; skipped at runtime if PCLMULQDQ is unavailable.
     ///
-    /// Currently `#[ignore]` and NOT wired into dispatch: the fold constants /
-    /// Barrett-reduction shape in `x86::crc32_pclmulqdq` have not been verified
-    /// against the bit-reflected ISO 3309 scalar path on an x86_64 host, so
-    /// `init_crc32_dispatch`/`SimdCrc32Dispatcher` deliberately fall back to
-    /// slicing-by-8 on x86_64. Un-ignore this test once `x86::crc32_pclmulqdq`
-    /// is validated on a PCLMULQDQ-capable CI runner with reflected-mode
-    /// constants (typically pre-shifted by x^1, i.e. 33-bit values) per Intel's
-    /// "Fast CRC Computation Using PCLMULQDQ".
-    ///
-    /// NOTE: this is a per-architecture, x86-only caveat. The aarch64 PMULL path
-    /// (`arm::crc32_pmull`) uses independently validated reflected-mode 33-bit
-    /// constants and IS enabled in dispatch; its equality with the scalar
-    /// reference is asserted by `test_pmull_matches_scalar_vectors`,
-    /// `test_pmull_length_sweep`, and `test_pmull_random_inputs` below.
+    /// This test used to be `#[ignore]`d because `x86::crc32_pclmulqdq` mixed
+    /// the *non-reflected* Intel whitepaper constants into reflected-mode code
+    /// (and extracted the result from the wrong dword lane), so it produced
+    /// wrong CRC-32 values. The path now uses the same reflected constants and
+    /// the same fold/Barrett steps as the validated aarch64 PMULL path, and
+    /// this test — together with `test_pclmulqdq_length_sweep` and
+    /// `test_pclmulqdq_random_inputs` — asserts equality with the scalar
+    /// reference on every x86_64 test run.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    #[ignore = "SIMD fold constants pending verification — see comment"]
     fn test_pclmulqdq_matches_scalar_vectors() {
         if !x86::is_supported() {
             eprintln!("PCLMULQDQ not available on this CPU; skipping.");
@@ -925,6 +920,57 @@ mod tests {
                 simd,
                 scalar
             );
+        }
+    }
+
+    /// Length sweep across every alignment class of the PCLMULQDQ path:
+    /// below the SIMD threshold, exact multiples of 16, and tails of 1..15.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_pclmulqdq_length_sweep() {
+        if !x86::is_supported() {
+            eprintln!("PCLMULQDQ not available on this CPU; skipping.");
+            return;
+        }
+        let data: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
+            .collect();
+        for len in 0..=4096usize {
+            let scalar = software_crc32(0, &data[..len]);
+            // SAFETY: is_supported() verified PCLMULQDQ + SSE4.1 are present.
+            let simd = unsafe { x86::crc32_pclmulqdq(0, &data[..len]) };
+            assert_eq!(scalar, simd, "length {len} mismatch");
+        }
+    }
+
+    /// Randomised cross-check of the PCLMULQDQ path against the scalar path.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_pclmulqdq_random_inputs() {
+        if !x86::is_supported() {
+            eprintln!("PCLMULQDQ not available on this CPU; skipping.");
+            return;
+        }
+        // Simple LCG for deterministic pseudo-random inputs.
+        let mut state: u64 = 0xdeadbeefcafe1234;
+        for _ in 0..100 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (state >> 48) as usize % 8193;
+            let data: Vec<u8> = (0..len)
+                .map(|i| ((state >> (i % 8)) & 0xFF) as u8)
+                .collect();
+            let scalar = software_crc32(0, &data);
+            // SAFETY: is_supported() verified PCLMULQDQ + SSE4.1 are present.
+            let simd = unsafe { x86::crc32_pclmulqdq(0, &data) };
+            assert_eq!(scalar, simd, "random input len {len} mismatch");
+
+            // Non-zero seed CRC (continuation) must agree as well.
+            let scalar_seeded = software_crc32(0x1234_5678, &data);
+            // SAFETY: as above.
+            let simd_seeded = unsafe { x86::crc32_pclmulqdq(0x1234_5678, &data) };
+            assert_eq!(scalar_seeded, simd_seeded, "seeded len {len} mismatch");
         }
     }
 

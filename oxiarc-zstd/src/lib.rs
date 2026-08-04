@@ -58,11 +58,8 @@ pub mod dict;
 mod encode;
 mod frame;
 mod fse;
-// Custom (non-predefined) FSE table *compression* for sequences is not
-// wired into the encoder yet: sequences use the RFC 8878 predefined/RLE
-// tables, which reference decoders accept. This module stays dormant until
-// FSE_Compressed sequence modes are emitted.
-#[allow(dead_code)]
+// Normalized-count computation and FSE table-description serialization used
+// by `compressed_block` to emit FSE_Compressed sequence modes.
 mod fse_encoder;
 mod huffman;
 mod huffman_encoder;

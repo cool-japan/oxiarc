@@ -137,8 +137,11 @@ impl LzhDecoder {
             return self.decode_stored(reader);
         }
 
-        if self.method == LzhMethod::Lh1 {
-            return self.decode_lh1_stream(reader);
+        if matches!(
+            self.method,
+            LzhMethod::Lh1 | LzhMethod::Lh2 | LzhMethod::Lh3 | LzhMethod::Lzs | LzhMethod::Lz5
+        ) {
+            return self.decode_whole_stream(reader);
         }
 
         if let LzhMethod::Unknown(id) = self.method {
@@ -153,11 +156,26 @@ impl LzhDecoder {
         Ok(output)
     }
 
-    /// Decode `-lh1-` (LZHUF adaptive Huffman) data.
-    fn decode_lh1_stream<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
+    /// Decode a method whose codec consumes the whole compressed payload in one
+    /// pass rather than through the shared lh4-lh7 block reader: `-lh1-`
+    /// (LZHUF adaptive Huffman), `-lh2-`/`-lh3-` (LHarc 2.x) and `-lzs-`/
+    /// `-lz5-` (LArc).
+    fn decode_whole_stream<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
         let mut compressed = Vec::new();
         reader.read_to_end(&mut compressed)?;
-        let output = crate::lh1::decode_lh1(&compressed, self.uncompressed_size)?;
+        let size = self.uncompressed_size;
+        let output = match self.method {
+            LzhMethod::Lh1 => crate::lh1::decode_lh1(&compressed, size)?,
+            LzhMethod::Lh2 => crate::legacy::decode_lh2(&compressed, size)?,
+            LzhMethod::Lh3 => crate::legacy::decode_lh3(&compressed, size)?,
+            LzhMethod::Lzs => crate::legacy::decode_lzs(&compressed, size)?,
+            LzhMethod::Lz5 => crate::legacy::decode_lz5(&compressed, size)?,
+            other => {
+                return Err(OxiArcError::unsupported_method(
+                    String::from_utf8_lossy(&other.id()).into_owned(),
+                ));
+            }
+        };
         self.output_buf = output.clone();
         self.finished = true;
         Ok(output)
