@@ -44,7 +44,13 @@ const LZMA_DICT_SIZE: u32 = 1 << 24;
 
 /// ZIP archive writer.
 pub struct ZipWriter<W: Write> {
-    writer: W,
+    /// Underlying writer. `None` only in the instant between `into_inner`
+    /// taking it and the enclosing `self` finishing its (now-skipped) drop;
+    /// no other method can observe `None` here, since every method other
+    /// than `into_inner` takes `&self`/`&mut self` and `into_inner` consumes
+    /// `self` by value, so the type system rules out any further call on the
+    /// same `ZipWriter` afterward.
+    writer: Option<W>,
     entries: Vec<CentralDirEntry>,
     offset: u64,
     compression: ZipCompressionLevel,
@@ -56,13 +62,38 @@ impl<W: Write> ZipWriter<W> {
     /// Create a new ZIP writer with default compression.
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: Some(writer),
             entries: Vec::new(),
             offset: 0,
             compression: ZipCompressionLevel::default(),
             finished: false,
             progress: None,
         }
+    }
+
+    /// Build the error used when `writer` is unexpectedly `None`.
+    ///
+    /// Centralized so the (unreachable-via-the-public-API) message is
+    /// written once rather than duplicated at every call site.
+    #[cold]
+    fn writer_taken_error() -> OxiArcError {
+        OxiArcError::Io(std::io::Error::other(
+            "ZipWriter: writer accessed after into_inner (unreachable via the public API)",
+        ))
+    }
+
+    /// Fallibly borrow the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Never, in practice: the only way `writer` becomes `None` is
+    /// `into_inner`, which consumes `self` by value and therefore makes this
+    /// method uncallable afterward. `Result` (rather than a panic) so every
+    /// call site propagates with a plain `?` instead of adding a new
+    /// `.expect()`.
+    #[inline]
+    fn writer_mut(&mut self) -> Result<&mut W> {
+        self.writer.as_mut().ok_or_else(Self::writer_taken_error)
     }
 
     /// Attach a progress handle to this writer.
@@ -184,37 +215,40 @@ impl<W: Write> ZipWriter<W> {
         };
 
         // Signature
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
-        self.writer.write_all(&version_needed.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&version_needed.to_le_bytes())?;
         // Flags (EFS bit for non-ASCII UTF-8 names)
-        self.writer.write_all(&flags.to_le_bytes())?;
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
         // Compression method
-        self.writer.write_all(&method.to_le_bytes())?;
+        self.writer_mut()?.write_all(&method.to_le_bytes())?;
         // Modification time
-        self.writer.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
         // Modification date
-        self.writer.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
         // CRC-32
-        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
         // Compressed size
-        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&compressed_size_32.to_le_bytes())?;
         // Uncompressed size
-        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&uncompressed_size_32.to_le_bytes())?;
         // Filename length
-        self.writer
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
         // Extra field length
-        self.writer
+        self.writer_mut()?
             .write_all(&(local_extra.len() as u16).to_le_bytes())?;
         // Filename
-        self.writer.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(filename_bytes)?;
         // Extra field
-        self.writer.write_all(&local_extra)?;
+        self.writer_mut()?.write_all(&local_extra)?;
 
         // Write file data
-        self.writer.write_all(&compressed_data)?;
+        self.writer_mut()?.write_all(&compressed_data)?;
 
         // Update offset (30 = local header fixed size)
         self.offset += 30
@@ -328,36 +362,39 @@ impl<W: Write> ZipWriter<W> {
         let method: u16 = 14;
 
         // Signature
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
-        self.writer.write_all(&version_needed.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&version_needed.to_le_bytes())?;
         // Flags (bit 1 = EOS marker present)
-        self.writer.write_all(&flags.to_le_bytes())?;
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
         // Compression method (14 = LZMA)
-        self.writer.write_all(&method.to_le_bytes())?;
+        self.writer_mut()?.write_all(&method.to_le_bytes())?;
         // Modification time
-        self.writer.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
         // Modification date
-        self.writer.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
         // CRC-32
-        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
         // Compressed size
-        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&compressed_size_32.to_le_bytes())?;
         // Uncompressed size
-        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&uncompressed_size_32.to_le_bytes())?;
         // Filename length
-        self.writer
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
         // Extra field length
-        self.writer
+        self.writer_mut()?
             .write_all(&(local_extra.len() as u16).to_le_bytes())?;
         // Filename
-        self.writer.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(filename_bytes)?;
         // Extra field
-        self.writer.write_all(&local_extra)?;
+        self.writer_mut()?.write_all(&local_extra)?;
         // Compressed LZMA data (method-14 format)
-        self.writer.write_all(&method14_payload)?;
+        self.writer_mut()?.write_all(&method14_payload)?;
 
         // Update offset (30 = local header fixed size)
         self.offset +=
@@ -473,8 +510,10 @@ impl<W: Write> ZipWriter<W> {
             }
         };
 
-        // Generate salt
-        let salt = generate_salt(strength.salt_len());
+        // Generate salt from the OS CSPRNG. This is fallible on purpose: a
+        // predictable salt would make WinZip-AES key derivation precomputable,
+        // so we refuse to write the entry rather than weaken it.
+        let salt = generate_salt(strength.salt_len())?;
 
         // Create encryptor and get password verification bytes
         let (mut encryptor, pw_verification): (ZipAesEncryptor, [u8; 2]) =
@@ -538,40 +577,44 @@ impl<W: Write> ZipWriter<W> {
         let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
         // Signature
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
-        self.writer.write_all(&version_needed.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&version_needed.to_le_bytes())?;
         // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
-        self.writer.write_all(&flags.to_le_bytes())?;
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
         // Compression method (99 = AES encrypted)
-        self.writer.write_all(&METHOD_AES_ENCRYPTED.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&METHOD_AES_ENCRYPTED.to_le_bytes())?;
         // Modification time
-        self.writer.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
         // Modification date
-        self.writer.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
         // CRC-32 (always 0 for AE-2; only AE-1 stores the plaintext CRC)
-        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
         // Compressed size (includes encryption overhead)
-        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&compressed_size_32.to_le_bytes())?;
         // Uncompressed size
-        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&uncompressed_size_32.to_le_bytes())?;
         // Filename length
-        self.writer
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
         // Extra field length
-        self.writer
+        self.writer_mut()?
             .write_all(&(local_extra.len() as u16).to_le_bytes())?;
         // Filename
-        self.writer.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(filename_bytes)?;
         // Extra field
-        self.writer.write_all(&local_extra)?;
+        self.writer_mut()?.write_all(&local_extra)?;
 
         // Write encrypted data: salt + pw_verification + encrypted_data + auth_code
-        self.writer.write_all(&salt)?;
-        self.writer.write_all(&pw_verification)?;
-        self.writer.write_all(&encrypted_data)?;
-        self.writer.write_all(&auth_code)?;
+        self.writer_mut()?.write_all(&salt)?;
+        self.writer_mut()?.write_all(&pw_verification)?;
+        self.writer_mut()?.write_all(&encrypted_data)?;
+        self.writer_mut()?.write_all(&auth_code)?;
 
         // Update offset
         self.offset +=
@@ -676,13 +719,16 @@ impl<W: Write> ZipWriter<W> {
             }
         };
 
-        // Create cipher and generate encryption header
+        // Create cipher and generate encryption header.
         let mut cipher = ZipCrypto::new(password);
 
-        // Generate encryption header using CRC and time-based seeds
-        let seed1 = mtime as u64 * 1000 + mdate as u64;
-        let seed2 = crc32 as u64 ^ (compressed_data.len() as u64);
-        let header = cipher.generate_header_seeded(crc32, seed1, seed2);
+        // The 11 random header bytes come from the OS CSPRNG. They used to be
+        // derived from an LCG seeded with the entry's DOS timestamp, CRC-32 and
+        // compressed length — all values that are stored in cleartext in the
+        // very same local file header, making the "random" prefix trivially
+        // reconstructible by an attacker and handing them known plaintext for
+        // the ZipCrypto keystream.
+        let header = cipher.generate_header_random(crc32)?;
 
         // Encrypt the compressed data
         let mut encrypted_data = compressed_data.clone();
@@ -734,40 +780,43 @@ impl<W: Write> ZipWriter<W> {
         let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
         // Signature
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
         // Version needed
-        self.writer.write_all(&version_needed.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&version_needed.to_le_bytes())?;
         // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
-        self.writer.write_all(&flags.to_le_bytes())?;
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
         // Compression method
-        self.writer.write_all(&method.to_le_bytes())?;
+        self.writer_mut()?.write_all(&method.to_le_bytes())?;
         // Modification time
-        self.writer.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
         // Modification date
-        self.writer.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
         // CRC-32
-        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
         // Compressed size (includes encryption header)
-        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&compressed_size_32.to_le_bytes())?;
         // Uncompressed size
-        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&uncompressed_size_32.to_le_bytes())?;
         // Filename length
-        self.writer
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
         // Extra field length
-        self.writer
+        self.writer_mut()?
             .write_all(&(local_extra.len() as u16).to_le_bytes())?;
         // Filename
-        self.writer.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(filename_bytes)?;
         // Extra field
-        self.writer.write_all(&local_extra)?;
+        self.writer_mut()?.write_all(&local_extra)?;
 
         // Write encryption header
-        self.writer.write_all(&header)?;
+        self.writer_mut()?.write_all(&header)?;
 
         // Write encrypted data
-        self.writer.write_all(&encrypted_data)?;
+        self.writer_mut()?.write_all(&encrypted_data)?;
 
         // Update offset
         self.offset +=
@@ -885,25 +934,28 @@ impl<W: Write> ZipWriter<W> {
         };
 
         // Write local file header
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        self.writer.write_all(&version_needed.to_le_bytes())?;
-        self.writer.write_all(&flags.to_le_bytes())?;
-        self.writer.write_all(&method_u16.to_le_bytes())?;
-        self.writer.write_all(&mtime.to_le_bytes())?;
-        self.writer.write_all(&mdate.to_le_bytes())?;
-        self.writer.write_all(&crc32.to_le_bytes())?;
-        self.writer.write_all(&compressed_size_32.to_le_bytes())?;
-        self.writer.write_all(&uncompressed_size_32.to_le_bytes())?;
-        self.writer
+        self.writer_mut()?
+            .write_all(&version_needed.to_le_bytes())?;
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
+        self.writer_mut()?.write_all(&method_u16.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&compressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&uncompressed_size_32.to_le_bytes())?;
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        self.writer
+        self.writer_mut()?
             .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        self.writer.write_all(filename_bytes)?;
-        self.writer.write_all(&local_extra)?;
+        self.writer_mut()?.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(&local_extra)?;
 
         // Write pre-compressed data verbatim
-        self.writer.write_all(compressed_data)?;
+        self.writer_mut()?.write_all(compressed_data)?;
 
         // Update offset (30 = fixed local header size)
         self.offset +=
@@ -952,20 +1004,20 @@ impl<W: Write> ZipWriter<W> {
         let flags = utf8_name_flag(&dir_name);
 
         // Write local file header for directory
-        self.writer
+        self.writer_mut()?
             .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        self.writer.write_all(&10u16.to_le_bytes())?; // Version needed
-        self.writer.write_all(&flags.to_le_bytes())?; // Flags (EFS bit if non-ASCII)
-        self.writer.write_all(&0u16.to_le_bytes())?; // Method (stored)
-        self.writer.write_all(&mtime.to_le_bytes())?;
-        self.writer.write_all(&mdate.to_le_bytes())?;
-        self.writer.write_all(&0u32.to_le_bytes())?; // CRC-32
-        self.writer.write_all(&0u32.to_le_bytes())?; // Compressed size
-        self.writer.write_all(&0u32.to_le_bytes())?; // Uncompressed size
-        self.writer
+        self.writer_mut()?.write_all(&10u16.to_le_bytes())?; // Version needed
+        self.writer_mut()?.write_all(&flags.to_le_bytes())?; // Flags (EFS bit if non-ASCII)
+        self.writer_mut()?.write_all(&0u16.to_le_bytes())?; // Method (stored)
+        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
+        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
+        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // CRC-32
+        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // Compressed size
+        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // Uncompressed size
+        self.writer_mut()?
             .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        self.writer.write_all(&0u16.to_le_bytes())?; // Extra field length
-        self.writer.write_all(filename_bytes)?;
+        self.writer_mut()?.write_all(&0u16.to_le_bytes())?; // Extra field length
+        self.writer_mut()?.write_all(filename_bytes)?;
 
         self.offset += 30 + filename_bytes.len() as u64;
 
@@ -1001,11 +1053,20 @@ impl<W: Write> ZipWriter<W> {
         let central_dir_offset = self.offset;
         let mut central_dir_size = 0u64;
 
-        // Write central directory
+        // Write central directory.
+        //
+        // `self.writer.as_mut().ok_or_else(...)` is used directly here
+        // (rather than the `writer_mut()` helper) because the helper is a
+        // method call that borrows all of `self`, which conflicts with the
+        // `&self.entries` the `for` loop below is already holding; a direct
+        // field projection is what lets the borrow checker see `writer` and
+        // `entries` as the disjoint fields they are, exactly as the
+        // preceding `&mut self.writer` did before this type became
+        // `Option<W>`.
         for entry in &self.entries {
             let entry_size = entry.written_size() as u64;
             central_dir_size += entry_size;
-            entry.write(&mut self.writer)?;
+            entry.write(self.writer.as_mut().ok_or_else(Self::writer_taken_error)?)?;
         }
 
         // Determine if Zip64 EOCD is needed
@@ -1020,37 +1081,40 @@ impl<W: Write> ZipWriter<W> {
 
             // Write Zip64 End of Central Directory Record
             // Signature
-            self.writer
+            self.writer_mut()?
                 .write_all(&ZIP64_END_OF_CENTRAL_DIR_SIG.to_le_bytes())?;
             // Size of Zip64 EOCD record (44 bytes following this field)
-            self.writer.write_all(&44u64.to_le_bytes())?;
+            self.writer_mut()?.write_all(&44u64.to_le_bytes())?;
             // Version made by
-            self.writer.write_all(&0x031Eu16.to_le_bytes())?;
+            self.writer_mut()?.write_all(&0x031Eu16.to_le_bytes())?;
             // Version needed to extract
-            self.writer.write_all(&45u16.to_le_bytes())?;
+            self.writer_mut()?.write_all(&45u16.to_le_bytes())?;
             // Number of this disk
-            self.writer.write_all(&0u32.to_le_bytes())?;
+            self.writer_mut()?.write_all(&0u32.to_le_bytes())?;
             // Disk where central directory starts
-            self.writer.write_all(&0u32.to_le_bytes())?;
+            self.writer_mut()?.write_all(&0u32.to_le_bytes())?;
             // Number of central directory records on this disk
-            self.writer.write_all(&num_entries.to_le_bytes())?;
+            self.writer_mut()?.write_all(&num_entries.to_le_bytes())?;
             // Total number of central directory records
-            self.writer.write_all(&num_entries.to_le_bytes())?;
+            self.writer_mut()?.write_all(&num_entries.to_le_bytes())?;
             // Size of central directory
-            self.writer.write_all(&central_dir_size.to_le_bytes())?;
+            self.writer_mut()?
+                .write_all(&central_dir_size.to_le_bytes())?;
             // Offset of start of central directory
-            self.writer.write_all(&central_dir_offset.to_le_bytes())?;
+            self.writer_mut()?
+                .write_all(&central_dir_offset.to_le_bytes())?;
 
             // Write Zip64 End of Central Directory Locator
             // Signature
-            self.writer
+            self.writer_mut()?
                 .write_all(&ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG.to_le_bytes())?;
             // Number of disk with Zip64 EOCD
-            self.writer.write_all(&0u32.to_le_bytes())?;
+            self.writer_mut()?.write_all(&0u32.to_le_bytes())?;
             // Relative offset of Zip64 EOCD
-            self.writer.write_all(&zip64_eocd_offset.to_le_bytes())?;
+            self.writer_mut()?
+                .write_all(&zip64_eocd_offset.to_le_bytes())?;
             // Total number of disks
-            self.writer.write_all(&1u32.to_le_bytes())?;
+            self.writer_mut()?.write_all(&1u32.to_le_bytes())?;
         }
 
         // Write (regular) End of Central Directory record
@@ -1071,45 +1135,55 @@ impl<W: Write> ZipWriter<W> {
             central_dir_offset as u32
         };
 
-        self.writer
+        self.writer_mut()?
             .write_all(&END_OF_CENTRAL_DIR_SIG.to_le_bytes())?;
         // Disk number
-        self.writer.write_all(&0u16.to_le_bytes())?;
+        self.writer_mut()?.write_all(&0u16.to_le_bytes())?;
         // Disk with central directory
-        self.writer.write_all(&0u16.to_le_bytes())?;
+        self.writer_mut()?.write_all(&0u16.to_le_bytes())?;
         // Number of entries on this disk
-        self.writer.write_all(&num_entries_16.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&num_entries_16.to_le_bytes())?;
         // Total number of entries
-        self.writer.write_all(&num_entries_16.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&num_entries_16.to_le_bytes())?;
         // Size of central directory
-        self.writer.write_all(&central_dir_size_32.to_le_bytes())?;
+        self.writer_mut()?
+            .write_all(&central_dir_size_32.to_le_bytes())?;
         // Offset of central directory
-        self.writer
+        self.writer_mut()?
             .write_all(&central_dir_offset_32.to_le_bytes())?;
         // Comment length
-        self.writer.write_all(&0u16.to_le_bytes())?;
+        self.writer_mut()?.write_all(&0u16.to_le_bytes())?;
 
-        self.writer.flush()?;
+        self.writer_mut()?.flush()?;
         self.finished = true;
         Ok(())
     }
 
     /// Consume the writer and return the inner writer.
     pub fn into_inner(mut self) -> Result<W> {
-        self.finish()?;
-        // SAFETY: `self` is wrapped in `ManuallyDrop` so its `Drop` impl
-        // (which would call `finish()` again) never runs. We read `writer`
-        // out without dropping it — it is the value returned to the caller
-        // — then explicitly drop every other field that owns a heap
-        // allocation (`entries`, `progress`) so nothing leaks. `offset`,
-        // `compression`, and `finished` are `Copy` and own no resources, so
-        // leaving them undropped here has no effect.
-        let mut this = std::mem::ManuallyDrop::new(self);
-        let writer = unsafe { std::ptr::read(&this.writer) };
-        unsafe {
-            std::ptr::drop_in_place(&mut this.entries);
-            std::ptr::drop_in_place(&mut this.progress);
-        }
+        // Deliberately not `self.finish()?`: that would return early on a
+        // partial failure (e.g. the central directory writes out fine but
+        // the final EOCD `flush()` fails) while `self.finished` is still
+        // `false`, leaving `self` to drop normally — and `Drop::drop` would
+        // then call `finish()` a second time, silently re-writing however
+        // much of the central directory/EOCD it got through before hitting
+        // an error again (`Drop` discards it). Capturing the `Result`
+        // instead of propagating it immediately lets `writer` be taken
+        // unconditionally below, so `Drop::drop` always sees `None` once
+        // `into_inner` has run — on every path, not just the success path.
+        let finish_result = self.finish();
+
+        // `finish()` above only ever borrows `self.writer` through
+        // `writer_mut()`, never takes it, so it is still `Some` here
+        // regardless of `finish_result`. Taking it lets `self`'s remaining
+        // fields — `entries` (a `Vec`) and `progress` (an `Arc` clone) —
+        // drop normally through the ordinary (non-`unsafe`) path below
+        // instead of needing to be enumerated and dropped by hand.
+        let writer = self.writer.take().ok_or_else(Self::writer_taken_error)?;
+
+        finish_result?;
         Ok(writer)
     }
 
@@ -1134,7 +1208,12 @@ impl<W: Write> ZipWriter<W> {
 
 impl<W: Write> Drop for ZipWriter<W> {
     fn drop(&mut self) {
-        let _ = self.finish();
+        // `into_inner` takes `writer`, leaving `None`, right before this
+        // `self` finishes its own (now-skipped) drop; every other path still
+        // has `Some` and gets the usual best-effort finish.
+        if self.writer.is_some() {
+            let _ = self.finish();
+        }
     }
 }
 

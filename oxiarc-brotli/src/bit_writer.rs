@@ -109,6 +109,18 @@ impl BitWriter {
         self.output
     }
 
+    /// Remove and return every *complete* byte accumulated so far, leaving any
+    /// partial (sub-byte) residue in place for subsequent writes.
+    ///
+    /// This is the streaming drain primitive: a bit-packed Brotli stream can
+    /// only be handed to a byte sink one whole byte at a time, so the trailing
+    /// partial byte (0..8 bits) must stay buffered until later writes complete
+    /// it. Unlike [`flush`](Self::flush) it never pads, so the bitstream stays
+    /// exact across an arbitrary number of drains.
+    pub(crate) fn drain_complete_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output)
+    }
+
     /// Return the number of bits written so far (including partial byte).
     pub fn bits_written(&self) -> usize {
         self.output.len() * 8 + self.bit_count as usize

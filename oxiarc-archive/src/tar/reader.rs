@@ -398,10 +398,16 @@ impl<R: Read + Seek> TarReader<R> {
                         header.apply_pax_attrs(&global_pax_attrs);
                     }
 
-                    // Detect PAX-encoded sparse (`GNU.sparse.map` present in
-                    // local PAX attrs) before `pax_attrs.clear()` drains
-                    // them.
-                    let is_pax_sparse = pax_attrs.contains_key("GNU.sparse.map");
+                    // Detect PAX-encoded sparse before `pax_attrs.clear()`
+                    // drains them. Format 0.1 carries the map as
+                    // pax-attribute text (`GNU.sparse.map`); format 1.0
+                    // instead carries `GNU.sparse.major`/`.minor` = "1"/"0",
+                    // with the map itself living at the START of this
+                    // entry's own data stream (see `parse_pax_1_0_preamble`).
+                    let is_pax_sparse_0_1 = pax_attrs.contains_key("GNU.sparse.map");
+                    let is_pax_sparse_1_0 = pax_attrs.get("GNU.sparse.major").map(String::as_str)
+                        == Some("1")
+                        && pax_attrs.get("GNU.sparse.minor").map(String::as_str) == Some("0");
 
                     if !pax_attrs.is_empty() {
                         header.apply_pax_attrs(&pax_attrs);
@@ -421,7 +427,30 @@ impl<R: Read + Seek> TarReader<R> {
                     // Read count of bytes the payload occupies on the
                     // medium. For non-sparse entries this is `header.size`;
                     // for PAX-sparse entries we rederive it from the map.
-                    let stored_bytes = if is_pax_sparse {
+                    //
+                    // `preamble_bytes` is non-zero only for format 1.0: its
+                    // map has no announced length, so it must be READ (not
+                    // blindly seeked over) to find out how long it is.
+                    // `entry.offset`/the `sparse_maps` key are shifted past
+                    // it so `extract()` — unchanged below — lands exactly on
+                    // the first run byte, identical to formats 0.1/old.
+                    let mut preamble_bytes = 0u64;
+                    let stored_bytes = if is_pax_sparse_1_0 {
+                        let preamble_start = reader.stream_position()?;
+                        let map = SparseMap::parse_pax_1_0_preamble(reader, &pax_attrs)?;
+                        map.validate()?;
+                        preamble_bytes = reader.stream_position()? - preamble_start;
+
+                        entry.size = map.realsize;
+                        entry.offset = data_offset + preamble_bytes;
+                        if let Some(real_name) = pax_attrs.get("GNU.sparse.name") {
+                            entry.name = real_name.clone();
+                        }
+
+                        let padded = map.padded_stored_size();
+                        sparse_maps.insert(entry.offset, map);
+                        padded
+                    } else if is_pax_sparse_0_1 {
                         let map = SparseMap::from_pax_attrs(&pax_attrs)?;
                         map.validate()?;
                         // PAX sparse: logical size is realsize, stored
@@ -459,7 +488,7 @@ impl<R: Read + Seek> TarReader<R> {
                     // Use seek for efficiency
                     reader.seek(SeekFrom::Current(stored_bytes as i64))?;
 
-                    offset += BLOCK_SIZE as u64 + stored_bytes;
+                    offset += BLOCK_SIZE as u64 + preamble_bytes + stored_bytes;
                 }
                 None => break, // End of archive
             }
@@ -1214,6 +1243,85 @@ mod tests {
         let entry = reader.entries()[0].clone();
         assert_eq!(
             entry.name, "sparse.dat",
+            "GNU.sparse.name must shadow the dummy GNUSparseFile path"
+        );
+        assert_eq!(
+            entry.size, realsize,
+            "entry.size must reflect GNU.sparse.realsize, not stored size"
+        );
+
+        let out = reader.extract_to_vec(&entry).expect("extract");
+        assert_eq!(out.len() as u64, realsize);
+        assert!(out[0..100].iter().all(|&b| b == b'X'));
+        assert!(out[100..5_000].iter().all(|&b| b == 0));
+        assert!(out[5_000..5_200].iter().all(|&b| b == b'Y'));
+        assert!(out[5_200..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_tar_sparse_pax_1_0_format() {
+        // PAX 1.0 sparse: unlike 0.1, `GNU.sparse.map` does NOT appear as a
+        // pax attribute — instead `GNU.sparse.major`/`.minor` = "1"/"0" mark
+        // the format, and the map is a decimal-ASCII preamble at the START
+        // of the regular '0' data entry's own payload. The reader must (a)
+        // detect the major/minor pair, (b) parse the preamble directly out
+        // of the data stream rather than the header, and (c) still shadow
+        // the dummy `GNUSparseFile` name via `GNU.sparse.name`, exactly as
+        // for 0.1.
+        // Payload: 100 bytes of 'X' at offset 0, 200 bytes of 'Y' at 5000.
+        let realsize: u64 = 10_000;
+        let runs: Vec<(u64, u64)> = vec![(0, 100), (5_000, 200)];
+        let stored_run_bytes: u64 = runs.iter().map(|(_, n)| *n).sum();
+        let padded_run_bytes = stored_run_bytes.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+
+        let preamble = sparse::build_pax_1_0_preamble(&runs);
+        let total_stored = preamble.len() as u64 + padded_run_bytes;
+
+        // Build PAX payload.
+        let mk_record =
+            |k: &str, v: &str| -> String { TarWriter::<Vec<u8>>::format_pax_record(k, v) };
+        let mut pax_payload = String::new();
+        pax_payload.push_str(&mk_record("GNU.sparse.name", "sparse10.dat"));
+        pax_payload.push_str(&mk_record("GNU.sparse.major", "1"));
+        pax_payload.push_str(&mk_record("GNU.sparse.minor", "0"));
+        pax_payload.push_str(&mk_record("GNU.sparse.realsize", &realsize.to_string()));
+        pax_payload.push_str(&mk_record("size", &total_stored.to_string()));
+
+        let pax_bytes = pax_payload.as_bytes();
+        let pax_hdr = sparse::build_pax_header_block(b'x', pax_bytes.len() as u64);
+
+        // Build the data-entry header: typeflag '0', size = total stored
+        // size (preamble + runs, both BLOCK_SIZE-padded), name = the
+        // GNU-tar `./GNUSparseFile.XXXX/<file>` sentinel — same convention
+        // as 0.1, shadowed by `GNU.sparse.name`.
+        let dummy_name = "./GNUSparseFile.98765/sparse10.dat";
+        let mut data_hdr = TarHeader::new_file(dummy_name, total_stored, 0o644);
+        data_hdr.typeflag = b'0';
+        let data_hdr_block = data_hdr.to_block().expect("data_hdr.to_block");
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&pax_hdr);
+        pad_to_block(&mut archive, pax_bytes);
+        archive.extend_from_slice(&data_hdr_block);
+
+        // The preamble comes first (already BLOCK_SIZE-padded), then the
+        // run payload.
+        archive.extend_from_slice(&preamble);
+        let mut payload = Vec::new();
+        payload.extend(std::iter::repeat_n(b'X', 100));
+        payload.extend(std::iter::repeat_n(b'Y', 200));
+        pad_to_block(&mut archive, &payload);
+
+        // End-of-archive.
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 2]);
+
+        let cursor = Cursor::new(archive);
+        let mut reader = TarReader::new(cursor).expect("TarReader::new");
+
+        assert_eq!(reader.entries().len(), 1);
+        let entry = reader.entries()[0].clone();
+        assert_eq!(
+            entry.name, "sparse10.dat",
             "GNU.sparse.name must shadow the dummy GNUSparseFile path"
         );
         assert_eq!(

@@ -199,6 +199,27 @@ impl<R: Read> TarStreamReader<R> {
                         return Ok(Some(self.make_sparse_entry(header, map)));
                     }
 
+                    // ---- PAX 1.0 sparse (`GNU.sparse.major`/`.minor` = "1"/"0") ----
+                    //
+                    // Unlike 0.1, the map is not pax-attribute text — it is a
+                    // decimal-ASCII preamble at the very start of this data
+                    // entry's own payload, so it must be read directly off
+                    // `self.reader` here (no `Seek` available). Once
+                    // consumed, the reader sits exactly at the first run
+                    // byte, which is exactly what `make_sparse_entry`
+                    // expects (identical to the old-format 'S' case above,
+                    // whose continuation blocks are consumed the same way).
+                    if pax_attrs.get("GNU.sparse.major").map(String::as_str) == Some("1")
+                        && pax_attrs.get("GNU.sparse.minor").map(String::as_str) == Some("0")
+                    {
+                        let map = SparseMap::parse_pax_1_0_preamble(&mut self.reader, &pax_attrs)?;
+                        map.validate()?;
+                        if let Some(real_name) = pax_attrs.get("GNU.sparse.name") {
+                            header.name = real_name.clone();
+                        }
+                        return Ok(Some(self.make_sparse_entry(header, map)));
+                    }
+
                     let data_size = header.size;
                     let padding =
                         (BLOCK_SIZE as u64 - (data_size % BLOCK_SIZE as u64)) % BLOCK_SIZE as u64;
@@ -913,6 +934,86 @@ mod tests {
         let mut reader = TarReader::new(Cursor::new(archive)).expect("TarReader::new");
         let seekable = reader
             .extract_by_name("sparse.dat")
+            .expect("extract_by_name")
+            .expect("entry present");
+        assert_eq!(content, seekable);
+    }
+
+    /// PAX 1.0 sparse (`GNU.sparse.major`/`.minor` = "1"/"0"): unlike 0.1,
+    /// `GNU.sparse.map` is absent from the pax attributes — the map is a
+    /// decimal-ASCII preamble read directly off the stream at the start of
+    /// the data entry's own payload (no `Seek` available, unlike the
+    /// seekable `TarReader`). The stream reader must still produce logical
+    /// content and shadow the dummy `GNUSparseFile` path with
+    /// `GNU.sparse.name`, exactly as for 0.1.
+    #[test]
+    fn test_tar_stream_pax_1_0_sparse() {
+        let realsize = 10_000u64;
+        let runs = vec![(0u64, 100u64), (5_000, 200)];
+        let fill = |i: usize| (i % 199) as u8;
+
+        let mk_record =
+            |k: &str, v: &str| -> String { TarWriter::<Vec<u8>>::format_pax_record(k, v) };
+        let mut pax_payload = String::new();
+        pax_payload.push_str(&mk_record("GNU.sparse.name", "sparse10.dat"));
+        pax_payload.push_str(&mk_record("GNU.sparse.major", "1"));
+        pax_payload.push_str(&mk_record("GNU.sparse.minor", "0"));
+        pax_payload.push_str(&mk_record("GNU.sparse.realsize", &realsize.to_string()));
+        let pax_bytes = pax_payload.as_bytes();
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&sparse::build_pax_header_block(
+            b'x',
+            pax_bytes.len() as u64,
+        ));
+        archive.extend_from_slice(pax_bytes);
+        let pad = (BLOCK_SIZE - (pax_bytes.len() % BLOCK_SIZE)) % BLOCK_SIZE;
+        archive.extend(std::iter::repeat_n(0u8, pad));
+
+        // Data-entry header: typeflag '0', size = total stored size
+        // (preamble + runs, both BLOCK_SIZE-padded), dummy name.
+        let preamble = sparse::build_pax_1_0_preamble(&runs);
+        let stored_run_bytes: u64 = runs.iter().map(|&(_, n)| n).sum();
+        let padded_run_bytes = stored_run_bytes.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+        let total_stored = preamble.len() as u64 + padded_run_bytes;
+
+        let mut data_hdr = sparse::build_pax_header_block(b'0', total_stored);
+        // Rewrite the name field to the GNUSparseFile dummy path.
+        let dummy = b"./GNUSparseFile.43/sparse10.dat";
+        data_hdr[..100].fill(0);
+        data_hdr[..dummy.len()].copy_from_slice(dummy);
+        // Re-checksum after the name rewrite.
+        data_hdr[148..156].copy_from_slice(b"        ");
+        let checksum: u32 = data_hdr.iter().map(|&b| b as u32).sum();
+        let s = format!("{:06o}\0 ", checksum);
+        data_hdr[148..156].copy_from_slice(&s.as_bytes()[..8]);
+        archive.extend_from_slice(&data_hdr);
+        // Preamble first (already BLOCK_SIZE-padded), then the run payload.
+        archive.extend_from_slice(&preamble);
+        archive.extend_from_slice(&stored_payload(&runs, fill));
+        archive.extend_from_slice(&[0u8; BLOCK_SIZE * 2]);
+
+        let mut stream = TarStreamReader::new(Cursor::new(archive.clone()));
+        let mut entry = stream
+            .next_entry()
+            .expect("next_entry pax 1.0 sparse")
+            .expect("entry present");
+        assert_eq!(
+            entry.header.name, "sparse10.dat",
+            "GNU.sparse.name must shadow the dummy path"
+        );
+        assert_eq!(entry.header.size, realsize);
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read content");
+        drop(entry);
+        assert!(stream.next_entry().expect("final").is_none());
+
+        assert_eq!(content, materialize(realsize, &runs, fill));
+
+        // Differential vs the seekable TarReader.
+        let mut reader = TarReader::new(Cursor::new(archive)).expect("TarReader::new");
+        let seekable = reader
+            .extract_by_name("sparse10.dat")
             .expect("extract_by_name")
             .expect("entry present");
         assert_eq!(content, seekable);

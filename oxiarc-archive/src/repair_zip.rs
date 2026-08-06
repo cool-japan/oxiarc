@@ -184,9 +184,11 @@ pub(crate) fn try_parse_lfh_and_extract(
             // Sizes unknown; scan for data descriptor / next LFH
             match resolve_data_descriptor(data, lfh.data_start, opts.max_entry_size) {
                 Some((comp_len, dd_crc)) => {
-                    let end = lfh.data_start + comp_len;
+                    // `saturating_add` guards against a `usize` wrap on 32-bit
+                    // targets before the `.min(data.len())` clamp can apply.
+                    let end = lfh.data_start.saturating_add(comp_len);
                     // Advance past the data descriptor if present
-                    let next = advance_past_dd(data, end);
+                    let next = advance_past_dd(data, end.min(data.len()));
                     (&data[lfh.data_start..end.min(data.len())], dd_crc, next)
                 }
                 None => return Ok(None),
@@ -197,8 +199,10 @@ pub(crate) fn try_parse_lfh_and_extract(
             } else {
                 lfh.compressed_size as usize
             };
-            // Cap to buffer
-            let end = (lfh.data_start + comp).min(data.len());
+            // Cap to buffer. `compressed_size` is an attacker-controlled u32,
+            // so `data_start + comp` can overflow `usize` on a 32-bit target;
+            // `saturating_add` keeps the clamp below well-defined.
+            let end = lfh.data_start.saturating_add(comp).min(data.len());
             let next = advance_past_dd(data, end);
             (&data[lfh.data_start..end], lfh.crc32_header, next)
         };
@@ -394,4 +398,127 @@ pub(crate) fn find_eocd_offset(data: &[u8]) -> Option<usize> {
         i -= 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small deterministic PRNG so the mutation sweep is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // PCG-style LCG constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+    }
+
+    /// Hand-build a Local File Header at the start of a buffer with an
+    /// arbitrary declared `compressed_size`, one-byte name, and `payload`.
+    fn lfh_with_compressed_size(compressed_size: u32, method: u16, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&LFH_SIG);
+        v.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        v.extend_from_slice(&0u16.to_le_bytes()); // flags
+        v.extend_from_slice(&method.to_le_bytes()); // method
+        v.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        v.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        v.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        v.extend_from_slice(&compressed_size.to_le_bytes()); // compressed size
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // uncompressed size
+        v.extend_from_slice(&1u16.to_le_bytes()); // fname len
+        v.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        v.push(b'x'); // filename
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// An LFH whose declared `compressed_size` is `u32::MAX` must not overflow
+    /// or read out of bounds; the payload is clamped to the buffer end.
+    #[test]
+    fn test_zip_repair_oversized_compressed_size_is_clamped() {
+        let payload = b"not really this large";
+        let data = lfh_with_compressed_size(u32::MAX, METHOD_DEFLATE, payload);
+        let opts = RepairOptions::default();
+
+        let report = scan_zip_bytes(&data, &opts).expect("scan must not error");
+        // Exactly one LFH is present; whatever its recovery status, the
+        // recorded compressed_size must never exceed the buffer we handed in.
+        for entry in &report.recovered_entries {
+            assert!(
+                entry.compressed_size <= data.len() as u64,
+                "compressed_size {} escaped the buffer ({} bytes)",
+                entry.compressed_size,
+                data.len()
+            );
+        }
+    }
+
+    /// A stored entry whose declared size runs past the end of a truncated
+    /// buffer is clamped to the available bytes rather than panicking.
+    #[test]
+    fn test_zip_repair_truncated_stored_payload_is_clamped() {
+        // Claim 1000 stored bytes but supply only 4.
+        let data = lfh_with_compressed_size(1000, METHOD_STORED, &[1, 2, 3, 4]);
+        let opts = RepairOptions::default();
+
+        let report = scan_zip_bytes(&data, &opts).expect("scan must not error");
+        for entry in &report.recovered_entries {
+            assert!(entry.compressed_size <= data.len() as u64);
+            assert!(entry.decompressed_data.len() <= data.len());
+        }
+    }
+
+    /// Feed thousands of deterministically-mutated copies of a valid archive
+    /// through the scanner and assert it always terminates without panicking.
+    ///
+    /// This substitutes for a multi-million-exec fuzz campaign (which cannot
+    /// run in-session): a reproducible, bounded regression net over the
+    /// corrupt-input surface the scanner exists to handle.
+    #[test]
+    fn test_zip_repair_mutation_never_panics() {
+        let base = build_test_zip(&[
+            ("alpha.txt", b"alpha content for repair mutation"),
+            ("beta.bin", &[0x11u8, 0x22, 0x33, 0x44].repeat(40)),
+        ]);
+        let opts = RepairOptions::default();
+        let mut rng = Lcg(0x0DDF_1CE5_1234_5678);
+
+        for _ in 0..4000 {
+            let mut m = base.clone();
+            // Flip between 1 and 6 bytes at pseudo-random positions.
+            let flips = 1 + (rng.next_u64() % 6) as usize;
+            for _ in 0..flips {
+                let pos = (rng.next_u64() as usize) % m.len();
+                m[pos] ^= (rng.next_u64() >> 24) as u8;
+            }
+
+            let report = scan_zip_bytes(&m, &opts).expect("scan returns Ok for corrupt input");
+            // Structural invariants that must survive any mutation.
+            assert!(report.recovered_entries.len() <= m.len());
+            for entry in &report.recovered_entries {
+                assert!(entry.offset < m.len() as u64);
+                assert!(entry.compressed_size <= m.len() as u64);
+            }
+            for &(start, end) in &report.skipped_ranges {
+                assert!(start <= end);
+                assert!(end <= m.len() as u64);
+            }
+        }
+    }
+
+    /// Truncating a valid archive at every prefix length must never panic.
+    #[test]
+    fn test_zip_repair_all_truncation_prefixes() {
+        let base = build_test_zip(&[("only.txt", b"only file body")]);
+        let opts = RepairOptions::default();
+        for cut in 0..=base.len() {
+            let report = scan_zip_bytes(&base[..cut], &opts).expect("scan Ok");
+            assert!(report.recovered_entries.len() <= cut.max(1));
+        }
+    }
 }

@@ -16,7 +16,15 @@ cargo build --workspace --all-features
 Requirements:
 
 - Rust 1.85+ (Edition 2024) — install/update via `rustup update`.
-- No external C/Fortran toolchain is required; OxiArc has no C bindings.
+- No external C/Fortran toolchain is required to build or test the shipped
+  libraries: default features of every member crate are 100% Pure Rust, with
+  no C bindings. The one exception is `cargo bench` / any `--all-targets`
+  build, which compiles the workspace-wide `criterion` dev-dependency;
+  `criterion` 0.8+ has a mandatory (non-optional) `alloca` dependency on
+  Unix/Windows targets, and `alloca` itself depends on the `cc` crate, so a C
+  compiler must be on `PATH` for that surface specifically. This does not
+  affect `cargo build`/`cargo test` without `--all-targets`, and does not
+  affect the crates.io package contents.
 
 ## Before You Submit
 
@@ -146,6 +154,10 @@ instead of via a public issue/PR.
 - Include a mix of data patterns (uniform/repetitive, text, binary/random)
   when benchmarking a codec, since compressors behave very differently
   across these.
+- `criterion` 0.8+ requires a C compiler on `PATH` (see "Getting Started"
+  above) because of its own mandatory `alloca` dependency — this is a
+  dev-only requirement for running benchmarks, not something the shipped
+  libraries need.
 
 ## Commit and PR Etiquette
 

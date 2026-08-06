@@ -220,3 +220,106 @@ pub(crate) fn build_test_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
     }
     buf
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A small deterministic PRNG so the mutation sweep is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+    }
+
+    /// An entry larger than `max_entry_size` must take the drain path: it is
+    /// warned about and its bytes are consumed from the stream (not buffered
+    /// into a giant allocation), while earlier/later entries stay recoverable.
+    #[test]
+    fn test_tar_scan_oversized_entry_uses_drain_path() {
+        let big = vec![0x5Au8; 4096]; // 8 blocks of payload.
+        let tar = build_test_tar(&[("small.txt", b"tiny"), ("big.bin", &big)]);
+
+        // Force the oversized branch for `big.bin` by capping at 8 bytes.
+        let opts = RepairOptions { max_entry_size: 8 };
+        let report = scan_tar_reader(&mut Cursor::new(&tar), &opts).expect("scan Ok");
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("exceeds max_entry_size")),
+            "oversized entry must produce a warning; got {:?}",
+            report.warnings
+        );
+        // `small.txt` (4 bytes < 8) must still be recovered.
+        assert!(
+            report
+                .recovered_entries
+                .iter()
+                .any(|e| e.name == "small.txt"),
+            "small.txt should still be recovered"
+        );
+        // Nothing may report a payload larger than the cap.
+        for entry in &report.recovered_entries {
+            assert!(entry.decompressed_data.len() as u64 <= opts.max_entry_size);
+        }
+    }
+
+    /// Deterministically mutate a valid TAR thousands of ways and assert the
+    /// block scanner always terminates without panicking. Substitutes for a
+    /// multi-million-exec fuzz campaign that cannot run in-session.
+    #[test]
+    fn test_tar_scan_mutation_never_panics() {
+        let base = build_test_tar(&[
+            ("one.txt", b"first tar entry body"),
+            ("dir/two.bin", &[0xABu8, 0xCD].repeat(60)),
+            ("three", b"third"),
+        ]);
+        // Cap decoded size so a mutated octal size field cannot allocate much.
+        let opts = RepairOptions {
+            max_entry_size: 64 * 1024,
+        };
+        let mut rng = Lcg(0x7A12_9F3C_5511_2244);
+
+        for _ in 0..4000 {
+            let mut m = base.clone();
+            let flips = 1 + (rng.next_u64() % 8) as usize;
+            for _ in 0..flips {
+                let pos = (rng.next_u64() as usize) % m.len();
+                m[pos] ^= (rng.next_u64() >> 24) as u8;
+            }
+
+            let report =
+                scan_tar_reader(&mut Cursor::new(&m), &opts).expect("scan Ok for corrupt input");
+            for entry in &report.recovered_entries {
+                assert!(entry.decompressed_data.len() as u64 <= opts.max_entry_size);
+                assert!(entry.offset < m.len() as u64);
+            }
+        }
+    }
+
+    /// Truncating a valid TAR at every 512-block boundary must never panic.
+    #[test]
+    fn test_tar_scan_block_truncations_never_panic() {
+        let base = build_test_tar(&[
+            ("a.txt", b"alpha"),
+            ("b.txt", &[7u8; 700]), // spans two data blocks
+        ]);
+        let opts = RepairOptions::default();
+        let mut cut = 0;
+        while cut <= base.len() {
+            let _ = scan_tar_reader(&mut Cursor::new(&base[..cut]), &opts).expect("scan Ok");
+            cut += BLOCK_SIZE;
+        }
+        // Also the exact full length and a mid-block cut.
+        let _ = scan_tar_reader(&mut Cursor::new(&base[..base.len().min(300)]), &opts)
+            .expect("scan Ok");
+    }
+}

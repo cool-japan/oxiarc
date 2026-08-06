@@ -11,6 +11,7 @@ description = "Pure Rust CCSDS-121.0-B-2 / libaec-compatible adaptive entropy co
 readme = "README.md"
 keywords = ["szip", "aec", "ccsds", "compression", "decompression"]
 categories = ["compression", "encoding", "science"]
+exclude = ["TODO.md"]
 
 [package.metadata.docs.rs]
 all-features = true

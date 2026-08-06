@@ -49,6 +49,32 @@ const MAX_CODERS_PER_FOLDER: usize = 64;
 /// reference implementation's bound is 64 (`kNumOutStreamsMax`).
 const MAX_FOLDER_STREAMS: u64 = 64;
 
+/// Maximum expansion factor a folder's whole coder chain may achieve over the
+/// bytes actually read for its packed stream.
+///
+/// A single decompression stage over highly redundant data reaches roughly
+/// 10^4; a chain that revisits coders multiplies those factors together, which
+/// is how a few hundred bytes of crafted 7z metadata turn into terabytes of
+/// output (SEVENZ-02). 10^6 leaves two orders of magnitude of headroom over any
+/// real single-stage ratio while still cutting the multiplicative case off.
+const MAX_FOLDER_EXPANSION_RATIO: u64 = 1_000_000;
+
+/// Floor for the per-folder decoded-byte budget, so a small but legitimate
+/// packed stream is never rejected by the ratio rule alone.
+const MIN_FOLDER_DECODED_ALLOWANCE: u64 = 64 * 1024 * 1024;
+
+/// Absolute ceiling on the bytes one folder's coder chain may produce in total.
+///
+/// `decode_folder_data` materialises the whole folder in memory, so anything
+/// approaching this is already impractical; the cap exists so that a *large*
+/// packed stream cannot license an unbounded chain via the ratio rule.
+const MAX_FOLDER_DECODED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+// `folder_decode_budget` clamps into [MIN_FOLDER_DECODED_ALLOWANCE,
+// MAX_FOLDER_DECODED_BYTES]; `u64::clamp` panics when the bounds are inverted,
+// so pin the ordering at compile time.
+const _: () = assert!(MIN_FOLDER_DECODED_ALLOWANCE <= MAX_FOLDER_DECODED_BYTES);
+
 /// Read exactly `declared_len` bytes starting at the reader's current
 /// position, bounding the allocation against the number of bytes actually
 /// remaining in the underlying stream.
@@ -1378,8 +1404,38 @@ fn decode_folder_data<R: Read + Seek>(
     reader.seek(SeekFrom::Start(pack_offset))?;
     let packed = read_bounded_by_remaining(reader, pack_size)?;
 
-    // Walk the linear coder chain via bind pairs. With 1-in/1-out coders,
-    // input stream i and output stream i both belong to coder i.
+    let data = decode_coder_chain(folder, packed)?;
+
+    if let Some(expected) = folder.unpack_crc {
+        let actual = Crc32::compute(&data);
+        if actual != expected {
+            return Err(OxiArcError::crc_mismatch(expected, actual));
+        }
+    }
+
+    Ok(data)
+}
+
+/// Walk a folder's coder chain via its bind pairs and return the final output.
+///
+/// With 1-in/1-out coders, input stream `i` and output stream `i` both belong
+/// to coder `i`, so the chain is a linear walk: start at the coder fed by the
+/// packed stream, then repeatedly follow the bind pair whose *output* index is
+/// the coder just decoded.
+///
+/// Two hardening rules apply, both driven by the fact that the bind-pair graph
+/// is attacker-controlled metadata (SEVENZ-02):
+///
+/// 1. **Acyclic**: a coder may be decoded at most once per folder. A crafted
+///    self-referential or cyclic bind-pair graph could otherwise re-enter the
+///    same decompressor repeatedly, each pass expanding the previous pass's
+///    output — a nested decompression bomb built from a tiny archive.
+/// 2. **Cumulative output budget**: the total number of bytes produced across
+///    *all* stages is bounded by [`folder_decode_budget`], checked both against
+///    the declared per-stage size (before decoding) and against the bytes each
+///    stage actually produced (after decoding). The declared size is only ever
+///    used to reject early — never to authorise a larger allocation.
+fn decode_coder_chain(folder: &Folder, packed: Vec<u8>) -> Result<Vec<u8>> {
     let start = *folder
         .packed_indices
         .first()
@@ -1391,11 +1447,19 @@ fn decode_folder_data<R: Read + Seek>(
         ));
     }
 
-    let mut data = decode_coder(
+    let budget = folder_decode_budget(packed.len() as u64);
+    let mut produced: u64 = 0;
+    let mut visited = vec![false; folder.coders.len()];
+    visited[start] = true;
+
+    let mut data = decode_chain_stage(
         &folder.coders[start],
         packed,
         folder.unpack_sizes.get(start).copied(),
+        budget,
+        &mut produced,
     )?;
+
     let mut current = start;
     for _ in 0..folder.coders.len() {
         match folder
@@ -1410,10 +1474,18 @@ fn decode_folder_data<R: Read + Seek>(
                         "7z bind pair index out of coder range",
                     ));
                 }
-                data = decode_coder(
+                if visited[next] {
+                    return Err(OxiArcError::invalid_header(
+                        "7z folder bind pairs form a cycle: coder chain revisits a coder",
+                    ));
+                }
+                visited[next] = true;
+                data = decode_chain_stage(
                     &folder.coders[next],
                     data,
                     folder.unpack_sizes.get(next).copied(),
+                    budget,
+                    &mut produced,
                 )?;
                 current = next;
             }
@@ -1421,14 +1493,60 @@ fn decode_folder_data<R: Read + Seek>(
         }
     }
 
-    if let Some(expected) = folder.unpack_crc {
-        let actual = Crc32::compute(&data);
-        if actual != expected {
-            return Err(OxiArcError::crc_mismatch(expected, actual));
+    Ok(data)
+}
+
+/// Cumulative decoded-byte budget for one folder's coder chain.
+///
+/// The chain is allowed to expand its packed input by up to
+/// [`MAX_FOLDER_EXPANSION_RATIO`], with a floor of
+/// [`MIN_FOLDER_DECODED_ALLOWANCE`] so that legitimately tiny packed streams
+/// still decode, and an absolute ceiling of [`MAX_FOLDER_DECODED_BYTES`] so a
+/// large packed stream cannot license an unbounded chain. Real archives sit far
+/// below all three: even LZMA over highly redundant data tops out around a
+/// 10^4 expansion in a single stage, whereas a bomb needs the *product* of
+/// several stages.
+fn folder_decode_budget(packed_len: u64) -> u64 {
+    packed_len
+        .saturating_mul(MAX_FOLDER_EXPANSION_RATIO)
+        .clamp(MIN_FOLDER_DECODED_ALLOWANCE, MAX_FOLDER_DECODED_BYTES)
+}
+
+/// Decode one stage of a folder's coder chain under the cumulative budget.
+fn decode_chain_stage(
+    coder: &Coder,
+    input: Vec<u8>,
+    out_size: Option<u64>,
+    budget: u64,
+    produced: &mut u64,
+) -> Result<Vec<u8>> {
+    // Cheap pre-check: if the header *claims* an output size that already blows
+    // the budget, reject before running the decompressor at all.
+    if let Some(declared) = out_size {
+        let projected = produced.saturating_add(declared);
+        if projected > budget {
+            return Err(budget_error(budget, projected));
         }
     }
 
-    Ok(data)
+    let output = decode_coder(coder, input, out_size)?;
+
+    // Authoritative check: what the stage actually produced.
+    let projected = produced.saturating_add(output.len() as u64);
+    if projected > budget {
+        return Err(budget_error(budget, projected));
+    }
+    *produced = projected;
+    Ok(output)
+}
+
+/// Build the budget error, clamping the u64 counters into the error's `usize`
+/// fields so the report is meaningful on 32-bit targets too.
+fn budget_error(budget: u64, requested: u64) -> OxiArcError {
+    OxiArcError::memory_budget_exceeded(
+        usize::try_from(budget).unwrap_or(usize::MAX),
+        usize::try_from(requested).unwrap_or(usize::MAX),
+    )
 }
 
 /// Decode the output of one coder.
@@ -1707,5 +1825,102 @@ mod tests {
             result.is_err(),
             "oversized next_header_size with no remaining bytes must error"
         );
+    }
+
+    /// Build a folder made of `count` `Copy` coders with the given bind pairs.
+    fn copy_folder(count: usize, bind_pairs: Vec<(u64, u64)>, unpack_sizes: Vec<u64>) -> Folder {
+        Folder {
+            coders: (0..count)
+                .map(|_| Coder {
+                    codec_id: CodecId::Copy,
+                    num_in_streams: 1,
+                    num_out_streams: 1,
+                    properties: Vec::new(),
+                })
+                .collect(),
+            bind_pairs,
+            packed_indices: vec![0],
+            unpack_sizes,
+            unpack_crc: None,
+        }
+    }
+
+    /// A linear two-coder chain must still decode end to end.
+    #[test]
+    fn test_coder_chain_linear_chain_still_decodes() {
+        let payload = b"7z coder chain payload".to_vec();
+        let len = payload.len() as u64;
+        // Bind pair (in=1, out=0): coder 1 consumes coder 0's output.
+        let folder = copy_folder(2, vec![(1, 0)], vec![len, len]);
+
+        let out = decode_coder_chain(&folder, payload.clone()).expect("linear chain must decode");
+        assert_eq!(out, payload);
+    }
+
+    /// Regression test for SEVENZ-02: a self-referential bind pair must be
+    /// rejected instead of re-entering the same coder.
+    #[test]
+    fn test_coder_chain_rejects_self_referential_bind_pair() {
+        let payload = b"payload".to_vec();
+        let len = payload.len() as u64;
+        // Bind pair (in=0, out=0): coder 0 feeds itself.
+        let folder = copy_folder(1, vec![(0, 0)], vec![len]);
+
+        let err = decode_coder_chain(&folder, payload)
+            .expect_err("self-referential bind pair must be rejected");
+        assert!(
+            matches!(err, OxiArcError::InvalidHeader { .. }),
+            "expected InvalidHeader, got {err:?}"
+        );
+    }
+
+    /// Regression test for SEVENZ-02: a cyclic two-coder bind-pair graph lets a
+    /// crafted archive run the decompressor chain repeatedly over its own
+    /// output. The walk must stop at the first revisit.
+    #[test]
+    fn test_coder_chain_rejects_cyclic_bind_pairs() {
+        let payload = b"payload".to_vec();
+        let len = payload.len() as u64;
+        // (in=1, out=0) and (in=0, out=1): 0 -> 1 -> 0 -> ...
+        let folder = copy_folder(2, vec![(1, 0), (0, 1)], vec![len, len]);
+
+        let err =
+            decode_coder_chain(&folder, payload).expect_err("cyclic bind pairs must be rejected");
+        assert!(
+            matches!(err, OxiArcError::InvalidHeader { .. }),
+            "expected InvalidHeader, got {err:?}"
+        );
+    }
+
+    /// A declared per-stage output size beyond the folder budget must be
+    /// refused *before* the coder runs, so the header cannot authorise a huge
+    /// allocation from a few bytes of packed input.
+    #[test]
+    fn test_coder_chain_rejects_oversized_declared_output() {
+        let payload = b"tiny".to_vec();
+        let folder = copy_folder(1, Vec::new(), vec![1 << 40]);
+
+        let err = decode_coder_chain(&folder, payload)
+            .expect_err("declared output beyond the budget must be rejected");
+        assert!(
+            matches!(err, OxiArcError::MemoryBudgetExceeded { .. }),
+            "expected MemoryBudgetExceeded, got {err:?}"
+        );
+    }
+
+    /// The budget scales with the packed size, but never below the floor and
+    /// never above the absolute ceiling.
+    #[test]
+    fn test_folder_decode_budget_bounds() {
+        assert_eq!(folder_decode_budget(0), MIN_FOLDER_DECODED_ALLOWANCE);
+        assert_eq!(folder_decode_budget(1), MIN_FOLDER_DECODED_ALLOWANCE);
+        // In the linear middle band the ratio rule applies verbatim.
+        assert_eq!(
+            folder_decode_budget(1024),
+            1024 * MAX_FOLDER_EXPANSION_RATIO
+        );
+        // Large packed streams are clamped by the absolute ceiling.
+        assert_eq!(folder_decode_budget(1024 * 1024), MAX_FOLDER_DECODED_BYTES);
+        assert_eq!(folder_decode_budget(u64::MAX), MAX_FOLDER_DECODED_BYTES);
     }
 }

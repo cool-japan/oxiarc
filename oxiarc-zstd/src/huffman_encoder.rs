@@ -73,10 +73,18 @@ impl HuffmanEncoder {
             }
         }
 
-        // Combine nodes until one remains
+        // Combine nodes until one remains. Each pop below is structurally
+        // guaranteed by the `while heap.len() > 1` / final-pop invariant
+        // (there are always >= 2 elements before the first pop and >= 1
+        // before the second, since the loop only runs while `len() > 1`),
+        // but that guarantee lives in the shape of this loop rather than in
+        // the type system. Using `?` on the `Option` this function already
+        // returns converts a future refactor that breaks the invariant into
+        // a clean `None` instead of a panic, at zero cost on the path that
+        // actually runs today.
         while heap.len() > 1 {
-            let Reverse((lf, li)) = heap.pop().expect("heap should have elements");
-            let Reverse((rf, ri)) = heap.pop().expect("heap should have elements");
+            let Reverse((lf, li)) = heap.pop()?;
+            let Reverse((rf, ri)) = heap.pop()?;
 
             let combined_freq = lf + rf;
             let new_idx = node_left.len();
@@ -86,7 +94,7 @@ impl HuffmanEncoder {
             heap.push(Reverse((combined_freq, new_idx)));
         }
 
-        let Reverse((_, final_root)) = heap.pop().expect("heap should have one element");
+        let Reverse((_, final_root)) = heap.pop()?;
 
         // Compute code lengths via DFS
         let mut code_lengths = vec![0u8; MAX_SYMBOLS];

@@ -699,7 +699,24 @@ impl<R: Read> XzReader<R> {
                 ),
             ));
         }
-        let expected_backward_size = (self.index_size / 4).saturating_sub(1) as u32;
+        // `self.index_size` is a `usize` derived from the untrusted, parsed
+        // Index field, while the footer's Backward Size is a `u32`. A plain
+        // `as u32` here would silently wrap on a 64-bit target once the index
+        // exceeds ~16 GiB, letting a crafted oversized index alias a forged
+        // footer value and defeat this consistency check. `try_from` instead
+        // rejects the stream outright when the real size cannot be
+        // represented, which is always correct: a genuine Backward Size field
+        // can never legitimately describe an index that large.
+        let expected_backward_size = u32::try_from((self.index_size / 4).saturating_sub(1))
+            .map_err(|_| {
+                OxiArcError::corrupted(
+                    0,
+                    format!(
+                        "XZ index size {} does not fit the 32-bit Backward Size field",
+                        self.index_size
+                    ),
+                )
+            })?;
         if backward_size_field != expected_backward_size {
             return Err(OxiArcError::corrupted(
                 0,
@@ -977,8 +994,20 @@ impl XzWriter {
         flags: StreamFlags,
         index_size: usize,
     ) -> Result<()> {
-        // Backward size (index size / 4 - 1)
-        let backward_size = ((index_size / 4) - 1) as u32;
+        // Backward size (index size / 4 - 1). `index_size` is a `usize` we
+        // computed ourselves while writing the Index field, but a plain
+        // `as u32` would still silently wrap once it exceeds `u32::MAX`
+        // (an index that large implies an implausibly large archive, but
+        // "implausible" is not "impossible" on a 64-bit target) and emit a
+        // footer whose Backward Size does not describe the Index we just
+        // wrote -- a self-corrupting archive our own reader would then
+        // reject. Mirrors the `try_from` guard `read_footer` applies to the
+        // same field on the decode side.
+        let backward_size = u32::try_from((index_size / 4).saturating_sub(1)).map_err(|_| {
+            OxiArcError::encoding_error(format!(
+                "XZ index size {index_size} does not fit the 32-bit Backward Size field"
+            ))
+        })?;
 
         // CRC32 of backward size and stream flags
         let mut footer_data = Vec::new();

@@ -1,8 +1,12 @@
 //! LZH compression method definitions.
 //!
-//! LZH archives support multiple compression methods (lh0-lh7 plus the
-//! directory marker `-lhd-`), each with different window sizes and
-//! compression characteristics.
+//! LZH containers carry more than the LHarc/LHA `-lh0-`..`-lh7-` line: LArc's
+//! `-lzs-`/`-lz4-`/`-lz5-`, LHarc 2.x's `-lh2-`/`-lh3-`, PMarc's
+//! `-pm0-`/`-pm2-` and the directory marker `-lhd-` all appear in real
+//! archives. Each has its own window size, match limits and entropy coding;
+//! the accessors here are the single source of truth for those parameters and
+//! deliberately name every variant explicitly rather than falling through a
+//! catch-all, so that adding a method can never silently inherit a zero window.
 
 /// LZH compression method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -12,6 +16,12 @@ pub enum LzhMethod {
     Lh0,
     /// lh1: 4KB window LZSS + adaptive Huffman (LHarc 1.x legacy format).
     Lh1,
+    /// lh2: 8KB window LZSS + adaptive Huffman over a growing position tree
+    /// (LHarc 2.x).
+    Lh2,
+    /// lh3: 8KB window LZSS + block-static Huffman with LHarc 2.x's table
+    /// format.
+    Lh3,
     /// lh4: 4KB window, static Huffman.
     Lh4,
     /// lh5: 8KB window, static Huffman (most common).
@@ -23,7 +33,15 @@ pub enum LzhMethod {
     Lh7,
     /// lhd: Directory entry marker (no data).
     Lhd,
-    /// Unrecognised method ID (e.g. `-lh2-`, `-lzs-`, `-pm2-`).
+    /// lzs: LArc LZSS — 2KB history, 11-bit absolute index, 4-bit length.
+    Lzs,
+    /// lz4: LArc stored (no compression).
+    Lz4,
+    /// lz5: LArc LZSS — 4KB pre-seeded history, 12-bit absolute index.
+    Lz5,
+    /// pm0: PMarc stored (no compression).
+    Pm0,
+    /// Unrecognised method ID (e.g. `-pm2-`, `-lhx-`).
     ///
     /// Carrying the raw 5-byte ID lets archive readers list such entries
     /// (and skip them at extraction time) instead of aborting the archive.
@@ -40,11 +58,17 @@ impl LzhMethod {
         match id {
             b"-lh0-" => Some(Self::Lh0),
             b"-lh1-" => Some(Self::Lh1),
+            b"-lh2-" => Some(Self::Lh2),
+            b"-lh3-" => Some(Self::Lh3),
             b"-lh4-" => Some(Self::Lh4),
             b"-lh5-" => Some(Self::Lh5),
             b"-lh6-" => Some(Self::Lh6),
             b"-lh7-" => Some(Self::Lh7),
             b"-lhd-" => Some(Self::Lhd),
+            b"-lzs-" => Some(Self::Lzs),
+            b"-lz4-" => Some(Self::Lz4),
+            b"-lz5-" => Some(Self::Lz5),
+            b"-pm0-" => Some(Self::Pm0),
             _ => None,
         }
     }
@@ -60,11 +84,17 @@ impl LzhMethod {
         match self {
             Self::Lh0 => *b"-lh0-",
             Self::Lh1 => *b"-lh1-",
+            Self::Lh2 => *b"-lh2-",
+            Self::Lh3 => *b"-lh3-",
             Self::Lh4 => *b"-lh4-",
             Self::Lh5 => *b"-lh5-",
             Self::Lh6 => *b"-lh6-",
             Self::Lh7 => *b"-lh7-",
             Self::Lhd => *b"-lhd-",
+            Self::Lzs => *b"-lzs-",
+            Self::Lz4 => *b"-lz4-",
+            Self::Lz5 => *b"-lz5-",
+            Self::Pm0 => *b"-pm0-",
             Self::Unknown(id) => *id,
         }
     }
@@ -72,9 +102,13 @@ impl LzhMethod {
     /// Get the sliding window size in bytes.
     pub fn window_size(&self) -> usize {
         match self {
-            Self::Lh0 | Self::Lhd | Self::Unknown(_) => 0,
+            Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0 | Self::Unknown(_) => 0,
+            Self::Lzs => 2048,  // 2 KB
             Self::Lh1 => 4096,  // 4 KB
             Self::Lh4 => 4096,  // 4 KB
+            Self::Lz5 => 4096,  // 4 KB
+            Self::Lh2 => 8192,  // 8 KB
+            Self::Lh3 => 8192,  // 8 KB
             Self::Lh5 => 8192,  // 8 KB
             Self::Lh6 => 32768, // 32 KB
             Self::Lh7 => 65536, // 64 KB
@@ -84,9 +118,13 @@ impl LzhMethod {
     /// Get the number of bits for position encoding.
     pub fn position_bits(&self) -> u8 {
         match self {
-            Self::Lh0 | Self::Lhd | Self::Unknown(_) => 0,
+            Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0 | Self::Unknown(_) => 0,
+            Self::Lzs => 11, // log2(2048)
             Self::Lh1 => 12, // log2(4096)
             Self::Lh4 => 12, // log2(4096)
+            Self::Lz5 => 12, // log2(4096)
+            Self::Lh2 => 13, // log2(8192)
+            Self::Lh3 => 13, // log2(8192)
             Self::Lh5 => 13, // log2(8192)
             Self::Lh6 => 15, // log2(32768)
             Self::Lh7 => 16, // log2(65536)
@@ -133,26 +171,38 @@ impl LzhMethod {
     /// Get the maximum match length.
     pub fn max_match(&self) -> usize {
         match self {
-            Self::Lh0 | Self::Lhd | Self::Unknown(_) => 0,
+            Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0 | Self::Unknown(_) => 0,
             Self::Lh1 => 60,
-            _ => 256,
+            Self::Lzs => 17,
+            Self::Lz5 => 18,
+            Self::Lh2 | Self::Lh3 | Self::Lh4 | Self::Lh5 | Self::Lh6 | Self::Lh7 => 256,
         }
     }
 
     /// Get the minimum match length.
     pub fn min_match(&self) -> usize {
         match self {
-            Self::Lh0 | Self::Lhd | Self::Unknown(_) => 0,
-            _ => 3,
+            Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0 | Self::Unknown(_) => 0,
+            Self::Lzs => 2,
+            Self::Lh1
+            | Self::Lh2
+            | Self::Lh3
+            | Self::Lh4
+            | Self::Lh5
+            | Self::Lh6
+            | Self::Lh7
+            | Self::Lz5 => 3,
         }
     }
 
     /// Check if this method is stored (no compression).
     ///
     /// Directory markers (`-lhd-`) are treated as stored: they carry zero
-    /// bytes of data, which passes through unchanged.
+    /// bytes of data, which passes through unchanged. LArc's `-lz4-` and
+    /// PMarc's `-pm0-` are genuine stored formats — the reference decoders map
+    /// both to a null (passthrough) decoder.
     pub fn is_stored(&self) -> bool {
-        matches!(self, Self::Lh0 | Self::Lhd)
+        matches!(self, Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0)
     }
 
     /// Check if this method marks a directory entry (`-lhd-`).
@@ -170,11 +220,17 @@ impl LzhMethod {
         match self {
             Self::Lh0 => "lh0",
             Self::Lh1 => "lh1",
+            Self::Lh2 => "lh2",
+            Self::Lh3 => "lh3",
             Self::Lh4 => "lh4",
             Self::Lh5 => "lh5",
             Self::Lh6 => "lh6",
             Self::Lh7 => "lh7",
             Self::Lhd => "lhd",
+            Self::Lzs => "lzs",
+            Self::Lz4 => "lz4",
+            Self::Lz5 => "lz5",
+            Self::Pm0 => "pm0",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -226,12 +282,23 @@ mod tests {
         assert_eq!(LzhMethod::from_id(b"-lh5-"), Some(LzhMethod::Lh5));
         assert_eq!(LzhMethod::from_id(b"-lh7-"), Some(LzhMethod::Lh7));
         assert_eq!(LzhMethod::from_id(b"-lhd-"), Some(LzhMethod::Lhd));
-        assert_eq!(LzhMethod::from_id(b"-lz5-"), None);
+        // `-lz5-` used to be unrecognised; it is now an implemented LArc
+        // method, so `from_id` must resolve it rather than return `None`.
+        assert_eq!(LzhMethod::from_id(b"-lz5-"), Some(LzhMethod::Lz5));
+        assert_eq!(LzhMethod::from_id(b"-lzs-"), Some(LzhMethod::Lzs));
+        assert_eq!(LzhMethod::from_id(b"-lz4-"), Some(LzhMethod::Lz4));
+        assert_eq!(LzhMethod::from_id(b"-lh2-"), Some(LzhMethod::Lh2));
+        assert_eq!(LzhMethod::from_id(b"-lh3-"), Some(LzhMethod::Lh3));
+        assert_eq!(LzhMethod::from_id(b"-pm0-"), Some(LzhMethod::Pm0));
+        // Still unimplemented, so still unrecognised.
+        assert_eq!(LzhMethod::from_id(b"-pm2-"), None);
+        assert_eq!(LzhMethod::from_id(b"-lhx-"), None);
     }
 
     #[test]
     fn test_method_from_id_lossy() {
         assert_eq!(LzhMethod::from_id_lossy(*b"-lh5-"), LzhMethod::Lh5);
+        assert_eq!(LzhMethod::from_id_lossy(*b"-lz5-"), LzhMethod::Lz5);
         assert_eq!(
             LzhMethod::from_id_lossy(*b"-pm2-"),
             LzhMethod::Unknown(*b"-pm2-")
@@ -240,12 +307,45 @@ mod tests {
 
     #[test]
     fn test_window_sizes() {
+        assert_eq!(LzhMethod::Lzs.window_size(), 2048);
         assert_eq!(LzhMethod::Lh1.window_size(), 4096);
         assert_eq!(LzhMethod::Lh4.window_size(), 4096);
+        assert_eq!(LzhMethod::Lz5.window_size(), 4096);
+        assert_eq!(LzhMethod::Lh2.window_size(), 8192);
+        assert_eq!(LzhMethod::Lh3.window_size(), 8192);
         assert_eq!(LzhMethod::Lh5.window_size(), 8192);
         assert_eq!(LzhMethod::Lh6.window_size(), 32768);
         assert_eq!(LzhMethod::Lh7.window_size(), 65536);
         assert_eq!(LzhMethod::Lhd.window_size(), 0);
+        assert_eq!(LzhMethod::Lz4.window_size(), 0);
+        assert_eq!(LzhMethod::Pm0.window_size(), 0);
+    }
+
+    #[test]
+    fn test_legacy_match_limits() {
+        assert_eq!(LzhMethod::Lzs.min_match(), 2);
+        assert_eq!(LzhMethod::Lzs.max_match(), 17);
+        assert_eq!(LzhMethod::Lz5.min_match(), 3);
+        assert_eq!(LzhMethod::Lz5.max_match(), 18);
+        assert_eq!(LzhMethod::Lh2.min_match(), 3);
+        assert_eq!(LzhMethod::Lh2.max_match(), 256);
+        assert_eq!(LzhMethod::Lh3.min_match(), 3);
+        assert_eq!(LzhMethod::Lh3.max_match(), 256);
+    }
+
+    #[test]
+    fn test_stored_methods() {
+        // LArc `-lz4-` and PMarc `-pm0-` are genuine stored formats (the
+        // reference decoders route both to a null decoder), so they must not
+        // reach a codec.
+        assert!(LzhMethod::Lz4.is_stored());
+        assert!(LzhMethod::Pm0.is_stored());
+        assert!(LzhMethod::Lh0.is_stored());
+        assert!(LzhMethod::Lhd.is_stored());
+        assert!(!LzhMethod::Lzs.is_stored());
+        assert!(!LzhMethod::Lz5.is_stored());
+        assert!(!LzhMethod::Lh2.is_stored());
+        assert!(!LzhMethod::Lh3.is_stored());
     }
 
     #[test]
@@ -286,13 +386,20 @@ mod tests {
         for m in [
             LzhMethod::Lh0,
             LzhMethod::Lh1,
+            LzhMethod::Lh2,
+            LzhMethod::Lh3,
             LzhMethod::Lh4,
             LzhMethod::Lh5,
             LzhMethod::Lh6,
             LzhMethod::Lh7,
             LzhMethod::Lhd,
+            LzhMethod::Lzs,
+            LzhMethod::Lz4,
+            LzhMethod::Lz5,
+            LzhMethod::Pm0,
         ] {
             assert_eq!(LzhMethod::from_id(&m.id()), Some(m));
+            assert_ne!(m.name(), "unknown");
         }
     }
 }

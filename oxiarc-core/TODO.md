@@ -1,5 +1,5 @@
 
-# oxiarc-core - Development Status (v0.4.0, 2026-07-30)
+# oxiarc-core - Development Status (v0.4.1, 2026-07-30)
 
 ## Completed Features (COMPLETE)
 
@@ -84,11 +84,13 @@
   - **Tests:** cross-validate SIMD path against scalar path on a randomized 1 MiB buffer — bit-exact equality; add a benchmark (criterion or black_box baseline) showing SIMD > 4× scalar on supported targets.
   - **Downstream compatibility (explicit):** the `simd` cargo-feature **name stays defined** in `oxiarc-core/Cargo.toml` as a no-op alias after the gate is removed. Any downstream `features = ["simd"]` (including workspace consumers) must continue to resolve and compile unchanged. Document the alias as deprecated-but-preserved in the feature doc-comment, and leave a follow-up to remove it after one minor release cycle.
   - **Risk:** feature-flag removal can break downstream consumers → mitigated by the no-op alias above. Secondary risk: `std::is_x86_feature_detected!` / `std::is_aarch64_feature_detected!` invocation cost on hot paths — dispatch only once via `OnceLock<fn>` to amortize.
+- [x] Enable SIMD CRC32 dispatch on x86_64 with corrected reflected fold constants (completed 0.4.1)
+  - **Done:** `crc_simd::x86::crc32_pclmulqdq` previously mixed the non-reflected Intel whitepaper constants into reflected-mode folding and extracted the wrong dword lane, so it returned wrong CRC-32 values while remaining a public `unsafe fn`; dispatch was hardcoded off to hide it. It is now a direct translation of the validated aarch64 PMULL path and both architectures share one `reflected_constants` module. `#[ignore]` removed from `test_pclmulqdq_matches_scalar_vectors`; added `test_pclmulqdq_length_sweep` (every length 0–4096) and `test_pclmulqdq_random_inputs` (100 vectors, zero and non-zero seed CRCs), plus `crc::tests::dispatched_crc32_matches_software_reference` which cross-checks the runtime-dispatched path on every architecture. Verified by running the `x86_64-apple-darwin` suite under Rosetta 2 translation (PCLMULQDQ + SSE4.1 present); not yet exercised on native x86_64 silicon.
 - [x] Enable SIMD CRC32 dispatch on aarch64 with corrected fold constants (completed 2026-05-06)
-  - **Goal:** `SimdCrc32Dispatcher::update` routes to `crc32_pmull` on aarch64 when `is_aarch64_feature_detected!("aes")` returns true. Output is bitwise-identical to scalar `software_crc32` for all input lengths 0–4096 bytes. `#[ignore]` removed from `test_pmull_matches_scalar_vectors`; test passes on Apple Silicon. x86_64 PCLMULQDQ path remains but its dispatch branch still returns false — regression test stays `#[ignore]` until a CI x86 runner exists.
+  - **Goal:** `SimdCrc32Dispatcher::update` routes to `crc32_pmull` on aarch64 when `is_aarch64_feature_detected!("aes")` returns true. Output is bitwise-identical to scalar `software_crc32` for all input lengths 0–4096 bytes. `#[ignore]` removed from `test_pmull_matches_scalar_vectors`; test passes on Apple Silicon. (x86_64 PCLMULQDQ dispatch followed in 0.4.1 — see the entry above.)
   - **Design:** (1) Pin aarch64 fold constants verbatim from crc32fast or zlib-ng with citation comment. (2) Replace crc_simd.rs lines 262–273 aarch64 constants block. (3) Wire `is_simd_available()` (line 507): on aarch64 return `is_aarch64_feature_detected!("aes")`; keep x86 returning false. (4) `SimdCrc32Dispatcher::update` (lines 543–547): branch to `crc32_pmull` when aarch64+feature, else scalar. (5) `crc.rs` lines 161–164: route through `SimdCrc32Dispatcher` instead of direct `software_crc32`. (6) Un-ignore `test_pmull_matches_scalar_vectors` (line 864); add length-sweep and randomized tests.
   - **Files:** MODIFY `oxiarc-core/src/crc_simd.rs`, MODIFY `oxiarc-core/src/crc.rs`
-  - **Tests:** un-ignored `test_pmull_matches_scalar_vectors`; `test_pmull_length_sweep` (19 lengths 0–4096); `test_pmull_random_inputs` (100 random vectors, fixed seed); x86 test stays `#[ignore]`
+  - **Tests:** un-ignored `test_pmull_matches_scalar_vectors`; `test_pmull_length_sweep` (19 lengths 0–4096); `test_pmull_random_inputs` (100 random vectors, fixed seed)
   - **Risk:** If `is_aarch64_feature_detected!("aes")` unavailable on the toolchain, fall back to `cfg!(target_feature = "aes")`; if neither resolves, keep dispatch off but land corrected constants.
 - [ ] Vectorized bit operations
 - [ ] Zero-copy buffer operations

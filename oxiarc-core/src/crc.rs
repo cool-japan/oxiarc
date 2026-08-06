@@ -26,9 +26,11 @@
 //!   `is_aarch64_feature_detected!("aes")` reports the crypto extensions
 //!   (AES implies PMULL). The fold/Barrett constants are verified against the
 //!   scalar slicing-by-8 reference; see `crc_simd::arm`.
-//! - **x86_64**: The PCLMULQDQ path exists in `crc_simd::x86` but is **not**
-//!   wired into dispatch pending empirical CI verification, so x86_64 currently
-//!   uses the slicing-by-8 software path.
+//! - **x86_64**: Uses PCLMULQDQ when `pclmulqdq` and `sse4.1` are detected.
+//!   The fold/Barrett constants and reduction shape are shared with the
+//!   aarch64 path (`crc_simd::reflected_constants`) and are cross-checked
+//!   against the scalar slicing-by-8 reference by the `test_pclmulqdq_*`
+//!   tests; see `crc_simd::x86` for how that verification was performed.
 //! - **Other architectures**: always use the slicing-by-8 software path.
 //!
 //! Every implementation uses the same ISO 3309 polynomial (0xEDB88320) as the
@@ -166,8 +168,7 @@ static CRC32_DISPATCH: std::sync::OnceLock<Crc32Dispatch> = std::sync::OnceLock:
 /// Called once and cached in `CRC32_DISPATCH`. Checks for CPU features and
 /// returns the selected implementation together with a label describing it:
 /// - On aarch64 with AES/PMULL support: verified `arm::crc32_pmull` wrapper.
-/// - On x86_64: PCLMULQDQ dispatch is *not* enabled pending CI verification, so
-///   the slicing-by-8 software path is used.
+/// - On x86_64 with PCLMULQDQ + SSE4.1: verified `x86::crc32_pclmulqdq` wrapper.
 /// - Other architectures: slicing-by-8.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn init_crc32_dispatch() -> Crc32Dispatch {
@@ -186,6 +187,21 @@ fn init_crc32_dispatch() -> Crc32Dispatch {
             };
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::crc_simd::x86::is_supported() {
+            fn pclmulqdq_dispatch(crc: u32, data: &[u8]) -> u32 {
+                // SAFETY: this function is only selected when is_supported() is true,
+                // meaning both the PCLMULQDQ and SSE4.1 CPU features are present.
+                unsafe { crate::crc_simd::x86::crc32_pclmulqdq(crc, data) }
+            }
+            return Crc32Dispatch {
+                func: pclmulqdq_dispatch,
+                name: "PCLMULQDQ (x86_64 SIMD)",
+                simd: true,
+            };
+        }
+    }
     // Fallback: slicing-by-8 software implementation.
     fn software_dispatch(crc: u32, data: &[u8]) -> u32 {
         crate::crc_simd::software_crc32(crc, data)
@@ -194,7 +210,7 @@ fn init_crc32_dispatch() -> Crc32Dispatch {
     #[cfg(target_arch = "aarch64")]
     let name = "slicing-by-8 (software, PMULL not available)";
     #[cfg(target_arch = "x86_64")]
-    let name = "slicing-by-8 (software; x86_64 PCLMULQDQ dispatch not enabled)";
+    let name = "slicing-by-8 (software, PCLMULQDQ not available)";
     Crc32Dispatch {
         func: software_dispatch,
         name,
@@ -1059,5 +1075,57 @@ mod tests {
         let mut crc = Crc32::new();
         crc.update(b"Hello, World!");
         assert_eq!(crc.finalize(), EXPECTED);
+    }
+
+    /// Regression test for the x86_64 PCLMULQDQ CRC-32 path (OXIARC-CRC-01).
+    ///
+    /// `crc_simd::x86::crc32_pclmulqdq` shipped as a public `unsafe fn` while
+    /// combining the *non-reflected* Intel whitepaper constants with
+    /// reflected-mode folding and extracting the result from the wrong dword
+    /// lane, so it returned wrong CRC-32 values — silently accepting corrupt
+    /// archives or rejecting valid ones for any downstream caller that did its
+    /// own feature detection and called it. The crate worked around this by
+    /// hardcoding dispatch off, which left the broken arithmetic exported.
+    ///
+    /// The path is now the same arithmetic as the validated aarch64 PMULL path
+    /// and IS dispatched, so the runtime-selected implementation must agree
+    /// with the scalar slicing-by-8 reference byte for byte. This test asserts
+    /// that on every architecture, including the incremental (chunked) form
+    /// which exercises non-zero seed CRCs.
+    #[test]
+    fn dispatched_crc32_matches_software_reference() {
+        let data: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+
+        for len in [
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 79, 127, 128, 129, 255, 256, 1023,
+            1024, 4095, 4096, 8192,
+        ] {
+            let slice = &data[..len];
+            assert_eq!(
+                Crc32::compute(slice),
+                Crc32::compute_software(slice),
+                "dispatched CRC-32 diverges from the software reference at len {len} \
+                 (implementation: {})",
+                Crc32::implementation_name()
+            );
+        }
+
+        // Incremental updates: every chunk after the first feeds a non-zero
+        // running CRC into the dispatched function.
+        for chunk in [1usize, 3, 16, 17, 64, 1000] {
+            let mut incremental = Crc32::new();
+            for part in data.chunks(chunk) {
+                incremental.update(part);
+            }
+            assert_eq!(
+                incremental.finalize(),
+                Crc32::compute_software(&data),
+                "incremental CRC-32 diverges from the software reference with chunk size {chunk} \
+                 (implementation: {})",
+                Crc32::implementation_name()
+            );
+        }
     }
 }

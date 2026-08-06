@@ -134,3 +134,135 @@ fn test_zipcrypto_roundtrip() {
         "expected error extracting ZipCrypto entry with wrong password"
     );
 }
+
+/// Locate every local file header in a ZIP image and return the first
+/// `take` bytes of each entry's raw (still encrypted) payload.
+///
+/// The scan is deliberately dumb — signature match, then the fixed 30-byte
+/// local header layout — because the point is to inspect the bytes actually
+/// written to disk rather than anything the reader re-derives.
+fn raw_entry_payload_prefixes(archive: &[u8], take: usize) -> Vec<Vec<u8>> {
+    const LOCAL_HEADER_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+    const LOCAL_HEADER_LEN: usize = 30;
+
+    let mut prefixes = Vec::new();
+    let mut index = 0usize;
+    while index + LOCAL_HEADER_LEN <= archive.len() {
+        if archive[index..index + 4] != LOCAL_HEADER_SIG {
+            index += 1;
+            continue;
+        }
+        let name_len = u16::from_le_bytes([archive[index + 26], archive[index + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([archive[index + 28], archive[index + 29]]) as usize;
+        let data_start = index + LOCAL_HEADER_LEN + name_len + extra_len;
+        let data_end = data_start + take;
+        if data_end > archive.len() {
+            break;
+        }
+        prefixes.push(archive[data_start..data_end].to_vec());
+        index = data_start;
+    }
+    prefixes
+}
+
+/// Regression test: the ZipCrypto encryption header must come from the OS
+/// CSPRNG, not from values that are stored in cleartext next to it.
+///
+/// `ZipWriter::add_encrypted_file_traditional` used to seed an LCG with
+/// `mtime * 1000 + mdate` and `crc32 ^ compressed_len`. Every one of those
+/// inputs is written into the local file header in the clear, so an attacker
+/// could reconstruct the 11 "random" header bytes exactly — which is precisely
+/// the known plaintext ZipCrypto's keystream must not leak. Worse, two entries
+/// with identical content written in the same second produced byte-identical
+/// encryption headers.
+///
+/// Writing eight identical entries in one pass makes that collision certain
+/// under the old code and impossible under the fixed code.
+#[test]
+fn zipcrypto_header_is_csprng_sourced_not_derived_from_public_fields() {
+    const ENTRY_COUNT: usize = 8;
+    let payload = b"identical payload for every entry";
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = ZipWriter::new(&mut buf);
+        for i in 0..ENTRY_COUNT {
+            writer
+                .add_encrypted_file_traditional(&format!("dup{i}.txt"), payload, PASSWORD)
+                .expect("zipcrypto encrypt");
+        }
+        writer.finish().expect("finish");
+    }
+
+    // 12 bytes = the full ZipCrypto encryption header.
+    let headers = raw_entry_payload_prefixes(&buf, 12);
+    assert_eq!(headers.len(), ENTRY_COUNT, "expected one header per entry");
+
+    let unique: std::collections::HashSet<_> = headers.iter().collect();
+    assert_eq!(
+        unique.len(),
+        ENTRY_COUNT,
+        "ZipCrypto encryption headers repeated across identical entries — \
+         the random prefix is being derived from public header fields"
+    );
+
+    // The archive must still round-trip.
+    let mut reader = ZipReader::new(Cursor::new(&buf)).expect("open archive");
+    let entries: Vec<_> = reader.entries().to_vec();
+    for entry in &entries {
+        let data = reader
+            .extract_encrypted(entry, PASSWORD)
+            .expect("extract entry");
+        assert_eq!(data.as_slice(), payload.as_slice());
+    }
+}
+
+/// Regression test: WinZip-AES salts must be unique per entry.
+///
+/// The salt is the sole value that differentiates PBKDF2-SHA1 key derivation
+/// between entries; a repeat means keystream reuse under AES-CTR. The salt is
+/// stored in the clear as the first `salt_len` bytes of the entry payload, so
+/// it can be read straight out of the archive image.
+#[test]
+fn aes_salts_are_unique_across_identical_entries() {
+    const ENTRY_COUNT: usize = 8;
+    // AES-256 (the default for `add_encrypted_file`) uses a 16-byte salt.
+    const SALT_LEN: usize = 16;
+    let payload = b"identical payload for every entry";
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = ZipWriter::new(&mut buf);
+        for i in 0..ENTRY_COUNT {
+            writer
+                .add_encrypted_file(&format!("dup{i}.txt"), payload, PASSWORD)
+                .expect("aes encrypt");
+        }
+        writer.finish().expect("finish");
+    }
+
+    let salts = raw_entry_payload_prefixes(&buf, SALT_LEN);
+    assert_eq!(salts.len(), ENTRY_COUNT, "expected one salt per entry");
+
+    let unique: std::collections::HashSet<_> = salts.iter().collect();
+    assert_eq!(
+        unique.len(),
+        ENTRY_COUNT,
+        "WinZip-AES salts repeated across entries — key derivation is not unique"
+    );
+    for salt in &salts {
+        assert!(
+            salt.iter().any(|&byte| byte != salt[0]),
+            "salt must not be a constant byte pattern"
+        );
+    }
+
+    let mut reader = ZipReader::new(Cursor::new(&buf)).expect("open archive");
+    let entries: Vec<_> = reader.entries().to_vec();
+    for entry in &entries {
+        let data = reader
+            .extract_encrypted(entry, PASSWORD)
+            .expect("extract entry");
+        assert_eq!(data.as_slice(), payload.as_slice());
+    }
+}

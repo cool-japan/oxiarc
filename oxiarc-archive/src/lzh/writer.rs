@@ -29,7 +29,13 @@ pub enum LzhCompressionLevel {
 
 /// LZH archive writer.
 pub struct LzhWriter<W: Write> {
-    writer: W,
+    /// Underlying writer. `None` only in the instant between `into_inner`
+    /// taking it and the enclosing `self` finishing its (now-skipped) drop;
+    /// no other method can observe `None` here, since every method other
+    /// than `into_inner` takes `&self`/`&mut self` and `into_inner` consumes
+    /// `self` by value, so the type system rules out any further call on the
+    /// same `LzhWriter` afterward.
+    writer: Option<W>,
     compression: LzhCompressionLevel,
     finished: bool,
     /// LZH header level to write (0, 1, 2, or 3).
@@ -45,13 +51,38 @@ impl<W: Write> LzhWriter<W> {
     /// headers (Shift_JIS filenames — the standard LZH form).
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: Some(writer),
             compression: LzhCompressionLevel::default(),
             finished: false,
             header_level: 2,
             entry_index: 0,
             progress: None,
         }
+    }
+
+    /// Build the error used when `writer` is unexpectedly `None`.
+    ///
+    /// Centralized so the (unreachable-via-the-public-API) message is
+    /// written once rather than duplicated at every call site.
+    #[cold]
+    fn writer_taken_error() -> OxiArcError {
+        OxiArcError::Io(std::io::Error::other(
+            "LzhWriter: writer accessed after into_inner (unreachable via the public API)",
+        ))
+    }
+
+    /// Fallibly borrow the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Never, in practice: the only way `writer` becomes `None` is
+    /// `into_inner`, which consumes `self` by value and therefore makes this
+    /// method uncallable afterward. `Result` (rather than a panic) so every
+    /// call site propagates with a plain `?` instead of adding a new
+    /// `.expect()`.
+    #[inline]
+    fn writer_mut(&mut self) -> Result<&mut W> {
+        self.writer.as_mut().ok_or_else(Self::writer_taken_error)
     }
 
     /// Add a file with per-entry Unix metadata encoded as level-3
@@ -210,7 +241,7 @@ impl<W: Write> LzhWriter<W> {
         }
 
         // Write compressed data
-        self.writer.write_all(&compressed)?;
+        self.writer_mut()?.write_all(&compressed)?;
 
         // Emit progress: bytes written
         if let Some(ref handle) = self.progress {
@@ -309,7 +340,7 @@ impl<W: Write> LzhWriter<W> {
         }
 
         // Write the raw (pre-compressed) data verbatim
-        self.writer.write_all(compressed_data)?;
+        self.writer_mut()?.write_all(compressed_data)?;
 
         // Emit progress: bytes written
         if let Some(ref handle) = self.progress {
@@ -450,7 +481,7 @@ impl<W: Write> LzhWriter<W> {
         // Terminator: next_ext_size = 0 (4 bytes)
         header.extend_from_slice(&0u32.to_le_bytes());
 
-        self.writer.write_all(&header)?;
+        self.writer_mut()?.write_all(&header)?;
 
         Ok(())
     }
@@ -556,7 +587,7 @@ impl<W: Write> LzhWriter<W> {
             ));
         }
 
-        self.writer.write_all(&header)?;
+        self.writer_mut()?.write_all(&header)?;
         Ok(())
     }
 
@@ -635,7 +666,7 @@ impl<W: Write> LzhWriter<W> {
         header[1] = checksum;
 
         // Write header
-        self.writer.write_all(&header)?;
+        self.writer_mut()?.write_all(&header)?;
 
         Ok(())
     }
@@ -644,8 +675,8 @@ impl<W: Write> LzhWriter<W> {
     pub fn finish(&mut self) -> Result<()> {
         if !self.finished {
             // Write end marker (0 byte)
-            self.writer.write_all(&[0u8])?;
-            self.writer.flush()?;
+            self.writer_mut()?.write_all(&[0u8])?;
+            self.writer_mut()?.flush()?;
             self.finished = true;
             if let Some(ref handle) = self.progress {
                 handle.on_finish();
@@ -656,19 +687,41 @@ impl<W: Write> LzhWriter<W> {
 
     /// Consume the writer and return the inner writer.
     pub fn into_inner(mut self) -> Result<W> {
-        self.finish()?;
-        // SAFETY: `self` is wrapped in `ManuallyDrop` so its `Drop` impl
-        // (which would call `finish()` again) never runs. We read `writer`
-        // out without dropping it — it is the value returned to the caller
-        // — then explicitly drop `progress`, the only other field owning a
-        // resource (an `Arc` clone), so it is never leaked. `compression`,
-        // `finished`, `header_level`, and `entry_index` are `Copy` and own
-        // no resources.
-        let mut this = std::mem::ManuallyDrop::new(self);
-        let writer = unsafe { std::ptr::read(&this.writer) };
-        unsafe {
-            std::ptr::drop_in_place(&mut this.progress);
+        // Deliberately not `self.finish()?`: that would return early on a
+        // partial failure (e.g. `write_all` above succeeds but `flush`
+        // fails) while `self.finished` is still `false`, leaving `self` to
+        // drop normally — and `Drop::drop` would then call `finish()` a
+        // second time, silently re-writing the end marker before hitting an
+        // error again (Drop discards it). Inlining the same two writes here
+        // and taking `writer` unconditionally, before propagating any error,
+        // means `Drop::drop` always sees `None` once `into_inner` has run —
+        // on every path, not just the success path.
+        let write_result: Result<()> = if self.finished {
+            Ok(())
+        } else {
+            (|| {
+                self.writer_mut()?.write_all(&[0u8])?;
+                self.writer_mut()?.flush()?;
+                Ok(())
+            })()
+        };
+
+        // `writer_mut()` above only ever borrows `self.writer`, never takes
+        // it, so it is still `Some` here regardless of `write_result`.
+        // Taking it lets `self`'s remaining fields — notably `progress`, an
+        // `Arc` clone — drop normally through the ordinary (non-`unsafe`)
+        // path below instead of needing to be enumerated and dropped by
+        // hand.
+        let writer = self.writer.take().ok_or_else(Self::writer_taken_error)?;
+
+        if write_result.is_ok() && !self.finished {
+            self.finished = true;
+            if let Some(ref handle) = self.progress {
+                handle.on_finish();
+            }
         }
+
+        write_result?;
         Ok(writer)
     }
 
@@ -683,6 +736,11 @@ impl<W: Write> LzhWriter<W> {
 
 impl<W: Write> Drop for LzhWriter<W> {
     fn drop(&mut self) {
-        let _ = self.finish();
+        // `into_inner` takes `writer`, leaving `None`, right before this
+        // `self` finishes its own (now-skipped) drop; every other path still
+        // has `Some` and gets the usual best-effort finish.
+        if self.writer.is_some() {
+            let _ = self.finish();
+        }
     }
 }

@@ -854,8 +854,13 @@ impl<R: Read> BitReader<R> {
 /// remaining partial byte.
 #[derive(Debug)]
 pub struct BitWriter<W: Write> {
-    /// Underlying writer.
-    writer: W,
+    /// Underlying writer. `None` only in the instant between `into_inner`
+    /// taking it and the enclosing `self` finishing its (now-skipped) drop;
+    /// no other method can observe `None` here, since every method other
+    /// than `into_inner` takes `&self`/`&mut self` and `into_inner` consumes
+    /// `self` by value, so the type system rules out any further call on the
+    /// same `BitWriter` afterward.
+    writer: Option<W>,
     /// Bit buffer (LSB-first).
     buffer: u64,
     /// Number of bits in buffer.
@@ -868,21 +873,61 @@ impl<W: Write> BitWriter<W> {
     /// Create a new `BitWriter` wrapping the given writer.
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: Some(writer),
             buffer: 0,
             bits_in_buffer: 0,
             total_bits_written: 0,
         }
     }
 
+    /// Build the error used when `writer` is unexpectedly `None`.
+    ///
+    /// Centralized so the (unreachable-via-the-public-API) message is
+    /// written once rather than duplicated at every call site.
+    #[cold]
+    fn writer_taken_error() -> OxiArcError {
+        OxiArcError::Io(std::io::Error::other(
+            "BitWriter: writer accessed after into_inner (unreachable via the public API)",
+        ))
+    }
+
+    /// Fallibly borrow the underlying writer for internal write-path use.
+    ///
+    /// # Errors
+    ///
+    /// Never, in practice: the only way `writer` becomes `None` is
+    /// `into_inner`, which consumes `self` by value and therefore makes this
+    /// method uncallable afterward. `Result` (rather than a panic) so the
+    /// every call site propagates with a plain `?` instead of adding a new
+    /// `.expect()`.
+    #[inline]
+    fn try_writer_mut(&mut self) -> Result<&mut W> {
+        self.writer.as_mut().ok_or_else(Self::writer_taken_error)
+    }
+
     /// Get a reference to the underlying writer.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice — see `Self::try_writer_mut`. Unlike the
+    /// internal write path this is public, infallible API (mirroring
+    /// [`std::io::BufWriter::get_ref`]), so there is no `Result` to
+    /// propagate into.
     pub fn get_ref(&self) -> &W {
-        &self.writer
+        self.writer
+            .as_ref()
+            .expect("BitWriter: writer accessed after into_inner (unreachable via the public API)")
     }
 
     /// Get a mutable reference to the underlying writer.
+    ///
+    /// # Panics
+    ///
+    /// See [`Self::get_ref`].
     pub fn get_mut(&mut self) -> &mut W {
-        &mut self.writer
+        self.writer
+            .as_mut()
+            .expect("BitWriter: writer accessed after into_inner (unreachable via the public API)")
     }
 
     /// Consume this `BitWriter` and return the underlying writer.
@@ -890,10 +935,10 @@ impl<W: Write> BitWriter<W> {
     /// This flushes any remaining bits before returning the writer.
     pub fn into_inner(mut self) -> Result<W> {
         self.flush()?;
-        // Use ManuallyDrop to prevent Drop from running (we already flushed)
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: We're consuming self and preventing drop, so it's safe to take the writer
-        Ok(unsafe { std::ptr::read(&this.writer) })
+        // `flush()` above only touches the writer through `try_writer_mut()`,
+        // so `self.writer` is still `Some` here; `Drop::drop` sees `None`
+        // after this `take()` and skips its best-effort flush accordingly.
+        self.writer.take().ok_or_else(Self::writer_taken_error)
     }
 
     /// Get the total number of bits written so far.
@@ -913,7 +958,7 @@ impl<W: Write> BitWriter<W> {
                 ((self.buffer >> 16) & 0xFF) as u8,
                 ((self.buffer >> 24) & 0xFF) as u8,
             ];
-            self.writer.write_all(&bytes)?;
+            self.try_writer_mut()?.write_all(&bytes)?;
             self.buffer >>= 32;
             self.bits_in_buffer -= 32;
         }
@@ -921,7 +966,7 @@ impl<W: Write> BitWriter<W> {
         // Write remaining complete bytes one at a time
         while self.bits_in_buffer >= 8 {
             let byte = (self.buffer & 0xFF) as u8;
-            self.writer.write_all(&[byte])?;
+            self.try_writer_mut()?.write_all(&[byte])?;
             self.buffer >>= 8;
             self.bits_in_buffer -= 8;
         }
@@ -1012,7 +1057,7 @@ impl<W: Write> BitWriter<W> {
         self.flush_bytes()?;
 
         // Flush underlying writer
-        self.writer.flush()?;
+        self.try_writer_mut()?.flush()?;
 
         Ok(())
     }
@@ -1031,7 +1076,7 @@ impl<W: Write> BitWriter<W> {
             }
         } else {
             // Direct write
-            self.writer.write_all(buf)?;
+            self.try_writer_mut()?.write_all(buf)?;
             self.total_bits_written += buf.len() as u64 * 8;
         }
 
@@ -1041,8 +1086,12 @@ impl<W: Write> BitWriter<W> {
 
 impl<W: Write> Drop for BitWriter<W> {
     fn drop(&mut self) {
-        // Best-effort flush on drop
-        let _ = self.flush();
+        // `into_inner` takes `writer`, leaving `None`, right before this
+        // `self` finishes its own (now-skipped) drop; every other path still
+        // has `Some` and gets the usual best-effort flush.
+        if self.writer.is_some() {
+            let _ = self.flush();
+        }
     }
 }
 

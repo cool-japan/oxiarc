@@ -15,8 +15,11 @@
 //!
 //! - None (stored): No compression
 //! - MSZIP: Deflate-based compression
-//! - Quantum: Proprietary compression (not implemented)
-//! - LZX: Dictionary-based compression (not implemented)
+//! - LZX: window exponents 15 through 21, all three block types, x86 `CALL`
+//!   translation (see the `lzx` module)
+//! - Quantum: proprietary, undocumented, and not implemented — folders using
+//!   it are listed and rejected at extraction time with a typed
+//!   unsupported-method error, never silently mis-decoded
 //!
 //! ## Example
 //!
@@ -34,6 +37,7 @@
 //! ```
 
 mod header;
+mod lzx;
 
 use crate::ArchiveFormat;
 use crate::lenient::{LenientWarning, LenientWarningKind};
@@ -97,8 +101,10 @@ impl<R: Read + Seek> CabReader<R> {
                     match folders[f.folder_index as usize].compression_type {
                         CompressionType::None => CompressionMethod::Stored,
                         CompressionType::MsZip => CompressionMethod::Deflate,
-                        CompressionType::Quantum => CompressionMethod::Unknown(0),
-                        CompressionType::Lzx(_) => CompressionMethod::Unknown(0),
+                        CompressionType::Lzx(_) => CompressionMethod::Lzx,
+                        // Quantum is recognized but unimplemented; report its
+                        // real method code rather than a bare zero.
+                        CompressionType::Quantum => CompressionMethod::Unknown(2),
                         CompressionType::Unknown(code) => CompressionMethod::Unknown(code),
                     }
                 } else {
@@ -321,17 +327,29 @@ impl<R: Read + Seek> CabReader<R> {
             CompressionType::Quantum => {
                 return Err(OxiArcError::unsupported_method("Quantum compression"));
             }
-            CompressionType::Lzx(_) => {
-                return Err(OxiArcError::unsupported_method("LZX compression"));
-            }
             CompressionType::Unknown(code) => {
                 return Err(OxiArcError::unsupported_method(format!(
                     "CAB compression method {:#06x}",
                     code
                 )));
             }
-            CompressionType::None | CompressionType::MsZip => {}
+            CompressionType::None | CompressionType::MsZip | CompressionType::Lzx(_) => {}
         }
+
+        let compression = folder.compression_type;
+        let num_blocks = folder.num_data_blocks;
+
+        // An LZX folder is one continuous bitstream: the sliding window, the
+        // repeated-offset queue and the Huffman code lengths all carry from
+        // one CFDATA record to the next, and the 32 KiB frames the format
+        // realigns on are counted in *output* bytes rather than records. The
+        // decoder is therefore built once here and fed the whole folder.
+        // Building it up front also validates the attacker-supplied window
+        // exponent before a single byte of data is read.
+        let mut lzx_stream = match compression {
+            CompressionType::Lzx(window_bits) => Some(LzxFolder::new(window_bits)?),
+            _ => None,
+        };
 
         // Seek to the folder's data offset
         self.reader
@@ -344,8 +362,6 @@ impl<R: Read + Seek> CabReader<R> {
         // per block), so each block after the first is decoded with the
         // last 32 KiB of cumulative folder output preloaded as dictionary.
         let mut inflater = Inflater::new();
-        let compression = folder.compression_type;
-        let num_blocks = folder.num_data_blocks;
 
         // Process each data block
         for block_index in 0..num_blocks {
@@ -420,15 +436,82 @@ impl<R: Read + Seek> CabReader<R> {
 
                     output.extend_from_slice(&decompressed);
                 }
+                CompressionType::Lzx(_) => match lzx_stream.as_mut() {
+                    Some(stream) => stream.push(&data, block.uncompressed_size, block_index)?,
+                    None => {
+                        return Err(OxiArcError::corrupted(0, "LZX folder without a decoder"));
+                    }
+                },
                 // Unreachable: rejected before the loop.
-                CompressionType::Quantum
-                | CompressionType::Lzx(_)
-                | CompressionType::Unknown(_) => {
+                CompressionType::Quantum | CompressionType::Unknown(_) => {
                     return Err(OxiArcError::unsupported_method("CAB compression"));
                 }
             }
         }
 
+        if let Some(stream) = lzx_stream {
+            output = stream.finish()?;
+        }
+
+        Ok(output)
+    }
+}
+
+/// Accumulates one Cabinet folder's LZX records and decodes them as the
+/// single continuous bitstream the format defines.
+struct LzxFolder {
+    decoder: lzx::LzxDecoder,
+    compressed: Vec<u8>,
+    uncompressed_len: usize,
+}
+
+impl LzxFolder {
+    fn new(window_bits: u8) -> Result<Self> {
+        Ok(Self {
+            decoder: lzx::LzxDecoder::new(window_bits)?,
+            compressed: Vec::new(),
+            uncompressed_len: 0,
+        })
+    }
+
+    /// Add one CFDATA record's payload.
+    fn push(&mut self, data: &[u8], uncompressed_size: u16, block_index: u16) -> Result<()> {
+        // Each record carries at most one 32 KiB output frame. A larger
+        // declared size would put the record boundary out of step with the
+        // frame boundaries the bitstream realigns on.
+        if usize::from(uncompressed_size) > lzx::FRAME_SIZE {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "CFDATA block {block_index} declares {uncompressed_size} uncompressed bytes, \
+                     above the {} an LZX frame may hold",
+                    lzx::FRAME_SIZE
+                ),
+            ));
+        }
+        self.compressed
+            .try_reserve(data.len())
+            .map_err(|_| OxiArcError::memory_budget_exceeded(data.len(), data.len()))?;
+        self.compressed.extend_from_slice(data);
+        self.uncompressed_len += usize::from(uncompressed_size);
+        Ok(())
+    }
+
+    /// Decode the whole folder.
+    fn finish(mut self) -> Result<Vec<u8>> {
+        let output = self
+            .decoder
+            .decompress(&self.compressed, self.uncompressed_len)?;
+        if output.len() != self.uncompressed_len {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "LZX folder produced {} bytes, expected {}",
+                    output.len(),
+                    self.uncompressed_len
+                ),
+            ));
+        }
         Ok(output)
     }
 }
@@ -742,13 +825,11 @@ mod tests {
 
     /// CAB-04: an unrecognized compression-method code must produce a clear
     /// unsupported-method error at extraction time, never a silent raw copy.
-    /// Quantum and LZX (recognized but unimplemented) must behave the same.
+    /// Quantum — recognized but undocumented and unimplemented — behaves the
+    /// same; LZX is implemented and is covered separately below.
     #[test]
     fn test_cab_unknown_and_unimplemented_methods_error() {
-        for type_compress in [
-            0x0004u16, 0x00FF, 0x0002, /* Quantum */
-            0x0F03, /* LZX */
-        ] {
+        for type_compress in [0x0004u16, 0x00FF, 0x0002 /* Quantum */] {
             let payload = b"opaque bytes".to_vec();
             let uncomp = payload.len() as u16;
             let total = payload.len() as u32;
@@ -763,6 +844,98 @@ mod tests {
                 "method {type_compress:#06x} must yield UnsupportedMethod, got {result:?}"
             );
         }
+    }
+
+    /// `typeCompress` for LZX with the given window exponent.
+    fn lzx_type_compress(window_bits: u8) -> u16 {
+        0x0003 | (u16::from(window_bits) << 8)
+    }
+
+    /// An LZX folder spread over two CFDATA records must decode, including
+    /// the record whose only symbol is a match reaching back into the
+    /// previous record's output. This is the property a decoder that resets
+    /// per record cannot have.
+    #[test]
+    fn test_cab_lzx_folder_spans_records() {
+        let (records, expected) = lzx::cab_two_record_fixture();
+        let total = expected.len() as u32;
+        let cab = build_cab(lzx_type_compress(15), &records, total, false);
+
+        let mut reader = CabReader::new(std::io::Cursor::new(cab)).expect("CAB parse");
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.method, CompressionMethod::Lzx);
+        let data = reader.extract(&entry).expect("LZX folder extracts");
+        assert_eq!(data.len(), expected.len());
+        assert_eq!(data, expected);
+    }
+
+    /// The window exponent comes from an attacker-controlled header field and
+    /// must be validated before anything is allocated or decoded.
+    #[test]
+    fn test_cab_lzx_window_exponent_validated() {
+        for window_bits in [0u8, 1, 14, 22, 31] {
+            let payload = vec![0u8; 32];
+            let cab = build_cab(lzx_type_compress(window_bits), &[(payload, 16)], 16, true);
+            let mut reader = CabReader::new(std::io::Cursor::new(cab)).expect("CAB parse");
+            let entry = reader.entries()[0].clone();
+            let result = reader.extract(&entry);
+            assert!(
+                matches!(result, Err(OxiArcError::InvalidHeader { .. })),
+                "window exponent {window_bits} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    /// Arbitrary bytes in an LZX folder must fail loudly rather than produce
+    /// plausible-looking wrong output.
+    #[test]
+    fn test_cab_lzx_garbage_payload_is_rejected() {
+        let payload: Vec<u8> = (0..64u32).map(|value| (value * 91 + 3) as u8).collect();
+        let cab = build_cab(lzx_type_compress(15), &[(payload, 4096)], 4096, true);
+        let mut reader = CabReader::new(std::io::Cursor::new(cab)).expect("CAB parse");
+        let entry = reader.entries()[0].clone();
+        assert!(
+            reader.extract(&entry).is_err(),
+            "garbage LZX data must be rejected"
+        );
+    }
+
+    /// A record claiming more than one frame's worth of output would put the
+    /// record boundaries out of step with the frame boundaries the bitstream
+    /// realigns on, so it is refused.
+    #[test]
+    fn test_cab_lzx_oversized_record_is_rejected() {
+        let payload = vec![0u8; 64];
+        let oversized = (lzx::FRAME_SIZE + 1) as u16;
+        let cab = build_cab(
+            lzx_type_compress(15),
+            &[(payload, oversized)],
+            u32::from(oversized),
+            true,
+        );
+        let mut reader = CabReader::new(std::io::Cursor::new(cab)).expect("CAB parse");
+        let entry = reader.entries()[0].clone();
+        let result = reader.extract(&entry);
+        assert!(
+            matches!(result, Err(OxiArcError::CorruptedData { .. })),
+            "oversized LZX record must be rejected, got {result:?}"
+        );
+    }
+
+    /// A Quantum folder is listed with its real method code and rejected with
+    /// a typed error, never decoded as something else.
+    #[test]
+    fn test_cab_quantum_is_listed_and_refused() {
+        let payload = b"quantum payload".to_vec();
+        let uncomp = payload.len() as u16;
+        let cab = build_cab(0x0002, &[(payload, uncomp)], u32::from(uncomp), true);
+        let mut reader = CabReader::new(std::io::Cursor::new(cab)).expect("CAB parse");
+        let entry = reader.entries()[0].clone();
+        assert_eq!(entry.method, CompressionMethod::Unknown(2));
+        assert!(matches!(
+            reader.extract(&entry),
+            Err(OxiArcError::UnsupportedMethod { .. })
+        ));
     }
 
     /// CAB-06: folder_offset/uncompressed_size whose sum overflows must be

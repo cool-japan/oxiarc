@@ -7,10 +7,17 @@
 //! decompression for the following methods:
 //!
 //! - **lh0**: Stored (no compression)
+//! - **lh1**: 4KB window LZSS + adaptive Huffman (LHarc 1.x)
+//! - **lh2**: 8KB window LZSS + adaptive Huffman with a growing position tree
+//! - **lh3**: 8KB window LZSS + block-static Huffman (LHarc 2.x tables)
 //! - **lh4**: 4KB window, static Huffman
 //! - **lh5**: 8KB window, static Huffman (most common)
 //! - **lh6**: 32KB window, static Huffman
 //! - **lh7**: 64KB window, static Huffman
+//! - **lzs**: LArc LZSS, 2KB absolute-indexed history
+//! - **lz4**: LArc stored (no compression)
+//! - **lz5**: LArc LZSS, 4KB pre-seeded absolute-indexed history
+//! - **pm0**: PMarc stored (no compression)
 //!
 //! ## Example
 //!
@@ -50,6 +57,7 @@
 pub mod decode;
 pub mod encode;
 pub mod huffman;
+pub mod legacy;
 pub mod lh1;
 pub mod lzss;
 pub mod methods;
@@ -63,6 +71,10 @@ pub mod parallel;
 pub use decode::{LzhDecoder, decode_lzh};
 pub use encode::{LzhEncoder, encode_lzh};
 pub use huffman::LzhHuffmanTree;
+pub use legacy::{
+    PositionTablePolicy, decode_lh2, decode_lh3, decode_lz5, decode_lzs, encode_lh2, encode_lh3,
+    encode_lh3_with, encode_lz5, encode_lzs,
+};
 pub use lh1::{decode_lh1, encode_lh1};
 pub use lzss::{LzssDecoder, LzssEncoder, LzssToken};
 pub use methods::LzhMethod;

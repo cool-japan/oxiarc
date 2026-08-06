@@ -1,6 +1,6 @@
 //! TAR sparse file support.
 //!
-//! This module implements two variants of TAR sparse encoding:
+//! This module implements three variants of TAR sparse encoding:
 //!
 //! 1. **GNU old-format** (typeflag `'S'`): the sparse map is encoded in the
 //!    512-byte TAR header's unused bytes, with optional continuation headers
@@ -11,6 +11,13 @@
 //!    `GNU.sparse.map` holds a comma-separated list of
 //!    `offset,numbytes,offset,numbytes,...` pairs and
 //!    `GNU.sparse.realsize` holds the logical file size.
+//!
+//! 3. **PAX 1.0** (`GNU.sparse.major=1`, `GNU.sparse.minor=0`): unlike 0.1,
+//!    the map is *not* pax-attribute text — it is a newline-terminated
+//!    decimal-ASCII preamble at the very start of the data entry's own
+//!    payload (see [`SparseMap::parse_pax_1_0_preamble`] for the exact
+//!    grammar). `GNU.sparse.realsize` and the optional `GNU.sparse.name`
+//!    shadow-name convention are shared with 0.1.
 //!
 //! Sparse entries are *materialized*: the reader allocates a buffer of
 //! `realsize` bytes, fills each `(offset, numbytes)` run from the data
@@ -72,6 +79,21 @@ const GNU_ISEXTENDED_CONT: usize = 504;
 /// headers yields up to 4096 × 21 + 4 ≈ 86_020 run segments, which is far
 /// beyond any legitimate sparse file.
 const MAX_SPARSE_CONT_HEADERS: usize = 4096;
+
+/// Upper bound on the declared entry count in a PAX 1.0 data-block preamble.
+/// Unlike the old-format's fixed-size 24-byte binary entries, a 1.0 preamble
+/// entry count is itself untrusted decimal text with no structural size
+/// limit, so a crafted count must be capped independently of how much data
+/// actually follows. 1,000,000 is far beyond any legitimate sparse file's
+/// fragment count while still bounding worst-case `Vec` growth.
+const MAX_PAX_1_0_SPARSE_ENTRIES: usize = 1_000_000;
+
+/// Upper bound on the number of digits accepted for a single decimal field
+/// (entry count, an offset, or a numbytes) in a PAX 1.0 preamble.
+/// `u64::MAX` is 20 digits; 24 leaves a little headroom for a stray leading
+/// zero without opening the door to an unbounded read from a
+/// newline-free/malformed stream.
+const MAX_PAX_1_0_DECIMAL_DIGITS: usize = 24;
 
 /// Parsed sparse map: the logical file size plus the list of non-hole runs.
 #[derive(Debug, Clone)]
@@ -256,6 +278,143 @@ impl SparseMap {
 
         Ok(Self { realsize, runs })
     }
+
+    /// Construct a sparse map from a PAX 1.0 in-data-stream preamble.
+    ///
+    /// GNU tar's "Sparse Format 1.0" moves the map out of pax-attribute text
+    /// (format 0.1's `GNU.sparse.map`) and into the data entry's own
+    /// payload, as a newline-terminated decimal-ASCII preamble:
+    ///
+    /// ```text
+    /// <count>\n
+    /// <offset_0>\n<numbytes_0>\n
+    /// <offset_1>\n<numbytes_1>\n
+    /// ...
+    /// <offset_{count-1}>\n<numbytes_{count-1}>\n
+    /// ```
+    ///
+    /// padded with NUL bytes to the next [`BLOCK_SIZE`] boundary, after
+    /// which the concatenated non-hole data runs follow (themselves
+    /// `BLOCK_SIZE`-padded at the end, exactly as for formats 0.1/old —
+    /// see [`extract_sparse`]). This function consumes precisely the
+    /// preamble plus its padding from `reader` and stops there; it does
+    /// not touch the run bytes that follow.
+    ///
+    /// `realsize` is read from the `GNU.sparse.realsize` pax attribute,
+    /// shared with format 0.1 (the archiver emits it identically for both
+    /// sparse pax variants — only the location of the offset/numbytes map
+    /// itself differs between them).
+    ///
+    /// # Errors
+    ///
+    /// Returns `invalid_header` if `GNU.sparse.realsize` is missing or not
+    /// a decimal integer, if the declared entry count exceeds
+    /// [`MAX_PAX_1_0_SPARSE_ENTRIES`], if any decimal field is empty,
+    /// contains a non-digit/non-newline byte, exceeds
+    /// [`MAX_PAX_1_0_DECIMAL_DIGITS`] digits, or overflows `u64`; returns
+    /// `corrupted` if the stream ends before the preamble (or its padding)
+    /// is fully read.
+    pub(crate) fn parse_pax_1_0_preamble<R: Read>(
+        reader: &mut R,
+        attrs: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let realsize_str = attrs.get("GNU.sparse.realsize").ok_or_else(|| {
+            OxiArcError::invalid_header("sparse PAX 1.0 header missing GNU.sparse.realsize")
+        })?;
+        let realsize: u64 = realsize_str.parse().map_err(|_| {
+            OxiArcError::invalid_header(format!(
+                "sparse PAX 1.0 GNU.sparse.realsize not a decimal integer: {}",
+                realsize_str
+            ))
+        })?;
+
+        let mut consumed: u64 = 0;
+
+        let count_u64 = read_pax_1_0_decimal(reader, &mut consumed)?;
+        let count: usize = usize::try_from(count_u64)
+            .ok()
+            .filter(|&c| c <= MAX_PAX_1_0_SPARSE_ENTRIES)
+            .ok_or_else(|| {
+                OxiArcError::invalid_header(format!(
+                    "sparse PAX 1.0 preamble declares {} entries, exceeding the {} limit",
+                    count_u64, MAX_PAX_1_0_SPARSE_ENTRIES
+                ))
+            })?;
+
+        let mut runs = Vec::new();
+        for _ in 0..count {
+            let entry_offset = read_pax_1_0_decimal(reader, &mut consumed)?;
+            let numbytes = read_pax_1_0_decimal(reader, &mut consumed)?;
+            runs.push((entry_offset, numbytes));
+        }
+
+        // The preamble (count + all offset/numbytes pairs) is NUL-padded to
+        // the next BLOCK_SIZE boundary before the data runs begin.
+        let rem = (consumed % BLOCK_SIZE as u64) as usize;
+        if rem != 0 {
+            let pad = BLOCK_SIZE - rem;
+            let mut buf = [0u8; BLOCK_SIZE];
+            reader.read_exact(&mut buf[..pad]).map_err(|e| {
+                OxiArcError::corrupted(consumed, format!("sparse PAX 1.0 preamble padding: {}", e))
+            })?;
+        }
+
+        Ok(Self { realsize, runs })
+    }
+}
+
+/// Read a single newline-terminated decimal-ASCII number from `reader`, one
+/// byte at a time — a PAX 1.0 preamble field has no announced width, unlike
+/// the fixed 12-byte octal fields of the GNU old format. Adds the number of
+/// bytes read (including the terminating newline) to `*consumed`.
+///
+/// Builds the value by direct digit accumulation (`checked_mul`/
+/// `checked_add`) rather than buffering into a `String` and calling
+/// `str::parse`: every byte is already verified ASCII-digit before use, so
+/// there is no fallible UTF-8 conversion step to handle.
+fn read_pax_1_0_decimal<R: Read>(reader: &mut R, consumed: &mut u64) -> Result<u64> {
+    let mut value: u64 = 0;
+    let mut digit_count = 0usize;
+
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).map_err(|e| {
+            OxiArcError::corrupted(*consumed, format!("sparse PAX 1.0 preamble: {}", e))
+        })?;
+        *consumed += 1;
+
+        if byte[0] == b'\n' {
+            break;
+        }
+        if !byte[0].is_ascii_digit() {
+            return Err(OxiArcError::invalid_header(
+                "sparse PAX 1.0 preamble contains a non-digit, non-newline byte",
+            ));
+        }
+
+        digit_count += 1;
+        if digit_count > MAX_PAX_1_0_DECIMAL_DIGITS {
+            return Err(OxiArcError::invalid_header(
+                "sparse PAX 1.0 preamble decimal field exceeds the maximum digit count",
+            ));
+        }
+
+        let digit = u64::from(byte[0] - b'0');
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or_else(|| {
+                OxiArcError::invalid_header("sparse PAX 1.0 preamble field overflows u64")
+            })?;
+    }
+
+    if digit_count == 0 {
+        return Err(OxiArcError::invalid_header(
+            "sparse PAX 1.0 preamble contains an empty decimal field",
+        ));
+    }
+
+    Ok(value)
 }
 
 /// Read at most `count` sparse entries from `data`, pushing those with
@@ -520,6 +679,25 @@ pub(crate) fn build_pax_header_block(typeflag: u8, payload_len: u64) -> [u8; BLO
     block
 }
 
+/// Test-only helper: build a PAX 1.0 sparse data-block preamble (the
+/// `<count>\n(<offset>\n<numbytes>\n)*` text, NUL-padded to the next
+/// `BLOCK_SIZE` boundary) for `runs`. This is the exact byte sequence
+/// [`SparseMap::parse_pax_1_0_preamble`] consumes; it does **not** include
+/// the run data itself, which the caller appends (also `BLOCK_SIZE`-padded)
+/// to forge a complete synthetic entry.
+#[cfg(test)]
+pub(crate) fn build_pax_1_0_preamble(runs: &[(u64, u64)]) -> Vec<u8> {
+    let mut preamble = format!("{}\n", runs.len()).into_bytes();
+    for &(offset, numbytes) in runs {
+        preamble.extend_from_slice(format!("{offset}\n{numbytes}\n").as_bytes());
+    }
+    let rem = preamble.len() % BLOCK_SIZE;
+    if rem != 0 {
+        preamble.resize(preamble.len() + (BLOCK_SIZE - rem), 0);
+    }
+    preamble
+}
+
 /// Test-only helper: write an ASCII octal number into `field`,
 /// null-terminated, left-padded with '0'. Produces `field.len() - 1`
 /// octal digits followed by a single NUL byte. Shared between
@@ -637,6 +815,140 @@ mod tests {
         attrs.insert("GNU.sparse.realsize".into(), "1000".into());
         attrs.insert("GNU.sparse.map".into(), "0,100,5000".into());
         SparseMap::from_pax_attrs(&attrs).expect_err("odd tokens");
+    }
+
+    fn pax_1_0_attrs(realsize: u64) -> HashMap<String, String> {
+        let mut attrs = HashMap::new();
+        attrs.insert("GNU.sparse.major".into(), "1".into());
+        attrs.insert("GNU.sparse.minor".into(), "0".into());
+        attrs.insert("GNU.sparse.realsize".into(), realsize.to_string());
+        attrs
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_basic() {
+        let realsize = 10_000u64;
+        let runs = vec![(0u64, 100u64), (5_000, 200)];
+        let preamble = build_pax_1_0_preamble(&runs);
+        assert_eq!(
+            preamble.len() % BLOCK_SIZE,
+            0,
+            "preamble must be BLOCK_SIZE-padded"
+        );
+
+        let mut stream = std::io::Cursor::new(preamble);
+        let map = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(realsize))
+            .expect("parse_pax_1_0_preamble");
+
+        assert_eq!(map.realsize, realsize);
+        assert_eq!(map.runs, runs);
+        map.validate().expect("validate parsed 1.0 map");
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_zero_entries() {
+        // realsize=0, no runs at all — a degenerate but legal fully-sparse
+        // (all-hole) zero-length... well, non-zero-length-but-all-hole file.
+        let runs: Vec<(u64, u64)> = vec![];
+        let preamble = build_pax_1_0_preamble(&runs);
+        // "0\n" padded to one full block.
+        assert_eq!(preamble.len(), BLOCK_SIZE);
+
+        let mut stream = std::io::Cursor::new(preamble);
+        let map = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(0))
+            .expect("zero-entry preamble");
+        assert_eq!(map.realsize, 0);
+        assert!(map.runs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_consumes_exact_padding() {
+        // After parsing, the stream must sit exactly at the end of the
+        // padded preamble — neither short (leaving stray padding bytes
+        // for the caller to misinterpret as map data) nor long (eating
+        // into what would be the first run byte).
+        let runs = vec![(0u64, 100u64), (5_000, 200)];
+        let mut preamble = build_pax_1_0_preamble(&runs);
+        let preamble_len = preamble.len();
+        preamble.push(0xAB); // sentinel simulating the first run byte
+
+        let mut stream = std::io::Cursor::new(preamble);
+        let _map = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(10_000))
+            .expect("parse_pax_1_0_preamble");
+
+        assert_eq!(
+            stream.position(),
+            preamble_len as u64,
+            "must consume exactly the padded preamble, no more, no less"
+        );
+        let mut next_byte = [0u8; 1];
+        std::io::Read::read_exact(&mut stream, &mut next_byte).expect("sentinel still present");
+        assert_eq!(next_byte[0], 0xAB);
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_rejects_missing_realsize() {
+        let runs = vec![(0u64, 100u64)];
+        let preamble = build_pax_1_0_preamble(&runs);
+        let mut stream = std::io::Cursor::new(preamble);
+        let attrs = HashMap::new(); // no GNU.sparse.realsize
+        SparseMap::parse_pax_1_0_preamble(&mut stream, &attrs).expect_err("missing realsize");
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_rejects_non_digit_byte() {
+        // "1\n" (one entry) then a non-digit byte where a decimal offset
+        // should be.
+        let mut bytes = b"1\nX\n5\n".to_vec();
+        bytes.resize(BLOCK_SIZE, 0);
+        let mut stream = std::io::Cursor::new(bytes);
+        let err = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(1_000))
+            .expect_err("non-digit byte must be rejected");
+        match err {
+            OxiArcError::InvalidHeader { .. } => {}
+            other => panic!("unexpected error variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_rejects_truncated_stream() {
+        // Declares 5 entries but the stream ends after the count.
+        let bytes = b"5\n".to_vec();
+        let mut stream = std::io::Cursor::new(bytes);
+        let err = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(1_000))
+            .expect_err("truncated preamble must error, not panic");
+        match err {
+            OxiArcError::CorruptedData { .. } => {}
+            other => panic!("unexpected error variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_rejects_excessive_entry_count() {
+        // Declares far more entries than MAX_PAX_1_0_SPARSE_ENTRIES allows;
+        // must be rejected before attempting to read that many pairs.
+        let bytes = b"99999999999999\n".to_vec();
+        let mut stream = std::io::Cursor::new(bytes);
+        let err = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(1_000))
+            .expect_err("excessive entry count must be rejected");
+        match err {
+            OxiArcError::InvalidHeader { .. } => {}
+            other => panic!("unexpected error variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_pax_1_0_preamble_rejects_digit_overflow() {
+        // A single field with more digits than fit in a u64.
+        let mut bytes = b"1\n99999999999999999999\n5\n".to_vec();
+        bytes.resize(BLOCK_SIZE, 0);
+        let mut stream = std::io::Cursor::new(bytes);
+        let err = SparseMap::parse_pax_1_0_preamble(&mut stream, &pax_1_0_attrs(1_000))
+            .expect_err("field too wide for u64 must be rejected");
+        match err {
+            OxiArcError::InvalidHeader { .. } => {}
+            other => panic!("unexpected error variant: {:?}", other),
+        }
     }
 
     #[test]

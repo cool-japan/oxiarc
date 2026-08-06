@@ -50,6 +50,18 @@ pub fn fixed_distance_lengths() -> [u8; 30] {
 /// Get the fixed literal/length Huffman tree.
 ///
 /// This tree is cached after first construction.
+///
+/// # Panics (theoretical, unreachable)
+///
+/// `fixed_litlen_lengths()` returns the RFC 1951 §3.2.6 fixed code lengths, a
+/// compile-time constant, and every stable release of `HuffmanTree` back to
+/// this crate's first version has accepted it. The `.expect` below cannot be
+/// replaced with `?` because [`OnceLock::get_or_init`]'s closure is
+/// infallible (`get_or_try_init` exists for that but is still unstable —
+/// `once_cell_try`, rust-lang/rust#109737 — as of this crate's MSRV); caching
+/// a `Result<HuffmanTree, _>` instead would require `OxiArcError: Clone` for
+/// no practical benefit, since this specific input can only ever be this
+/// specific compile-time array.
 pub fn fixed_litlen_tree() -> Result<&'static HuffmanTree> {
     static TREE: OnceLock<HuffmanTree> = OnceLock::new();
 
@@ -62,6 +74,12 @@ pub fn fixed_litlen_tree() -> Result<&'static HuffmanTree> {
 /// Get the fixed distance Huffman tree.
 ///
 /// This tree is cached after first construction.
+///
+/// # Panics (theoretical, unreachable)
+///
+/// See [`fixed_litlen_tree`]: the same "compile-time-constant input, blocked
+/// on unstable `get_or_try_init`" reasoning applies to
+/// `fixed_distance_lengths()`.
 pub fn fixed_distance_tree() -> Result<&'static HuffmanTree> {
     static TREE: OnceLock<HuffmanTree> = OnceLock::new();
 

@@ -233,9 +233,17 @@ impl Default for BrotliPool {
     }
 }
 
-// SAFETY: All mutable state is guarded by `Mutex`.
-unsafe impl Send for BrotliPool {}
-unsafe impl Sync for BrotliPool {}
+// `BrotliPool` is `Arc<PoolInner>`, and `PoolInner` holds only `Mutex<Vec<..>>`,
+// `usize` and `AtomicUsize` fields — already auto-Send + Sync. A manual
+// `unsafe impl` here would add no capability today, but it would permanently
+// suppress the compiler's auto-trait derivation, so a future field (e.g. a
+// `Cell` or raw pointer) could silently make the type unsound with no
+// diagnostic. Assert the property instead: this is a compile-time check, not
+// a grant of one.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BrotliPool>();
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API: PoolStats

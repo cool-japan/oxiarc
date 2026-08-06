@@ -5,6 +5,391 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-06
+
+**Security hardening (ZIP CSPRNG, constant-time AES, x86 CRC-32, 7z
+coder-chain), two long-standing encoder-ratio limitations closed (Zstandard
+`FSE_Compressed_Mode` sequence tables, Brotli literal block splitting), plus a
+hygiene/infrastructure pass** (`deny.toml` bans, `rustfmt.toml`/`clippy.toml`,
+`ManuallyDrop` removal, docs-truth fixes). No archive/stream wire format
+changed and no public API was removed for any read/decode path; the ZIP
+write-side salt/header API changed from infallible to fallible (see
+Security below), which is the one intentional breaking change in this
+release. The two encoder changes alter the *bytes produced* by
+`oxiarc-zstd` and by `oxiarc-brotli` at quality 10-11 — both remain
+RFC-conformant and reference-decodable, and both are strictly smaller or
+equal, never larger.
+
+### Security
+
+- **ZIP encryption salts and ZipCrypto headers now always come from a real
+  OS CSPRNG.** `zip::encryption::generate_salt` and
+  `zip::crypto::ZipCrypto::generate_header_random` previously used
+  `/dev/urandom` on Unix with a `#[cfg(not(unix))]` arm that unconditionally
+  returned `false`, silently falling back — on every non-Unix target, and on
+  Unix if `/dev/urandom` could not be opened (fd exhaustion, chroot,
+  seccomp) — to a low-entropy seed (wall-clock nanos, PID, a per-process
+  counter, a stack address, a heap address, and a thread-id hash) expanded
+  with SHA-1, despite the module documentation claiming salts were "sourced
+  from the operating system CSPRNG." A predictable WinZip-AES salt is the
+  sole input differentiating PBKDF2-SHA1 key derivation between archives; a
+  collision under AES-CTR is direct keystream reuse. Fixed by a new internal
+  `zip::csprng` module with a real, unconditional platform binding
+  (`/dev/urandom` on Unix, `BCryptGenRandom` with
+  `BCRYPT_USE_SYSTEM_PREFERRED_RNG` on Windows, pure-Rust `#[link]`
+  declarations with no external crate) and **no software fallback**: if the
+  OS source cannot be reached, generation now fails with a typed
+  `OxiArcError::Io` instead of silently emitting weak material.
+  `generate_salt`/`generate_header_random` are therefore now fallible
+  (`Result<..>`), which is a breaking change to those two write-side
+  signatures — callers must handle the new `Result`. New tests assert
+  distinctness and non-constant-pattern output across many draws
+  (`test_generate_salt_is_fallible_and_os_sourced`,
+  `os_csprng_produces_distinct_high_entropy_output`); a new
+  `tests/zip_encryption_e2e.rs` covers full AES-256/ZipCrypto write→read
+  round-trips including wrong-password rejection.
+- **Fixed silently-wrong x86_64 CRC-32 SIMD arithmetic; enabled dispatch.**
+  `oxiarc_core::crc_simd::x86::crc32_pclmulqdq` mixed the non-reflected
+  Intel whitepaper fold constants with reflected-mode folding and extracted
+  the result from the wrong dword lane, so it returned incorrect CRC-32
+  values — but shipped as a public `unsafe fn` with dispatch hardcoded off
+  specifically because it was unverified, so the wrong arithmetic was
+  reachable only by a downstream caller doing its own feature detection.
+  The constants are now a direct translation of the already-validated
+  aarch64 PMULL path (both architectures now share one
+  `reflected_constants` module), and `SimdCrc32Dispatcher` now dispatches to
+  it on x86_64 when PCLMULQDQ + SSE4.1 are detected. New tests
+  (`dispatched_crc32_matches_software_reference`, a 0–4096-byte length
+  sweep, and 100 randomized-input vectors including non-zero seed CRCs)
+  cross-check the dispatched implementation against the scalar
+  slicing-by-8 reference on every architecture.
+- **Bounded 7z folder coder-chain amplification.** A crafted 7z bind-pair
+  graph that revisits coders could chain decompression stages up to
+  `folder.coders.len()` deep, each stage expanding the previous stage's
+  output with no cumulative budget — a nested decompression bomb from a
+  tiny input. `decode_folder_data`'s coder-chain walk (extracted into
+  `decode_coder_chain`) now tracks per-folder visited-coder state (each
+  coder decodes at most once) and enforces a cumulative output budget
+  (`folder_decode_budget`: ratio-capped at 10^6× the packed size, floored at
+  64 MiB, ceilinged at 16 GiB) checked both against declared per-stage sizes
+  before decoding and against actual bytes produced after.
+
+### Fixed
+
+- **`BrotliCompressor` (`oxiarc-brotli`) is now genuinely streaming**
+  instead of buffering the entire input in memory until `finish()`. Written
+  data is buffered only up to a bounded threshold
+  (`with_max_input`, default one meta-block); `Write::flush` now actually
+  compresses and pushes every complete byte toward the inner writer instead
+  of being a silent `Ok(())` no-op (the only such trivial `flush` body found
+  anywhere in the workspace); a new `BitWriter::drain_complete_bytes`
+  primitive drains whole bytes while leaving a sub-byte residue buffered
+  until the next meta-block or `finish()` completes it.
+- **`repair_zip`/`repair_tar` (`oxiarc-archive`):** fixed a `usize`
+  overflow in the truncated/corrupt-archive scanner where
+  `local_file_header.data_start + declared_compressed_size` — the latter an
+  attacker-controlled `u32` — could wrap on a 32-bit target before the
+  buffer-length clamp applied; both call sites now use `saturating_add`.
+  Added a deterministic bit-flip/byte-mutation regression suite
+  (`tests/iso_sevenz_mutation.rs`) targeting the two previously
+  least-covered untrusted-input parsers (ISO 9660, 7z: 0 B and 8 KB fuzz
+  corpora respectively, against 1.7–9.4 MB for every other target) — not a
+  substitute for a real `cargo fuzz` campaign, but a cheap permanent check
+  that both parsers return `Ok`/`Err` and never panic or allocate unbounded
+  memory across thousands of reproducible mutations of the embedded
+  fixtures. Also expanded inline test coverage in `repair_zip.rs`/
+  `repair_tar.rs` for oversized/malformed declared sizes.
+- **XZ stream-footer Backward Size validation** (`xz::header::read_footer`)
+  cast `usize` to `u32` with a plain `as`, which wraps rather than
+  saturates; an index exceeding ~16 GiB on a 64-bit target could therefore
+  alias a forged footer value and defeat the consistency check. Now uses
+  `u32::try_from` and rejects the stream when the real size cannot be
+  represented in the field.
+- **XZ stream-footer Backward Size construction** (`xz::header::write_stream_footer`)
+  had the same `as u32` truncation on the write side: an implausibly large
+  (but not impossible, on a 64-bit target) `index_size` would silently wrap
+  and produce a footer whose Backward Size does not describe the Index this
+  crate just wrote — an archive that corrupts itself in the act of being
+  created, which this crate's own `read_footer` guard above would then
+  reject. Now uses the same `u32::try_from` guard as the read side instead
+  of a differently-shaped bug in the mirror-image code path.
+
+### Changed
+
+- **Removed four redundant `unsafe impl Send`/`Sync` blocks**
+  (`LzmaPool`, `SnappyPool`, `BrotliPool`, `DeflatePool`): every backing
+  field is `Mutex`/`Arc`/`AtomicUsize`-based and therefore already
+  auto-`Send`+`Sync`. The manual impls added no capability but permanently
+  suppressed the compiler's auto-trait derivation, so a future non-`Send`
+  field addition would have silently compiled into an unsound type with no
+  diagnostic. Replaced with a `const _: fn() = || { fn
+  assert_send_sync<T: Send + Sync>() {} assert_send_sync::<T>(); };`
+  compile-time check in each module — same guarantee, but it now fails to
+  *compile* instead of failing to *warn* if it is ever violated.
+- **Replaced `ManuallyDrop` + `ptr::read` + hand-enumerated `drop_in_place`
+  with `Option<W>` + `.take()`** in `into_inner` for `ZipWriter`,
+  `TarWriter`, `LzhWriter` (`oxiarc-archive`) and `oxiarc-core`'s
+  `BitWriter`. All four implementations were already sound, but the
+  drop-field list was a hand-maintained duplicate of the struct's field
+  list with nothing tying the two together, so a future non-`Copy` field
+  addition would have leaked silently. Every other field now drops through
+  the ordinary safe path with no enumeration needed. As a side effect this
+  also closes a latent double-finish hazard in `ZipWriter`/
+  `LzhWriter::into_inner`: previously, calling the public `finish()` before
+  the (then-)`ManuallyDrop` wrap meant a partial failure (e.g. the central
+  directory writes out but the final flush fails) left `self.finished ==
+  false` and `self` to drop normally, and `Drop` would re-invoke `finish()`
+  a second time — silently re-writing however much output it got through
+  before hitting an error again, since `Drop` discards it. `into_inner` now
+  takes the writer unconditionally *before* propagating any error, so
+  `Drop` never re-enters `finish()` on any path.
+- **Six of eight non-test `.expect()` calls converted to `Result`
+  propagation** (the other two are blocked by an unstable API, see below).
+  The three `BinaryHeap::pop()` calls in `oxiarc-zstd`'s Huffman tree
+  builder (`HuffmanEncoder::from_frequencies`) now use `?` on the `Option`
+  the function already returns. The three RFC 8878 predefined-FSE-table
+  constructors in `oxiarc-zstd::sequences` (`predefined_ll_table`/
+  `predefined_of_table`/`predefined_ml_table`) now return
+  `Result<FseTable>`, propagated with `?` from their (already-`Result`
+  -returning) callers. All six operated on a provably-safe input (a loop
+  invariant or a compile-time constant) with zero behavior change on the
+  path that actually runs — this closes the "safe today, silently breaks on
+  a future refactor" gap rather than fixing a live bug.
+- **`deny.toml` gained `[[bans.deny]]` entries** for the full COOLJAPAN
+  replacement table (`zip`, `flate2`, `miniz_oxide`, `zstd`(-safe/-sys),
+  `bzip2`(-sys), `lz4`(-sys)/`lz4_flex`, `tar`, `snap`, `brotli`
+  `-decompressor`, plus the wider-ecosystem `bincode`, `rustfft`,
+  `quick-xml`, `openblas-src`). Previously `[bans]` had `multiple-versions`
+  and `wildcards` but zero `deny` entries, so `cargo deny check bans`
+  passed vacuously for the one workspace whose entire purpose is replacing
+  those crates; verified live with a temporary positive-control entry
+  (denying `thiserror`, a real dependency) that correctly failed the check
+  before being removed.
+- **Added `rustfmt.toml`** (`edition = "2024"`, `max_width = 100` — both
+  already rustfmt's stable defaults, pinned explicitly so `cargo fmt`
+  behavior cannot silently drift with a future rustfmt release) **and
+  `clippy.toml`** (`msrv = "1.85"`, matching `[workspace.package]
+  .rust-version`). Neither config triggers a repo-wide reformat or new lint
+  hit on its own — a one-time `cargo fmt --all` was still needed for four
+  files touched by the security/hardening fixes above
+  (`sevenz/header.rs`, `zip/crypto.rs`, `zip/csprng.rs`, `crc_simd.rs`)
+  that had never been run through `cargo fmt` after being hand-edited;
+  all four diffs were whitespace/line-wrap only, no logic change.
+  `cargo fmt --all --check` and `cargo clippy --workspace --all-targets`
+  are both clean as of this entry.
+
+### Added
+
+- **LZH legacy methods: `-lh2-`, `-lh3-`, `-lzs-`, `-lz4-`, `-lz5-`, `-pm0-`**
+  (`oxiarc-lzhuf/src/legacy/`, ~1,900 lines across six new modules). Until now
+  everything outside the LHarc `-lh0-`..`-lh7-` line was reported as
+  `LzhMethod::Unknown` and refused at extraction time. All six now decode
+  **and** encode, and `CompressionMethod`/`LzhMethod` name them honestly in
+  archive listings instead of "unknown".
+
+  - `-lh2-` (`legacy/lh2.rs` + `legacy/dynhuff.rs`): 8 KiB LZSS over the
+    LHarc 2.x *adaptive* Huffman of `dhuf.c` — a flat frequency-sorted node
+    array with equal-frequency blocks (so a code bit is the parity of a node
+    index), plus a match-position tree that starts as a single leaf and grafts
+    on one 64-distance group every time the output passes another 64-byte
+    boundary. Structurally unrelated to the Vitter-style tree `-lh1-` uses.
+  - `-lh3-` (`legacy/lh3.rs` + `legacy/huffcode.rs`): the same window with
+    `shuf.c` block-static tables — a 16-bit block size, 286 x (1 + 4)-bit
+    literal/length lengths, an optional 128 x 4-bit position table, the
+    three-consecutive-1-lengths degenerate escape for both, and LArc's built-in
+    `ready_made` position table as the fallback when transmitting one does not
+    pay. This needed a *different* Huffman length builder from the one
+    `encode.rs` uses: `-lh3-`'s `make_table` rejects an incomplete code
+    outright, whereas the existing clamp-and-reinflate limiter satisfies Kraft
+    only as an inequality. `huffcode.rs` instead re-runs an exact (always
+    complete) merge on progressively flattened frequencies until the deepest
+    code fits the field.
+  - `-lzs-`/`-lz5-` (`legacy/larc.rs`): LArc LZSS with no entropy coding.
+    These address history by **absolute ring index**, not by distance back —
+    the single most dangerous difference from every other method here, since
+    confusing the two yields a codec that round-trips perfectly against itself
+    and is unreadable by every real LHA implementation. `legacy/ring.rs`
+    therefore exposes only absolute indexing, with one conversion point.
+  - `-lz4-`/`-pm0-`: genuine stored formats (the reference decoders route both
+    to a null decoder), now handled as such.
+
+  **Verification.** `-lzs-`/`-lz5-`/`-lz4-`/`-pm0-` are gated by the real `lha`
+  CLI (Lhasa 0.6.0) in a new `oxiarc-archive` `lha-oracle` suite: this crate
+  builds a `.lzh` through the public `LzhWriter`, `lha t` CRC-tests it, `lha x`
+  extracts it, and the extraction must equal the input byte for byte — 14
+  payload/method/header-level combinations. Lhasa implements **no** `-lh2-` or
+  `-lh3-` decoder (there is no `lh2_decoder.c`/`lh3_decoder.c` in its source
+  tree at all) and neither does `delharc`, so those two have no oracle that a
+  test can shell out to. Conformance was instead established against the
+  canonical *LHa for UNIX* `dhuf.c`/`shuf.c` decode path compiled standalone:
+  10 payloads x 2 methods = 20 streams decoded byte-identically, plus 10 more
+  with the `ready_made` position table forced. Five payloads x 2 methods are
+  frozen into `oxiarc-lzhuf/tests/lzh_legacy_vectors.rs`, asserted in both
+  directions, so the in-repo gate stays hermetic and pure Rust.
+
+  **Not implemented: `-pm1-`/`-pm2-`.** PMarc's compressed variants have no
+  published format description; the only specification is Lhasa's
+  `pm2_decoder.c`/`pm1_decoder.c`, which are GPL-2.0 and cannot be ported into
+  this Apache-2.0/MIT crate. A clean-room derivation would need fixtures, and
+  `lha` can decode `-pm2-` but cannot create it, so there is no way to generate
+  them. Such entries stay listed with a typed `unsupported_method` error at
+  extraction, never a silent mis-decode.
+- **Constant-time AES for WinZip AES ZIP encryption**
+  (`oxiarc-archive/src/zip/aes_ct.rs`, new module). `SubBytes`, the key
+  schedule's `SubWord` and the GF(2^8) doubling inside `MixColumns` used to be
+  a 256-byte S-box lookup and a branch on the high bit — the classic
+  cache-timing / `prime+probe` target, since both the table index and the
+  branch depend on key material. They are now a bitsliced Boyar-Peralta S-box
+  circuit (113 `AND`/`XOR`/`NOT` gates evaluated over eight 16-bit bit planes,
+  substituting all 16 state bytes at once) and a mask-based `xtime`. No table
+  is indexed with secret data and no branch is taken on it anywhere in the
+  cipher. The change is provably behaviour-preserving — the new circuit is
+  checked against the FIPS 197 table for **all 256 inputs in all 16 lanes**,
+  and the branchless `xtime` against the textbook branching definition for all
+  256 inputs — so ciphertext, and therefore wire compatibility with
+  WinZip/7-Zip/WinRAR, is unchanged. New known-answer tests add the NIST
+  SP 800-38A F.1.1/F.1.3/F.1.5 `ECB-AES128/192/256.Encrypt` vectors (an
+  unstructured key, unlike FIPS 197 Appendix C's `000102...`, so key-schedule
+  bugs cannot hide) plus WinZip little-endian CTR counter and carry tests
+  derived from the now-NIST-verified block cipher.
+  Delegation of these primitives to the sibling `oxicrypto` crates was
+  evaluated and is not possible today: `oxicrypto-cipher` exposes only
+  AES-128/256 single-block ECB (no AES-192), and no `oxicrypto` crate ships
+  SHA-1, HMAC-SHA1 or PBKDF2-HMAC-SHA1 — all four of which WinZip AE-1/AE-2
+  requires. A partial delegation would have left AES-192 on the vulnerable
+  table path, which is worse than a uniform in-repo fix.
+
+- **Zstandard `FSE_Compressed_Mode` sequence tables** (resolves TODO Known
+  Issue #2). `oxiarc-zstd/src/fse_encoder.rs` gained reference-faithful ports
+  of `FSE_normalizeCount` (with the `FSE_normalizeM2` fallback) and
+  `FSE_writeNCount`, and `compressed_block.rs` now chooses per symbol category
+  whichever of RLE, the RFC 8878 predefined table, and a table built from the
+  block's own distribution costs fewest bits *including* the table
+  description. Custom tables also raise the offset-code ceiling from the
+  predefined table's 0..=28 to the format's full 0..=31. Measured on a 1.5 MB
+  structured-record corpus: 173,521 → 109,359 bytes at level 1 (-37%).
+  `fse.rs` gained a `read_ncount` split out of `read_fse_table_description` so
+  the writer can be validated against the exact parser that reads real `zstd`
+  output. The `zstd-oracle` suite gained an independent frame walker that
+  asserts a block really used mode 2 before requiring `zstd -d` to reproduce
+  the input byte for byte — without that assertion the oracle check would pass
+  vacuously on predefined-table frames.
+
+- **Brotli literal block splitting** (`oxiarc-brotli/src/block_split.rs`, new
+  module; partially resolves TODO Known Issue #3). The encoder previously
+  hardcoded `NBLTYPESL = 1`, so it could never use the block-type switching
+  and context maps the decoder has supported all along. It now segments the
+  literal stream, clusters segment histograms by merge cost, collapses
+  adjacent equal labels into runs, and emits up to 8 literal block types, each
+  bound to its own prefix code through a move-to-front + zero-run-length-coded
+  context map. The meta-block is encoded **both** ways and the smaller kept, so
+  a poor split can cost encode time but never compression ratio. Active at
+  quality 10-11 only; quality 0-9 output is byte-identical to the previously
+  reference-verified path, asserted by a test. Measured on a 180 KB
+  two-population input: 145,638 → 125,264 bytes (-14%). The `brotli-oracle`
+  suite gained an independent stream-header walker that asserts
+  `NBLTYPESL > 1` before requiring `brotli -d` to reproduce the input.
+- **Brotli insert-and-copy + distance block splitting and per-context
+  histogram assignment** — the remainder of the block-splitting work. The
+  encoder now splits all three symbol categories, not just literals, and
+  exploits the `LSB6` context mode it already declared instead of binding one
+  prefix code per block type. `block_split.rs` grew a category-generic
+  clustering core (`cluster_histograms` / `split_symbols`) plus two plan
+  builders (`plan_literals`, `plan_distances`) that also cluster
+  per-`(block type, context)` histograms into prefix codes and emit the
+  binding context map, so `NTREESL`/`NTREESD` may now exceed their block-type
+  counts. `compress.rs` gained `SymbolStreams` (the three streams flattened in
+  decoder order with their Section 7.1/7.2 context IDs) and `BlockSwitcher`
+  (a mirror of the decoder's `BlockCategory::tick`, shared by all three
+  categories).
+
+  The three categories are searched by **coordinate ascent**: each category's
+  candidates are measured against the current best plan for the other two, and
+  a change is kept only when the fully-written meta-block gets smaller. A
+  single joint on/off switch was tried first and was strictly worse — it
+  coupled the categories, so data whose literal statistics are uniform but
+  whose command statistics change halfway had to buy literal splitting (pure
+  cost) to get insert-and-copy splitting, and the measured comparison then
+  correctly rejected the whole bundle, leaving both features unused on exactly
+  the inputs they were built for. Relatedly, every cluster-opening threshold is
+  now expressed **per symbol** rather than as an absolute bit count: merge cost
+  scales linearly with segment length, so absolute bars silently meant
+  different things per category and would silently disable a feature if a
+  segment length were ever tuned.
+
+  Measured: a two-regime 162 KB corpus 62,719 → 60,659 bytes; 240 KB of
+  context-dependent text 146,769 → 142,703. Still quality 10-11 only, and
+  quality 0-9 is now asserted byte-frozen for *every* category, not just
+  literals.
+
+  Verification needed a new tool. The existing oracle's independent header
+  walker cannot reach `NBLTYPESI`/`NBLTYPESD` — skipping past `NBLTYPESL`
+  requires decoding Huffman-coded block counts, i.e. reimplementing the
+  decoder inside the test. Instead `oxiarc-brotli` gained
+  `decompress_reporting_shapes`, which reports the `MetaBlockShape` each
+  meta-block header actually declared as a side effect of a normal decode
+  through the reference-validated decoder (608/608 reference streams). Five new
+  `brotli-oracle` tests use it to assert each feature genuinely reached the
+  wire — a round-trip alone is also true of a stream that silently declined to
+  split, so without this the tests would pass vacuously — and then require
+  reference `brotli -d` to reproduce the input byte for byte.
+- **TAR PAX 1.0 sparse format support** (`GNU.sparse.major=1`/
+  `GNU.sparse.minor=0`) in both `TarReader` (seekable) and
+  `TarStreamReader` (streaming) — the one sparse variant this crate
+  previously did not read (old-format `'S'` and PAX 0.1 were already fully
+  supported in both readers). Unlike PAX 0.1, where the offset/numbytes map
+  lives in `GNU.sparse.map` pax-attribute text, PAX 1.0's map is a
+  newline-terminated decimal-ASCII preamble at the very start of the data
+  entry's own payload (`SparseMap::parse_pax_1_0_preamble`,
+  `oxiarc-archive/src/tar/sparse.rs`); it is consumed directly off the
+  stream rather than seeked over, so both the seekable and streaming
+  readers support it with the same code path (no `Seek` requirement added).
+  `GNU.sparse.realsize` and the `GNU.sparse.name` shadow-name convention
+  are shared with 0.1. A non-1.0 archive is unaffected: detection requires
+  both `GNU.sparse.major == "1"` and `GNU.sparse.minor == "0"` to be
+  present; previously such an archive failed cleanly with "missing
+  GNU.sparse.map" (additive change, no prior behavior removed). 10 new
+  tests: 8 unit tests (round-trip, zero-entry, exact-padding-consumption,
+  and five malformed-preamble cases — missing realsize, a non-digit byte,
+  a truncated stream, an excessive declared entry count, and digit
+  overflow) plus one end-to-end test per reader, cross-checked against
+  each other. Writer-side sparse emission remains out of scope for all
+  three variants, unchanged from before.
+- `oxiarc-szip` gained a `TODO.md` (previously the only member crate
+  without one), documenting its real entropy-coding-encoder gap (`encode()`
+  currently emits only no-compression blocks — spec-valid and
+  libaec-round-trippable, but not actual compression), the unimplemented
+  CCSDS restricted option set, and unimplemented `AEC_DATA_SIGNED` support.
+- `oxiarc-lzhuf` and `oxiarc-lzw` gained runnable `examples/`
+  (`lzh_roundtrip.rs` round-trips every implemented LZH method;
+  `lzw_roundtrip.rs` round-trips both the TIFF and GIF bitstream
+  configurations) — both previously had none, unlike the other ten member
+  crates.
+
+### Docs
+
+- Corrected two stale per-crate `TODO.md` "Fuzzing tests" checkboxes
+  (`oxiarc-snappy`, `oxiarc-deflate`) that were still shown unchecked
+  despite the corresponding `fuzz/fuzz_targets/` harnesses and
+  multi-megabyte corpora already existing.
+- Marked the root `TODO.md`'s zstd-release and OxiGDAL-downstream checklist
+  items as stale/out of this repo's scope: the branch has shipped multiple
+  releases (0.3.6 → 0.4.0 → 0.4.1) since that checklist was written, and
+  the OxiGDAL item was always a separate project's backlog.
+- Documented, in `CONTRIBUTING.md` and root `TODO.md`, that `cargo bench` /
+  any `--all-targets` build requires a C compiler on `PATH` because of
+  `criterion` 0.8+'s mandatory (non-optional, non-feature-gated) `alloca`
+  dependency. This is dev-only and does not affect the shipped libraries:
+  every member crate's default features remain 100% Pure Rust, verified by
+  walking the full `Cargo.lock` for any other C/C++/Fortran build
+  dependency (none found). `CONTRIBUTING.md` previously stated flatly that
+  "no external C/Fortran toolchain is required," which was true for
+  `cargo build`/`cargo test` but not for the benchmark surface.
+- `oxiarc-cli` intentionally still has no `examples/` directory: it is a
+  `[[bin]]`-only crate with no library target, so there is no public API
+  for an example to demonstrate; its usage is documented via `README.md`,
+  `man/`, and `completions/` instead.
+
 ## [0.4.0] - 2026-07-30
 
 **DEFLATE/zlib decoder performance rewrite.** No archive/stream wire format
@@ -1092,6 +1477,7 @@ All crates published at version 0.2.0:
 - Workspace-based dependency management
 
 [Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...HEAD
+[0.4.1]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/cool-japan/oxiarc/compare/v0.3.4...v0.3.5

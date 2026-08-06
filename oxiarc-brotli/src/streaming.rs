@@ -1,31 +1,54 @@
 //! Streaming compression and decompression for Brotli.
 //!
-//! Provides `Write`-based compression and `Read`-based decompression
-//! **adapters**. Note the buffering model honestly:
+//! Provides a genuinely incremental `Write`-based compressor and a
+//! `Read`-based decompressor adapter.
 //!
-//! - [`BrotliCompressor`] buffers *all* written input in memory and
-//!   compresses it in one pass when [`BrotliCompressor::finish`] is called
-//!   (or on drop, best-effort). Peak memory is proportional to the total
-//!   input size.
-//! - [`BrotliDecompressor`] reads the *entire* compressed input and
-//!   materializes the *entire* decompressed output in memory on the first
-//!   `read` call; subsequent reads serve from that buffer.
+//! ## [`BrotliCompressor`] — incremental
 //!
-//! These types adapt the one-shot codec to `std::io` interfaces; they do
-//! **not** bound memory for data larger than RAM. For such data, feed the
-//! codec in application-level chunks instead.
+//! Written data is buffered only up to a bounded threshold
+//! ([`BrotliCompressor::with_max_input`], default one meta-block). Once the
+//! threshold is reached — and on every explicit [`flush`](std::io::Write::flush) — the
+//! buffered input is encoded as one or more Brotli content meta-blocks
+//! (`ISLAST = 0`) and every *complete* byte of the resulting bitstream is
+//! pushed to the inner writer. Peak memory is therefore bounded by the
+//! threshold rather than by the total input size.
+//!
+//! A Brotli stream is a single continuous bitstream, so a `flush` can push
+//! only whole bytes; a residue of at most 7 bits from the final meta-block
+//! stays buffered until the next meta-block completes it or
+//! [`BrotliCompressor::finish`] pads the stream. This is inherent to the
+//! bit-packed format, not a buffering shortcut — `flush` really does compress
+//! and emit everything it validly can.
+//!
+//! [`BrotliCompressor::finish`] flushes the last buffered input, writes the
+//! empty final meta-block, pads to a byte boundary and returns the inner
+//! writer.
+//!
+//! Because the encoder emits incrementally it cannot retroactively re-verify
+//! the whole stream the way the one-shot [`crate::compress::compress`] path
+//! does; the per-meta-block encoder it shares is the same code that path
+//! round-trips and that reference decoders accept.
+//!
+//! ## [`BrotliDecompressor`]
+//!
+//! Reads the *entire* compressed input and materializes the *entire*
+//! decompressed output in memory on the first `read` call; subsequent reads
+//! serve from that buffer. Peak memory is proportional to the decompressed
+//! size (bounded by [`BrotliDecompressor::with_max_output`]).
 //!
 //! ## Drop behavior
 //!
-//! Dropping a [`BrotliCompressor`] without calling `finish()` performs a
-//! best-effort finish that **silently swallows I/O and encoding errors**.
-//! Always call [`BrotliCompressor::finish`] explicitly when you need to
-//! observe failures.
+//! Dropping a [`BrotliCompressor`] that has emitted or still holds data
+//! performs a best-effort finish so the sink never receives an unterminated
+//! (invalid) stream; that best-effort path **silently swallows I/O and
+//! encoding errors**. Always call [`BrotliCompressor::finish`] explicitly when
+//! you need to observe failures — between the last write and an unchecked
+//! drop, a write error is lost.
 //!
 //! ## Progress and Cancellation
 //!
-//! Both `BrotliCompressor` and `BrotliDecompressor` support optional
-//! progress reporting and cooperative cancellation via `oxiarc-core` primitives:
+//! Both types support optional progress reporting and cooperative
+//! cancellation via `oxiarc-core` primitives:
 //!
 //! ```rust,no_run
 //! use std::io::Write;
@@ -48,7 +71,8 @@ use std::io::{self, Read, Write};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 
-use crate::compress::BrotliParams;
+use crate::bit_writer::BitWriter;
+use crate::compress::{BrotliParams, EncoderState, encode_meta_block, write_window_bits};
 use crate::decompress::decompress_with_hooks;
 use crate::error::BrotliError;
 use crate::pool::BrotliPool;
@@ -58,10 +82,13 @@ const DEFAULT_BUF_SIZE: usize = 256 * 1024;
 
 /// A streaming Brotli compressor that implements `Write`.
 ///
-/// All written data is buffered in memory and compressed in a single pass
-/// by `finish()` (peak memory is proportional to the total input). Call
-/// [`BrotliCompressor::finish`] explicitly: the `Drop` fallback compresses
-/// best-effort and silently discards any error.
+/// Written data is buffered only up to a bounded threshold and encoded into
+/// Brotli meta-blocks incrementally, so peak memory does not grow with the
+/// total input. On each [`flush`](std::io::Write::flush) every complete compressed byte is
+/// pushed to the inner writer (a sub-byte residue is inherent to the format).
+/// Call [`BrotliCompressor::finish`] explicitly to write the stream
+/// terminator and observe any error; the `Drop` fallback completes the stream
+/// best-effort and silently discards errors.
 ///
 /// Supports optional progress reporting via [`ProgressHandle`] and
 /// cooperative cancellation via [`CancellationToken`].
@@ -84,15 +111,23 @@ pub struct BrotliCompressor<W: Write> {
     inner: Option<W>,
     /// Compression parameters.
     params: BrotliParams,
-    /// Input buffer.
+    /// Pending (not-yet-encoded) input.
     buffer: Vec<u8>,
-    /// Whether any data has been written (used for multi-block streams).
-    has_written: bool,
-    /// Optional progress sink; receives `on_progress` once per `finish()`.
+    /// Persistent output bitstream; drained (whole bytes) into `inner`.
+    writer: BitWriter,
+    /// Distance-ring state carried across meta-blocks / calls.
+    state: EncoderState,
+    /// Whether the stream's window header has been emitted into `writer`.
+    header_written: bool,
+    /// Whether the stream has been terminated (final meta-block written).
+    finished: bool,
+    /// Buffer threshold: `write` emits meta-blocks once `buffer` reaches this.
+    max_input: usize,
+    /// Optional progress sink; receives cumulative `on_progress` per drain.
     progress: Option<ProgressHandle>,
-    /// Optional cancellation token; checked at the start of `finish()`.
+    /// Optional cancellation token; checked before each meta-block emission.
     cancel: Option<CancellationToken>,
-    /// Cumulative compressed bytes emitted so far.
+    /// Cumulative compressed bytes pushed to the inner writer.
     bytes_out: u64,
     /// Optional buffer pool for per-encode allocations.
     pool: Option<BrotliPool>,
@@ -100,12 +135,27 @@ pub struct BrotliCompressor<W: Write> {
 
 impl<W: Write> BrotliCompressor<W> {
     /// Create a new streaming Brotli compressor.
+    ///
+    /// Invalid `params` are not rejected here (the constructor is infallible);
+    /// they surface as an `io::Error` from the first `write`/`flush`/`finish`
+    /// that touches the encoder, matching the one-shot path. `block_size()` is
+    /// only consulted for validated params, since an out-of-range `lgblock`
+    /// would otherwise overflow the shift.
     pub fn new(inner: W, params: BrotliParams) -> Self {
+        let max_input = if params.validate().is_ok() {
+            params.block_size().max(1)
+        } else {
+            DEFAULT_BUF_SIZE
+        };
         BrotliCompressor {
             inner: Some(inner),
             params,
             buffer: Vec::with_capacity(DEFAULT_BUF_SIZE),
-            has_written: false,
+            writer: BitWriter::new(),
+            state: EncoderState::new(),
+            header_written: false,
+            finished: false,
+            max_input,
             progress: None,
             cancel: None,
             bytes_out: 0,
@@ -113,19 +163,26 @@ impl<W: Write> BrotliCompressor<W> {
         }
     }
 
-    /// Create a new streaming compressor with a custom buffer size.
+    /// Create a new streaming compressor with a custom buffering threshold.
+    ///
+    /// `buf_size` (minimum 1 KiB) is the number of buffered input bytes that
+    /// triggers an incremental meta-block emission during [`Write::write`]. A
+    /// smaller value bounds memory more tightly at a small ratio cost.
     pub fn with_buffer_size(inner: W, params: BrotliParams, buf_size: usize) -> Self {
-        let actual_size = buf_size.max(1024); // Minimum 1KB.
-        BrotliCompressor {
-            inner: Some(inner),
-            params,
-            buffer: Vec::with_capacity(actual_size),
-            has_written: false,
-            progress: None,
-            cancel: None,
-            bytes_out: 0,
-            pool: None,
-        }
+        let mut compressor = Self::new(inner, params);
+        compressor.max_input = buf_size.max(1024);
+        compressor
+    }
+
+    /// Set the buffered-input threshold that triggers incremental emission.
+    ///
+    /// Bounds peak memory: at most `max_input` (minimum 1 KiB) bytes of input
+    /// plus one meta-block of output are held before bytes are pushed to the
+    /// inner writer.
+    #[must_use]
+    pub fn with_max_input(mut self, max_input: usize) -> Self {
+        self.max_input = max_input.max(1024);
+        self
     }
 
     /// Attach a buffer pool to amortise per-encode allocations.
@@ -158,10 +215,9 @@ impl<W: Write> BrotliCompressor<W> {
 
     /// Attach a progress sink.
     ///
-    /// The sink's `on_progress(bytes_out, None)` is called after each
-    /// compressed block is written to the inner writer.  Since the
-    /// compressor buffers all input until `finish()`, progress fires
-    /// once per `finish()` call.
+    /// The sink's `on_progress(bytes_out, None)` is called with the cumulative
+    /// compressed byte count each time bytes are drained to the inner writer
+    /// (i.e. on threshold emission, on `flush`, and on `finish`).
     #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
@@ -170,8 +226,8 @@ impl<W: Write> BrotliCompressor<W> {
 
     /// Attach a cancellation token.
     ///
-    /// The token is checked at the start of `finish()`. If it has been
-    /// cancelled, `finish()` returns an I/O error with the message
+    /// The token is checked before each meta-block emission. If it has been
+    /// cancelled, the operation returns an I/O error with the message
     /// `"operation cancelled"`.
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
@@ -181,8 +237,9 @@ impl<W: Write> BrotliCompressor<W> {
 
     /// Finish compression and return the inner writer.
     ///
-    /// This flushes all buffered data, writes the final Brotli
-    /// stream to the inner writer, and returns it.
+    /// Encodes any remaining buffered input, writes the empty final
+    /// meta-block, pads to a byte boundary, drains everything to the inner
+    /// writer and returns it.
     pub fn finish(mut self) -> io::Result<W> {
         self.do_finish()?;
         self.inner
@@ -190,53 +247,134 @@ impl<W: Write> BrotliCompressor<W> {
             .ok_or_else(|| io::Error::other("compressor already finished"))
     }
 
-    /// Internal finish implementation.
-    fn do_finish(&mut self) -> io::Result<()> {
-        // Compress all buffered data, threading progress/cancel hooks into
-        // the per-meta-block loop inside compress_with_hooks(_pooled).
-        let all_data = std::mem::take(&mut self.buffer);
+    /// Emit the one-time window header into the persistent bitstream.
+    ///
+    /// Validates the parameters first, so an invalid `quality`/`lgwin`/
+    /// `lgblock` surfaces as a typed error exactly where the one-shot encoder
+    /// would reject it — before any meta-block (or `block_size()` shift) runs.
+    fn ensure_header(&mut self) -> io::Result<()> {
+        if !self.header_written {
+            self.params
+                .validate()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            write_window_bits(&mut self.writer, self.params.lgwin)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            self.header_written = true;
+        }
+        Ok(())
+    }
 
-        let compressed = crate::compress::compress_with_hooks_pooled(
-            &all_data,
-            &self.params,
-            self.progress.as_ref(),
-            self.cancel.as_ref(),
-            self.pool.as_ref(),
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let compressed_len = compressed.len() as u64;
-
+    /// Drain every complete byte of the bitstream into the inner writer,
+    /// updating the cumulative counter and firing progress.
+    fn drain_to_inner(&mut self) -> io::Result<()> {
+        let bytes = self.writer.drain_complete_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if let Some(ref mut writer) = self.inner {
-            writer.write_all(&compressed)?;
+            writer.write_all(&bytes)?;
+        }
+        self.bytes_out += bytes.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_progress(self.bytes_out, None);
+        }
+        Ok(())
+    }
+
+    /// Encode all currently-buffered input as content meta-blocks and drain
+    /// the complete bytes produced. A no-op when nothing is buffered.
+    fn emit_buffered(&mut self) -> io::Result<()> {
+        if let Some(ref token) = self.cancel {
+            token.check().map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.ensure_header()?;
+        let data = std::mem::take(&mut self.buffer);
+        let block_size = self.params.block_size().max(1);
+        for chunk in data.chunks(block_size) {
+            encode_meta_block(
+                &mut self.writer,
+                chunk,
+                &self.params,
+                &mut self.state,
+                self.pool.as_ref(),
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            self.drain_to_inner()?;
+        }
+        Ok(())
+    }
+
+    /// Internal finish implementation (idempotent).
+    fn do_finish(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        // Encode whatever remains buffered.
+        self.emit_buffered()?;
+        // A valid stream needs the window header even if nothing was written.
+        self.ensure_header()?;
+        // Empty last meta-block: ISLAST = 1, ISLASTEMPTY = 1.
+        self.writer
+            .write_bit(true)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.writer
+            .write_bit(true)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // Pad the trailing partial byte and drain everything.
+        self.writer.flush();
+        self.drain_to_inner()?;
+        if let Some(ref mut writer) = self.inner {
             writer.flush()?;
         }
-
-        // Update cumulative bytes_out so callers can inspect final total.
-        self.bytes_out += compressed_len;
-
+        self.finished = true;
         Ok(())
     }
 }
 
 impl<W: Write> Write for BrotliCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.finished {
+            return Err(io::Error::other("write after finish"));
+        }
         self.buffer.extend_from_slice(buf);
-        self.has_written = true;
+        // Note: if the threshold emission fails (sink or encoder error), `buf`
+        // has already been absorbed into the stream, so this reports `Err`
+        // after taking the bytes. A caller retrying the same bytes via
+        // `write_all` would duplicate them; treat a `write` error as terminal
+        // for the stream (drop or stop), do not retry the same input.
+        if self.buffer.len() >= self.max_input {
+            self.emit_buffered()?;
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // For streaming, we don't compress on flush -- only on finish.
-        // This allows better compression by having more context.
+        if self.finished {
+            return Ok(());
+        }
+        // Compress and push every complete byte we can; a <=7-bit residue of
+        // the final meta-block necessarily stays until the next block/finish.
+        self.emit_buffered()?;
+        if let Some(ref mut writer) = self.inner {
+            writer.flush()?;
+        }
         Ok(())
     }
 }
 
 impl<W: Write> Drop for BrotliCompressor<W> {
     fn drop(&mut self) {
-        // Best-effort finish on drop.
-        if self.inner.is_some() && self.has_written {
+        // Complete the stream best-effort if we have committed anything to the
+        // sink (header emitted) or still hold buffered input; otherwise there
+        // is nothing to terminate and an untouched sink stays empty. Skipping
+        // this once committed would leave an unterminated, invalid stream.
+        if !self.finished
+            && self.inner.is_some()
+            && (self.header_written || !self.buffer.is_empty())
+        {
             let _ = self.do_finish();
         }
     }
@@ -538,5 +676,207 @@ mod tests {
         d.read_to_end(&mut output)
             .expect("decompress without cancel");
         assert_eq!(output, data);
+    }
+
+    // ── Incremental streaming tests ───────────────────────────────────────────
+
+    /// A `Write` sink backed by a shared buffer so a test can observe what the
+    /// compressor has actually pushed *before* `finish` consumes it.
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedSink {
+        fn new() -> Self {
+            SharedSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn len(&self) -> usize {
+            self.0.lock().expect("sink lock").len()
+        }
+        fn snapshot(&self) -> Vec<u8> {
+            self.0.lock().expect("sink lock").clone()
+        }
+    }
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("sink lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn roundtrip(bytes: &[u8], expected: &[u8]) {
+        let decoded = crate::decompress::decompress(bytes).expect("decompress streamed output");
+        assert_eq!(decoded, expected, "streamed stream must round-trip");
+    }
+
+    /// `flush` must actually compress buffered input and push complete bytes to
+    /// the sink — not the old no-op — while still round-tripping after finish.
+    #[test]
+    fn test_streaming_flush_pushes_complete_bytes() {
+        let sink = SharedSink::new();
+        let params = BrotliParams {
+            quality: 5,
+            ..BrotliParams::default()
+        };
+        let mut compressor = BrotliCompressor::new(sink.clone(), params);
+        let input = vec![b'A'; 8192];
+        compressor.write_all(&input).expect("write");
+        compressor.flush().expect("flush");
+        assert!(
+            sink.len() > 0,
+            "flush must push compressed bytes to the sink (was a no-op before)"
+        );
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), &input);
+    }
+
+    /// Many single-byte writes must not accumulate unbounded input and must
+    /// still produce a stream that decodes back to the exact input.
+    #[test]
+    fn test_streaming_many_small_writes_roundtrip() {
+        let sink = SharedSink::new();
+        let params = BrotliParams {
+            quality: 4,
+            ..BrotliParams::default()
+        };
+        // Tight threshold so most writes trigger an incremental emission.
+        let mut compressor = BrotliCompressor::new(sink.clone(), params).with_max_input(1024);
+        let input: Vec<u8> = (0u32..5000).map(|i| (i % 251) as u8).collect();
+        for byte in &input {
+            compressor.write_all(&[*byte]).expect("write one byte");
+        }
+        assert!(
+            sink.len() > 0,
+            "with a 1 KiB threshold and 5000 bytes, output must have started before finish"
+        );
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), &input);
+    }
+
+    /// Interleaving writes and flushes must round-trip.
+    #[test]
+    fn test_streaming_flush_then_write_roundtrip() {
+        let sink = SharedSink::new();
+        let params = BrotliParams::default();
+        let mut compressor = BrotliCompressor::new(sink.clone(), params);
+        let mut expected = Vec::new();
+        for chunk in ["first chunk ", "second chunk ", "third and final chunk"] {
+            compressor.write_all(chunk.as_bytes()).expect("write");
+            compressor.flush().expect("flush");
+            expected.extend_from_slice(chunk.as_bytes());
+        }
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), &expected);
+    }
+
+    /// A cap-breach mid-write (input far larger than the threshold) must bound
+    /// memory by emitting during `write`, and still round-trip.
+    #[test]
+    fn test_streaming_cap_breach_midwrite_roundtrip() {
+        let sink = SharedSink::new();
+        let params = BrotliParams {
+            quality: 6,
+            ..BrotliParams::default()
+        };
+        let mut compressor = BrotliCompressor::new(sink.clone(), params).with_max_input(4096);
+        // Compressible but varied so it is not degenerate.
+        let input: Vec<u8> = (0u32..40_000).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        // Write in 3000-byte chunks; each write past 4096 buffered triggers emit.
+        for chunk in input.chunks(3000) {
+            compressor.write_all(chunk).expect("write chunk");
+        }
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), &input);
+    }
+
+    /// Finishing without any write must produce a valid empty stream.
+    #[test]
+    fn test_streaming_empty_finish_roundtrips() {
+        let sink = SharedSink::new();
+        let compressor = BrotliCompressor::new(sink.clone(), BrotliParams::default());
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), b"");
+    }
+
+    /// Quality 0 (stored meta-blocks) must also stream and round-trip.
+    #[test]
+    fn test_streaming_quality0_roundtrip() {
+        let sink = SharedSink::new();
+        let params = BrotliParams {
+            quality: 0,
+            ..BrotliParams::default()
+        };
+        let mut compressor = BrotliCompressor::new(sink.clone(), params).with_max_input(2048);
+        let input: Vec<u8> = (0u32..9000).map(|i| (i % 97) as u8).collect();
+        for chunk in input.chunks(1500) {
+            compressor.write_all(chunk).expect("write");
+            compressor.flush().expect("flush");
+        }
+        compressor.finish().expect("finish");
+        roundtrip(&sink.snapshot(), &input);
+    }
+
+    /// Dropping after a flush (without `finish`) must still terminate the
+    /// stream so the sink holds a valid, decodable brotli stream.
+    #[test]
+    fn test_streaming_drop_after_flush_terminates_stream() {
+        let sink = SharedSink::new();
+        let input = b"data written then flushed then dropped without finish";
+        {
+            let mut compressor = BrotliCompressor::new(sink.clone(), BrotliParams::default());
+            compressor.write_all(input).expect("write");
+            compressor.flush().expect("flush");
+            // No finish(): Drop must complete the stream.
+        }
+        roundtrip(&sink.snapshot(), input);
+    }
+
+    /// Invalid parameters must not panic the infallible constructor and must
+    /// surface as an error from `finish` (matching the one-shot path). Covers
+    /// both an out-of-range quality and an out-of-range `lgblock` whose
+    /// `block_size()` shift would otherwise overflow.
+    #[test]
+    fn test_streaming_invalid_params_error_without_panic() {
+        // Out-of-range quality.
+        let sink = SharedSink::new();
+        let bad_quality = BrotliParams {
+            quality: 99,
+            ..BrotliParams::default()
+        };
+        let compressor = BrotliCompressor::new(sink, bad_quality);
+        assert!(
+            compressor.finish().is_err(),
+            "quality 99 must error at finish, not silently encode"
+        );
+
+        // Out-of-range lgblock: `1 << 64` would panic if `block_size()` were
+        // consulted; construction and buffered write must stay panic-free.
+        let sink = SharedSink::new();
+        let bad_block = BrotliParams {
+            lgblock: 64,
+            ..BrotliParams::default()
+        };
+        let mut compressor = BrotliCompressor::new(sink, bad_block);
+        let _ = compressor.write_all(b"data"); // buffers without touching encoder
+        assert!(
+            compressor.finish().is_err(),
+            "lgblock 64 must error, not panic"
+        );
+    }
+
+    /// Dropping after buffered writes (never flushed, never finished) must also
+    /// produce a valid terminated stream (best-effort Drop).
+    #[test]
+    fn test_streaming_drop_with_buffered_data_terminates_stream() {
+        let sink = SharedSink::new();
+        let input = b"buffered but never flushed or finished";
+        {
+            let mut compressor = BrotliCompressor::new(sink.clone(), BrotliParams::default());
+            compressor.write_all(input).expect("write");
+        }
+        roundtrip(&sink.snapshot(), input);
     }
 }

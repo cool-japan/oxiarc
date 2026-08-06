@@ -89,6 +89,8 @@
 
 pub mod bit_reader;
 pub mod bit_writer;
+/// Literal block splitting and context-map serialization for the encoder.
+mod block_split;
 /// Brotli compression.
 pub mod compress;
 /// Context modeling for prefix code selection.
@@ -121,7 +123,9 @@ pub mod async_brotli;
 
 // Re-export primary API.
 pub use compress::{BrotliParams, compress, compress_with_params};
-pub use decompress::{decompress, decompress_with_limit};
+pub use decompress::{
+    MetaBlockShape, decompress, decompress_reporting_shapes, decompress_with_limit,
+};
 pub use error::{BrotliError, BrotliResult};
 pub use pool::{BrotliPool, PoolStats};
 pub use streaming::{BrotliCompressor, BrotliDecompressor};

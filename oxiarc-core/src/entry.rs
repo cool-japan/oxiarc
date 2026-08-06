@@ -20,6 +20,10 @@ pub enum CompressionMethod {
     Lh0,
     /// LZH method lh1 (4KB window, adaptive Huffman — LHarc 1.x legacy).
     Lh1,
+    /// LZH method lh2 (8KB window, adaptive Huffman — LHarc 2.x legacy).
+    Lh2,
+    /// LZH method lh3 (8KB window, block-static Huffman — LHarc 2.x legacy).
+    Lh3,
     /// LZH method lhd (directory entry marker, no data).
     Lhd,
     /// LZH method lh4 (4KB window).
@@ -30,6 +34,14 @@ pub enum CompressionMethod {
     Lh6,
     /// LZH method lh7 (64KB window).
     Lh7,
+    /// LArc method lzs (2KB window LZSS, no entropy coding).
+    Lzs,
+    /// LArc method lz4 (stored, no compression).
+    Lz4,
+    /// LArc method lz5 (4KB pre-seeded window LZSS, no entropy coding).
+    Lz5,
+    /// PMarc method pm0 (stored, no compression).
+    Pm0,
     /// LZMA compression (7z).
     Lzma,
     /// LZMA2 compression (xz, 7z).
@@ -38,6 +50,8 @@ pub enum CompressionMethod {
     Bzip2,
     /// Zstandard compression.
     Zstd,
+    /// LZX compression (Microsoft Cabinet compression type 3).
+    Lzx,
     /// Unknown/unsupported method.
     Unknown(u16),
 }
@@ -45,9 +59,13 @@ pub enum CompressionMethod {
 impl CompressionMethod {
     /// Check if this method is "stored" (no compression).
     ///
-    /// Directory markers (`lhd`) carry no data and are treated as stored.
+    /// Directory markers (`lhd`) carry no data and are treated as stored, as
+    /// are LArc's `lz4` and PMarc's `pm0`, which are genuine stored formats.
     pub fn is_stored(&self) -> bool {
-        matches!(self, Self::Stored | Self::Lh0 | Self::Lhd)
+        matches!(
+            self,
+            Self::Stored | Self::Lh0 | Self::Lhd | Self::Lz4 | Self::Pm0
+        )
     }
 
     /// Get the method name as a string.
@@ -57,15 +75,22 @@ impl CompressionMethod {
             Self::Deflate => "Deflate",
             Self::Lh0 => "lh0",
             Self::Lh1 => "lh1",
+            Self::Lh2 => "lh2",
+            Self::Lh3 => "lh3",
             Self::Lhd => "lhd",
             Self::Lh4 => "lh4",
             Self::Lh5 => "lh5",
             Self::Lh6 => "lh6",
             Self::Lh7 => "lh7",
+            Self::Lzs => "lzs",
+            Self::Lz4 => "lz4",
+            Self::Lz5 => "lz5",
+            Self::Pm0 => "pm0",
             Self::Lzma => "LZMA",
             Self::Lzma2 => "LZMA2",
             Self::Bzip2 => "Bzip2",
             Self::Zstd => "Zstd",
+            Self::Lzx => "LZX",
             Self::Unknown(_) => "Unknown",
         }
     }
@@ -815,6 +840,7 @@ mod tests {
                 CompressionMethod::Lzma2,
                 CompressionMethod::Bzip2,
                 CompressionMethod::Zstd,
+                CompressionMethod::Lzx,
                 CompressionMethod::Unknown(42),
             ];
 

@@ -24,6 +24,7 @@
 //! - `Size_Format` 11: 4 streams, 5-byte header, 18+18 bits
 
 use crate::bitwriter::BackwardBitWriter;
+use crate::fse_encoder;
 use crate::huffman_encoder::HuffmanEncoder;
 use crate::literals::LiteralsDecoder;
 use crate::lz77::Lz77Sequence;
@@ -82,12 +83,26 @@ const ML_EXTRA: [u8; 53] = [
 ];
 
 /// Sequence compression mode for encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SequenceCompressionMode {
     /// Use the predefined FSE table from the specification.
     Predefined,
     /// RLE mode: every symbol in this category is the same value.
     Rle(u8),
+    /// `FSE_Compressed_Mode`: a table built from this block's own symbol
+    /// distribution, described inline in the Sequences Section header.
+    ///
+    /// Carries the normalized counts and the accuracy log they were normalized
+    /// at, plus the already-serialized table description so it is written and
+    /// costed from a single source of truth.
+    Fse {
+        /// Normalized counts summing to `1 << table_log`.
+        norm: Vec<i16>,
+        /// Accuracy log of the table.
+        table_log: u8,
+        /// Serialized RFC 8878 §4.1.1 table description.
+        description: Vec<u8>,
+    },
 }
 
 /// Encode a compressed block from LZ77 sequences.
@@ -476,9 +491,10 @@ fn encode_sequences_section(sequences: &[ZstdSequence]) -> Result<Vec<u8>> {
     }
 
     // Determine compression mode for each symbol type.
-    let ll_mode = choose_mode_for_codes(sequences.iter().map(|s| s.ll_code));
-    let of_mode = choose_mode_for_codes(sequences.iter().map(|s| s.of_code));
-    let ml_mode = choose_mode_for_codes(sequences.iter().map(|s| s.ml_code));
+    let (ll_freqs, of_freqs, ml_freqs) = count_symbol_frequencies(sequences);
+    let ll_mode = choose_mode(&ll_freqs, TableCategory::LiteralLength);
+    let of_mode = choose_mode(&of_freqs, TableCategory::Offset);
+    let ml_mode = choose_mode(&ml_freqs, TableCategory::MatchLength);
 
     // Write compression-modes byte.
     // Bits: [LL(2)][OF(2)][ML(2)][reserved(2)]
@@ -499,20 +515,89 @@ fn encode_sequences_section(sequences: &[ZstdSequence]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Choose a compression mode by inspecting all codes in a category.
+/// Choose the cheapest RFC 8878 compression mode for one symbol category.
 ///
-/// If every code is the same value we can use RLE which is the most compact.
-/// Otherwise we fall back to the predefined FSE table.
-fn choose_mode_for_codes(mut codes: impl Iterator<Item = u8>) -> SequenceCompressionMode {
-    let first = match codes.next() {
-        Some(v) => v,
-        None => return SequenceCompressionMode::Predefined,
-    };
-    if codes.all(|c| c == first) {
-        SequenceCompressionMode::Rle(first)
-    } else {
-        SequenceCompressionMode::Predefined
+/// The decision is made on measured cost, not on a heuristic guess:
+///
+/// * If every sequence carries the same code, `RLE` wins trivially — one byte
+///   of header and not a single bit in the bitstream.
+/// * Otherwise the block's own distribution is normalized and serialized, and
+///   the resulting `FSE_Compressed_Mode` cost (entropy under the custom table
+///   **plus** the bytes its description occupies) is compared against the cost
+///   of the RFC's predefined table. The cheaper one is used.
+///
+/// Comparing total cost — rather than always taking the custom table — is what
+/// keeps small blocks from regressing: a 20-sequence block would spend more on
+/// the table description than the sharper distribution ever recovers.
+///
+/// Any failure to build a custom table (an alphabet wider than the table, a
+/// distribution the normalizer cannot represent) simply falls through to the
+/// predefined table, which is always valid.
+fn choose_mode(frequencies: &[u32], category: TableCategory) -> SequenceCompressionMode {
+    let total: u32 = frequencies.iter().sum();
+    if total == 0 {
+        return SequenceCompressionMode::Predefined;
     }
+
+    // Single distinct symbol -> RLE.
+    let mut used = frequencies.iter().enumerate().filter(|&(_, &f)| f > 0);
+    let first = used.next();
+    if let Some((symbol, &count)) = first
+        && count == total
+    {
+        return SequenceCompressionMode::Rle(symbol as u8);
+    }
+
+    let predefined = predefined_distribution(category);
+    let predefined_cost =
+        fse_encoder::estimate_encoded_bits(frequencies, predefined.norm, predefined.table_log);
+
+    match build_custom_mode(frequencies, total, category) {
+        Some((mode, custom_cost)) => match predefined_cost {
+            // The predefined table cannot represent this block's alphabet at
+            // all (an offset code beyond 28, for instance): the custom table is
+            // not just cheaper, it is the only legal choice.
+            None => mode,
+            Some(base) if custom_cost < base => mode,
+            Some(_) => SequenceCompressionMode::Predefined,
+        },
+        None => SequenceCompressionMode::Predefined,
+    }
+}
+
+/// Build an `FSE_Compressed_Mode` candidate and its total cost in bits.
+///
+/// Returns `None` when no valid custom table exists for this distribution.
+fn build_custom_mode(
+    frequencies: &[u32],
+    total: u32,
+    category: TableCategory,
+) -> Option<(SequenceCompressionMode, f64)> {
+    let max_symbol = frequencies.iter().rposition(|&f| f > 0)? as u8;
+    let table_log =
+        fse_encoder::optimal_table_log(max_table_log(category), total as usize, max_symbol);
+    // The reference switches to the "less than one" marker only for blocks with
+    // many sequences, where its extra precision outweighs the wider table it
+    // implies (`ZSTD_useLowProbCount`).
+    let low_prob_count = if total >= 2048 { -1i16 } else { 1i16 };
+
+    let alphabet = &frequencies[..=max_symbol as usize];
+    let norm = fse_encoder::normalize_counts(alphabet, total, table_log, low_prob_count).ok()?;
+    let description = fse_encoder::write_ncount(&norm, table_log).ok()?;
+    // Reject anything the decoder side would not accept, before it reaches an
+    // archive: build the very table the decoder will build.
+    FseCTable::from_normalized(table_log, &norm).ok()?;
+
+    let bits = fse_encoder::estimate_encoded_bits(alphabet, &norm, table_log)?;
+    let cost = bits + (description.len() as f64) * 8.0;
+    Some((
+        SequenceCompressionMode::Fse {
+            norm,
+            table_log,
+            description,
+        },
+        cost,
+    ))
 }
 
 /// Convert a `SequenceCompressionMode` to its 2-bit representation.
@@ -520,16 +605,20 @@ fn mode_to_bits(mode: &SequenceCompressionMode) -> u8 {
     match mode {
         SequenceCompressionMode::Predefined => 0,
         SequenceCompressionMode::Rle(_) => 1,
+        SequenceCompressionMode::Fse { .. } => 2,
     }
 }
 
 /// Write the table description bytes for a mode (nothing for Predefined,
-/// one symbol byte for RLE).
+/// one symbol byte for RLE, the serialized normalized counts for FSE).
 fn write_mode_table_data(out: &mut Vec<u8>, mode: &SequenceCompressionMode) {
     match mode {
         SequenceCompressionMode::Predefined => {}
         SequenceCompressionMode::Rle(symbol) => {
             out.push(*symbol);
+        }
+        SequenceCompressionMode::Fse { description, .. } => {
+            out.extend_from_slice(description);
         }
     }
 }
@@ -739,10 +828,46 @@ const ML_PREDEFINED_DIST: [i16; 53] = [
 ];
 
 /// Table category for predefined FSE table construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TableCategory {
     LiteralLength,
     Offset,
     MatchLength,
+}
+
+/// A predefined distribution together with the accuracy log it is defined at.
+struct PredefinedTable {
+    norm: &'static [i16],
+    table_log: u8,
+}
+
+/// The RFC 8878 predefined distribution for a symbol category.
+fn predefined_distribution(category: TableCategory) -> PredefinedTable {
+    match category {
+        TableCategory::LiteralLength => PredefinedTable {
+            norm: &LL_PREDEFINED_DIST,
+            table_log: 6,
+        },
+        TableCategory::Offset => PredefinedTable {
+            norm: &OF_PREDEFINED_DIST,
+            table_log: 5,
+        },
+        TableCategory::MatchLength => PredefinedTable {
+            norm: &ML_PREDEFINED_DIST,
+            table_log: 6,
+        },
+    }
+}
+
+/// Largest `Accuracy_Log` RFC 8878 §3.1.1.3.2.2.1 permits for a category.
+///
+/// Offsets are capped one bit lower than the length tables; exceeding the cap
+/// makes the description undecodable rather than merely inefficient.
+fn max_table_log(category: TableCategory) -> u8 {
+    match category {
+        TableCategory::LiteralLength | TableCategory::MatchLength => 9,
+        TableCategory::Offset => 8,
+    }
 }
 
 /// Build the FSE compression table for a mode (None for RLE — an RLE
@@ -753,14 +878,14 @@ fn build_ctable_for_mode(
 ) -> Result<Option<FseCTable>> {
     match mode {
         SequenceCompressionMode::Predefined => {
-            let table = match category {
-                TableCategory::LiteralLength => FseCTable::from_normalized(6, &LL_PREDEFINED_DIST),
-                TableCategory::Offset => FseCTable::from_normalized(5, &OF_PREDEFINED_DIST),
-                TableCategory::MatchLength => FseCTable::from_normalized(6, &ML_PREDEFINED_DIST),
-            }?;
+            let predefined = predefined_distribution(category);
+            let table = FseCTable::from_normalized(predefined.table_log, predefined.norm)?;
             Ok(Some(table))
         }
         SequenceCompressionMode::Rle(_) => Ok(None),
+        SequenceCompressionMode::Fse {
+            norm, table_log, ..
+        } => Ok(Some(FseCTable::from_normalized(*table_log, norm)?)),
     }
 }
 
@@ -849,23 +974,37 @@ fn encode_sequences_bitstream(
 }
 
 // ---------------------------------------------------------------------------
-// Count symbol frequencies (utility for future FSE table building)
+// Count symbol frequencies (input to FSE table building)
 // ---------------------------------------------------------------------------
+
+/// Largest offset code an `FSE_Compressed_Mode` offset table can describe.
+///
+/// RFC 8878 caps `Offset_Code` at 31; the predefined table only covers 0..=28,
+/// which is one reason a custom table is sometimes mandatory rather than merely
+/// cheaper.
+const MAX_OFFSET_CODE_SYMBOLS: usize = 32;
 
 /// Count the frequency of each symbol code across all sequences.
 ///
 /// Returns `(ll_freqs, of_freqs, ml_freqs)` where each vector is indexed by
-/// the symbol code and contains its occurrence count.
-#[allow(dead_code)]
+/// the symbol code and contains its occurrence count. Codes are produced by
+/// `encode_literal_length` / `encode_match_length` / `encode_offset`, which
+/// bound them to the array sizes below.
 fn count_symbol_frequencies(sequences: &[ZstdSequence]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut ll_freqs = vec![0u32; 36];
-    let mut of_freqs = vec![0u32; 29];
+    let mut of_freqs = vec![0u32; MAX_OFFSET_CODE_SYMBOLS];
     let mut ml_freqs = vec![0u32; 53];
 
     for seq in sequences {
-        ll_freqs[seq.ll_code as usize] += 1;
-        of_freqs[seq.of_code as usize] += 1;
-        ml_freqs[seq.ml_code as usize] += 1;
+        if let Some(slot) = ll_freqs.get_mut(seq.ll_code as usize) {
+            *slot += 1;
+        }
+        if let Some(slot) = of_freqs.get_mut(seq.of_code as usize) {
+            *slot += 1;
+        }
+        if let Some(slot) = ml_freqs.get_mut(seq.ml_code as usize) {
+            *slot += 1;
+        }
     }
 
     (ll_freqs, of_freqs, ml_freqs)
@@ -993,16 +1132,224 @@ mod tests {
         assert_eq!(encoded, vec![0]);
     }
 
-    #[test]
-    fn test_choose_mode_all_same() {
-        let mode = choose_mode_for_codes([5u8, 5, 5, 5].iter().copied());
-        assert_eq!(mode, SequenceCompressionMode::Rle(5));
+    /// Build a frequency vector from a list of symbol codes.
+    fn freqs_of(codes: &[u8], alphabet: usize) -> Vec<u32> {
+        let mut freqs = vec![0u32; alphabet];
+        for &code in codes {
+            freqs[code as usize] += 1;
+        }
+        freqs
     }
 
     #[test]
-    fn test_choose_mode_different() {
-        let mode = choose_mode_for_codes([1u8, 2, 3].iter().copied());
+    fn test_choose_mode_all_same() {
+        let freqs = freqs_of(&[5, 5, 5, 5], 36);
+        let mode = choose_mode(&freqs, TableCategory::LiteralLength);
+        assert_eq!(mode, SequenceCompressionMode::Rle(5));
+    }
+
+    /// A handful of sequences cannot pay for a custom table description, so the
+    /// cost comparison must keep choosing the predefined table.
+    #[test]
+    fn test_choose_mode_tiny_block_stays_predefined() {
+        let freqs = freqs_of(&[1, 2, 3], 36);
+        let mode = choose_mode(&freqs, TableCategory::LiteralLength);
         assert_eq!(mode, SequenceCompressionMode::Predefined);
+    }
+
+    /// A large, sharply skewed block is exactly the case a custom table exists
+    /// for: the predefined distribution spreads probability across 36 symbols
+    /// while this block only ever uses three.
+    #[test]
+    fn test_choose_mode_skewed_block_uses_custom_table() {
+        let mut codes = vec![4u8; 4000];
+        codes.extend(std::iter::repeat_n(9u8, 400));
+        codes.extend(std::iter::repeat_n(20u8, 40));
+        let freqs = freqs_of(&codes, 36);
+        let mode = choose_mode(&freqs, TableCategory::LiteralLength);
+        match &mode {
+            SequenceCompressionMode::Fse {
+                norm,
+                table_log,
+                description,
+            } => {
+                assert!((5..=9).contains(table_log), "table log {table_log}");
+                assert!(!description.is_empty());
+                let sum: i32 = norm
+                    .iter()
+                    .map(|&p| if p == -1 { 1 } else { i32::from(p) })
+                    .sum();
+                assert_eq!(sum, 1i32 << table_log);
+                assert_eq!(mode_to_bits(&mode), 2);
+            }
+            other => panic!("expected FSE_Compressed_Mode, got {other:?}"),
+        }
+    }
+
+    /// Build a synthetic sequence list whose symbol distributions are skewed
+    /// enough that a custom FSE table beats the predefined one.
+    ///
+    /// Returns the encoder-side sequences together with the (literal length,
+    /// match length, offset) triples they were built from, so a decode can be
+    /// checked against the intended values rather than against itself.
+    #[allow(clippy::type_complexity)]
+    fn skewed_sequences(count: usize) -> (Vec<ZstdSequence>, Vec<(usize, usize, usize)>) {
+        let mut sequences = Vec::with_capacity(count);
+        let mut expected = Vec::with_capacity(count);
+        for i in 0..count {
+            // Literal lengths cluster hard on 3 and 4, match lengths on 4..6,
+            // offsets on three magnitudes — a realistic profile for structured
+            // data, and one the RFC's flat predefined tables model poorly.
+            // The offsets are spread across distinct offset *codes* (the
+            // magnitude, not the value, is what the FSE table sees), and every
+            // `Offset_Value` stays above 3 so no sequence takes the decoder's
+            // repeat-offset path, which would rewrite the value.
+            let literal_len = if i % 17 == 0 { 11 } else { 3 + (i % 2) };
+            let match_len = 4 + (i % 3);
+            let offset = match i % 20 {
+                0 => 61,
+                1..=3 => 13,
+                _ => 5,
+            };
+            let (ll_code, ll_extra_bits, ll_extra_value) =
+                encode_literal_length(literal_len as u32).expect("valid literal length");
+            let (ml_code, ml_extra_bits, ml_extra_value) =
+                encode_match_length(match_len as u32).expect("valid match length");
+            let (of_code, of_extra_bits, of_extra_value) =
+                encode_offset(offset as u32).expect("valid offset");
+            sequences.push(ZstdSequence {
+                ll_code,
+                ll_extra_bits,
+                ll_extra_value,
+                ml_code,
+                ml_extra_bits,
+                ml_extra_value,
+                of_code,
+                of_extra_bits,
+                of_extra_value,
+            });
+            expected.push((literal_len, match_len, offset));
+        }
+        (sequences, expected)
+    }
+
+    /// End-to-end proof for `FSE_Compressed_Mode`: a sequences section that
+    /// carries custom tables must decode back to the exact same sequences
+    /// through the crate's own (reference-verified) `SequencesDecoder`.
+    ///
+    /// This is the check that catches a table description written with the
+    /// wrong threshold or a normalized distribution the decoder reads
+    /// differently — the encoder and decoder here are independent code paths,
+    /// and the decoder is the one validated against real `zstd` output.
+    #[test]
+    fn test_fse_compressed_sequences_round_trip_through_decoder() {
+        let (sequences, expected) = skewed_sequences(3000);
+        let (ll_freqs, of_freqs, ml_freqs) = count_symbol_frequencies(&sequences);
+        assert!(
+            matches!(
+                choose_mode(&ll_freqs, TableCategory::LiteralLength),
+                SequenceCompressionMode::Fse { .. }
+            ),
+            "skewed literal lengths should select a custom table"
+        );
+        assert!(
+            matches!(
+                choose_mode(&of_freqs, TableCategory::Offset),
+                SequenceCompressionMode::Fse { .. }
+            ),
+            "skewed offsets should select a custom table"
+        );
+        assert!(
+            matches!(
+                choose_mode(&ml_freqs, TableCategory::MatchLength),
+                SequenceCompressionMode::Fse { .. }
+            ),
+            "skewed match lengths should select a custom table"
+        );
+
+        let encoded = encode_sequences_section(&sequences).expect("sequences section encodes");
+
+        // The modes byte must actually advertise FSE_Compressed_Mode (2) for
+        // all three categories, or this test would pass vacuously.
+        let count_bytes = if sequences.len() < 128 {
+            1
+        } else if sequences.len() < 0x7F00 {
+            2
+        } else {
+            3
+        };
+        let modes_byte = encoded[count_bytes];
+        assert_eq!((modes_byte >> 6) & 3, 2, "LL mode is not FSE_Compressed");
+        assert_eq!((modes_byte >> 4) & 3, 2, "OF mode is not FSE_Compressed");
+        assert_eq!((modes_byte >> 2) & 3, 2, "ML mode is not FSE_Compressed");
+
+        let mut decoder = crate::sequences::SequencesDecoder::new();
+        let (decoded, _) = decoder.decode(&encoded).expect("custom tables decode");
+        assert_eq!(decoded.len(), expected.len());
+        for (index, (got, &(literal_len, match_len, offset))) in
+            decoded.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(
+                got.literal_length, literal_len,
+                "literal length differs at sequence {index}"
+            );
+            assert_eq!(
+                got.match_length, match_len,
+                "match length differs at sequence {index}"
+            );
+            assert_eq!(got.offset, offset, "offset differs at sequence {index}");
+        }
+    }
+
+    /// The custom table has to actually pay for itself: encoding the same
+    /// skewed sequences with `FSE_Compressed_Mode` must be smaller than the
+    /// predefined-table encoding, header bytes included.
+    #[test]
+    fn test_fse_compressed_sequences_beat_predefined() {
+        let (sequences, _) = skewed_sequences(3000);
+        let custom = encode_sequences_section(&sequences).expect("sequences section encodes");
+
+        // Same sequences, forced through the predefined tables.
+        let predefined = {
+            let mut out = Vec::new();
+            let count = sequences.len();
+            assert!((128..0x7F00).contains(&count));
+            out.push(((count >> 8) as u8) + 128);
+            out.push((count & 0xFF) as u8);
+            out.push(0); // all three modes = Predefined
+            let bitstream = encode_sequences_bitstream(
+                &sequences,
+                &SequenceCompressionMode::Predefined,
+                &SequenceCompressionMode::Predefined,
+                &SequenceCompressionMode::Predefined,
+            )
+            .expect("predefined encoding works");
+            out.extend_from_slice(&bitstream);
+            out
+        };
+
+        assert!(
+            custom.len() < predefined.len(),
+            "custom FSE tables ({} bytes) did not beat predefined ({} bytes)",
+            custom.len(),
+            predefined.len()
+        );
+    }
+
+    /// The offset table's accuracy log is capped at 8, one below the length
+    /// tables; a custom offset table that exceeded it would be undecodable.
+    #[test]
+    fn test_custom_offset_table_respects_accuracy_cap() {
+        let mut codes: Vec<u8> = Vec::new();
+        for code in 1u8..=20 {
+            codes.extend(std::iter::repeat_n(code, 200 - usize::from(code) * 5));
+        }
+        let freqs = freqs_of(&codes, MAX_OFFSET_CODE_SYMBOLS);
+        if let SequenceCompressionMode::Fse { table_log, .. } =
+            choose_mode(&freqs, TableCategory::Offset)
+        {
+            assert!(table_log <= 8, "offset accuracy log {table_log} exceeds 8");
+        }
     }
 
     #[test]

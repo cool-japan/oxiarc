@@ -1,0 +1,8 @@
+# Clippy configuration for the oxiarc workspace.
+#
+# Pinned to the workspace MSRV (see `rust-version` in the root Cargo.toml's
+# `[workspace.package]`) so `clippy::incompatible_msrv` and other
+# MSRV-sensitive lints check suggestions against what 1.85 actually supports,
+# rather than against whatever toolchain happens to run clippy locally or in
+# CI.
+msrv = "1.85"

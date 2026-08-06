@@ -203,7 +203,20 @@ impl StreamingLzhDecoder {
             LzhMethod::Lh4 | LzhMethod::Lh5 => 14usize,
             LzhMethod::Lh6 => 16,
             LzhMethod::Lh7 => 17,
-            LzhMethod::Lh0 | LzhMethod::Lh1 | LzhMethod::Lhd | LzhMethod::Unknown(_) => 0,
+            // Every other method is either stored or uses a codec this
+            // streaming decoder does not implement (see `decompress`, which
+            // returns a typed `unsupported_method` for them); `np` is unused
+            // in both cases.
+            LzhMethod::Lh0
+            | LzhMethod::Lh1
+            | LzhMethod::Lh2
+            | LzhMethod::Lh3
+            | LzhMethod::Lhd
+            | LzhMethod::Lzs
+            | LzhMethod::Lz4
+            | LzhMethod::Lz5
+            | LzhMethod::Pm0
+            | LzhMethod::Unknown(_) => 0,
         };
         let offset_bits = crate::methods::p_tree_count_bits(np);
         let max_offset_codes = (1usize << offset_bits).saturating_sub(1);
@@ -299,7 +312,15 @@ impl StreamingLzhDecoder {
             return self.decompress_stored(input, output);
         }
 
-        if matches!(self.method, LzhMethod::Lh1 | LzhMethod::Unknown(_)) {
+        if matches!(
+            self.method,
+            LzhMethod::Lh1
+                | LzhMethod::Lh2
+                | LzhMethod::Lh3
+                | LzhMethod::Lzs
+                | LzhMethod::Lz5
+                | LzhMethod::Unknown(_)
+        ) {
             return Err(OxiArcError::unsupported_method(format!(
                 "streaming decode not supported for {}",
                 self.method
