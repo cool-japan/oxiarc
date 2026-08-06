@@ -1,4 +1,4 @@
-# oxiarc-szip - Development Status (v0.4.1, 2026-08-03)
+# oxiarc-szip - Development Status (v0.4.2, 2026-08-06)
 
 ## Completed Features (COMPLETE)
 

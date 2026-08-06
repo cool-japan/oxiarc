@@ -150,15 +150,15 @@ cargo install --path oxiarc-cli
 
 ```toml
 [dependencies]
-oxiarc-archive = "0.4.1"  # For archive format support
-oxiarc-deflate = "0.4.1"  # For DEFLATE compression
-oxiarc-lzma = "0.4.1"     # For LZMA/LZMA2 compression
-oxiarc-bzip2 = "0.4.1"    # For Bzip2 compression
-oxiarc-lz4 = "0.4.1"      # For LZ4 compression
-oxiarc-zstd = "0.4.1"     # For Zstandard compression
-oxiarc-brotli = "0.4.1"   # For Brotli compression
-oxiarc-snappy = "0.4.1"   # For Snappy compression
-oxiarc-szip = "0.4.1"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
+oxiarc-archive = "0.4.2"  # For archive format support
+oxiarc-deflate = "0.4.2"  # For DEFLATE compression
+oxiarc-lzma = "0.4.2"     # For LZMA/LZMA2 compression
+oxiarc-bzip2 = "0.4.2"    # For Bzip2 compression
+oxiarc-lz4 = "0.4.2"      # For LZ4 compression
+oxiarc-zstd = "0.4.2"     # For Zstandard compression
+oxiarc-brotli = "0.4.2"   # For Brotli compression
+oxiarc-snappy = "0.4.2"   # For Snappy compression
+oxiarc-szip = "0.4.2"      # For AEC/SZIP (CCSDS-121.0-B-2) compression
 ```
 
 ## Quick Start

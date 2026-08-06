@@ -3,11 +3,11 @@
 
 Pure Rust implementation of CCSDS-121.0-B-2 / libaec-compatible AEC (Adaptive Entropy Coding) / SZIP compression.
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.2-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.1** (2026-07-30) — 47 tests passing.
+**Version 0.4.2** (2026-08-06) — 47 tests passing.
 
 **What's new in 0.3.6**:
 
@@ -82,7 +82,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-szip = "0.4.1"
+oxiarc-szip = "0.4.2"
 ```
 
 ## API Reference

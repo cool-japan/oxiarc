@@ -3,11 +3,11 @@
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.2-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.1** (2026-07-30) — 293 tests passing.
+**Version 0.4.2** (2026-08-06) — 293 tests passing.
 
 **What's new in 0.4.0**: DEFLATE/zlib decoder performance rewrite — no wire-format change, no public API removed. New `inflate_into(src, dst) -> Result<usize>` decompresses a raw DEFLATE stream directly into a caller-supplied buffer with no intermediate `Vec` and no output-size guessing (`BufferTooSmall` if the stream would overflow `dst`, never silently truncated; `InvalidDistance` if a back-reference reaches before the start of `dst` — use `Inflater::with_dictionary` when history before `dst` is needed instead). `zlib::zlib_decompress_into` is the zlib-wrapper equivalent — validates the header, decodes via `inflate_into`, and verifies the trailing Adler-32. New `Inflater::with_output_capacity(size_hint)` pre-sizes the output buffer from a size hint (clamped to the new `MAX_OUTPUT_CAPACITY_HINT` = 64 MiB, since the hint is untrusted); GZIP decoding now seeds this automatically from the trailing ISIZE field. Internally (no API change): `HuffmanTree` now decodes through a two-level root+sub-table (root widened from a 9-bit to a 10-bit table, zlib/libdeflate style); the LZ77 history is now the output buffer itself (`InflateWindow`, via `Vec::extend_from_within`) rather than a separate ring buffer that wrote every decoded byte twice; `Adler32::update` now folds 32-byte groups through a closed-form reduction instead of one add-pair per byte so the compiler can auto-vectorize it. These decoders build on `oxiarc-core`'s new buffered `BitReader`/`BitCache`. New differential test suite `tests/inflate_differential.rs` proves the buffered fast path, the exact-mode path, and `inflate_into`/`zlib_decompress_into` all agree byte-for-byte, including hostile/truncated/corrupted input, plus a new `fuzz_inflate_into` fuzz target.
 
@@ -64,21 +64,21 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-deflate = "0.4.1"
+oxiarc-deflate = "0.4.2"
 ```
 
 With async I/O support:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.4.1", features = ["async-io"] }
+oxiarc-deflate = { version = "0.4.2", features = ["async-io"] }
 ```
 
 With parallel GZIP compression:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.4.1", features = ["parallel"] }
+oxiarc-deflate = { version = "0.4.2", features = ["parallel"] }
 ```
 
 ## Quick Start
