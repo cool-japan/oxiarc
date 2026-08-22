@@ -116,6 +116,20 @@ impl<R: Read> BzDecoder<R> {
     /// `Ok(None)` therefore means the whole input is exhausted. Trailing
     /// bytes that do not start a valid stream header are an error.
     pub fn read_block(&mut self) -> Result<Option<Vec<u8>>> {
+        self.read_block_inner(None)
+    }
+
+    /// Read and decode the next block with a decoded-output limit.
+    ///
+    /// The limit applies to the block returned by this call and is enforced
+    /// during RLE1 reconstruction, before the decoded block grows beyond
+    /// `max_output` bytes. Callers enforcing a cumulative output limit should
+    /// pass their remaining budget on each call.
+    pub fn read_block_with_limit(&mut self, max_output: usize) -> Result<Option<Vec<u8>>> {
+        self.read_block_inner(Some(max_output))
+    }
+
+    fn read_block_inner(&mut self, max_output: Option<usize>) -> Result<Option<Vec<u8>>> {
         if self.finished {
             return Ok(None);
         }
@@ -131,7 +145,7 @@ impl<R: Read> BzDecoder<R> {
             // Read block / end-of-stream marker (48 bits).
             let magic = self.reader.read_bits_u64(48)?;
             if magic == BLOCK_MAGIC_BITS {
-                return self.decode_block_body().map(Some);
+                return self.decode_block_body(max_output).map(Some);
             }
             if magic != EOS_MAGIC_BITS {
                 return Err(OxiArcError::invalid_header("Invalid block header"));
@@ -191,7 +205,7 @@ impl<R: Read> BzDecoder<R> {
     }
 
     /// Decode one block after its 48-bit block magic has been consumed.
-    fn decode_block_body(&mut self) -> Result<Vec<u8>> {
+    fn decode_block_body(&mut self, max_output: Option<usize>) -> Result<Vec<u8>> {
         let block_crc = self.reader.read_bits(32)?;
 
         // Randomised blocks (deprecated since bzip2 0.9.5, produced only by
@@ -357,7 +371,11 @@ impl<R: Read> BzDecoder<R> {
         if randomised {
             rand::derandomise(&mut rle1_data);
         }
-        let data = rle::rle1_decode(&rle1_data)?;
+        let data = if let Some(limit) = max_output {
+            rle::rle1_decode_with_limit(&rle1_data, limit)?
+        } else {
+            rle::rle1_decode(&rle1_data)?
+        };
 
         // Verify the block CRC (bzip2-specific CRC-32).
         self.crc.reset();
@@ -401,8 +419,10 @@ impl<R: Read> BzDecoder<R> {
 /// maximum 255x run expansion), but a crafted file may contain arbitrarily
 /// many blocks, so the total output — and therefore the allocation — is
 /// unbounded. When decoding untrusted input, use
-/// [`decompress_with_limit`] to cap the output size, or drive
-/// [`BzDecoder::read_block`] directly for streaming consumption.
+/// [`decompress_with_limit`] to cap cumulative output size, or drive
+/// [`BzDecoder::read_block_with_limit`] directly for bounded block-at-a-time
+/// consumption. [`BzDecoder::read_block`] remains available when no decoded
+/// output limit is required.
 ///
 /// # Example
 ///
@@ -434,10 +454,14 @@ pub fn decompress<R: Read>(reader: R) -> Result<Vec<u8>> {
 ///
 /// # Memory characteristics
 ///
-/// Peak memory is bounded by `max_out` plus one decoded block (a block
-/// expands to at most ~46 MiB): the limit is enforced *before* each block
-/// is appended to the output, so a bomb is rejected without ever
-/// materialising the oversized result.
+/// The remaining cumulative output budget is passed into each block decode
+/// and enforced during RLE1 reconstruction, before the returned decoded block
+/// grows beyond that remaining budget. Reaching exactly `max_out` bytes does
+/// not skip end-of-stream, CRC, concatenated-stream, or trailing-data checks.
+///
+/// This is a decoded-output size limit, not a total process-memory or RSS
+/// limit. Other decoder working structures, including BWT and Huffman state,
+/// are governed separately by BZip2's format-level block-size bounds.
 ///
 /// # Example
 ///
@@ -449,18 +473,27 @@ pub fn decompress<R: Read>(reader: R) -> Result<Vec<u8>> {
 /// // Generous limit: succeeds.
 /// let ok = decompress_with_limit(&compressed[..], 1 << 20).expect("decompress");
 /// assert_eq!(ok, data);
-/// // Tight limit: rejected instead of allocating 100 kB.
+/// // Tight limit: rejected before materialising a 100 kB decoded block.
 /// assert!(decompress_with_limit(&compressed[..], 1024).is_err());
 /// ```
 pub fn decompress_with_limit<R: Read>(reader: R, max_out: usize) -> Result<Vec<u8>> {
     let mut decoder = BzDecoder::new(reader)?;
     let mut output = Vec::new();
 
-    while let Some(block) = decoder.read_block()? {
+    loop {
+        let remaining = max_out
+            .checked_sub(output.len())
+            .ok_or_else(|| OxiArcError::memory_budget_exceeded(max_out, output.len()))?;
+
+        let Some(block) = decoder.read_block_with_limit(remaining)? else {
+            break;
+        };
+
         let projected = output.len().saturating_add(block.len());
         if projected > max_out {
             return Err(OxiArcError::memory_budget_exceeded(max_out, projected));
         }
+
         output.extend_from_slice(&block);
     }
 
@@ -636,6 +669,79 @@ mod tests {
 
         let err = decompress_with_limit(&compressed[..], data.len() - 1);
         assert!(matches!(err, Err(OxiArcError::MemoryBudgetExceeded { .. })));
+    }
+
+    #[test]
+    fn decompress_with_limit_is_cumulative_across_concatenated_streams() {
+        use crate::{CompressionLevel, compress};
+
+        let first = vec![b'A'; 700];
+        let second = vec![b'B'; 700];
+
+        let mut stream = compress(&first, CompressionLevel::new(1)).expect("compress first stream");
+        stream.extend_from_slice(
+            &compress(&second, CompressionLevel::new(1)).expect("compress second stream"),
+        );
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+
+        let decoded =
+            decompress_with_limit(&stream[..], expected.len()).expect("exact limit should succeed");
+        assert_eq!(decoded, expected);
+
+        let result = decompress_with_limit(&stream[..], expected.len() - 1);
+        assert!(matches!(
+            result,
+            Err(OxiArcError::MemoryBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn decompress_with_limit_exact_limit_still_requires_complete_stream() {
+        use crate::{CompressionLevel, compress};
+
+        let data = vec![b'A'; 50_000];
+        let mut stream = compress(&data, CompressionLevel::new(1)).expect("compress test payload");
+
+        let decoded =
+            decompress_with_limit(&stream[..], data.len()).expect("complete stream should succeed");
+        assert_eq!(decoded, data);
+
+        // Reaching the output limit must not bypass the trailing EOS and CRC checks.
+        stream.pop().expect("compressed stream should not be empty");
+        assert!(
+            decompress_with_limit(&stream[..], data.len()).is_err(),
+            "truncated framing must still be rejected at the exact output limit"
+        );
+    }
+
+    #[test]
+    fn decoder_output_limit_reaches_block_reconstruction() {
+        use crate::{CompressionLevel, compress};
+
+        // Repeated data exercises RLE1 expansion inside a normal, valid BZip2
+        // block. The stream itself is intentionally valid; the rejection here
+        // must come from the caller's resource policy rather than format errors.
+        let original = vec![b'A'; 50_000];
+        let compressed =
+            compress(&original, CompressionLevel::new(1)).expect("compress test payload");
+
+        // Give the streaming decoder a budget smaller than the decoded block.
+        // The budget needs to travel through read_block_with_limit() into RLE1
+        // reconstruction so expansion stops before the complete block is materialized.
+        let mut decoder =
+            BzDecoder::new(Cursor::new(&compressed)).expect("decoder should construct");
+
+        let result = decoder.read_block_with_limit(1024);
+
+        // Resource-policy rejection is distinct from malformed input. Preserve
+        // that distinction so streaming callers can make an explicit policy
+        // decision instead of treating a valid but oversized stream as corrupt.
+        assert!(matches!(
+            result,
+            Err(OxiArcError::MemoryBudgetExceeded { .. })
+        ));
     }
 
     #[test]

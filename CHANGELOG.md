@@ -5,6 +5,24 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - Unreleased
+
+### Added
+
+- **oxiarc-bzip2**: Added `BzDecoder::read_block_with_limit(max_output)` for
+  block-at-a-time callers that need to bound the decoded output returned by
+  each call. Cumulative callers can pass their remaining output budget for
+  each block.
+
+### Fixed
+
+- **oxiarc-bzip2**: `decompress_with_limit` now propagates its remaining
+  cumulative output budget into block decoding and enforces it during RLE1
+  reconstruction, instead of materialising a complete decoded block before
+  rejecting output that exceeds the limit. Exact-limit decoding still
+  validates end-of-stream framing, CRCs, concatenated streams, and trailing
+  data.
+
 ## [0.4.1] - 2026-08-06
 
 **Security hardening (ZIP CSPRNG, constant-time AES, x86 CRC-32, 7z

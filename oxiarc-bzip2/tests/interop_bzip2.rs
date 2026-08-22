@@ -315,6 +315,22 @@ fn decompress_with_limit_rejects_over_budget() {
 }
 
 #[test]
+fn decompress_with_limit_is_cumulative_across_blocks() {
+    // This real libbz2 level-9 fixture contains 1.2 MB of decoded data, so it
+    // crosses the format's 900 KB block boundary within one BZip2 stream.
+    let expected = text_data(1_200_000);
+
+    let decoded = decompress_with_limit(PY_TEXT1M2_L9, expected.len())
+        .expect("exact cumulative limit should accept multi-block stream");
+    assert_eq!(decoded, expected);
+
+    assert!(
+        decompress_with_limit(PY_TEXT1M2_L9, expected.len() - 1).is_err(),
+        "one byte below the cumulative multi-block output must be rejected"
+    );
+}
+
+#[test]
 fn multistream_every_truncation_errs_or_is_a_stream_boundary() {
     // Truncating the two-stream fixture at any point must never panic and
     // may only succeed at exact stream boundaries (first member: 122

@@ -51,7 +51,35 @@ pub fn rle1_encode(data: &[u8]) -> Vec<u8> {
 /// Any 4 consecutive identical bytes in the encoded stream must be followed
 /// by a count byte; a missing count byte is a corruption error.
 pub fn rle1_decode(data: &[u8]) -> Result<Vec<u8>> {
-    let mut result = Vec::with_capacity(data.len() * 2);
+    rle1_decode_inner(data, None)
+}
+
+/// Decode RLE1-encoded data while enforcing a decoded-output budget.
+///
+/// The budget is checked before every output-vector growth. The bounded path
+/// also uses fallible reservation before `Vec::resize`, so an RLE1 run cannot
+/// materialize bytes beyond the caller's configured output limit first and be
+/// rejected only afterward.
+pub(crate) fn rle1_decode_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    rle1_decode_inner(data, Some(max_output))
+}
+
+/// Shared RLE1 decoder used by the traditional unbounded path and the
+/// resource-limited decoder path.
+fn rle1_decode_inner(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+    let mut result = if let Some(limit) = max_output {
+        // Preserve the existing doubled-input capacity estimate without
+        // intentionally reserving beyond the caller's decoded-output budget.
+        let initial_capacity = data.len().saturating_mul(2).min(limit);
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(initial_capacity)
+            .map_err(|_| OxiArcError::memory_budget_exceeded(limit, initial_capacity))?;
+        result
+    } else {
+        Vec::with_capacity(data.len() * 2)
+    };
+
     let mut i = 0usize;
 
     while i < data.len() {
@@ -60,16 +88,42 @@ pub fn rle1_decode(data: &[u8]) -> Result<Vec<u8>> {
         while run < 4 && i + run < data.len() && data[i + run] == byte {
             run += 1;
         }
-        if run == 4 {
+
+        // Four identical bytes are followed by one count byte describing the
+        // additional copies. Shorter runs are emitted literally. Determine the
+        // decoded growth first so the bounded path can reject it before touching
+        // the output vector.
+        let (decoded_run, encoded_run) = if run == 4 {
             let extra = *data.get(i + 4).ok_or_else(|| {
                 OxiArcError::corrupted(i as u64, "BZip2 RLE run length byte missing")
             })? as usize;
-            result.resize(result.len() + 4 + extra, byte);
-            i += 5;
+            (4 + extra, 5)
         } else {
-            result.resize(result.len() + run, byte);
-            i += run;
+            (run, run)
+        };
+
+        if let Some(limit) = max_output {
+            let requested = result
+                .len()
+                .checked_add(decoded_run)
+                .ok_or_else(|| OxiArcError::memory_budget_exceeded(limit, usize::MAX))?;
+
+            if requested > limit {
+                return Err(OxiArcError::memory_budget_exceeded(limit, requested));
+            }
+
+            // Reserve for exactly this decoded growth after proving the requested
+            // output length fits the caller's budget. `try_reserve_exact` avoids
+            // Vec's deliberate geometric over-allocation strategy on this path.
+            result
+                .try_reserve_exact(decoded_run)
+                .map_err(|_| OxiArcError::memory_budget_exceeded(limit, requested))?;
+
+            result.resize(requested, byte);
+        } else {
+            result.resize(result.len() + decoded_run, byte);
         }
+        i += encoded_run;
     }
 
     Ok(result)
@@ -209,6 +263,33 @@ mod tests {
         let encoded = rle1_encode(data);
         let decoded = rle1_decode(&encoded).expect("rle1 decode roundtrip");
         assert_eq!(decoded, data.as_slice());
+    }
+
+    #[test]
+    fn rle1_decode_with_limit_enforces_output_budget() {
+        // Four identical bytes followed by the count byte 6 represent a ten-byte
+        // decoded run. Keeping this fixture small makes the allocation boundary
+        // explicit without depending on a large compressed stream.
+        let encoded = [b'A', b'A', b'A', b'A', 6];
+
+        // Output exactly equal to the configured budget must remain valid. This
+        // verifies the limit is inclusive and protects against an off-by-one error
+        // that would reject a block which fits the caller's budget exactly.
+        let decoded =
+            rle1_decode_with_limit(&encoded, 10).expect("exact output limit should succeed");
+        assert_eq!(decoded, vec![b'A'; 10]);
+
+        // Reducing the budget by one byte must reject the same RLE1 expansion. The
+        // failure must be MemoryBudgetExceeded so callers can distinguish a resource
+        // policy rejection from malformed or corrupt BZip2 input.
+        let result = rle1_decode_with_limit(&encoded, 9);
+        match result {
+            Err(OxiArcError::MemoryBudgetExceeded { budget, requested }) => {
+                assert_eq!(budget, 9);
+                assert_eq!(requested, 10);
+            }
+            other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+        }
     }
 
     #[test]
