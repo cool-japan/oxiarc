@@ -28,15 +28,15 @@
 //! let mut output = Vec::new();
 //! {
 //!     let mut writer = BitWriter::new(&mut output);
-//!     writer.write_bits(0b101, 3).unwrap();  // Write 3 bits
-//!     writer.write_bits(0b1100, 4).unwrap(); // Write 4 bits
-//!     writer.flush().unwrap();
+//!     writer.write_bits(0b101, 3).expect("write 3 bits");  // Write 3 bits
+//!     writer.write_bits(0b1100, 4).expect("write 4 bits"); // Write 4 bits
+//!     writer.flush().expect("flush writer");
 //! }
 //!
 //! // Reading bits
 //! let mut reader = BitReader::new(Cursor::new(&output));
-//! assert_eq!(reader.read_bits(3).unwrap(), 0b101);
-//! assert_eq!(reader.read_bits(4).unwrap(), 0b1100);
+//! assert_eq!(reader.read_bits(3).expect("read 3 bits"), 0b101);
+//! assert_eq!(reader.read_bits(4).expect("read 4 bits"), 0b1100);
 //! ```
 
 use crate::error::{OxiArcError, Result};

@@ -13,30 +13,48 @@
 //!   of a row rather than its width.
 //!
 //! The state is shared (`&CodecState`) and internally synchronised, because
-//! [`Codec`](super::Codec) is `Send + Sync` and a later parallel-strip feature
-//! must be able to hand the same state to several workers.
+//! [`Codec`](super::Codec) is `Send + Sync` and
+//! [`rayon_support`](crate::rayon_support) hands the same state to every
+//! worker of a parallel strip decode.
 //!
-//! What it does **not** cover: `oxiarc_zstd::decompress_into` and
-//! `oxiarc_lzma::xz::decompress_into` take no context argument, so those two
-//! build their window per chunk; and the JPEG codec allocates on its two rare
-//! paths (deep precision, and a frame whose geometry disagrees with the
-//! chunk's), never on the common one. Each is a slot away from being pooled
-//! here the day the upstream crate offers a reusable decoder.
+//! Five slots live here: the LZW dialect decision, the inflate machine and
+//! its 32 KiB window, the fax changing-element buffers, the
+//! [`ZstdStream`](oxiarc_zstd::ZstdStream) (window ring, literals and
+//! sequence buffers) and the [`XzDecoder`](oxiarc_lzma::xz::XzDecoder) (the
+//! LZMA2 dictionary). Every one of them is what a *fresh* decoder would have
+//! to allocate again for the next strip of the same page.
+//!
+//! Four of the five are *pools* (`compression::pool`) rather than single
+//! slots. A slot would have to hold its lock across the decode itself, which
+//! is correct but turns a parallel decode of a Deflate, CCITT, ZSTD or LZMA
+//! page into a serial one behind the codec's mutex; a pool holds the lock
+//! only while a decoder is taken out and put back, so each worker gets a
+//! decoder of its own and no decoder is ever touched by two threads at once.
+//! A serial decode holds exactly one entry, which is the original single-slot
+//! behaviour.
+//!
+//! What it does **not** cover: the JPEG codec allocates on its two rare paths
+//! (deep precision, and a frame whose geometry disagrees with the chunk's),
+//! never on the common one.
 
 #[cfg(feature = "lzw")]
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Which code-width rule this image's LZW strips follow.
+/// Which LZW dialect this image's strips follow.
 #[cfg(feature = "lzw")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LzwMode {
     /// Not decided yet: the next strip decides.
     #[default]
     Undecided,
-    /// libtiff's rule: the code width grows one code early.
+    /// libtiff's `LZWDecode`: MSB-first, the code width grows one code early.
     Standard,
-    /// TIFF 6.0's own pseudo-code: the code width grows one code late.
+    /// TIFF 6.0's own pseudo-code: MSB-first, the code width grows one code
+    /// late.
     OldStyle,
+    /// libtiff's `LZWDecodeCompat`: pre-1993 writers that packed codes
+    /// **LSB-first** and grew the code width one code late.
+    CompatLsb,
 }
 
 #[cfg(feature = "lzw")]
@@ -46,6 +64,7 @@ impl LzwMode {
         match value {
             1 => Self::Standard,
             2 => Self::OldStyle,
+            3 => Self::CompatLsb,
             _ => Self::Undecided,
         }
     }
@@ -56,6 +75,7 @@ impl LzwMode {
             Self::Undecided => 0,
             Self::Standard => 1,
             Self::OldStyle => 2,
+            Self::CompatLsb => 3,
         }
     }
 }
@@ -85,6 +105,12 @@ pub struct CodecState {
     /// The reusable fax changing-element buffers.
     #[cfg(feature = "ccitt")]
     fax: super::ccitt::FaxScratch,
+    /// The reusable zstd decoder.
+    #[cfg(feature = "zstd")]
+    zstd: super::zstd::ZstdSlot,
+    /// The reusable `.xz` decoder.
+    #[cfg(feature = "lzma")]
+    xz: super::lzma::XzSlot,
 }
 
 impl CodecState {
@@ -94,7 +120,12 @@ impl CodecState {
         Self::default()
     }
 
-    /// `true` once a strip of this image has proved to be old-style LZW.
+    /// `true` once a strip of this image has proved to use TIFF 6.0's
+    /// late code-width change with MSB-first packing.
+    ///
+    /// It stays `false` for libtiff's `LZWDecodeCompat` dialect, which is a
+    /// *different* deviation (LSB-first packing, also with the late change);
+    /// [`CodecState::lzw_is_compat_lsb`] reports that one.
     ///
     /// Always `false` without the `lzw` feature.
     #[must_use]
@@ -102,6 +133,29 @@ impl CodecState {
         #[cfg(feature = "lzw")]
         {
             self.lzw_mode() == LzwMode::OldStyle
+        }
+        #[cfg(not(feature = "lzw"))]
+        {
+            false
+        }
+    }
+
+    /// `true` once a strip of this image has proved to be libtiff's
+    /// `LZWDecodeCompat` dialect: LSB-first packing, late code-width change.
+    ///
+    /// Always `false` without the `lzw` feature.
+    ///
+    /// ```
+    /// use oxiarc_tiff::compression::CodecState;
+    ///
+    /// let state = CodecState::new();
+    /// assert!(!state.lzw_is_compat_lsb());
+    /// ```
+    #[must_use]
+    pub fn lzw_is_compat_lsb(&self) -> bool {
+        #[cfg(feature = "lzw")]
+        {
+            self.lzw_mode() == LzwMode::CompatLsb
         }
         #[cfg(not(feature = "lzw"))]
         {
@@ -132,6 +186,18 @@ impl CodecState {
     pub(crate) fn fax(&self) -> &super::ccitt::FaxScratch {
         &self.fax
     }
+
+    /// The reusable zstd decoder.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn zstd(&self) -> &super::zstd::ZstdSlot {
+        &self.zstd
+    }
+
+    /// The reusable `.xz` decoder.
+    #[cfg(feature = "lzma")]
+    pub(crate) fn xz(&self) -> &super::lzma::XzSlot {
+        &self.xz
+    }
 }
 
 #[cfg(test)]
@@ -153,7 +219,12 @@ mod tests {
     #[cfg(feature = "lzw")]
     #[test]
     fn the_wire_encoding_round_trips() {
-        for mode in [LzwMode::Undecided, LzwMode::Standard, LzwMode::OldStyle] {
+        for mode in [
+            LzwMode::Undecided,
+            LzwMode::Standard,
+            LzwMode::OldStyle,
+            LzwMode::CompatLsb,
+        ] {
             assert_eq!(LzwMode::from_u8(mode.to_u8()), mode);
         }
         assert_eq!(LzwMode::from_u8(200), LzwMode::Undecided);

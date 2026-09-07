@@ -19,7 +19,9 @@
 //! `LzwEncoder` shares the same table type, so it is exercised the same
 //! way.
 
-use oxiarc_lzw::{LzwConfig, LzwDecoder, LzwEncoder, compress_tiff, decompress_tiff_into};
+use oxiarc_lzw::{
+    LzwBitOrder, LzwConfig, LzwDecoder, LzwEncoder, compress_tiff, decompress_tiff_into,
+};
 
 /// Deterministic strip shapes that between them drive every decode path:
 /// long runs (the copy-back fast path), a growing KwKwK run (the
@@ -226,37 +228,105 @@ fn reuse_holds_for_the_old_style_configuration_too() {
 }
 
 #[test]
-fn the_gif_config_is_the_old_style_config_and_stays_msb_first() {
-    // `LzwConfig` has no bit-order field, so `LzwConfig::GIF` and
-    // `LzwConfig::TIFF_OLD_STYLE` are literally the same value. Passing
-    // either to `decompress_into` reads MSB-first codes; GIF's LSB-first
-    // packing is only reachable through `gif_decompress`. This is pinned
-    // because the two constants reading identically is what the
-    // `decompress_into` rustdoc warns about, and a future bit-order field
-    // must update that warning rather than silently change the meaning of
-    // an existing call.
-    assert_eq!(LzwConfig::GIF, LzwConfig::TIFF_OLD_STYLE);
+fn the_gif_config_is_lsb_first_and_no_longer_equals_the_old_style_config() {
+    // 0.4.2 closes a documented footgun: before it, `LzwConfig` had no
+    // bit-order field, so `LzwConfig::GIF` and `LzwConfig::TIFF_OLD_STYLE`
+    // were literally the same value and `decompress_into(_, _, GIF)`
+    // silently decoded MSB-first. `bit_order` is what separates them, and
+    // this test pins the new meaning of both constants.
+    assert_ne!(LzwConfig::GIF, LzwConfig::TIFF_OLD_STYLE);
+    assert_eq!(LzwConfig::GIF.bit_order, LzwBitOrder::Lsb);
+    assert_eq!(LzwConfig::TIFF_OLD_STYLE.bit_order, LzwBitOrder::Msb);
 
-    let payload = b"gif-shaped payload, decoded MSB-first anyway".repeat(9);
-    let mut encoder = LzwEncoder::new(LzwConfig::TIFF_OLD_STYLE).expect("encoder");
-    let stream = encoder.encode(&payload).expect("encode");
+    let payload = b"gif-shaped payload, now really decoded LSB-first".repeat(9);
+
+    // The same payload encoded under each configuration packs to different
+    // bytes, and each stream decodes only under its own bit order.
+    let mut msb_encoder = LzwEncoder::new(LzwConfig::TIFF_OLD_STYLE).expect("msb encoder");
+    let msb_stream = msb_encoder.encode(&payload).expect("msb encode");
+    let mut lsb_encoder = LzwEncoder::new(LzwConfig::GIF).expect("lsb encoder");
+    let lsb_stream = lsb_encoder.encode(&payload).expect("lsb encode");
+    assert_ne!(
+        msb_stream, lsb_stream,
+        "the two bit orders must not produce the same bytes"
+    );
+    assert_eq!(
+        msb_stream.len(),
+        lsb_stream.len(),
+        "same codes, same code widths: only the packing differs"
+    );
 
     let mut via_gif = vec![0u8; payload.len()];
-    let mut via_old = vec![0u8; payload.len()];
-    let gif_written =
-        oxiarc_lzw::decompress_into(&stream, &mut via_gif, LzwConfig::GIF).expect("gif config");
-    let old_written = oxiarc_lzw::decompress_into(&stream, &mut via_old, LzwConfig::TIFF_OLD_STYLE)
-        .expect("old-style config");
-    assert_eq!(gif_written, old_written);
-    assert_eq!(via_gif, via_old);
-    assert_eq!(&via_gif[..gif_written], &payload[..]);
+    let written = oxiarc_lzw::decompress_into(&lsb_stream, &mut via_gif, LzwConfig::GIF)
+        .expect("LSB stream under the GIF (LSB) config");
+    assert_eq!(&via_gif[..written], &payload[..]);
 
-    // The real GIF path is a different bit order and a different entry
-    // point, and does not decode this MSB-first stream to the same bytes.
+    let mut via_old = vec![0u8; payload.len()];
+    let written = oxiarc_lzw::decompress_into(&msb_stream, &mut via_old, LzwConfig::TIFF_OLD_STYLE)
+        .expect("MSB stream under the old-style (MSB) config");
+    assert_eq!(&via_old[..written], &payload[..]);
+
+    // Cross-decoding is now wrong rather than silently identical: reading an
+    // MSB-packed stream as LSB (or vice versa) either errors or produces
+    // different bytes. It must never quietly return the same payload.
+    let mut scratch = vec![0u8; payload.len()];
+    if let Ok(n) = oxiarc_lzw::decompress_into(&msb_stream, &mut scratch, LzwConfig::GIF) {
+        assert_ne!(
+            &scratch[..n],
+            &payload[..n.min(payload.len())],
+            "MSB bytes must not decode correctly under the LSB config"
+        );
+    }
+    let mut scratch = vec![0u8; payload.len()];
+    if let Ok(n) = oxiarc_lzw::decompress_into(&lsb_stream, &mut scratch, LzwConfig::TIFF_OLD_STYLE)
+    {
+        assert_ne!(
+            &scratch[..n],
+            &payload[..n.min(payload.len())],
+            "LSB bytes must not decode correctly under the MSB config"
+        );
+    }
+
+    // `LzwConfig::GIF` still is not the GIF 89a codec. For inputs that
+    // never fill the 4096-entry table the two encoders now coincide byte
+    // for byte (same clear code, same EOI, same late width rule, same LSB
+    // packing) ...
     let gif_stream = oxiarc_lzw::gif_compress(&payload, 8).expect("gif compress");
     assert_eq!(
         oxiarc_lzw::gif_decompress(&gif_stream, 8).expect("gif decompress"),
         payload
     );
-    assert_ne!(gif_stream, stream, "the two packings must not coincide");
+    assert_eq!(
+        gif_stream, lsb_stream,
+        "below the table-full point the two LSB encoders agree"
+    );
+
+    // ... but they diverge once the table fills, because `gif_compress`
+    // emits its ClearCode at the next entry it cannot store while the
+    // generic engine emits it as soon as the last slot is taken. Pinned so
+    // that nobody "simplifies" one into the other.
+    let mut state: u32 = 0x1234_5678;
+    let entropy: Vec<u8> = (0..65536)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state % 256) as u8
+        })
+        .collect();
+    let generic_big = oxiarc_lzw::compress(&entropy, LzwConfig::GIF).expect("generic big");
+    let gif_big = oxiarc_lzw::gif_compress(&entropy, 8).expect("gif big");
+    assert_ne!(
+        generic_big, gif_big,
+        "the two encoders must differ once the code table fills"
+    );
+    assert_eq!(
+        oxiarc_lzw::decompress(&generic_big, entropy.len(), LzwConfig::GIF)
+            .expect("generic big rt"),
+        entropy
+    );
+    assert_eq!(
+        oxiarc_lzw::gif_decompress(&gif_big, 8).expect("gif big rt"),
+        entropy
+    );
 }

@@ -1,7 +1,9 @@
 //! LZW encoder (compression).
 
+use crate::bits::LzwCodeWriter;
+use crate::bitstream_lsb::LsbBitWriter;
 use crate::bitstream_msb::MsbBitWriter;
-use crate::config::LzwConfig;
+use crate::config::{LzwBitOrder, LzwConfig};
 use crate::dictionary::{LzwCodeIndex, LzwDictionary};
 use crate::error::Result;
 
@@ -67,20 +69,27 @@ impl LzwEncoder {
         self.dict.reset();
         self.index.clear();
 
-        let mut writer = MsbBitWriter::new();
+        match self.dict.config().bit_order {
+            LzwBitOrder::Msb => self.encode_with(input, MsbBitWriter::new()),
+            LzwBitOrder::Lsb => self.encode_with(input, LsbBitWriter::new()),
+        }
+    }
+
+    /// The encode loop, generic over the bit order's code writer.
+    fn encode_with<W: LzwCodeWriter>(&mut self, input: &[u8], mut writer: W) -> Result<Vec<u8>> {
         let use_clear_code = self.dict.config().use_clear_code;
         let clear_code = self.dict.clear_code();
         let reset_trigger = self.reset_trigger();
 
         // TIFF 6.0: every LZW strip must begin with a ClearCode.
         if use_clear_code {
-            writer.write_bits(clear_code, self.dict.current_bits())?;
+            writer.write_code(clear_code, self.dict.current_bits())?;
         }
 
         let Some((&first, rest)) = input.split_first() else {
             // Empty input - just write EOI
-            writer.write_bits(self.dict.eoi_code(), self.dict.current_bits())?;
-            return writer.into_vec();
+            writer.write_code(self.dict.eoi_code(), self.dict.current_bits())?;
+            return writer.finish();
         };
 
         // Code of the string matched so far. Every byte is a root code, so
@@ -96,7 +105,7 @@ impl LzwEncoder {
 
             // The extended string is new: emit the match we had, learn the
             // extension, and restart the match at `byte`.
-            writer.write_bits(current, self.dict.current_bits())?;
+            writer.write_code(current, self.dict.current_bits())?;
 
             if !self.dict.is_full() {
                 let code = self.dict.add_entry_encode(current, byte)?;
@@ -107,7 +116,7 @@ impl LzwEncoder {
             if use_clear_code && self.dict.next_code() >= reset_trigger {
                 // Emit a ClearCode at the current width, then reset the
                 // table and drop back to the minimum code width.
-                writer.write_bits(clear_code, self.dict.current_bits())?;
+                writer.write_code(clear_code, self.dict.current_bits())?;
                 self.dict.reset();
                 self.index.clear();
             }
@@ -116,7 +125,7 @@ impl LzwEncoder {
         }
 
         // Output code for the final match.
-        writer.write_bits(current, self.dict.current_bits())?;
+        writer.write_code(current, self.dict.current_bits())?;
 
         // The decoder creates one more table entry while processing that
         // final code; mirror it (libtiff `LZWPostEncode` does the same) so
@@ -126,16 +135,16 @@ impl LzwEncoder {
         // ClearCode before EOI — mirror that too.
         self.dict.note_final_code();
         if use_clear_code && self.dict.next_code() >= reset_trigger {
-            writer.write_bits(clear_code, self.dict.current_bits())?;
+            writer.write_code(clear_code, self.dict.current_bits())?;
             self.dict.reset();
             self.index.clear();
         }
 
         // Write EOI code
-        writer.write_bits(self.dict.eoi_code(), self.dict.current_bits())?;
+        writer.write_code(self.dict.eoi_code(), self.dict.current_bits())?;
 
         // Flush remaining bits
-        writer.into_vec()
+        writer.finish()
     }
 
     /// The `next_code` value at which the encoder emits a ClearCode and
@@ -146,12 +155,17 @@ impl LzwEncoder {
     /// - Standard change: only once the table is completely full
     ///   (`max_code + 1`), preserving the previous GIF-style behaviour of
     ///   this generic encoder (the real GIF path lives in `gif_lzw`).
-    fn reset_trigger(&self) -> u16 {
+    fn reset_trigger(&self) -> u32 {
         let config = self.dict.config();
+        let max_code = u32::from(config.max_code());
         if config.early_change {
-            config.max_code().saturating_sub(1)
+            max_code.saturating_sub(1)
         } else {
-            config.max_code().saturating_add(1)
+            // One past the last usable code: reset only when the table is
+            // completely full. `max_code` is 65535 for a 16-bit config, so
+            // this must be computed in `u32` — a `u16` `saturating_add`
+            // would clamp to 65535 and fire one entry early.
+            max_code + 1
         }
     }
 

@@ -270,7 +270,7 @@ impl XzWriter {
                 writer.write_all(&crc.to_le_bytes())?;
             }
             CheckType::Sha256 => {
-                let digest = super::sha256::Sha256::compute(data);
+                let digest = oxiarc_core::sha256::Sha256::compute(data);
                 writer.write_all(&digest)?;
             }
         }

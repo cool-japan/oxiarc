@@ -1,4 +1,4 @@
-# oxiarc-cli - Development Status (v0.4.2, 2026-08-06)
+# oxiarc-cli - Development Status (v0.4.2, 2026-09-08)
 
 ## Completed Features (COMPLETE)
 
@@ -24,6 +24,18 @@
 - [x] `detect` - Detect archive format
   - [x] Magic byte display
   - [x] Format classification
+  - [x] PNG/JPEG/TIFF image recognition (Phase 8 wave 3, 2026-09-07): a
+        CLI-layer magic-byte fallback (`src/image_probe.rs`) consulted only
+        when `ArchiveFormat::detect_with_path` reports `Unknown` — never a
+        new `ArchiveFormat` variant (see `repo-conventions.md` §13's cost
+        table). Prints dimensions, colour type/bit depth and compression.
+  - [x] `info`'s image path additionally prints a chunk/segment/IFD summary
+        (PNG chunks via a hand-rolled container walk; JPEG marker segments
+        up to `SOS`; TIFF via `Decoder::all_tags()`).
+  - [x] `list`/`extract`/`test`/`convert`/`add` refuse a recognised image
+        with an enriched "this looks like a PNG/JPEG/TIFF image, not an
+        archive" error (`utils::image_format_hint`) instead of a bare
+        "unrecognized format" message.
 
 ### Infrastructure (332 lines)
 - [x] clap-based argument parsing
@@ -164,60 +176,108 @@
 
 ## Test Coverage
 
-- 73 tests passing (13 integration-test files under `tests/` — including
-  three new in 0.3.6: `cli_flags`, `cli_convert`, `cli_completion` — plus
+- 121 tests passing (16 integration-test files under `tests/` — including
+  `cli_image_detect` new in 0.4.2 (Phase 8: `detect`/`info` PNG/JPEG/TIFF
+  recognition, plus every other subcommand's image-aware refusal) — plus
   library unit tests in `main.rs`/`utils.rs`/`windows.rs`/`style.rs`/
-  `commands/extract.rs`/`commands/man.rs`)
-  (`cargo nextest run -p oxiarc-cli --all-features`)
+  `image_probe.rs`/`commands/extract.rs`/`commands/man.rs`)
+  (`cargo nextest run -p oxiarc-cli --all-features`, measured 2026-09-08)
 
 ## Code Statistics
 
 | File | Lines (code) |
 |------|---------------|
-| commands/extract.rs | 1,356 |
+| commands/extract.rs | 1,413 |
 | commands/create.rs | 571 |
-| main.rs | 375 |
-| utils.rs | 357 |
-| commands/test.rs | 333 |
-| commands/list.rs | 328 |
-| commands/add.rs | 424 |
-| commands/convert.rs | 418 |
+| utils.rs | 453 |
+| commands/add.rs | 434 |
+| image_probe.rs | 427 |
+| commands/convert.rs | 419 |
+| main.rs | 377 |
+| commands/list.rs | 350 |
+| commands/test.rs | 334 |
 | windows.rs | 231 |
+| commands/info.rs | 203 |
 | style.rs | 152 |
-| commands/info.rs | 145 |
+| commands/detect.rs | 67 |
 | commands/man.rs | 56 |
 | commands/mod.rs | 27 |
-| commands/detect.rs | 25 |
-| **Total** | **4,798** |
+| **Total** | **5,514** |
 
-(measured via `tokei oxiarc-cli/src`, code lines only — excludes comments/blanks)
+(measured via `tokei oxiarc-cli/src`, code lines only — excludes comments/blanks;
+new in 0.4.2: `image_probe.rs`, the PNG/JPEG/TIFF magic-sniffing/summary module
+behind `detect`/`info`'s CLI-layer image fallback, Phase 8 Wave 3)
 
 ## Command Reference
 
+Verbatim `oxiarc --help` output (regenerated 2026-09-08 from the built
+binary; `completion` is `#[command(hide = true)]` and correctly does not
+appear here).
+
 ```
-oxiarc 0.4.2
 OxiArc is a Pure Rust implementation of common archive formats.
+Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2, Brotli, Snappy
+
+Examples:
+  oxiarc list archive.zip
+  oxiarc list archive.7z
+  oxiarc list --json --tree archive.zip
+  oxiarc extract archive.zip
+  oxiarc extract archive.7z
+  oxiarc extract data.xz
+  oxiarc extract data.lz4
+  oxiarc extract data.zst
+  oxiarc extract data.bz2
+  oxiarc extract data.br
+  oxiarc extract data.sz
+  oxiarc extract --password secret --lenient archive.zip
+  oxiarc extract --memory-limit 512M archive.zip
+  oxiarc create archive.zip file1.txt file2.txt
+  oxiarc create data.xz file.txt
+  oxiarc create data.lz4 file.txt
+  oxiarc create data.bz2 file.txt
+  oxiarc create data.br file.txt
+  oxiarc create data.sz file.txt
+  oxiarc add archive.zip newfile.txt
+  oxiarc add archive.tar dir/
+  oxiarc convert archive.lzh output.zip
+  oxiarc convert archive.7z output.zip
+  oxiarc test archive.lzh
+  oxiarc info archive.7z
+  oxiarc detect photo.jpg
+  oxiarc info image.png
+  oxiarc man ./man
+
 
 Usage: oxiarc [OPTIONS] <COMMAND>
 
 Commands:
-  list        List contents of an archive
-  extract     Extract files from an archive
-  test        Test archive integrity
-  create      Create a new archive
-  add         Add files to an existing archive (ZIP, TAR, LZH)
-  info        Show information about an archive
-  detect      Detect archive format
-  convert     Convert archive to another format
-  man         Generate man pages for all subcommands
-  completion  Generate shell completion scripts (hidden from top-level help)
-  help        Print this message or the help of the given subcommand(s)
+  list     List contents of an archive
+  extract  Extract files from an archive
+  test     Test archive integrity
+  create   Create a new archive
+  add      Add files to an existing archive (ZIP, TAR, LZH)
+  info     Show information about an archive, or a PNG/JPEG/TIFF image
+  detect   Detect archive format, or a PNG/JPEG/TIFF image
+  convert  Convert archive to another format
+  man      Generate man pages for all subcommands
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
-      --color <COLOR>  Control color output [default: auto] [possible values: auto, always, never]
-  -q, --quiet           Suppress non-error output
-  -h, --help            Print help
-  -V, --version         Print version
+      --color <COLOR>
+          Control color output
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+  -q, --quiet
+          Suppress non-error output
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ## Known Limitations

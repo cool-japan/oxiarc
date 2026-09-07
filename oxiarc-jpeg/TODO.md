@@ -2,7 +2,10 @@
 
 Program context: root `TODO.md`, "Phase 8", items **W1-F1** (decoder),
 **W1-F2** (encoder) and **W1-F3** (arithmetic coding, OJPEG, `rayon`, fuzz
-seeds, benches). All three have landed in this crate.
+seeds, benches). All three have landed in this crate. Reduced-/enlarged-scale
+decode and the `zune_jpeg`/`jpeg-decoder` compat facades (design report
+§7.4/§8, tracked as **JPEGSCALE**, not a numbered Phase 8 wave item) have
+landed as follow-on work in the same cycle — see below.
 
 ## Completed (W1-F1, decoder)
 
@@ -215,6 +218,219 @@ seeds, benches). All three have landed in this crate.
       neighbouring 0 and 65535 samples ran the magnitude chain off the end of
       its statistics area).
 
+## Completed (JPEGSCALE: reduced-/enlarged-scale decode, compat facades)
+
+- [x] **`DecodeOptions::scale: Scale`** — libjpeg's `-scale M/N` with `N`
+      fixed at 8; `Scale::new(M)` for `M` in `1..=16`, plus `FULL`/
+      `ONE_HALF`/`ONE_QUARTER`/`ONE_EIGHTH` constants. Ignored for lossless
+      frames (`SOF3`/`SOF11`), matching libjpeg's own hardwired "no scaling"
+      there. `ImageInfo::scaled_width`/`scaled_height` (`ceil(dim * M / 8)`,
+      libjpeg's own formula) drive `Decoder::output_buffer_size` and every
+      decode entry point; `width`/`height` keep their pre-existing
+      SOF/DNL-resolved, unscaled meaning.
+- [x] **`idct/scaled.rs`**: `idct_1x1_into`/`idct_2x2_into`/`idct_4x4_into`,
+      bit-identical ports of libjpeg-turbo's `jidctred.c`
+      (`jpeg_idct_1x1`/`_2x2`/`_4x4`), sharing `idct/islow.rs`'s
+      `coefficient()` narrowing and `descale()`. `idct_general_into`: this
+      crate's own kernel for the twelve `M` values libjpeg gives a dedicated
+      hand-derived fixed-point routine and this crate does not (`{3, 5, 6, 7,
+      9..=16}`) — a direct `f64` evaluation of T.81 A.3.3's cosine basis at
+      `n` output positions per axis, truncating to the lowest `n` frequencies
+      for `n < 8` (matching `jidctint.c`'s own separate `n < 8` family, *not*
+      `jidctred.c`'s full-spectrum-with-cancellation approach — the two
+      disagree on an AC-heavy block at `n` in `{1, 2, 4}` by construction,
+      pinned by a test so the difference cannot be "fixed" away by accident).
+      `idct_scaled_into` dispatches on output size: `8` → the untouched,
+      unaffected `idct_islow_into`; `1`/`2`/`4` → the ported kernels;
+      otherwise → the general kernel.
+- [x] Per-component **`_DCT_scaled_size` bump** (`decoder/planes.rs`
+      `component_output_size`, `component_downsampled_dim`, ported from
+      `jdmaster.c::jpeg_calc_output_dimensions`): a subsampled component's own
+      output block size grows past the requested `M` when doing so brings it
+      to the frame's full resolution, letting the upsampler skip a real
+      resample. `OutputPlan::new`'s fancy-upsampling gate
+      (`do_fancy = fancy_upsampling && planes.min_output_size() > 1`) and
+      per-component `h_in_group`/`v_in_group` ratio are `jdsample.c`'s exact
+      rules, empirically confirmed against `djpeg -scale M/8` vs
+      `-scale M/8 -nosmooth` before any kernel was written.
+- [x] **Byte parity for `M` in `{1, 2, 4, 8}`**: `tests/scale_oracle.rs`
+      (feature `jpeg-oracle`, self-skipping, records `cjpeg -version`) checks
+      `djpeg -dct int -scale M/8` against baseline **and** progressive
+      frames, 4:4:4 / 4:2:0 / 4:2:2 sampling and both 8x8-aligned and odd
+      (37x29, 18x11) dimensions. Verified green on this machine
+      (libjpeg-turbo 3.1.4.1) with every comparison counted
+      (`require_comparisons`, the vacuity guard the F1 review pass added).
+- [x] **Tolerance check for the other twelve `M` values**, same file: measured
+      over 216 encoder/scale/sampling configurations and 2 141 046 samples,
+      **peak error 3, MSE 0.0531** against `djpeg`. (Before the general
+      kernel's `jidctint.c`-style truncation was found to be the right
+      convention for `n < 8`, the same matrix measured peak error 134, MSE
+      55.5 — recorded so nobody re-derives that mistake.)
+- [x] Self-consistency tests in `idct/scaled.rs` (no external tool needed):
+      `idct_general_into` at `n = 8` agrees with `idct_islow_into` within
+      ±1 LSB; a DC-only block reconstructs to the flat level
+      `dc_dequantised / 8` for every `n` in `1..=16` (pins the general
+      kernel's normalisation, independent of `n`, exactly); the ported and
+      general kernels are pinned to agree on a DC-only block at `n` in
+      `{1, 2, 4}` and pinned to *not* necessarily agree on an AC-heavy one
+      (so the algorithmic difference cannot regress silently in either
+      direction); every kernel clamps rather than panics at the most extreme
+      coefficient/quantiser the narrowing admits, at every `n` in `1..=16`.
+- [x] `tests/scale_api.rs`: `ceil(w * M / 8)` for odd dimensions (down to
+      1x1) at every `M` in `1..=16`, cross-checked against an
+      independently-written `expected_dim` rather than the crate's own
+      private `scaled_dim` helper; `output_buffer_size`/
+      `decode_into_strided` agreement, including that a stride wider than
+      the row leaves the inter-row padding untouched; `Scale::FULL` byte-
+      identical to no scale option at all (the regression guard for "the
+      whole geometry change is a no-op at the default scale"); `scale` is a
+      no-op on a lossless frame; every `M` in `1..=16` decodes without
+      panicking on both processes and all three common sampling ratios.
+- [x] Adversarial coverage: `corrupt_no_panic.rs` gained `probe_scaled` and
+      two sweeps (truncation at every offset, and dense single-byte
+      corruption) that decode at `M` in `{1, 2, 3, 8}` or the full `1..=16`
+      range rather than only at native resolution; `adversarial.rs`'s
+      byte-insertion/deletion fuzzer now also decodes each mutated buffer at
+      one of `{1, 2, 5, 8}` per iteration (an exact-kernel, a
+      component-bump, a general-kernel and the unscaled case).
+- [x] **`compat::zune`** (new; `compat.rs` split into `compat/{mod,zune,
+      jpeg_decoder}.rs` to stay well under the line-count target):
+      `JpegDecoder::new(bytes: &[u8])`, `new_with_options`, `decode`,
+      `decode_headers`, `info`, `dimensions`, `output_buffer_size`,
+      `input_colorspace`, `output_colorspace`, `set_options`, `icc_profile`,
+      `exif` — read directly from real zune-jpeg 0.5.15's source
+      (`~/.cargo/registry/src/*/zune-jpeg-0.5.15`), not from memory.
+      Output-colourspace enum: `Rgb`/`Rgba`/`Luma`/`YCbCr`. `Rgba` synthesises
+      an opaque alpha byte (this crate's `ColorSpace` has no native alpha);
+      `YCbCr` maps to `DecodeOptions::raw()`; a single-component source
+      expands to whatever multi-channel space was requested rather than
+      erroring, matching `zune_jpeg`'s own behaviour; a colour-space request
+      this crate's pipeline cannot satisfy (e.g. `Rgb` from a CMYK source) is
+      a named `Unsupported(ColorTransform(_))` error.
+- [x] **`compat::jpeg_decoder`**: `Decoder::new(reader: R)`, `read_info`,
+      `info`, `decode`, `icc_profile`, `exif_data`, with `ImageInfo {width,
+      height, pixel_format, coding_process}` and `PixelFormat::{L8, L16,
+      Rgb24, Cmyk32}` / `CodingProcess::{DctSequential, DctProgressive,
+      Lossless}` matching real jpeg-decoder 0.3.2's shapes exactly (read
+      from `~/.cargo/registry/src/*/jpeg-decoder-0.3.2`). One deliberate
+      signature change: real `jpeg_decoder::Decoder::info()` is infallible
+      and panics for a component count outside `{1, 3, 4}`; this crate's
+      no-panic policy means `Decoder::info` returns
+      `Result<Option<ImageInfo>, JpegError>` instead, reporting
+      `Unsupported(ComponentCount(_))` where the real crate would abort.
+- [x] Both facades are feature-free (always compiled) and every method named
+      in the task's list is exercised by at least one test, not merely
+      constructed and decoded once.
+- [x] `benches/decode_bench.rs` gained a `scaled_decode` group: `M` in
+      `{1, 2, 4, 8}` over 4:2:0 and 4:4:4 512x512 sources, with a
+      `reference/…` row timing `djpeg -dct int -scale M/8` on the same
+      encoded file (mirrors `encode_bench.rs`'s `reference/…` convention for
+      `cjpeg`). No perf table is published in the README this cycle: the
+      session's machine measured a system load average above 80 from
+      unrelated concurrent builds, and two runs of the same case disagreed by
+      more than an order of magnitude — noise, not signal. See the README's
+      "Reduced- and enlarged-scale decode" performance note.
+
+## Completed (JPEGSCALE-verify: adversarial verification pass)
+
+An independent verification pass over the JPEGSCALE work above found and
+fixed three real defects; each has a regression test that was confirmed to
+fail on the pre-fix code.
+
+- [x] **`rayon` band merge ignored the scaled block size (correctness, all
+      component counts, both entropy coders).** `decoder/parallel.rs`'s
+      `plan_bands` placed each band's rows at `mcu_row * Vi * 8` instead of
+      `mcu_row * Vi * _DCT_scaled_size`, so with the `rayon` feature on,
+      every band but the first landed in the wrong plane rows at every
+      `Scale` except `Scale::FULL`. Measured before the fix on a 256x256
+      4:2:0 frame with `RestartInterval::Mcus(16)`: **2686 of 3072 output
+      bytes wrong at `M = 1`**, 10736/12288 at `M = 2`, 42947/49152 at
+      `M = 4`, 0/196608 at `M = 8` — the same magnitude for grayscale, CMYK
+      and arithmetic coding, and 0 everywhere in a `--no-default-features`
+      build, which isolated it to the parallel path. This also made
+      `lib.rs`'s feature-table claim that the `rayon` output "is
+      byte-identical with and without it" false; it is true again.
+      `plan_bands` now reads the destination `Planes`' own `output_sizes()`
+      rather than recomputing from `Scale`, so the two cannot disagree.
+      Why every existing gate missed it: `tests/scale_oracle.rs`'s fixtures
+      are 64x64 or smaller and carry no `DRI`, so the band planner declined
+      all of them, and `parallel.rs`'s own differential suite ran only at
+      `Scale::FULL`, where the wrong multiplier is also `8`. Regression
+      tests: `parallel.rs`'s
+      `bands_land_on_the_right_plane_rows_at_every_scale` (serial vs
+      parallel planes, `M` in `1..=16` x 3 ratios x both coders, asserting
+      all 16 scales really split), `scale_api.rs`'s
+      `restart_markers_do_not_change_a_scaled_decode` (hermetic, always
+      runs), `scale_oracle.rs`'s
+      `restart_marker_streams_are_byte_identical_to_djpeg_at_every_exact_scale`
+      (320x256 `cjpeg -restart` fixtures, colour and grayscale), and the
+      pre-existing `a_truncated_scan_reports_the_same_thing_either_way`
+      extended to three reduced scales.
+- [x] **`compat::jpeg_decoder` reported a pixel format its own `decode()`
+      did not produce.** `PixelFormat`'s only wide variant is `L16`, which is
+      single-component, but `info()` answered `Rgb24` for a twelve-bit
+      *colour* frame while `decode()` returned big-endian `u16` samples —
+      measured on a 9x7 twelve-bit RGB frame, `decode()` gave 378 bytes where
+      `info()` implied 189, so a caller sizing a buffer the way the module's
+      own example does read half the image. Both now report
+      `Unsupported(SamplePrecision(_))` in step with each other; the frame is
+      still decodable through `Decoder::inner_mut` +
+      `oxiarc_jpeg::Decoder::decode_u16`, and twelve-bit *grayscale* still
+      resolves to `L16` and matches `pixel_bytes()`. `inner_mut`'s rustdoc
+      also claimed it reached scale/limits/raw-components settings, which it
+      cannot (those are fixed at construction) — corrected to name the entry
+      points it does reach.
+- [x] **`compat::zune`'s three accessors disagreed with each other.**
+      `output_buffer_size()` computed its width from the requested
+      `ColorSpace`'s nominal component count, but `ColorSpace::YCbCr` is a
+      raw passthrough of *the source's* components: measured on a 9x7
+      fixture, it reported 189 bytes where a grayscale decode produced 63,
+      and 189 where a CMYK decode produced **252** — i.e. it told a caller to
+      allocate less than `decode()` returns, the one thing that method
+      exists to prevent. It now reports exactly what `decode()` produces, and
+      a new test pins `output_buffer_size() == decode()?.len()` over
+      grayscale/RGB/CMYK sources x all four requests. Separately,
+      `output_colorspace()` answered `Luma` for any one-component source
+      "mirroring `zune_jpeg`" — it does not: real zune-jpeg 0.5.15 returns
+      `self.options.jpeg_get_out_colorspace()` unmodified (the
+      `jpeg_set_out_colorspace(Luma)` line in its `headers.rs` is commented
+      out) and its `worker.rs` carries `(Luma, RGB)`/`(Luma, RGBA)` expansion
+      arms, exactly like this facade's own `decode()`, which was returning
+      three bytes per pixel while the accessor said `Luma`. Corrected, with
+      the existing test strengthened to assert the accessor and `decode()`'s
+      real length together.
+- [x] **`idct_general_into` rebuilt its cosine basis for every 8x8 block**
+      (performance): `8 * M` `f64::cos` evaluations plus a 1 KiB zeroed stack
+      array per block — 24 per block at `M = 3`, 128 at `M = 16`, i.e. about
+      147 000 transcendental calls for one 512x512 4:2:0 frame at `M = 3`,
+      orders of magnitude more work than the transform they feed. Hoisted
+      into a process-wide `OnceLock` table (17 x 8 x 16 `f64`, ~17 KiB).
+      Bit-identical by construction and confirmed as such: the `djpeg`
+      tolerance oracle reproduces **peak error 3, MSE 0.0531 over 2 141 046
+      samples** exactly, unchanged, and a new unit test asserts the table
+      equals `cosine_basis(n)` with `assert_eq!` on `f64` (bit equality, not
+      an epsilon) for every `n` in `1..=16`. No timing figure is published,
+      for the machine-contention reason recorded above.
+- [x] **Twelve-bit scaled decode was never checked against `djpeg`.** The
+      ported `jidctred.c` kernels take `PASS1_BITS = 1` above eight-bit
+      samples, changing five shift amounts, and every fixture in
+      `tests/scale_oracle.rs` was eight-bit — a wrong branch there would have
+      produced a systematically wrong twelve-bit image with the whole suite
+      green. `twelve_bit_scale_1_2_4_8_is_byte_identical_to_djpeg` closes it
+      (grayscale, 4:2:0 colour and 4:4:4 progressive, `M` in `{1, 2, 4, 8}`,
+      asserting `djpeg` really emitted `maxval 4095` so it cannot degrade to
+      an eight-bit comparison). It passes as written — the kernels were
+      already correct — and was confirmed non-vacuous by forcing
+      `pass1_bits = 2`, which fails it immediately
+      (`gray_12bit scale 2/8: sample 9 differs (ours 271, djpeg 272)`).
+- [x] Coverage the verification pass added on top: `raw_components` decodes
+      follow the scaled geometry at every `M` (the `Mode::Passthrough` arm of
+      `OutputPlan`, which the colour-transform tests never reach);
+      `decode_into_u16_strided` is bounded by the scaled geometry, leaves
+      inter-row padding untouched and refuses a buffer one sample short; and
+      `decode_abbreviated_into` (the TIFF `JPEGTables` entry point) threads
+      `scale` through and reports it back.
+
 ## Not in W1-F1 / W1-F2 / W1-F3 (owned by other items)
 
 - [ ] Parallelise the output stage (upsampling and colour conversion). They
@@ -235,8 +451,6 @@ seeds, benches). All three have landed in this crate.
 - Hierarchical JPEG (`SOF5`/`6`/`7`/`13`/`14`/`15`). No reference encoder
   produces it, so there is nothing to test against; it returns a named
   `Unsupported` error.
-- Reduced-scale decode (`scale_denom`, `djpeg -scale M/N`). Not named in the
-  W1-F1 contract; the scaled IDCT variants are follow-on work.
 - EXIF interpretation, ICC application, orientation, resizing. This crate
   decodes JPEG and hands metadata back verbatim.
 

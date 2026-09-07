@@ -233,6 +233,10 @@ pub struct ImageSpec {
     pub resolution: Option<(Rational, Rational, ResolutionUnit)>,
     /// `YCbCrSubSampling`.
     pub ycbcr_subsampling: Option<(u16, u16)>,
+    /// How often a JPEG chunk writes a restart marker, in MCU rows.
+    ///
+    /// `0`, the default, writes none, which is what libtiff writes.
+    pub jpeg_restart_rows: u16,
     /// Arbitrary extra tags: GeoTIFF, ICC, XMP, `DocumentName`, ...
     pub extra_tags: Vec<(u16, Value)>,
 }
@@ -241,7 +245,13 @@ impl ImageSpec {
     /// A page of `width` x `height` pixels in the given colour layout.
     ///
     /// The strip height defaults to roughly 8 KiB of pixel data, which is what
-    /// libtiff picks.
+    /// libtiff picks. Every channel's `SampleFormat` defaults to
+    /// [`SampleFormat::Uint`], because [`ColorType`] names a bit depth and a
+    /// colour model but not a numeric format -- a page of signed or
+    /// floating-point samples **must** call
+    /// [`with_sample_format`](Self::with_sample_format), or it will be
+    /// written with the right bytes under the wrong label and read back as
+    /// unsigned integers everywhere, with no error reported.
     #[must_use]
     pub fn new(width: u32, height: u32, color: ColorType) -> Self {
         let spp = color.samples_per_pixel();
@@ -267,6 +277,7 @@ impl ImageSpec {
             // because that is the TIFF 6.0 default. Full-resolution chroma
             // therefore has to say so explicitly.
             ycbcr_subsampling: matches!(color, ColorType::YCbCr(_)).then_some((1, 1)),
+            jpeg_restart_rows: 0,
             extra_tags: Vec::new(),
         }
     }
@@ -366,6 +377,17 @@ impl ImageSpec {
     #[must_use]
     pub fn with_ycbcr_subsampling(mut self, h: u16, v: u16) -> Self {
         self.ycbcr_subsampling = Some((h, v));
+        self
+    }
+
+    /// Writes a JPEG restart marker every `rows` MCU rows (`cjpeg -restart`).
+    ///
+    /// `0` restores libtiff's behaviour: no `DRI` segment and no `RSTn`
+    /// markers. Only meaningful for [`Compression::Jpeg`]; every other codec
+    /// ignores it.
+    #[must_use]
+    pub fn with_jpeg_restart_rows(mut self, rows: u16) -> Self {
+        self.jpeg_restart_rows = rows;
         self
     }
 

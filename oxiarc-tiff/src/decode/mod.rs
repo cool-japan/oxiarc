@@ -305,6 +305,9 @@ pub fn decode_fetched_chunk(
         } else {
             (1, 1)
         },
+        // Decode-only: the interval a stream was coded with lives in its own
+        // `DRI` segment, never in a tag.
+        jpeg_restart_rows: 0,
         jpeg_tables: info.jpeg_tables.as_deref(),
         old_jpeg: info.old_jpeg.as_ref(),
         endian: info.endian,

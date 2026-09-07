@@ -28,7 +28,7 @@ use crate::arith::{
 };
 use crate::error::{JpegError, Result, TableKind};
 use crate::frame::{ArithmeticConditioning, FrameHeader, ScanHeader};
-use crate::idct::idct_islow_into;
+use crate::idct::idct_scaled_into;
 use crate::tables::ZIGZAG_TO_NATURAL;
 
 /// Decode one DC difference (T.81 figures F.19 to F.24).
@@ -341,9 +341,12 @@ pub(crate) fn decode_sequential_arith(
             }
 
             let index = scan.component_indices[k];
+            let output_size = planes.output_size(index);
+            let size = usize::from(output_size);
             let stride = planes.stride(index);
-            let offset = planes.offset(index) + brow as usize * 8 * stride + bcol as usize * 8;
-            idct_islow_into(
+            let offset =
+                planes.offset(index) + brow as usize * size * stride + bcol as usize * size;
+            idct_scaled_into(
                 &block,
                 quant_tables[k].natural(),
                 planes.data_mut(),
@@ -351,6 +354,7 @@ pub(crate) fn decode_sequential_arith(
                 stride,
                 center,
                 maxval,
+                output_size,
             );
             Ok(())
         })?;

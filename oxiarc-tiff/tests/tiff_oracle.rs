@@ -936,3 +936,115 @@ fn libtiff_accepts_our_subsampled_ycbcr() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// **Regression (TIFF-verify V7), validated externally.** The `compat`
+/// encoder's colour-type markers must write a `SampleFormat` (339) that an
+/// **independent** reader agrees with.
+///
+/// The bug this pins was a *label* bug: the compat encoder wrote every marker
+/// as `SampleFormat = Uint`, so a `Gray32Float` page carried IEEE-754 bytes
+/// under an unsigned-integer tag. Our own encoder and our own decoder agreed
+/// with each other before the fix as much as after it, which is exactly why
+/// the round-trip tests in `tests/compat_api.rs` cannot be the whole
+/// evidence: only a reader this crate did not write can say the label is
+/// right. `tifffile` reports the dtype it inferred from the tag, so a
+/// mislabelled page shows up as `uint32` where `float32` belongs.
+#[cfg(feature = "compat")]
+#[test]
+fn tifffile_agrees_with_the_compat_encoders_sample_format() {
+    use oxiarc_tiff::compat::encoder::{
+        TiffEncoder,
+        colortype::{Gray8, Gray16, Gray32Float, Gray64Float, GrayI8, GrayI16, GrayI32},
+    };
+    use std::process::Command;
+
+    let Some(python) = find_python() else {
+        eprintln!("skipping: python3 is not available");
+        return;
+    };
+    let has_tifffile = Command::new(&python)
+        .args(["-c", "import tifffile"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_tifffile {
+        eprintln!("skipping: python3 tifffile is not available");
+        return;
+    }
+
+    let dir = scratch_dir("compat_sample_format");
+    let mut expected: Vec<(String, &str)> = Vec::new();
+
+    macro_rules! emit {
+        ($marker:ty, $data:expr, $dtype:literal) => {{
+            let name = format!("{}.tif", stringify!($marker).to_lowercase());
+            let mut buffer = Cursor::new(Vec::new());
+            TiffEncoder::new(&mut buffer)
+                .expect("compat encoder")
+                .write_image::<$marker>(4, 2, $data)
+                .expect("write");
+            fs::write(dir.join(&name), buffer.into_inner()).expect("write fixture");
+            expected.push((name, $dtype));
+        }};
+    }
+
+    emit!(Gray8, &[1u8, 2, 3, 4, 5, 6, 7, 8], "uint8");
+    emit!(Gray16, &[1u16, 2, 3, 4, 5, 6, 7, 8], "uint16");
+    emit!(GrayI8, &[-1i8, 2, -3, 4, -5, 6, -7, 8], "int8");
+    emit!(GrayI16, &[-1i16, 2, -3, 4, -5, 6, -7, 8], "int16");
+    emit!(GrayI32, &[-1i32, 2, -3, 4, -5, 6, -7, 8], "int32");
+    emit!(
+        Gray32Float,
+        &[0.5f32, -1.25, 2.0, 3.5, -4.0, 5.25, 6.0, 7.75],
+        "float32"
+    );
+    emit!(
+        Gray64Float,
+        &[0.5f64, -1.25, 2.0, 3.5, -4.0, 5.25, 6.0, 7.75],
+        "float64"
+    );
+
+    let names: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
+    let script = format!(
+        r#"
+import tifffile, json
+out = {{}}
+for name in {names:?}:
+    with tifffile.TiffFile({dir:?} + "/" + name) as tif:
+        page = tif.pages[0]
+        out[name] = [str(page.dtype), int(page.sampleformat)]
+print(json.dumps(out))
+"#,
+        names = names,
+        dir = dir.display().to_string(),
+    );
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("spawn python");
+    assert!(
+        output.status.success(),
+        "tifffile could not read the compat-written pages: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // `tifffile` reports the dtype it derived from `SampleFormat` +
+    // `BitsPerSample`. A mislabelled float page prints `uint32` here.
+    for (name, dtype) in &expected {
+        let needle = format!("\"{name}\": [\"{dtype}\"");
+        assert!(
+            report.contains(&needle),
+            "tifffile read {name} as something other than {dtype}\n{report}"
+        );
+    }
+    // Non-vacuity: every fixture really appeared in the report.
+    assert_eq!(
+        report.matches("\": [\"").count(),
+        expected.len(),
+        "tifffile did not report every fixture:\n{report}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -1,4 +1,4 @@
-# oxiarc-brotli - Development Status (v0.4.2, 2026-09-07)
+# oxiarc-brotli - Development Status (v0.4.2, 2026-09-08)
 
 ## Completed Features (COMPLETE)
 
@@ -60,6 +60,47 @@
       incremental leg (byte- and shape-identical vs the reference CLI), bit-flip
       agreement with the one-shot decoder, counting-allocator memory bounds
 
+### Shared (custom LZ77) dictionaries and `dcb` (0.4.2)
+- [x] `compress_with_dictionary(data, dict, params)`,
+      `decompress_with_dictionary(data, dict)`,
+      `decompress_with_dictionary_and_limit(data, dict, max_output)`
+- [x] `BrotliStream::with_dictionary(Vec<u8>)` / `dictionary()`, surviving `reset()`;
+      `BrotliDecompressor::with_dictionary`, `BrotliAsyncDecompressor::with_dictionary`
+- [x] `shared_dict::classify_distance` — the three-way distance space
+      (`1..=max_backward` output, then the dictionary, then the Appendix A static
+      words), established by measurement against `brotli 1.1.0` rather than
+      assumed: `p1`/`p2` are *not* seeded from the dictionary, the dictionary sits
+      *beyond* the declared window, it stays reachable for the whole stream, and it
+      is addressed relative to `max_backward = min(window_size, produced)`.
+      A shared-dictionary reference *is* pushed onto the distance ring; a copy that
+      runs past the end of the dictionary continues in the produced output at the
+      same distance
+- [x] `shared_dict::MAX_SHARED_DICTIONARY` (16 MiB), refused by every entry point
+- [x] Encoder side: `lz77_compress_with_prefix` seeds the match finder with the
+      dictionary, caps matches at the boundary and arbitrates by gain; each
+      meta-block is encoded both with and without the dictionary and the smaller
+      kept, so attaching a dictionary can never cost ratio. `prefix_len == 0` is
+      byte-identical to the dictionary-free encoder (asserted)
+- [x] `dcb` module — RFC 9842 framing: `DCB_MAGIC` (`FF 44 43 42`),
+      `DCB_HEADER_LEN` (36), `dictionary_id` (SHA-256, from `oxiarc_core::sha256`),
+      `write_header`, `parse_header`, `verify_header`, `compress`, `decompress`,
+      `decompress_with_limit`
+- [x] The same `dcb` items at the crate root under names that say what they frame
+      (`parse_dcb_header`, `verify_dcb_header`, `write_dcb_header`, `compress_dcb`,
+      `decompress_dcb`, `decompress_dcb_with_limit`, `dictionary_id`, `DCB_MAGIC`,
+      `DCB_HEADER_LEN`) — what `oxiarc-http` imports for `Content-Encoding: dcb`;
+      `compress`/`decompress` keep their plain-Brotli meaning at the crate root
+- [x] Tests: `tests/shared_dictionary.rs` (dictionary sizes 0 / 1 KiB / 64 KiB /
+      larger than the window, every quality and lgwin, chunk invariance, boundary
+      distances, straddling copies, wrong-dictionary rejection, budget, `reset`,
+      the `Read` adapter, a `dcb` fixture assembled from our own encoder, the
+      crate-root aliases, and the dictionary id against the FIPS 180-4 vectors),
+      the async adapter's dictionary round trip through a 7-byte trickling source
+      with a 256-byte staging buffer (`tests/async_brotli_tests.rs`), plus two
+      self-skipping `brotli-oracle` legs: 45/45 reference `-D` streams decode
+      byte-identically and 48/48 of our `-D` streams are accepted by
+      `brotli -d -D`
+
 ### Public API
 - [x] compress(data, quality) -> BrotliResult<Vec<u8>>
 - [x] compress_with_params(data, params) -> BrotliResult<Vec<u8>>
@@ -69,21 +110,82 @@
 ## Future Enhancements
 
 ### Performance
-- [ ] Close the remaining decode gap on literal-dense payloads. `BrotliStream`
-      is 5-6x faster than the one-shot decoder on repetitive content (bulk
-      match copies and periodic tiling beat the one-shot's byte-at-a-time
-      append) but ~0.67x on hex-dump-like text. The cost is localised: it is the
-      memory traffic of maintaining a real 4 MiB ring plus the copy out to the
-      caller, where the one-shot decoder uses its output `Vec` as the window and
-      touches each byte once. Re-running the same payload at `lgwin = 10` (a
-      cache-resident ring) recovers part of the gap — 0.67x -> 0.80x, not all of
-      it. Numbers and method in the README's Performance section; harness in
-      `examples/decode_profile.rs`. Two candidate fixes were measured and
-      rejected in 2026-09 verification: an inline word-at-a-time replacement for
-      the short `copy_from_slice`/`copy_within` runs (0-10% *slower* on every
-      payload shape) and allocating-and-copying instead of `Vec::resize` when
-      the ring grows (no change beyond noise). The remaining cost is the ring's
-      memory traffic itself.
+- [x] **Push-decoder throughput pass (0.4.2).** The window-memory-traffic
+      diagnosis in the previous entry was wrong, and disproving it is what
+      unlocked the fix: disabling the ring mirror entirely (an incorrect build,
+      for measurement only) moved a literal-dense decode by 4 %, while the same
+      payload at `lgwin = 10` was 40 % faster — because the *stream* differs, not
+      because the ring is smaller. The real costs were, in order: one `memmove`
+      **call** per literal run and per short match (`_platform_memmove` was
+      12.7 % of the profile — the calls, not the bytes); a 256-byte periodic tile
+      built to emit a 5-byte copy; a `Vec::resize` memset of the whole declared
+      window; and a `BrotliError` constructed and dropped on every literal by an
+      eager `ok_or`. What landed:
+      * `SHORT_MATCH = 32` byte-loop paths in `copy_match` and `push_slice`, with
+        the ring mask and every bounds check hoisted out when neither end wraps,
+        and `#[inline(never)]` bulk halves so the short halves inline;
+      * ring sized from the meta-block's declared `MLEN` (`expect_total`) and
+        grown by a fresh lazily-zeroed allocation instead of `Vec::resize`;
+      * stored meta-blocks longer than the declared window mirror only their
+        tail (`push_slice_tail`) — a window only ever needs its last
+        `1 << WBITS` bytes;
+      * `BrotliStream::decode` runs straight off the caller's slice when nothing
+        is held back, so a stored meta-block never copies its bytes into the
+        carry at all;
+      * the fast command path no longer requires `insert_length * 69` bits of
+        buffered input to *enter* — that silently disabled it for every stream
+        smaller than a few hundred bytes, and `fast_path_commands()` now asserts
+        it engages.
+      Reproduce with `cargo run --release --example decode_profile`, which
+      reports **min and median** ratios (read the median on a loaded machine) and
+      prints a `copy floor` row for the stored shape.
+- [x] **Caller's buffer as the newest history segment (0.4.2).** The redesign
+      the previous entry proposed is implemented: nothing in the command loop
+      writes to the ring any more. Literals and matches go straight to the
+      caller's slice, `command::copy_into_pending` resolves a match's *source*
+      across the boundary between the ring (everything produced before this
+      call) and `out[..at]` (everything produced during it), and `run_commands`
+      mirrors the produced bytes into the ring with one bulk `push_slice` at the
+      end — which also runs on the error path, so the window stays consistent.
+      Verified by a differential test that drives `copy_into_pending` with the
+      same history split at every interesting boundary (`mirrored`/`pending` ×
+      distance × count) against one flat history.
+      Measured, 64 KiB in / 64 KiB out, median of five runs of 25 interleaved
+      repetitions: repetitive **9.5x** (lgwin 22) / **24.9x** (lgwin 10), single
+      repeated byte **19.7x** / **29.6x**, literal-dominated hex dump **1.21x**,
+      stored **0.33x** at lgwin 22 against a **0.34x** measured copy floor and
+      **1.01x** at lgwin 10 against **1.01x** — i.e. the stored shape is at its
+      physical floor, 97-100 % of it. The `copy floor` row models exactly the
+      irreducible work (every byte to the caller, the still-reachable tail to
+      the ring) and is timed against the same one-shot decode as every other
+      row, so the two ratios share a denominator.
+- [ ] Copy-dense streams at large windows: 0.76x, against a 0.85x target — the
+      one shape of the four that misses it.
+      The 2.94 MB hex-dump payload is literal-dominated only at lgwin 10 (95,605
+      copy commands, 1.21x — faster than the one-shot decoder); at lgwin 22 the
+      same payload becomes 570,440 copy
+      commands of a mean 5.0 bytes at a mean distance of 116,525 — 97 % of the
+      output — and 65 % of them read their source out of the ring because the
+      distance reaches back past everything produced in the current call.
+      (Census taken 2026-09-08 with temporary counters in `copy_into_pending`;
+      the function shares below with `sample`, run against one decoder at a time
+      through `PROFILE_PUSH_ONLY` / `PROFILE_ONE_SHOT_ONLY`. Neither instrument
+      ships, so `decode_profile` alone does not reproduce those two figures —
+      the wall-clock ratios it prints are the reproducible part.)
+      Diagnosis, all measured rather than argued: the window mirror is free
+      (compiling it out moves the row from 21.9 ms to 22.1 ms); the Huffman work
+      is identical in the two decoders (`decode_symbol` 29 vs 30.6 units of a
+      normalised 100, `decode_distance` 19.1 vs 19.6); the difference is the
+      resumable command machinery, spread over half a million 5-byte commands
+      (`run` 51 + `copy_into_pending` 16.3 + `memmove` 11.4 + `decode_literal_run`
+      10.7 = 89.4 units against the one-shot's single 50-unit loop). Removing the
+      per-copy `memmove` call (7.9 % of the profile) was tried and reverted:
+      LLVM's loop-idiom pass rewrites a `zip` loop and an 8-byte-chunked loop
+      back into the same call, and the wrapping-index loop that does remove it
+      (7.9 % -> 0.5 %) costs what the call cost. What is left is a structural
+      change — a whole-meta-block fast path that runs the one-shot loop when the
+      caller's slice is large enough to hold the rest of the meta-block — which
+      would not help the 64 KiB gate row and so was not taken.
 - [ ] SIMD-accelerated matching
 - [ ] Multi-threaded compression
 - [x] Memory pool for per-encode allocations (`BrotliPool`)
@@ -101,7 +203,7 @@
 - [ ] Optimal parsing improvements
 
 ### Features
-- [ ] Dictionary preloading (shared dictionary)
+- [x] Dictionary preloading (shared dictionary) — done, see above
 - [ ] Quality level fine-tuning
 - [x] Progress callbacks (planned 2026-04-20)
   - **Goal:** `BrotliEncoder`, `BrotliDecoder`, and the streaming reader/writer types accept `ProgressHandle` and emit `on_progress(bytes_in, Some(total))` at each encode/decode call boundary.
@@ -153,11 +255,13 @@
 
 ## Test Coverage
 
-- Unit tests (lib): 160 — tables/context/dictionary CRC-checked against the
+- Unit tests (lib): 166 — tables/context/dictionary CRC-checked against the
   RFC's own check values; huffman descriptor write/read round-trips;
   decoder primitives (WBITS tree, NBLTYPES VLC, distance ring semantics);
   sliding-window ring checked byte-for-byte against a growing-`Vec` reference
-  for every small distance, across the wrap, and through short output slices
+  for every small distance, across the wrap, and through short output slices;
+  `copy_into_pending` driven against one flat history at every split of the
+  ring/pending boundary; the `dcb` dictionary id against FIPS 180-4
 - reference_vectors: 11 (embedded reference-brotli fixtures; always run)
 - stream_conformance: 26 — chunk invariance (1-byte in and out), prime chunk
   sizes, `MetaBlockShape` differential vs `decompress_reporting_shapes`,
@@ -174,44 +278,52 @@
 - stream_adapters: 11 (`Interrupted` retry, `WouldBlock` propagation, output
   before EOF, truncated source, caps through the adapter, a >2 MiB compressed
   stream through the staging buffer)
-- brotli_oracle: 15 (differential sweeps vs the `brotli` CLI, including an
-  incremental-decode leg asserting byte- *and* shape-identity, and rejection of
-  every prefix of every reference stream; feature-gated, self-skipping)
+- shared_dictionary: 16 — every dictionary size × quality × lgwin, chunk
+  invariance with a dictionary attached, boundary distances, a hand-built
+  straddling copy, wrong-dictionary rejection, budgets, `reset`, the `Read`
+  adapter, `dcb` bodies from our own encoder, and the crate-root `dcb` aliases
+- brotli_oracle: 17 (differential sweeps vs the `brotli` CLI, including an
+  incremental-decode leg asserting byte- *and* shape-identity, rejection of
+  every prefix of every reference stream, and both shared-dictionary legs —
+  45/45 reference `-D` streams in and 48/48 of ours out; feature-gated,
+  self-skipping)
 - memory_limit: 7 (counting global allocator; bomb rejection and the
   window-bounded peak of the push decoder and the `Read` adapter)
 - corruption_robustness: 4, interop_vectors: 19, high_entropy_roundtrip: 8,
-  encoder_bugs: 7, pool: 8, progress_cancel: 10, proptest: 2, async: 16,
-  doctests: 16
-- Total: 318 tests + 16 doctests passing (with `--all-features`)
+  encoder_bugs: 7, pool: 8, progress_cancel: 10, proptest: 2, async: 17
+  (including the async adapter's shared-dictionary round trip), doctests: 21
+- Total: 343 tests + 21 doctests passing (with `--all-features`)
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| huffman.rs | ~1,335 |
-| decompress.rs | ~1,140 |
-| compress.rs | ~1,145 |
-| block_split.rs | ~1,105 |
-| streaming.rs | ~990 |
-| stream/mod.rs | ~940 |
-| stream/command.rs | ~530 |
-| bit_reader.rs | ~560 |
-| lz77.rs | ~475 |
-| pool.rs | ~475 |
-| dictionary.rs | ~470 (+ 122,784-byte `dict_data.bin`) |
-| stream/window.rs | ~450 |
-| parallel.rs | ~360 |
-| async_brotli.rs | ~360 |
-| tables.rs | ~315 |
-| context.rs | ~270 |
-| lib.rs | ~290 |
-| bit_writer.rs | ~235 |
-| stream/meta.rs | ~170 |
-| error.rs | ~130 |
-| stream/budget.rs | ~95 |
-| **Total** | **~11,100** |
+| compress.rs | 1,356 |
+| huffman.rs | 1,335 |
+| decompress.rs | 1,272 |
+| stream/mod.rs | 1,255 |
+| block_split.rs | 1,105 |
+| stream/command.rs | 1,048 |
+| streaming.rs | 1,033 |
+| lz77.rs | 621 |
+| bit_reader.rs | 559 |
+| pool.rs | 473 |
+| dictionary.rs | 468 (+ 122,784-byte `dict_data.bin`) |
+| stream/window.rs | 421 |
+| async_brotli.rs | 386 |
+| parallel.rs | 361 |
+| lib.rs | 339 |
+| tables.rs | 313 |
+| context.rs | 268 |
+| bit_writer.rs | 234 |
+| dcb.rs | 205 |
+| shared_dict.rs | 179 |
+| stream/meta.rs | 170 |
+| error.rs | 128 |
+| stream/budget.rs | 93 |
 
-Every file is under the 2,000-line house limit.
+Total: 13,622 lines of Rust in `src/` (every file well under the
+2,000-line ceiling), plus the 122,784-byte Appendix A dictionary blob.
 
 ## Known Limitations
 

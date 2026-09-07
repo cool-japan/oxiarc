@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use oxiarc_jpeg::{
-    DecodeLimits, DecodeOptions, Decoder, TableSet, TablesMode, decode_abbreviated_into, sample,
-    tiff,
+    DecodeLimits, DecodeOptions, Decoder, Scale, TableSet, TablesMode, decode_abbreviated_into,
+    sample, tiff,
 };
 
 /// Wall-clock budget for the whole sweep.
@@ -50,6 +50,29 @@ fn probe(data: &[u8]) {
     }
     let _ = tiff::parse_jpeg_tables(data);
     let _ = tiff::merge_jpeg_tables(&sample::RGB_8X8_420_TABLES, data);
+}
+
+/// [`probe`], but decoding at `numerator/8` instead of native resolution.
+///
+/// A separate, narrower function rather than folding `scale` into [`probe`]
+/// itself: every call site of `probe` already runs at every byte offset of
+/// every fixture under [`BUDGET`], and multiplying that by several `scale`
+/// values would risk the budget for no real gain. The scaled plane geometry
+/// and kernel dispatch are exercised the same way regardless of which byte
+/// is corrupted, so a coarser sweep — this function's own call sites below —
+/// is enough to catch a panic specific to the scaled path.
+fn probe_scaled(data: &[u8], numerator: u8) {
+    let scale = Scale::new(numerator).expect("1..=16");
+    let options = DecodeOptions {
+        limits: DecodeLimits::strict(),
+        scale,
+        ..DecodeOptions::default()
+    };
+    let mut decoder = Decoder::with_options(data, options);
+    if decoder.read_info().is_ok() {
+        let _ = decoder.decode();
+        let _ = decoder.decode_u16();
+    }
 }
 
 /// Multi-MCU fixtures for the processes `src/sample.rs` cannot express.
@@ -335,4 +358,56 @@ fn a_scan_bomb_is_capped() {
     let start = Instant::now();
     probe(&stream);
     assert!(start.elapsed() < BUDGET, "scan bomb was not capped");
+}
+
+/// Every byte offset of every fixture, truncated, decoded at a scale other
+/// than native — `1`, `2`, `3` and `8` cover an exact ported kernel
+/// (`idct_1x1_into`), a component-bump case (4:2:0's chroma at `2/8` grows
+/// to a `4x4` block, still exact), the general kernel
+/// (`idct_general_into`'s low-pass-truncation path), and the pre-existing
+/// unscaled path, respectively. [`fixtures`] already covers baseline,
+/// progressive, restart, twelve-bit, lossless and (when the feature is on)
+/// every arithmetic `SOF`, so this reaches the same breadth of frame shapes
+/// [`truncation_at_every_offset_never_panics`] does, at each scale, without
+/// separately duplicating that sweep's full offset x mask x fixture matrix.
+#[test]
+fn truncation_at_every_offset_never_panics_at_any_scale() {
+    let start = Instant::now();
+    for (name, data) in fixtures() {
+        for numerator in [1u8, 2, 3, 8] {
+            for n in 0..=data.len() {
+                probe_scaled(&data[..n], numerator);
+            }
+            assert!(
+                start.elapsed() < BUDGET,
+                "{name} at scale {numerator}/8: sweep exceeded its time budget"
+            );
+        }
+    }
+}
+
+/// The same fixtures, single-byte corrupted at a sparser set of offsets and
+/// masks than [`single_byte_corruption_never_panics`] (that sweep is
+/// exhaustive at native scale already; this one adds the scale dimension
+/// instead of multiplying an already-exhaustive one), at every scale in
+/// `1..=16` so no `output_size` the dispatcher in `idct/scaled.rs` can
+/// select goes unreached by a corrupt stream.
+#[test]
+fn corrupted_bytes_never_panic_at_any_output_size() {
+    let start = Instant::now();
+    for (name, data) in fixtures() {
+        for offset in (0..data.len()).step_by(7) {
+            for mask in [0xFFu8, 0x55] {
+                let mut corrupt = data.clone();
+                corrupt[offset] ^= mask;
+                for numerator in 1u8..=16 {
+                    probe_scaled(&corrupt, numerator);
+                }
+            }
+        }
+        assert!(
+            start.elapsed() < BUDGET,
+            "{name}: sweep exceeded its time budget"
+        );
+    }
 }

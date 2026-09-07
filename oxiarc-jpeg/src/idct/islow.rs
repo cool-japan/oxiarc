@@ -35,9 +35,40 @@ const FIX_2_562915447: i32 = 20995;
 const FIX_3_072711026: i32 = 25172;
 
 /// Rounding right shift, libjpeg's `DESCALE`.
+///
+/// `pub(crate)`: shared with [`super::scaled`], whose ported `jidctred.c`
+/// kernels use the identical macro.
 #[inline(always)]
-fn descale(x: i64, n: u32) -> i32 {
+pub(crate) fn descale(x: i64, n: u32) -> i32 {
     ((x + (1i64 << (n - 1))) >> n) as i32
+}
+
+/// Narrow one coefficient to the width libjpeg stores it in.
+///
+/// libjpeg's coefficient type is `JCOEF`, a 16-bit `short`, so every value
+/// that reaches `jpeg_idct_islow` has already been truncated to that width by
+/// the store. This crate keeps coefficients in `i32` — the progressive DC
+/// predictor is a running `wrapping_add` and the refinement passes need the
+/// room — so the narrowing is applied here, at the IDCT boundary, instead of
+/// at every store. Two things depend on it:
+///
+/// * **Byte parity.** A conforming stream never leaves the `i16` range, so
+///   this is the identity for every real image, and the "all AC terms zero"
+///   shortcut below then tests the same value libjpeg tests. On a *malformed*
+///   stream the two are not obliged to agree and do not: libjpeg narrows at
+///   every progressive refinement store as well, and wraps its final samples
+///   through `range_limit[x & RANGE_MASK]` where this crate clamps. No parity
+///   is claimed on input whose intermediates overflow.
+/// * **No overflow.** `coefficient * quantiser` is `32768 * 65535` at worst,
+///   which is `2_147_450_880` and still fits `i32`. Without the narrowing a
+///   16-bit `DQT` (`Pq = 1`) plus a DC prediction accumulated over two blocks
+///   overflows the multiply and panics a debug build.
+///
+/// `pub(crate)`: shared with [`super::scaled`], whose ported kernels dequantise
+/// the same coefficients and need the same narrowing for the same reason.
+#[inline(always)]
+pub(crate) fn coefficient(value: i32) -> i32 {
+    i32::from(value as i16)
 }
 
 /// Inverse DCT one 8x8 block into `plane` at `(col, row)`.
@@ -65,7 +96,7 @@ pub(crate) fn idct_islow_into(
 
     // Pass 1: columns.
     for col in 0..8 {
-        let c = |k: usize| coefs[col + k * 8];
+        let c = |k: usize| coefficient(coefs[col + k * 8]);
         let q = |k: usize| i32::from(quant[col + k * 8]);
 
         if c(1) == 0 && c(2) == 0 && c(3) == 0 && c(4) == 0 && c(5) == 0 && c(6) == 0 && c(7) == 0 {
@@ -297,9 +328,48 @@ mod tests {
         idct_islow_into(&coefs, &quant, &mut plane, 0, 8, 2048, 4095);
         assert!(plane.iter().all(|&v| v == 2048 + 256));
 
-        coefs[0] = 40_000;
+        // A DC that saturates the 12-bit output from inside `JCOEF` range.
+        coefs[0] = 32_000;
         idct_islow_into(&coefs, &quant, &mut plane, 0, 8, 2048, 4095);
         assert!(plane.iter().all(|&v| v == 4095));
+
+        // Outside `JCOEF` range the value is truncated exactly as libjpeg's
+        // 16-bit store truncates it: 40_000 becomes -25_536, so the block
+        // clamps *low*. Asserting 4095 here would assert a behaviour no
+        // conforming stream can produce and `djpeg` does not share.
+        coefs[0] = 40_000;
+        idct_islow_into(&coefs, &quant, &mut plane, 0, 8, 2048, 4095);
+        assert!(plane.iter().all(|&v| v == 0), "{plane:?}");
+    }
+
+    /// The `JCOEF` narrowing is the identity over the whole representable
+    /// range, and wraps outside it exactly as a 16-bit store does.
+    #[test]
+    fn coefficients_narrow_like_a_jcoef_store() {
+        for value in [0i32, 1, -1, 32_767, -32_768] {
+            assert_eq!(coefficient(value), value);
+        }
+        assert_eq!(coefficient(32_768), -32_768);
+        assert_eq!(coefficient(40_000), -25_536);
+        assert_eq!(coefficient(65_536), 0);
+        assert_eq!(coefficient(i32::MAX), -1);
+    }
+
+    /// A 16-bit `DQT` (`Pq = 1`) with a coefficient at the edge of `JCOEF`
+    /// must not overflow the dequantising multiply. `32_768 * 65_535` is
+    /// `2_147_450_880`, one of the two largest products the IDCT can see.
+    #[test]
+    fn a_sixteen_bit_quantiser_at_the_coefficient_edge_does_not_overflow() {
+        let quant = [65_535u16; 64];
+        for dc in [i32::MIN, i32::MAX, 65_534, -65_534, 32_768, -32_768] {
+            let mut coefs = [0i32; 64];
+            coefs[0] = dc;
+            coefs[1] = dc;
+            coefs[9] = dc;
+            let mut plane = [0u16; 64];
+            idct_islow_into(&coefs, &quant, &mut plane, 0, 8, 128, 255);
+            assert!(plane.iter().all(|&v| v <= 255));
+        }
     }
 
     /// A single AC coefficient produces the corresponding basis function; the

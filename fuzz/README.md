@@ -75,6 +75,58 @@ handful of small files with each crate's own encoder and drop the output
 into the matching `fuzz/corpus/<target>/` directory — the round-trip output
 is a guaranteed-valid input for the corresponding decoder.
 
+### Seeding a differential target from its own single-shot sibling
+
+`fuzz_inflate_stream`, `fuzz_wrapped_inflate`, `fuzz_inflate_reader`,
+`fuzz_zstd_stream` and `fuzz_brotli_stream` each drive a resumable/push
+decoder and compare it against a plain, already-fuzzed single-shot
+reference (`fuzz_inflate`, `fuzz_zlib_header`/`fuzz_gzip_header`,
+`fuzz_zstd_frame`, `fuzz_brotli_decompress` respectively) — so the fastest
+way to a useful corpus is copying that sibling's own corpus over, **prefixed
+with the exact picker bytes the target's `Unstructured` consumes before
+`take_rest()`** (verified against `arbitrary` 1.4.2's actual source:
+`fill_buffer`/`bytes` consume from the front and never error on too little
+data, so a 1-byte prefix reliably selects the intended branch). Without the
+prefix, a bare copy is off by that many bytes and mostly parses as garbage.
+
+```bash
+cd fuzz
+seed_prefixed() {  # <src corpus dir> <dst corpus dir> <picker-byte(s) as \xNN...>
+  local src="$1" dst="$2" prefix_hex="$3" n=0
+  mkdir -p "$dst"
+  for f in "$src"/*; do
+    [ -f "$f" ] || continue
+    n=$((n+1)); [ "$n" -gt 150 ] && break
+    printf "$prefix_hex" | cat - "$f" > "$dst/seed_${n}_$(basename "$f")"
+  done
+}
+
+# 1-byte prefix (granularity_pick): any value works, GRANULARITIES[x % 8].
+seed_prefixed corpus/fuzz_inflate           corpus/fuzz_inflate_stream '\x00'
+seed_prefixed corpus/fuzz_zstd_frame        corpus/fuzz_zstd_stream    '\x00'
+seed_prefixed corpus/fuzz_brotli_decompress corpus/fuzz_brotli_stream  '\x00'
+
+# 2-byte prefix (wrapper_pick, granularity_pick); wrapper_pick % 4:
+# 0=Raw 1=Zlib 2=Gzip 3=Auto — pick the byte to match the source corpus.
+seed_prefixed corpus/fuzz_inflate     corpus/fuzz_wrapped_inflate '\x00\x00'  # Raw
+seed_prefixed corpus/fuzz_zlib_header corpus/fuzz_wrapped_inflate '\x01\x00'  # Zlib
+seed_prefixed corpus/fuzz_gzip_header corpus/fuzz_wrapped_inflate '\x02\x00'  # Gzip
+
+# 5-byte prefix (wrapper_pick: u8, then size_seed: [u8; 4]); same wrapper mapping.
+seed_prefixed corpus/fuzz_inflate     corpus/fuzz_inflate_reader '\x00\x00\x00\x00\x00'  # Raw
+seed_prefixed corpus/fuzz_zlib_header corpus/fuzz_inflate_reader '\x01\x00\x00\x00\x00'  # Zlib
+seed_prefixed corpus/fuzz_gzip_header corpus/fuzz_inflate_reader '\x02\x00\x00\x00\x00'  # Gzip
+
+cargo +nightly fuzz run fuzz_zstd_stream -- -max_total_time=30
+```
+
+**Verify rather than trust**: compare libFuzzer's `cov:`/`ft:` counters on a
+short run with and without the seeded corpus present — if coverage barely
+moves, the byte-consumption assumption for this crate's `arbitrary` version
+no longer holds and the prefix length needs rechecking against
+`Unstructured`'s actual call sequence in the target's source, not assumed
+from this table.
+
 ## Coverage / priority
 
 Targets, in the priority order called out for this hardening pass:
@@ -94,11 +146,43 @@ Targets, in the priority order called out for this hardening pass:
    `fuzz_szip_decode`) and archive-container (`fuzz_zip_read`,
    `fuzz_tar_read`, `fuzz_cab_read`, `fuzz_iso9660_read`,
    `fuzz_sevenz_header`) entry points.
+4. **Phase 8 workspace-integration targets** — the resumable/push decoders
+   and the image codecs added in the P2/P3 program. These fall into three
+   shapes:
+   - *Differential* (a resumable decoder against its own whole-buffer
+     reference, at randomised split granularities):
+     `fuzz_inflate_stream` (`InflateStream` vs `oxiarc_deflate::inflate`),
+     `fuzz_wrapped_inflate` (`WrappedInflate` fine vs coarse split, all four
+     of `Raw`/`Zlib`/`Gzip`/`Auto`), `fuzz_inflate_reader` (`InflateReader`
+     under adversarial short reads vs a direct `WrappedInflate` drive),
+     `fuzz_brotli_stream` (`BrotliStream` vs `oxiarc_brotli::decompress`),
+     `fuzz_zstd_stream` (`ZstdStream` vs `decompress_multi_frame`;
+     see that target's module doc for why only "both accept ⇒ byte-equal"
+     is asserted), and `fuzz_png_streaming` (`StreamingDecoder`'s event
+     sequence, whole-buffer vs piecewise, through one shared helper).
+   - *Never-panic decoder entry points*: `fuzz_png_decode`,
+     `fuzz_jpeg_decode`, `fuzz_tiff_read`, `fuzz_tiff_ifd` (header/IFD chain
+     only — cheaper, so it spends its whole budget on the parsing surface),
+     `fuzz_image_open` (`oxiarc-image`'s facade, every format tried against
+     every input, not just the sniffed one).
+   - *Property/limit targets*: `fuzz_http_decode` (arbitrary
+     `Content-Encoding` chains and `DecodeLimits`, asserting the decoded
+     length never passes `max_output`), `fuzz_http_headers` (every header
+     parser, plus `AcceptEncoding::to_header_value` round-tripping through
+     this crate's own `parse_accept_encoding`), `fuzz_jpeg_tables`
+     (`TableSet::parse`/`emit` idempotence), and `fuzz_png_limits`, which
+     installs the peak-tracking global allocator from
+     [`support/counting_alloc.rs`](support/counting_alloc.rs) and asserts a
+     decode under tight `DecodeLimits` never allocates past a ceiling
+     derived from those same limits.
 
 Every target's contract is the same: feed it arbitrary bytes, and the
 decoder must return `Ok(..)` or a structured `Err(..)` — it must never
 panic, abort, hang, or (for the ASan-instrumented `cargo fuzz build`)
-read/write out of bounds.
+read/write out of bounds. The differential targets add one more: whenever
+both sides accept an input, their output must be byte-identical. Each one
+bounds its own driving loop with a `CALL_GUARD` so a state machine that
+stops making progress fails as a crash rather than as a libFuzzer timeout.
 
 ## Structured-input targets
 

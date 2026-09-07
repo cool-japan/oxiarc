@@ -231,8 +231,9 @@ pub fn cmd_list(
             }
         }
         _ => {
+            let hint = crate::utils::image_format_hint(&mut reader);
             return Err(format!(
-                "unsupported or unrecognized archive format for {}: {}",
+                "unsupported or unrecognized archive format for {}: {}{hint}",
                 input_display_name(archive),
                 format
             )
@@ -254,7 +255,7 @@ fn display_entries(entries: &[Entry], verbose: bool, tree: bool, styler: &Styler
 fn cmd_list_json<R: std::io::Read + std::io::Seek>(
     archive: &str,
     format: ArchiveFormat,
-    reader: R,
+    mut reader: R,
     options: &ListOptions<'_>,
     styler: &Styler,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -371,8 +372,9 @@ fn cmd_list_json<R: std::io::Read + std::io::Seek>(
             }));
         }
         _ => {
+            let hint = crate::utils::image_format_hint(&mut reader);
             return Err(format!(
-                "unsupported or unrecognized archive format for {}: {}",
+                "unsupported or unrecognized archive format for {}: {}{hint}",
                 input_display_name(archive),
                 format
             )

@@ -1,5 +1,5 @@
 
-# oxiarc-deflate - Development Status (v0.4.2, 2026-09-07)
+# oxiarc-deflate - Development Status (v0.4.2, 2026-09-08)
 
 ## Completed Features (COMPLETE)
 
@@ -116,11 +116,47 @@
       functions (Adler-32 read from the last 4 input bytes), with a
       regression test pinning it
 
+## Completed Features (Phase 8 — zlib-equivalent encoder, 0.4.2)
+
+### Encoder core rewritten as a zlib port (W3-DEFENC)
+- [x] `src/encoder/` — a faithful port of zlib's `deflate.c` + `trees.c`:
+      `config.rs` (window geometry + `configuration_table`), `tables.rs`
+      (length/distance/static-tree tables), `window.rs` (sliding window, slid
+      hash chains, `longest_match`, `match_candidates`), `trees.rs`
+      (`build_tree`/`gen_bitlen`/`gen_codes`/`scan_tree`/`send_tree`/
+      `flush_block` + `BitSink`), `stored.rs` (`deflate_stored`),
+      `optimal.rs` (the DP parser), `mod.rs` (the driver and
+      `deflate_fast`/`deflate_slow`/`deflate_rle`/`deflate_huff`)
+- [x] Output is **byte-identical to CPython `zlib.compress(data, level)`** at
+      every level 1-9 on every corpus (previously up to 179 % larger)
+- [x] Hash-chain match finder with the correct `cur_match > limit` termination
+      (the old encoder spun the whole chain budget on the `NIL == 0` tail),
+      `good_length` chain quartering, `nice_length` early exit, `TOO_FAR`
+- [x] Lazy matching exactly as zlib (`match_length <= prev_length` emits the
+      previous match; the lazy search itself is skipped once
+      `prev_length >= max_lazy`)
+- [x] Per-block stored / fixed / dynamic choice on real bit costs, blocks cut
+      at 16 383 symbols, `Z_FILTERED` / `Z_HUFFMAN_ONLY` / `Z_RLE` / `Z_FIXED`
+      via `Deflater::with_strategy`
+- [x] Bit-continuous multi-call behaviour with **no per-call fixed cost**: a
+      2 MiB stream costs 34.4 ms in 1 KiB calls vs 33.0 ms in 1 MiB calls and
+      produces the same bytes (previously 13x more for small calls)
+- [x] Level-6 throughput 0.77x-1.53x of CPython `zlib` (was 0.10x-0.40x)
+- [x] `Deflater::with_optimal_parsing` is never larger than the default ladder
+      at the same level: the candidate set now honours `TOO_FAR` (without it
+      the DP bought rare long-distance codes for 3-byte matches and lost 2 % on
+      noisy image rows), and each span keeps the cheaper of the DP path and a
+      zlib-equivalent lazy parse judged on the real block cost
+- [x] `tests/zlib_encoder_oracle.rs` (byte-identity oracle, `zlib-oracle`
+      feature), `tests/encoder_behaviour.rs` (21 mechanism tests, no external
+      tool), `tests/common/blocks.rs` (independent block walker),
+      `examples/zlib_ab.rs` (criterion-free ratio/throughput/per-call table)
+
 ## Future Enhancements
 
 ### Advanced LZ77
 - [x] Better hash function (4-byte hash) — already implemented in v0.2.8
-- [x] Optimal parsing (graph-based) — Zopfli-style OptimalParser with iterative cost retraining (done 2026-05-16)
+- [x] Optimal parsing (graph-based) — Zopfli-style OptimalParser with iterative cost retraining (done 2026-05-16; fed the full `TOO_FAR`-filtered candidate set and guarded by a real-block-cost comparison against a zlib-equivalent lazy parse, 2026-09-08)
 - [x] Match filtering heuristics + nice match length parameter (planned 2026-05-17)
   - **Goal:** Expose two well-known zlib LZ77 tuning knobs on the DEFLATE encoder: `nice_match_length` (early-exit when any match ≥ this length is found) and `max_chain_length` / `good_length` (cap on hash-chain walks, with a tighter cap once a "good enough" match is found).
   - **Design:**

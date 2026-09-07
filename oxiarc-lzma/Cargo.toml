@@ -43,5 +43,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 name = "lzma_bench"
 harness = false
 
+[[bench]]
+name = "xz_decoder_reuse"
+harness = false
+
 [lints]
 workspace = true

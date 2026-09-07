@@ -147,7 +147,7 @@ impl fmt::Display for DecodingError {
 
 impl StdError for DecodingError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.underlying.as_deref().map(|e| e as &(dyn StdError))
+        self.underlying.as_deref().map(|e| e as &dyn StdError)
     }
 }
 
@@ -194,7 +194,7 @@ impl fmt::Display for EncodingError {
 
 impl StdError for EncodingError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.underlying.as_deref().map(|e| e as &(dyn StdError))
+        self.underlying.as_deref().map(|e| e as &dyn StdError)
     }
 }
 
@@ -402,6 +402,9 @@ impl From<oxiarc_png::EncodingError> for ImageError {
         if let oxiarc_png::EncodingError::IoError(io_err) = err {
             return Self::IoError(io_err);
         }
+        if matches!(err, oxiarc_png::EncodingError::LimitsExceeded) {
+            return Self::Limits(LimitErrorKind::InsufficientMemory.into());
+        }
         Self::Encoding(EncodingError::new(ImageFormat::Png.into(), err))
     }
 }
@@ -422,6 +425,14 @@ impl From<oxiarc_jpeg::JpegError> for ImageError {
 }
 
 impl From<oxiarc_tiff::TiffError> for ImageError {
+    // Like `oxiarc_jpeg::JpegError` above, `oxiarc_tiff::TiffError` is one
+    // enum for both directions, so a `Format`/`Usage`/`Unsupported`/
+    // `IntOverflow` variant produced while *encoding* is still reported as
+    // `Decoding` here. `codecs::tiff::TiffEncoder` validates the one common
+    // encode-time mistake (a mismatched buffer length) itself and returns
+    // `Parameter` before ever reaching `oxiarc_tiff`, which covers the
+    // practical case; anything else from the encode path keeps this
+    // blanket conversion's `Decoding` label.
     fn from(err: oxiarc_tiff::TiffError) -> Self {
         match err {
             oxiarc_tiff::TiffError::Io(io_err) => Self::IoError(io_err),

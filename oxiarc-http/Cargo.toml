@@ -65,6 +65,13 @@ criterion = { workspace = true }
 oxiarc-deflate = { workspace = true }
 oxiarc-brotli = { workspace = true }
 oxiarc-zstd = { workspace = true }
+# tests/cross_crate_inflate.rs only: proves a PNG IDAT stream, a TIFF
+# deflate strip and an HTTP gzip body all decode byte-identically through
+# the same oxiarc-deflate core, however the input is split. Both crates'
+# own default features are used as-is (PNG has no cargo features to gate
+# the base codec; TIFF's `deflate` codec is in its default feature set).
+oxiarc-png = { workspace = true }
+oxiarc-tiff = { workspace = true }
 
 [[bench]]
 name = "decode_bench"

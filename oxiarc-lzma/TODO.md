@@ -30,6 +30,45 @@
 - [x] `oxiarc-archive` re-exports the module unchanged (same public paths)
 - [x] libtiff `tiffcp -c lzma` (TIFF `Compression = 34925`) multi-strip
       differential suite and an `xz` CLI check-type sweep, behind `xz-oracle`
+- [x] `XzWriter` multi-block output: `with_block_size(u64)` (default 64
+      MiB — chosen so even LZMA2's worst case, all-stored chunks, cannot
+      push a block past the reader's 100 MiB per-block cap), one index
+      record per block, unpadded sizes — `writer_splits_large_input_into_blocks`,
+      `multi_block_streams_carry_a_check_per_block`, and the `xz-oracle`
+      `multi_block_streams_interoperate_with_the_xz_cli` (both directions,
+      `xz -l` block count checked)
+- [x] `xz::XzDecoder` — a reusable decoder context (`new`, `with_max_output`,
+      `decompress_into(&mut self, src, dst)`, `reset`) that keeps its LZMA2
+      dictionary buffer, probability model and coder state allocated across
+      calls instead of rebuilding them per stream (the TIFF `Compression =
+      34925` shape: thousands of same-dictionary-size strips). A guard
+      (`block_opener_permits_decoder_reuse` in `header.rs`) keeps this safe: every
+      independent XZ block must open with a chunk that resets the
+      dictionary, which a *fresh* `Lzma2Decoder` already enforces on its
+      own but a *reused* one would silently skip without it. Proven
+      byte-identical to always-fresh decoding first (`tests` in
+      `src/xz/decoder.rs`: a malformed non-resetting block rejected
+      identically whether the decoder handling it is fresh or reused, and
+      `a_bigger_dictionary_is_never_decoded_against_a_smaller_cached_ring`,
+      which pins the cache's dictionary-size key with a stream whose match
+      distance really does reach past the cached ring — a mere size
+      *alternation* does not, since a payload smaller than the smallest
+      dictionary in the sequence never exercises the wrap point), then
+      measured (`benches/xz_decoder_reuse.rs`, 1000 × 64 KiB streams).
+      `xz::decompress_into` / `xz::decompress_with_limit` are unchanged,
+      thin one-shot entry points.
+- [x] SHA-256 moved to `oxiarc_core::sha256` (FIPS 180-4, unchanged
+      behaviour/bytes); `oxiarc-lzma` depends on it instead of carrying a
+      private copy, so `oxiarc-http` (RFC 9842 dictionary-hash matching) can
+      share the same implementation without depending on `oxiarc-lzma`.
+- [x] Block-check integrity coverage (`tests/xz_check_integrity.rs`): the
+      writer emits the reference CRC-32 / CRC-64 / SHA-256 of *each block*,
+      a corrupted or truncated check field is rejected through every entry
+      point (including a primed `XzDecoder`), and — behind `xz-oracle` —
+      real `xz -t` / `xz -dc` / `xz --robot -lvv` accept what this writer
+      emits for **all four** check types, not just the default CRC-32.
+      Added because the check comparison itself had no test at all: it
+      could be disabled outright and the whole suite stayed green.
 
 
 ## Completed Features (COMPLETE)

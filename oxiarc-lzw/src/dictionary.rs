@@ -52,7 +52,12 @@ pub struct LzwDictionary {
     /// Configuration.
     config: LzwConfig,
     /// Next available code.
-    next_code: u16,
+    ///
+    /// Held as a `u32` rather than a `u16` because a 16-bit configuration's
+    /// table is exhausted at `next_code == 65536`, which a `u16` cannot
+    /// represent: `is_full()` would never fire and `next_code += 1` would
+    /// overflow.
+    next_code: u32,
     /// Current code bit width.
     current_bits: u8,
 }
@@ -104,7 +109,7 @@ impl LzwDictionary {
     /// unreachable, so no memory has to be touched.
     pub fn reset(&mut self) {
         self.current_bits = self.config.min_bits;
-        self.next_code = self.config.first_code();
+        self.next_code = u32::from(self.config.first_code());
     }
 
     /// Number of code slots in the table (`max_code + 1`).
@@ -142,12 +147,12 @@ impl LzwDictionary {
 
     /// Store a new `(prefix, byte)` entry without touching the code width.
     fn store(&mut self, prefix: u16, byte: u8) -> Result<u16> {
-        if self.next_code > self.config.max_code() {
+        if self.next_code > u32::from(self.config.max_code()) {
             return Err(LzwError::TableFull {
                 max_codes: self.config.max_code(),
             });
         }
-        let code = self.next_code;
+        let code = self.next_code as u16;
         let index = code as usize;
         let parent = prefix as usize;
         if parent >= self.length.len() || index >= self.length.len() {
@@ -194,7 +199,7 @@ impl LzwDictionary {
     /// equals 2^current_bits (one code earlier than standard LZW).
     fn update_bit_width(&mut self) {
         if self.current_bits < self.config.max_bits {
-            let threshold = if self.config.early_change {
+            let threshold: u32 = if self.config.early_change {
                 // Early change: increase when next_code == 2^current_bits
                 1 << self.current_bits
             } else {
@@ -225,7 +230,7 @@ impl LzwDictionary {
     /// Solution: Decoder threshold = encoder threshold - 1
     fn update_bit_width_decode(&mut self) {
         if self.current_bits < self.config.max_bits {
-            let threshold = if self.config.early_change {
+            let threshold: u32 = if self.config.early_change {
                 // Decoder threshold is one less than encoder threshold
                 (1 << self.current_bits) - 1
             } else {
@@ -354,7 +359,7 @@ impl LzwDictionary {
     /// Check if the dictionary is full.
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.next_code > self.config.max_code()
+        self.next_code > u32::from(self.config.max_code())
     }
 
     /// Get the current bit width.
@@ -364,8 +369,11 @@ impl LzwDictionary {
     }
 
     /// Get the next code that will be assigned.
+    ///
+    /// Returned as a `u32`: a full 16-bit table's exhausted state is
+    /// `next_code == 65536`, one past `u16::MAX`.
     #[inline]
-    pub fn next_code(&self) -> u16 {
+    pub fn next_code(&self) -> u32 {
         self.next_code
     }
 
@@ -408,6 +416,15 @@ pub struct LzwCodeIndex {
 impl LzwCodeIndex {
     /// Create an index able to hold `capacity` entries at a load factor of
     /// at most 0.5 (rounded up to a power of two, minimum 1024 slots).
+    ///
+    /// The probe loops in [`Self::find`] and [`Self::insert`] terminate
+    /// because at least one slot is always free. The largest table this
+    /// crate builds is a 16-bit one, whose `capacity` is 65 536 and whose
+    /// live entry count therefore never exceeds 65 536 - 258 = 65 278; that
+    /// gets 131 072 slots, so the load factor stays below 0.5. (At 12 bits
+    /// it is 3 838 entries in 8 192 slots.) The `min(1 << 20)` clamp only
+    /// binds for capacities above 524 288, which no valid `LzwConfig` can
+    /// reach.
     pub fn with_capacity(capacity: usize) -> Self {
         let slots = capacity
             .saturating_mul(2)

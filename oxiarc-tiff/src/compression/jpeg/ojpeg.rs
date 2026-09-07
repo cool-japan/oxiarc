@@ -241,6 +241,22 @@ mod tests {
         (chunk, pixels)
     }
 
+    /// The `JPEGTables`-shaped blob for the same image [`complete_stream`]
+    /// builds, at the same quality.
+    fn tables_blob(width: usize, height: usize) -> Vec<u8> {
+        let bits = [8u16];
+        let mut cx = CodecContext::new(
+            CompressionMethod::Jpeg,
+            width,
+            height,
+            &bits,
+            1,
+            Endian::Little,
+        );
+        cx.photometric = PhotometricInterpretation::BlackIsZero;
+        super::super::shared_tables(&cx, CodecLevel::Level(95)).expect("tables")
+    }
+
     #[test]
     fn flavour_a_self_contained_chunks_decode() {
         let (stream, pixels) = complete_stream(32, 16);
@@ -306,8 +322,11 @@ mod tests {
     fn flavour_c_synthesises_a_frame_from_the_tags() {
         let (stream, pixels) = complete_stream(32, 16);
         // Take the tables out of the stream and hand them over as tags, the
-        // way a 1992 writer would have.
-        let tables = oxiarc_jpeg::TableSet::parse(&stream).expect("tables");
+        // way a 1992 writer would have. They are read from an abbreviated
+        // tables-only blob for the same context rather than from `stream`
+        // itself: the encoder writes libjpeg's marker order (`DQT SOF DHT
+        // SOS`), and `TableSet::parse` stops at the frame header.
+        let tables = oxiarc_jpeg::TableSet::parse(&tables_blob(32, 16)).expect("tables");
         let quant = tables.quant[0].expect("quant");
         let mut q_bytes = Vec::with_capacity(64);
         for index in 0..64 {

@@ -8,6 +8,10 @@
 //! - **Pure Rust**: No C dependencies, 100% safe Rust
 //! - **TIFF LZW**: MSB-first bit order, early code change
 //! - **GIF LZW**: LSB-first bit order, variable minimum code size
+//! - **UNIX `compress` / `.Z`**: the [`z`] module — `1F 9D` header, 9-16 bit
+//!   codes, block mode, LSB-first 8-code groups (new in 0.4.2)
+//! - **Explicit bit order**: [`LzwBitOrder`] on [`LzwConfig`], so the generic
+//!   entry points decode MSB-first *or* LSB-first streams (new in 0.4.2)
 //! - **Bug Fix**: Fixes truncation bug found in weezl crate
 //!
 //! ## TIFF LZW Specification
@@ -83,6 +87,7 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
 
+mod bits;
 mod bitstream_lsb;
 mod bitstream_msb;
 mod config;
@@ -92,8 +97,9 @@ mod encoder;
 mod error;
 mod gif_lzw;
 pub mod streaming;
+pub mod z;
 
-pub use config::LzwConfig;
+pub use config::{LzwBitOrder, LzwConfig};
 pub use decoder::LzwDecoder;
 pub use encoder::LzwEncoder;
 pub use error::{LzwError, Result};
@@ -187,20 +193,29 @@ pub fn decompress_tiff(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
 ///
 /// # Parameters
 ///
-/// - `src`: LZW-compressed input (MSB-first, as used by TIFF)
+/// - `src`: LZW-compressed input, packed in `config.bit_order`
 /// - `dst`: output buffer; decoding stops once it is full
-/// - `config`: LZW configuration (see [`LzwConfig::TIFF`] and
-///   [`LzwConfig::TIFF_OLD_STYLE`])
+/// - `config`: LZW configuration (see [`LzwConfig::TIFF`],
+///   [`LzwConfig::TIFF_OLD_STYLE`] and [`LzwConfig::TIFF_COMPAT_LSB`])
 ///
 /// # Bit order
 ///
-/// This entry point reads **MSB-first** codes, which is what TIFF uses, and
-/// [`LzwConfig`] carries no bit-order field. Passing [`LzwConfig::GIF`]
-/// therefore does *not* select GIF's LSB-first packing: `LzwConfig::GIF` and
-/// [`LzwConfig::TIFF_OLD_STYLE`] are the same four field values, so both
-/// decode an MSB-first stream under the standard (late) code-width rule.
-/// GIF data must go through [`gif_decompress`], which owns the LSB-first
-/// bit reader.
+/// `config.bit_order` selects the packing (new in 0.4.2):
+/// [`LzwConfig::TIFF`] and [`LzwConfig::TIFF_OLD_STYLE`] are MSB-first,
+/// [`LzwConfig::GIF`] and [`LzwConfig::TIFF_COMPAT_LSB`] are LSB-first.
+///
+/// Before 0.4.2 `LzwConfig` had no such field and `LzwConfig::GIF` was
+/// *literally the same value* as `LzwConfig::TIFF_OLD_STYLE`, so passing it
+/// here silently decoded MSB-first. That is fixed: the two constants are now
+/// different configurations and each decodes only streams packed its way.
+/// Callers that were relying on the old (accidental) MSB behaviour of
+/// `LzwConfig::GIF` must pass `LzwConfig::TIFF_OLD_STYLE` instead.
+///
+/// This entry point still is **not** the GIF 89a codec: real GIF image data
+/// carries its own `minimum_code_size` and sub-block framing and belongs in
+/// [`gif_decompress`]. For UNIX `compress(1)` (`.Z`) data use the [`z`]
+/// module, which additionally implements that format's container header and
+/// 8-code group alignment.
 ///
 /// # Returns
 ///

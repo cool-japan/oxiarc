@@ -217,6 +217,8 @@ pub struct BrotliAsyncDecompressor {
     max_output: Option<u64>,
     /// Optional declared-window ceiling, forwarded to the decoder.
     max_window: Option<usize>,
+    /// Optional shared (custom LZ77) dictionary, forwarded to the decoder.
+    dictionary: Vec<u8>,
 }
 
 impl BrotliAsyncDecompressor {
@@ -225,6 +227,7 @@ impl BrotliAsyncDecompressor {
         Self {
             max_output: None,
             max_window: None,
+            dictionary: Vec::new(),
         }
     }
 
@@ -249,6 +252,18 @@ impl BrotliAsyncDecompressor {
         self
     }
 
+    /// Attach a shared (custom LZ77) dictionary.
+    ///
+    /// The async counterpart of
+    /// [`BrotliStream::with_dictionary`](crate::BrotliStream::with_dictionary);
+    /// see [`crate::shared_dict`] for what a shared dictionary is and
+    /// [`crate::dcb`] for the RFC 9842 body framing that carries one.
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Vec<u8>) -> Self {
+        self.dictionary = dictionary;
+        self
+    }
+
     /// Build a decoder carrying this adapter's settings.
     fn build_stream(&self) -> BrotliStream {
         let mut stream = BrotliStream::new();
@@ -257,6 +272,9 @@ impl BrotliAsyncDecompressor {
         }
         if let Some(bytes) = self.max_window {
             stream = stream.with_max_window(bytes);
+        }
+        if !self.dictionary.is_empty() {
+            stream = stream.with_dictionary(self.dictionary.clone());
         }
         stream
     }

@@ -53,41 +53,49 @@ mod bits;
 mod decode;
 mod encode;
 mod tables;
+mod uncompressed;
 
 use bits::BitWriter;
 use decode::{FaxDecoder, RowFault};
 
+use super::pool::Pool;
 use super::{CodecContext, codec_error};
 use crate::error::{Result, TiffError, UnsupportedError};
 use crate::tags::{CompressionMethod, FillOrder};
-use std::sync::{Mutex, PoisonError};
 
 /// The changing-element buffers of one image, kept between chunks.
 ///
 /// A row is a list of changing elements, so the fax engine needs two growable
 /// buffers whose size follows the row's *content*, not its width. Allocating
 /// them per strip is what the design report's "zero per-chunk allocations in
-/// the steady state" forbids, so [`CodecState`](crate::CodecState) owns one
-/// pair per image and every chunk borrows it.
+/// the steady state" forbids, so [`CodecState`](crate::CodecState) owns a
+/// [`Pool`] of pairs per image and every chunk borrows one.
 ///
-/// The `Mutex` is what makes the state `Sync`; it is uncontended in a serial
-/// decode and it is the same shape as the inflate slot next door.
+/// A pool rather than one pair, for the reason the inflate machines next door
+/// are pooled: a chunk holds its pair for as long as it decodes, so a
+/// `rayon` decode of a fax page would otherwise serialise every worker behind
+/// one mutex. Both buffers are cleared at the head of every row, so a pair
+/// carries nothing between chunks but its capacity.
 #[derive(Default)]
-pub(crate) struct FaxScratch(Mutex<(Vec<u32>, Vec<u32>)>);
+pub(crate) struct FaxScratch(Pool<(Vec<u32>, Vec<u32>)>);
 
 impl core::fmt::Debug for FaxScratch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let held = self
-            .0
-            .lock()
-            .map(|slot| slot.0.capacity())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().0.capacity());
+        // The largest pooled capacity, which is what "the buffers survived"
+        // means; an empty pool reports zero.
+        let held = self.0.inspect(|entries| {
+            entries
+                .iter()
+                .map(|(changes, _)| changes.capacity())
+                .max()
+                .unwrap_or(0)
+        });
         f.debug_tuple("FaxScratch").field(&held).finish()
     }
 }
 
 impl FaxScratch {
-    /// Runs `body` on a decoder over the pooled buffers, returning them after.
+    /// Runs `body` on a decoder over a pooled pair, returning it after.
     fn with<T>(
         &self,
         data: &[u8],
@@ -95,11 +103,10 @@ impl FaxScratch {
         reversed: bool,
         body: impl FnOnce(&mut FaxDecoder<'_>) -> T,
     ) -> T {
-        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let scratch = core::mem::take(&mut *guard);
+        let scratch = self.0.take().unwrap_or_default();
         let mut decoder = FaxDecoder::with_scratch(data, width, reversed, scratch);
         let out = body(&mut decoder);
-        *guard = decoder.into_scratch();
+        self.0.put(decoder.into_scratch());
         out
     }
 }

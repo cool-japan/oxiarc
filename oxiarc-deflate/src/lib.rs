@@ -55,6 +55,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod deflate;
+mod encoder;
 pub mod gzip;
 pub mod huffman;
 pub mod inflate;
@@ -97,6 +98,7 @@ pub use parallel::{
 
 // Re-exports
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
+pub use encoder::{LevelConfig, Strategy};
 pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};

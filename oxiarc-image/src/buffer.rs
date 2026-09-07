@@ -18,7 +18,7 @@
 //! hatch for in-place mutation (there is no `get_pixel_mut() -> &mut P`
 //! either, for the same reason).
 
-use crate::color::{Luma, LumaA, Pixel, Rgb, Rgba};
+use crate::color::{Luma, LumaA, Pixel, Primitive, Rgb, Rgba};
 
 /// A width/height grid of pixels of type `P`, backed by one flat `Vec` of
 /// samples.
@@ -187,6 +187,33 @@ impl<P: Pixel> ImageBuffer<P> {
     pub fn put_pixel(&mut self, x: u32, y: u32, pixel: P) {
         let i = self.sample_index(x, y);
         self.data[i..i + P::CHANNEL_COUNT as usize].copy_from_slice(pixel.channels());
+    }
+
+    /// Wrap a sample vector the caller has already sized to
+    /// `width * height * P::CHANNEL_COUNT`.
+    ///
+    /// Crate-internal fast path for [`crate::DynamicImage`]'s colour
+    /// conversions, which build their output vector from a source buffer
+    /// whose own invariant already fixes the length exactly — re-deriving
+    /// the product only to hand back an [`Option`] every caller would have
+    /// to unwrap adds nothing. A `debug_assert!` pins the invariant in test
+    /// builds, and the `resize` keeps the struct invariant total even in a
+    /// release build where that assertion is compiled out (it is a no-op
+    /// whenever the length is already right, which is always).
+    pub(crate) fn from_raw_sized(width: u32, height: u32, mut data: Vec<P::Subpixel>) -> Self {
+        let len = pixel_buffer_len::<P>(width, height);
+        debug_assert_eq!(
+            data.len(),
+            len,
+            "a conversion produced {} samples for a {width}x{height} image that needs {len}",
+            data.len()
+        );
+        data.resize(len, P::Subpixel::DEFAULT_MIN_VALUE);
+        Self {
+            width,
+            height,
+            data,
+        }
     }
 
     /// Every pixel, row-major, copied out of the buffer.

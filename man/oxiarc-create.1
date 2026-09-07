@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-create 1  "oxiarc-create " 
+.TH oxiarc-create 1  "oxiarc-create 0.4.2" 
 .SH NAME
 oxiarc\-create \- Create a new archive
 .SH SYNOPSIS
-\fBoxiarc\-create\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-\-compress\-threshold\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
+\fBoxiarc\-create\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-\-compress\-threshold\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
 .SH DESCRIPTION
 Create a new archive
 .SH OPTIONS
@@ -67,8 +67,13 @@ Dry run: show what would be done without creating the archive
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIARCHIVE\fR>
 Output archive file (use "\-" for stdout)
 .TP
 [\fIFILES\fR]
 Files to add to the archive
+.SH VERSION
+v0.4.2

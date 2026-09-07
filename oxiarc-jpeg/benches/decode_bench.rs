@@ -9,7 +9,7 @@ use std::hint::black_box;
 use std::process::Command;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use oxiarc_jpeg::{DecodeOptions, Decoder, Upsampling};
+use oxiarc_jpeg::{DecodeOptions, Decoder, Scale, Upsampling};
 
 /// Build a synthetic PPM with edges, gradients and flat regions.
 fn source_ppm(width: usize, height: usize) -> Vec<u8> {
@@ -47,6 +47,25 @@ fn cjpeg(args: &[&str], source: &[u8]) -> Option<Vec<u8>> {
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
     bytes
+}
+
+/// `true` when `djpeg` runs.
+fn djpeg_available() -> bool {
+    Command::new("djpeg")
+        .arg("-version")
+        .output()
+        .map(|out| out.status.success() || !out.stderr.is_empty())
+        .unwrap_or(false)
+}
+
+/// Run `djpeg` once over a file already on disk.
+fn run_djpeg(args: &[&str], input: &std::path::Path, output: &std::path::Path) {
+    let _ = Command::new("djpeg")
+        .args(args)
+        .arg("-outfile")
+        .arg(output)
+        .arg(input)
+        .status();
 }
 
 fn bench_decode(c: &mut Criterion) {
@@ -214,5 +233,79 @@ fn bench_upsampling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_decode, bench_upsampling);
+/// [`DecodeOptions::scale`] at every `M` in `{1, 2, 4, 8}` — the four values
+/// libjpeg itself reconstructs with a dedicated fixed-point kernel this crate
+/// ports exactly (`idct/scaled.rs`'s module doc) — over one 4:2:0 and one
+/// 4:4:4 source. When `djpeg` is on `PATH` a `reference/…` group times
+/// `djpeg -dct int -scale M/8` over the same encoded file, so the ratio can
+/// be read straight off one run, the same convention `encode_bench.rs`'s
+/// `reference/…` group uses for `cjpeg`.
+///
+/// Throughput is reported against the **source's** pixel count (512x512, the
+/// same denominator at every `M`) rather than the shrinking output size, so
+/// the Melem/s column is directly comparable across scales on one row of the
+/// criterion report instead of being inflated at small `M` by a smaller
+/// denominator.
+fn bench_scaled_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scaled_decode");
+    let reference = djpeg_available();
+    let dir = std::env::temp_dir();
+
+    let fixtures: [(&str, &[&str]); 2] = [
+        ("420_q75", &["-quality", "75", "-sample", "2x2"]),
+        ("444_q95", &["-quality", "95", "-sample", "1x1"]),
+    ];
+
+    for (fixture_name, args) in fixtures {
+        let source = source_ppm(512, 512);
+        let Some(jpeg) = cjpeg(args, &source) else {
+            eprintln!("skipping scaled_decode/{fixture_name}: cjpeg unavailable");
+            continue;
+        };
+
+        let input_path = dir.join(format!(
+            "oxiarc_jpeg_scalebench_{}_{fixture_name}.jpg",
+            std::process::id()
+        ));
+        let reference_ready = reference && std::fs::write(&input_path, &jpeg).is_ok();
+
+        for numerator in [1u8, 2, 4, 8] {
+            let scale = Scale::new(numerator).expect("1..=16");
+            let name = format!("{fixture_name}_m{numerator}_8");
+            group.throughput(Throughput::Elements(512 * 512));
+            group.bench_function(&name, |b| {
+                b.iter(|| {
+                    let options = DecodeOptions {
+                        scale,
+                        ..DecodeOptions::default()
+                    };
+                    let mut decoder = Decoder::with_options(jpeg.as_slice(), options);
+                    black_box(decoder.decode().expect("decode"))
+                });
+            });
+
+            if reference_ready {
+                let scale_arg = format!("{numerator}/8");
+                let output_path = dir.join(format!(
+                    "oxiarc_jpeg_scalebench_{}_{fixture_name}_m{numerator}.ppm",
+                    std::process::id()
+                ));
+                group.bench_function(format!("reference/{name}"), |b| {
+                    b.iter(|| {
+                        run_djpeg(
+                            &["-dct", "int", "-scale", &scale_arg, "-pnm"],
+                            &input_path,
+                            &output_path,
+                        );
+                    });
+                });
+                let _ = std::fs::remove_file(&output_path);
+            }
+        }
+        let _ = std::fs::remove_file(&input_path);
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_decode, bench_upsampling, bench_scaled_decode);
 criterion_main!(benches);

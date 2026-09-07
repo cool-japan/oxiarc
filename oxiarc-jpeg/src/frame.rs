@@ -206,6 +206,33 @@ impl ArithmeticConditioning {
         Ok(())
     }
 
+    /// Check every slot against T.81 B.2.4.3's bounds.
+    ///
+    /// `0 <= L <= U <= 15` for the DC slots and `1 <= Kx <= 63` for the AC
+    /// ones. The fields are public so a caller can set anything a `u8` holds;
+    /// this is what stops the encoder writing a `DAC` segment that
+    /// [`ArithmeticConditioning::parse`] — and every conforming decoder —
+    /// refuses.
+    pub(crate) fn validate(&self) -> Result<()> {
+        for &cs in &self.dc {
+            if (cs & 0x0F) > (cs >> 4) {
+                return Err(JpegError::InvalidEncodeParameter {
+                    parameter: "arithmetic",
+                    reason: "DC conditioning requires L <= U (T.81 B.2.4.3)",
+                });
+            }
+        }
+        for &kx in &self.ac {
+            if kx == 0 || kx > 63 {
+                return Err(JpegError::InvalidEncodeParameter {
+                    parameter: "arithmetic",
+                    reason: "AC conditioning Kx must be 1..=63 (T.81 B.2.4.3)",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Emit `DAC` segments for every slot that differs from the T.81 default.
     pub(crate) fn emit(&self, out: &mut Vec<u8>) {
         let default = ArithmeticConditioning::default();

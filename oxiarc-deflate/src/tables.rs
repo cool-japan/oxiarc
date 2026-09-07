@@ -167,6 +167,7 @@ pub const CODE_LENGTH_ORDER: [usize; 19] = [
 /// pass an already-validated `3..=258` length, so this is safe as a
 /// crate-private helper; it must not be exposed as a public API without
 /// adding a real bounds check.
+#[cfg(test)]
 pub(crate) fn length_to_code(length: u16) -> (u16, u8, u16) {
     debug_assert!(
         (3..=258).contains(&length),
@@ -203,6 +204,7 @@ pub(crate) fn length_to_code(length: u16) -> (u16, u8, u16) {
 /// always pass an already-validated `1..=32768` distance, so this is safe
 /// as a crate-private helper; it must not be exposed as a public API
 /// without adding a real bounds check.
+#[cfg(test)]
 pub(crate) fn distance_to_code(distance: u16) -> (u16, u8, u16) {
     debug_assert!(
         (1..=32768).contains(&distance),

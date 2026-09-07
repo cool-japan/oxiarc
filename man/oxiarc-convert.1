@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-convert 1  "oxiarc-convert " 
+.TH oxiarc-convert 1  "oxiarc-convert 0.4.2" 
 .SH NAME
 oxiarc\-convert \- Convert archive to another format
 .SH SYNOPSIS
-\fBoxiarc\-convert\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIINPUT\fR> <\fIOUTPUT\fR> 
+\fBoxiarc\-convert\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIINPUT\fR> <\fIOUTPUT\fR> 
 .SH DESCRIPTION
 Convert archive to another format
 .SH OPTIONS
@@ -61,8 +61,13 @@ Verbose output
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIINPUT\fR>
 Input archive file
 .TP
 <\fIOUTPUT\fR>
 Output archive file
+.SH VERSION
+v0.4.2

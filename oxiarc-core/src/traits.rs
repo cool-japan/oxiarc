@@ -204,7 +204,8 @@ pub trait Decompressor {
                         // compressed stream the cut was noticed) is carried.
                         return Err(OxiArcError::corrupted(
                             input_pos as u64,
-                            "decompress_all: input exhausted while the decoder still                              needs more (truncated stream)",
+                            "decompress_all: input exhausted while the decoder still \
+                             needs more (truncated stream)",
                         ));
                     }
                     break;

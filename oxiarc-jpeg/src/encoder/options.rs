@@ -179,6 +179,11 @@ pub enum QuantTableSource {
     /// Caller-supplied tables, used verbatim — [`EncodeOptions::quality`] is
     /// **not** applied. Scale them yourself with
     /// [`QuantTable::scaled_for_quality`] if you want that.
+    ///
+    /// Every value must be `1..=65535`: T.81 B.2.4.1 has no zero quantiser,
+    /// and one would divide by zero. A table carrying one is rejected with
+    /// [`crate::JpegError::InvalidEncodeParameter`], as is a slot a component
+    /// references but the array leaves empty.
     Custom(Box<[Option<QuantTable>; 4]>),
     /// Every entry of every table set to one value. `Flat(1)` is the finest
     /// quantisation a JPEG can express.
@@ -347,7 +352,11 @@ pub struct EncodeOptions {
     ///
     /// The default is T.81's (`L = 0`, `U = 1`, `Kx = 5`), which is what
     /// every libjpeg-derived encoder writes. Only meaningful when
-    /// `entropy` is [`EntropyCoding::Arithmetic`].
+    /// `entropy` is [`EntropyCoding::Arithmetic`], and only then is it
+    /// checked: T.81 B.2.4.3 requires `0 <= L <= U <= 15` for each DC slot and
+    /// `1 <= Kx <= 63` for each AC one, and anything else is rejected with
+    /// [`crate::JpegError::InvalidEncodeParameter`] rather than written into a
+    /// `DAC` segment no conforming decoder would accept.
     pub arithmetic: ArithmeticConditioning,
 }
 

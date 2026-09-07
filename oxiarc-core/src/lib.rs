@@ -56,7 +56,7 @@
 //! // Read bits from data
 //! let data = vec![0xAB, 0xCD];
 //! let mut reader = BitReader::new(Cursor::new(data));
-//! let bits = reader.read_bits(12).unwrap();
+//! let bits = reader.read_bits(12).expect("read 12 bits from 2-byte buffer");
 //!
 //! // Compute CRC-32
 //! let crc = Crc32::compute(b"Hello, World!");
@@ -77,6 +77,7 @@ pub mod error;
 pub mod msb_bitstream;
 pub mod progress;
 pub mod ringbuffer;
+pub mod sha256;
 pub mod traits;
 
 #[cfg(feature = "async-io")]

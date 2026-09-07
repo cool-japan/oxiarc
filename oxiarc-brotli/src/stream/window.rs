@@ -6,15 +6,21 @@
 //! caller and must still be able to look `window_size` bytes back. This module
 //! provides that store as a power-of-two ring.
 //!
-//! Two properties matter and are both tested below:
+//! Three properties matter and are all tested below:
 //!
 //! * **Bounded.** Memory is `min(1 << WBITS, grown-to-need)` bytes, never a
 //!   function of the stream length.
-//! * **Bulk.** Matches and dictionary words are moved with `copy_within` /
-//!   `copy_from_slice` in runs, never byte at a time. Overlapping matches
-//!   (`distance < length`, the LZ77 repeat idiom) are handled by capping each
-//!   run at `distance`, which keeps every individual run non-overlapping while
-//!   reproducing the byte-at-a-time semantics exactly.
+//! * **Write-once.** The ring is *not* on the decoder's byte-producing path.
+//!   Literals and matches go straight to the caller's slice, and
+//!   `command::copy_into_pending` resolves a match's *source* across the
+//!   boundary between this ring and the bytes produced so far in the current
+//!   call; the ring is then caught up with one bulk [`BrotliWindow::push_slice`]
+//!   per call. That is what keeps a bounded decoder from writing every produced
+//!   byte twice.
+//! * **Tail-only where a tail suffices.** A stored meta-block longer than the
+//!   declared window mirrors only its last `1 << WBITS` bytes
+//!   ([`BrotliWindow::push_slice_tail`]); everything before that is out of
+//!   reach of every legal distance the moment the meta-block ends.
 
 /// Smallest ring allocation. Brotli streams routinely declare `lgwin = 22`
 /// (a 4 MiB window) for a payload of a few dozen bytes, so the ring starts
@@ -22,23 +28,14 @@
 /// front.
 const MIN_RING_CAPACITY: usize = 4096;
 
-/// Backward distances below this get the periodic-tiling path in
-/// [`BrotliWindow::copy_match`]. Above it, one run of `distance` bytes is
-/// already a worthwhile bulk copy.
-const SMALL_DISTANCE: usize = 64;
-
-/// Target size of the tiled pattern block. Rounded down to a whole number of
-/// periods, so `TILE / distance` copies replace `TILE` byte-at-a-time steps.
-const TILE: usize = 256;
-
-/// Once a stream has proved it needs more than this, the ring jumps straight
-/// to the declared window instead of doubling again.
+/// Runs no longer than this are moved byte at a time.
 ///
-/// Doubling is what keeps a 40-byte stream that declares `lgwin = 22` from
-/// allocating 4 MiB; past this point the stream has demonstrably earned its
-/// declared window, and further doubling only buys repeated reallocation and
-/// page-fault churn on the copy.
-const GROW_TO_TARGET_ABOVE: usize = 64 * 1024;
+/// A bulk copy is a `memmove` call, and at these lengths the call costs more
+/// than the bytes: real Brotli streams are dominated by literal runs and copies
+/// of 2-24 bytes (RFC 7932's copy-length alphabet starts at 2), and
+/// `_platform_memmove` was 12.7 % of the push decoder's profile before this
+/// threshold existed — the calls, not the bytes.
+pub(crate) const SHORT_MATCH: usize = 32;
 
 /// A Brotli LZ77 sliding window.
 ///
@@ -46,11 +43,9 @@ const GROW_TO_TARGET_ABOVE: usize = 64 * 1024;
 ///
 /// * `capacity` is a power of two and `mask == capacity - 1`;
 /// * `capacity <= target` (the declared `1 << WBITS`);
-/// * while `filled < capacity` the ring has never wrapped, so its bytes are
-///   exactly `buf[..filled]` and `pos == filled` — which is what makes growth
-///   a plain `resize`;
-/// * `filled == capacity` implies `capacity == target`, so the ring only ever
-///   evicts bytes once it has reached the declared window size.
+/// * every write is preceded by a [`BrotliWindow::reserve`] for exactly the
+///   bytes it will append, so while `capacity < target` the ring has never
+///   evicted anything: its bytes are `buf[..filled]` and `pos == filled`.
 #[derive(Debug)]
 pub(crate) struct BrotliWindow {
     buf: Vec<u8>,
@@ -64,6 +59,12 @@ pub(crate) struct BrotliWindow {
     filled: usize,
     /// The largest capacity this ring may grow to (`1 << WBITS`).
     target: usize,
+    /// Total bytes the ring is already known to be asked for — the current
+    /// meta-block's `MLEN` added to what it holds. Sizing from this turns the
+    /// growth of a large meta-block into one allocation instead of a
+    /// doubling schedule, and stops a 1 MiB body from claiming a stream's
+    /// declared 4 MiB window. Zero means "no announcement".
+    expected: usize,
 }
 
 impl BrotliWindow {
@@ -81,7 +82,19 @@ impl BrotliWindow {
             pos: 0,
             filled: 0,
             target,
+            expected: 0,
         }
+    }
+
+    /// Announce that the ring is about to be asked to hold `total` bytes in
+    /// all (what it holds now plus the current meta-block's `MLEN`).
+    ///
+    /// A meta-block declares its exact length before it produces a byte, so
+    /// the ring can be sized once, from the truth, instead of doubling its way
+    /// there — and a body far smaller than the stream's declared window never
+    /// pays for that window at all.
+    pub(crate) fn expect_total(&mut self, total: usize) {
+        self.expected = self.expected.max(total).min(self.target);
     }
 
     /// Bytes currently allocated for the ring.
@@ -90,13 +103,22 @@ impl BrotliWindow {
         self.capacity
     }
 
+    /// Number of valid history bytes the ring currently holds.
+    ///
+    /// This is `min(1 << WBITS, bytes produced so far)` once the ring has
+    /// reached its declared size, which is exactly the reach the one-shot
+    /// decoder has into its output `Vec` — the two decoders therefore accept
+    /// and reject the same backward distances.
+    pub(crate) fn filled(&self) -> usize {
+        self.filled
+    }
+
     /// Grow so that `extra` more bytes can be written without evicting any
     /// byte that is still reachable, up to the declared window size.
     ///
-    /// The `+ 1` keeps `filled < capacity` strictly true for every ring that
-    /// has not yet reached `target`, which is what preserves the
-    /// "never wrapped ⇒ `pos == filled`" invariant that makes growth a plain
-    /// `resize`.
+    /// The size chosen is the larger of what this write needs and what
+    /// [`BrotliWindow::expect_total`] announced, so a meta-block of known
+    /// length is allocated for once rather than doubled into.
     fn reserve(&mut self, extra: usize) {
         if self.capacity == self.target {
             return;
@@ -104,24 +126,50 @@ impl BrotliWindow {
         let needed = self
             .filled
             .saturating_add(extra)
-            .saturating_add(1)
+            .max(self.expected)
             .min(self.target);
         if needed <= self.capacity {
             return;
         }
-        let new_capacity = if needed > GROW_TO_TARGET_ABOVE {
-            self.target
+        self.regrow(needed.next_power_of_two().min(self.target));
+    }
+
+    /// Grow straight to the declared window.
+    ///
+    /// Used when the ring is *certain* to end up full — a meta-block longer
+    /// than the window — so that the intermediate sizes are skipped and
+    /// [`BrotliWindow::filled`] reaches the declared reach.
+    fn grow_to_target(&mut self) {
+        if self.capacity < self.target {
+            self.regrow(self.target);
+        }
+    }
+
+    /// Move the ring into a `new_capacity`-byte allocation, preserving both
+    /// its contents and their order.
+    ///
+    /// A fresh zeroed allocation rather than `Vec::resize`: at the sizes that
+    /// matter the allocator hands back lazily-zeroed pages, so the ring costs
+    /// no `memset` at all, while `resize` writes zeros across the whole new
+    /// tail before a single decoded byte lands in it — measured at 31.5 us for
+    /// the 4 KiB → 4 MiB step a `lgwin = 22` stream used to take, against a
+    /// 16.2 us *total* for one-shot-decoding a 1 MiB stored meta-block.
+    fn regrow(&mut self, new_capacity: usize) {
+        debug_assert!(new_capacity > self.capacity);
+        let mut grown = vec![0u8; new_capacity];
+        if self.filled == self.capacity {
+            // Exactly full: the bytes run `pos..capacity` then `..pos`.
+            let head = self.capacity - self.pos;
+            grown[..head].copy_from_slice(&self.buf[self.pos..]);
+            grown[head..self.capacity].copy_from_slice(&self.buf[..self.pos]);
         } else {
-            let mut grown = self.capacity;
-            while grown < needed {
-                grown = grown.saturating_mul(2);
-            }
-            grown.min(self.target)
-        };
-        self.buf.resize(new_capacity, 0);
+            debug_assert_eq!(self.pos, self.filled, "ring grew after wrapping");
+            grown[..self.filled].copy_from_slice(&self.buf[..self.filled]);
+        }
+        self.buf = grown;
+        self.pos = self.filled;
         self.capacity = new_capacity;
         self.mask = new_capacity - 1;
-        // Never wrapped, so `pos == filled` still addresses the write cursor.
     }
 
     /// Advance the write cursor by `n` bytes that were just written.
@@ -130,20 +178,36 @@ impl BrotliWindow {
         self.filled = (self.filled + n).min(self.capacity);
     }
 
-    /// Append one byte.
-    pub(crate) fn push(&mut self, byte: u8) {
-        self.reserve(1);
-        self.buf[self.pos] = byte;
-        self.advance(1);
-    }
-
-    /// Append `src` verbatim (uncompressed meta-block bytes and transformed
-    /// dictionary words), in at most two bulk copies.
+    /// Append `src` verbatim (a run of literals, uncompressed meta-block bytes,
+    /// a transformed dictionary word), in at most two bulk copies.
+    ///
+    /// Short runs take a byte loop instead. A literal run is a handful of bytes
+    /// on most real data, and one `memmove` call per run was 13 % of the push
+    /// decoder's profile — the calls, not the bytes.
+    #[inline]
     pub(crate) fn push_slice(&mut self, src: &[u8]) {
         if src.is_empty() {
             return;
         }
         self.reserve(src.len());
+        if src.len() <= SHORT_MATCH {
+            let mask = self.mask;
+            let mut pos = self.pos;
+            for &byte in src {
+                self.buf[pos] = byte;
+                pos = (pos + 1) & mask;
+            }
+            self.pos = pos;
+            self.filled = (self.filled + src.len()).min(self.capacity);
+            return;
+        }
+        self.push_slice_bulk(src);
+    }
+
+    /// The bulk half of [`BrotliWindow::push_slice`], kept out of line so the
+    /// short-run path above inlines into the command loop.
+    #[inline(never)]
+    fn push_slice_bulk(&mut self, src: &[u8]) {
         if src.len() >= self.capacity {
             // Only the last `capacity` bytes survive.
             let tail = &src[src.len() - self.capacity..];
@@ -161,93 +225,55 @@ impl BrotliWindow {
         self.advance(src.len());
     }
 
-    /// Copy an LZ77 match of `count` bytes from `distance` back, appending it
-    /// to the ring and writing the same bytes into `out`.
+    /// Append only the part of `src` that can still be reached once `future`
+    /// more bytes have been appended after it.
     ///
-    /// Returns the number of bytes produced, which is `min(count, out.len())`.
-    /// The caller must have validated `1 <= distance <= filled`.
-    pub(crate) fn copy_match(&mut self, distance: usize, count: usize, out: &mut [u8]) -> usize {
-        let total = count.min(out.len());
-        if total == 0 {
-            return 0;
+    /// A window needs its tail and nothing else: a byte with more than
+    /// `1 << WBITS` bytes behind it is out of reach of every legal distance,
+    /// so mirroring it is pure memory traffic. This is what a stored
+    /// (uncompressed) meta-block longer than the declared window exploits —
+    /// its bytes go to the caller directly and only the last window's worth is
+    /// ever written to the ring.
+    ///
+    /// Callers must pass the *exact* number of bytes still to come inside the
+    /// run being mirrored; the last `min(run, 1 << WBITS)` bytes of that run
+    /// then reach the ring, in order, which is precisely the history a decoder
+    /// may address afterwards.
+    pub(crate) fn push_slice_tail(&mut self, src: &[u8], future: usize) {
+        let room = self.target.saturating_sub(future);
+        if room >= src.len() {
+            self.push_slice(src);
+            return;
         }
-        self.reserve(total);
-        if distance < SMALL_DISTANCE && total > distance {
-            return self.copy_periodic(distance, total, out);
+        // More bytes follow than the window can hold, so the ring is certain
+        // to end up exactly full; grow to the declared size in one step so
+        // that `filled` really does reach the reach the distances assume.
+        self.grow_to_target();
+        if room > 0 {
+            self.push_slice(&src[src.len() - room..]);
         }
-        let mut done = 0;
-        while done < total {
-            let dst = self.pos;
-            let src = (self.pos + self.capacity - distance) & self.mask;
-            let run = (total - done)
-                .min(distance)
-                .min(self.capacity - dst)
-                .min(self.capacity - src);
-            self.buf.copy_within(src..src + run, dst);
-            out[done..done + run].copy_from_slice(&self.buf[dst..dst + run]);
-            self.advance(run);
-            done += run;
-        }
-        total
     }
 
-    /// A contiguous, writable slice at the head of the ring, at most `want`
-    /// bytes long.
+    /// Copy `dst.len()` bytes out of the ring, starting `distance` bytes back
+    /// from the write cursor, writing nothing.
     ///
-    /// This is the ring's "linear region": bytes written here become the next
-    /// output, so a decoder can produce literals straight into the window and
-    /// then hand the caller one bulk copy, instead of writing every byte twice.
-    /// The slice stops at the wrap point, so it may be shorter than `want`; the
-    /// caller loops. Nothing is published until [`BrotliWindow::commit`].
-    pub(crate) fn linear_mut(&mut self, want: usize) -> &mut [u8] {
-        self.reserve(want);
-        let end = (self.pos + want).min(self.capacity);
-        &mut self.buf[self.pos..end]
-    }
-
-    /// Publish `n` bytes written through [`BrotliWindow::linear_mut`].
-    pub(crate) fn commit(&mut self, n: usize) {
-        self.advance(n);
-    }
-
-    /// The short-distance case of [`BrotliWindow::copy_match`].
-    ///
-    /// An LZ77 copy whose length exceeds its distance is *periodic*: the output
-    /// is `pattern[i % distance]` where `pattern` is the `distance` bytes at
-    /// the source. Materialising one period, tiling it into a block of whole
-    /// periods and emitting the block in bulk replaces the byte-at-a-time
-    /// overlap loop — which matters, because `distance == 1` runs (a repeated
-    /// byte) are the single most common shape in real compressed data.
-    ///
-    /// `total > distance` and `distance < SMALL_DISTANCE` are the caller's
-    /// preconditions; `reserve` has already run.
-    fn copy_periodic(&mut self, distance: usize, total: usize, out: &mut [u8]) -> usize {
-        // One period, read out of the ring (at most two copies, for the wrap).
-        let mut pattern = [0u8; SMALL_DISTANCE];
-        let src = (self.pos + self.capacity - distance) & self.mask;
-        let first = (self.capacity - src).min(distance);
-        pattern[..first].copy_from_slice(&self.buf[src..src + first]);
-        if first < distance {
-            pattern[first..distance].copy_from_slice(&self.buf[..distance - first]);
+    /// This is the read half a decoder needs when the *destination* of a match
+    /// is the caller's buffer rather than the ring — see
+    /// `command::copy_into_pending`. The caller must have validated
+    /// `dst.len() <= distance <= filled()`, so the read never runs past the
+    /// write cursor into bytes that do not exist yet.
+    pub(crate) fn read_back(&self, distance: usize, dst: &mut [u8]) {
+        debug_assert!(dst.len() <= distance && distance <= self.filled);
+        if dst.is_empty() {
+            return;
         }
-
-        // Tile it into whole periods so every emitted chunk starts on a period
-        // boundary and a prefix of the block is always the right continuation.
-        let mut block = [0u8; TILE + SMALL_DISTANCE];
-        let reps = (TILE / distance).max(1);
-        let block_len = reps * distance;
-        for rep in 0..reps {
-            block[rep * distance..(rep + 1) * distance].copy_from_slice(&pattern[..distance]);
+        let start = (self.pos + self.capacity - distance) & self.mask;
+        let first = (self.capacity - start).min(dst.len());
+        dst[..first].copy_from_slice(&self.buf[start..start + first]);
+        if first < dst.len() {
+            let rest = dst.len() - first;
+            dst[first..].copy_from_slice(&self.buf[..rest]);
         }
-
-        let mut done = 0;
-        while done < total {
-            let n = (total - done).min(block_len);
-            out[done..done + n].copy_from_slice(&block[..n]);
-            self.push_slice(&block[..n]);
-            done += n;
-        }
-        total
     }
 
     /// The byte `distance` positions back from the write cursor.
@@ -260,17 +286,6 @@ impl BrotliWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A reference window: a plain growing `Vec`, i.e. what the one-shot
-    /// decoder does. Every ring operation must agree with it.
-    fn reference_copy(history: &mut Vec<u8>, distance: usize, count: usize) -> Vec<u8> {
-        let start = history.len();
-        for _ in 0..count {
-            let byte = history[history.len() - distance];
-            history.push(byte);
-        }
-        history[start..].to_vec()
-    }
 
     #[test]
     fn grows_lazily_from_the_minimum() {
@@ -291,108 +306,32 @@ mod tests {
     }
 
     #[test]
-    fn non_overlapping_match_matches_reference() {
-        let mut w = BrotliWindow::with_target(1 << 13);
-        let mut history = Vec::new();
-        let seed: Vec<u8> = (0..200u16).map(|i| (i % 251) as u8).collect();
-        w.push_slice(&seed);
-        history.extend_from_slice(&seed);
-
-        let mut out = vec![0u8; 100];
-        let n = w.copy_match(150, 100, &mut out);
-        assert_eq!(n, 100);
-        assert_eq!(out, reference_copy(&mut history, 150, 100));
-    }
-
-    #[test]
-    fn overlapping_match_matches_reference() {
-        let mut w = BrotliWindow::with_target(1 << 13);
-        let mut history = Vec::new();
-        w.push_slice(b"ab");
-        history.extend_from_slice(b"ab");
-
-        let mut out = vec![0u8; 9];
-        let n = w.copy_match(2, 9, &mut out);
-        assert_eq!(n, 9);
-        assert_eq!(out, reference_copy(&mut history, 2, 9));
-        assert_eq!(&out, b"ababababa");
-    }
-
-    #[test]
-    fn distance_one_run_matches_reference() {
-        let mut w = BrotliWindow::with_target(1 << 13);
-        let mut history = vec![0xAA];
-        w.push(0xAA);
-        let mut out = vec![0u8; 300];
-        assert_eq!(w.copy_match(1, 300, &mut out), 300);
-        assert_eq!(out, reference_copy(&mut history, 1, 300));
-    }
-
-    #[test]
-    fn match_across_the_wrap_matches_reference() {
-        let target = 1 << 12;
-        let mut w = BrotliWindow::with_target(target);
-        let mut history = Vec::new();
-        let seed: Vec<u8> = (0..target as u32 + 500).map(|i| (i % 253) as u8).collect();
-        w.push_slice(&seed);
-        history.extend_from_slice(&seed);
-
-        // A distance that reaches back over the wrap point.
-        let mut out = vec![0u8; 700];
-        assert_eq!(w.copy_match(3000, 700, &mut out), 700);
-        assert_eq!(out, reference_copy(&mut history, 3000, 700));
-    }
-
-    #[test]
-    fn linear_region_writes_are_visible_as_history() {
-        let mut w = BrotliWindow::with_target(1 << 12);
-        let mut history = Vec::new();
-        // Fill past the wrap so the linear region really does get truncated.
-        for round in 0..40u32 {
-            let want = 200usize;
-            let mut written = 0;
-            while written < want {
-                let dst = w.linear_mut(want - written);
-                let n = dst.len();
-                for (i, slot) in dst.iter_mut().enumerate() {
-                    *slot = (round as usize + i) as u8;
-                }
-                let produced: Vec<u8> = (0..n).map(|i| (round as usize + i) as u8).collect();
-                history.extend_from_slice(&produced);
-                w.commit(n);
-                written += n;
-            }
-        }
-        for d in 1..=(1usize << 12) {
-            assert_eq!(w.back(d), history[history.len() - d], "distance {d}");
-        }
-    }
-
-    #[test]
-    fn periodic_path_agrees_with_the_reference_for_every_small_distance() {
-        for distance in 1..SMALL_DISTANCE {
-            for length in [distance, distance + 1, 100, 257, 1000] {
-                let mut w = BrotliWindow::with_target(1 << 14);
-                let mut history = Vec::new();
-                let seed: Vec<u8> = (0..distance as u32)
-                    .map(|i| (i.wrapping_mul(37) % 251) as u8)
+    fn a_stored_run_longer_than_the_window_keeps_exactly_its_tail() {
+        // What `push_slice_tail` is for: a stored meta-block bigger than the
+        // declared window goes to the caller in full, but only its last
+        // window's worth is ever mirrored — and the ring must then hold
+        // exactly the history a decoder may address.
+        for target_bits in [12u32, 14] {
+            let target = 1usize << target_bits;
+            for mlen in [target / 2, target, target + 1, target * 3 + 7] {
+                let data: Vec<u8> = (0..mlen as u32)
+                    .map(|i| (i.wrapping_mul(31)) as u8)
                     .collect();
-                w.push_slice(&seed);
-                history.extend_from_slice(&seed);
-
-                let mut out = vec![0u8; length];
-                assert_eq!(w.copy_match(distance, length, &mut out), length);
-                assert_eq!(
-                    out,
-                    reference_copy(&mut history, distance, length),
-                    "distance {distance} length {length}"
-                );
-                // The ring must agree with the reference history too.
-                for d in 1..=distance {
+                let mut w = BrotliWindow::with_target(target);
+                w.expect_total(mlen);
+                let mut done = 0usize;
+                while done < mlen {
+                    let n = 333.min(mlen - done);
+                    w.push_slice_tail(&data[done..done + n], mlen - done - n);
+                    done += n;
+                }
+                let kept = mlen.min(target);
+                assert_eq!(w.filled(), kept, "target {target} mlen {mlen}");
+                for d in 1..=kept {
                     assert_eq!(
                         w.back(d),
-                        history[history.len() - d],
-                        "distance {distance} length {length}: ring byte at -{d}"
+                        data[data.len() - d],
+                        "target {target} mlen {mlen} distance {d}"
                     );
                 }
             }
@@ -400,40 +339,37 @@ mod tests {
     }
 
     #[test]
-    fn periodic_path_resumes_across_short_output_slices() {
-        // The tiling must stay period-aligned when the caller's slice cuts a
-        // block in half.
-        let mut w = BrotliWindow::with_target(1 << 14);
-        let mut history = Vec::new();
-        w.push_slice(b"abc");
-        history.extend_from_slice(b"abc");
-        let expected = reference_copy(&mut history, 3, 1000);
-
-        let mut got = Vec::new();
-        let mut remaining = 1000usize;
-        let mut chunk = 1usize;
-        while remaining > 0 {
-            let mut out = vec![0u8; chunk.min(remaining)];
-            let n = w.copy_match(3, remaining, &mut out);
-            got.extend_from_slice(&out[..n]);
-            remaining -= n;
-            chunk = chunk * 2 + 1;
-        }
-        assert_eq!(got, expected);
+    fn an_announced_meta_block_is_allocated_once_and_no_larger() {
+        // A 1 MiB body on a stream that declares a 4 MiB window gets a 1 MiB
+        // ring: the announcement, not the declaration, sizes the allocation.
+        let mut w = BrotliWindow::with_target(1 << 22);
+        w.expect_total(1 << 20);
+        w.push_slice(&vec![9u8; 1 << 16]);
+        assert_eq!(w.capacity(), 1 << 20);
+        w.push_slice(&vec![9u8; (1 << 20) - (1 << 16)]);
+        assert_eq!(w.capacity(), 1 << 20, "no growth beyond the announcement");
+        // Going past it still works, and still never exceeds the declaration.
+        w.push_slice(&vec![3u8; 1 << 20]);
+        assert!(w.capacity() > 1 << 20 && w.capacity() <= 1 << 22);
+        assert_eq!(w.back(1), 3);
     }
 
     #[test]
-    fn short_output_slice_produces_a_prefix() {
-        let mut w = BrotliWindow::with_target(1 << 13);
-        w.push_slice(b"0123456789");
-        let mut out = vec![0u8; 3];
-        assert_eq!(w.copy_match(10, 10, &mut out), 3);
-        assert_eq!(&out, b"012");
-        // The remaining 7 bytes are produced by a follow-up call, exactly as
-        // the resumable command loop does it.
-        let mut out2 = vec![0u8; 7];
-        assert_eq!(w.copy_match(10, 7, &mut out2), 7);
-        assert_eq!(&out2, b"3456789");
+    fn growth_preserves_history_across_a_wrap() {
+        // `regrow` must handle the exactly-full ring, whose bytes are split
+        // around `pos`; a plain prefix copy would silently rotate history.
+        let mut w = BrotliWindow::with_target(1 << 14);
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        w.push_slice(&data[..4096]);
+        assert_eq!(w.capacity(), 4096);
+        w.push_slice(&data[..100]);
+        assert!(w.capacity() > 4096);
+        for d in 1..=100 {
+            assert_eq!(w.back(d), data[100 - d], "distance {d}");
+        }
+        for d in 101..=4196 {
+            assert_eq!(w.back(d), data[4096 - (d - 100)], "distance {d}");
+        }
     }
 
     #[test]
@@ -443,6 +379,43 @@ mod tests {
         w.push_slice(&data);
         for d in 1..=(1usize << 12) {
             assert_eq!(w.back(d), data[data.len() - d], "distance {d}");
+        }
+    }
+
+    /// `read_back` is the ring's whole read interface now, so it gets its own
+    /// reference test: reading `n` bytes from `distance` back must reproduce
+    /// the same bytes a plain history `Vec` holds there, across the wrap and at
+    /// every distance the ring can hold.
+    #[test]
+    fn read_back_agrees_with_a_plain_history() {
+        let target = 1 << 12;
+        let mut w = BrotliWindow::with_target(target);
+        let mut history: Vec<u8> = Vec::new();
+        let feed: Vec<u8> = (0..(target as u32 * 2 + 777))
+            .map(|i| (i.wrapping_mul(97) % 251) as u8)
+            .collect();
+        let mut fed = 0usize;
+        while fed < feed.len() {
+            let n = 251.min(feed.len() - fed);
+            w.push_slice(&feed[fed..fed + n]);
+            history.extend_from_slice(&feed[fed..fed + n]);
+            fed += n;
+        }
+        assert_eq!(w.filled(), target);
+        for distance in [1usize, 2, 63, 64, 255, 1000, target - 1, target] {
+            for len in [1usize, 2, 31, 32, 33] {
+                if len > distance {
+                    continue;
+                }
+                let mut got = vec![0u8; len];
+                w.read_back(distance, &mut got);
+                let start = history.len() - distance;
+                assert_eq!(
+                    got,
+                    &history[start..start + len],
+                    "distance {distance} len {len}"
+                );
+            }
         }
     }
 }

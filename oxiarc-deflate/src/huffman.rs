@@ -45,6 +45,50 @@ const ENTRY_PAYLOAD_MASK: u32 = 0xFFFF;
 /// Largest table index representable in an entry's payload field.
 const MAX_TABLE_INDEX: usize = ENTRY_PAYLOAD_MASK as usize;
 
+/// Per-build scratch reused across [`HuffmanTree::build_into`] calls.
+///
+/// Building the two-level decode table needs two arrays indexed by root slot:
+/// the longest code sharing each root prefix, and where that slot's sub-table
+/// starts. Allocating them per build costs two allocations *per tree*, i.e.
+/// four per dynamic DEFLATE block once the code-length tree is excluded — a
+/// cost paid roughly every 16 K symbols by any zlib-shaped stream, which is
+/// exactly the steady state a push decoder is supposed to run allocation-free
+/// in. They are therefore owned by the tree and merely re-zeroed.
+///
+/// The buffers are needed only when some code is longer than the root index
+/// (`max_length > ROOT_BITS`), which forces `root_bits == ROOT_BITS` and hence
+/// a length of exactly `1 << ROOT_BITS`. A tree whose codes all fit the root
+/// table — the 19-symbol code-length alphabet always does — never allocates
+/// them at all.
+#[derive(Debug, Clone, Default)]
+struct TableScratch {
+    /// Longest code length sharing each root slot's prefix (0 = no sub-table).
+    max_len: Vec<u8>,
+    /// Start of each root slot's sub-table within `HuffmanTree::table`.
+    offset: Vec<u32>,
+}
+
+impl TableScratch {
+    /// Make both buffers at least `root_size` long and zero that prefix.
+    ///
+    /// Grows at most once per tree: `root_size` is `1 << HuffmanTree::ROOT_BITS`
+    /// on every call that reaches here.
+    fn prepare(&mut self, root_size: usize) {
+        if self.max_len.len() < root_size {
+            self.max_len.resize(root_size, 0u8);
+        }
+        if self.offset.len() < root_size {
+            self.offset.resize(root_size, 0u32);
+        }
+        if let Some(head) = self.max_len.get_mut(..root_size) {
+            head.fill(0u8);
+        }
+        if let Some(head) = self.offset.get_mut(..root_size) {
+            head.fill(0u32);
+        }
+    }
+}
+
 /// A Huffman tree for decoding.
 ///
 /// Decoding is table driven, in the two-level layout used by zlib's
@@ -89,6 +133,8 @@ pub struct HuffmanTree {
     base_codes: [u32; MAX_CODE_LENGTH + 1],
     /// Symbol offsets for each length.
     symbol_offsets: [u16; MAX_CODE_LENGTH + 1],
+    /// Reusable per-build scratch (see [`TableScratch`]).
+    scratch: TableScratch,
 }
 
 impl HuffmanTree {
@@ -200,6 +246,7 @@ impl HuffmanTree {
             symbols: Vec::new(),
             base_codes: [0; MAX_CODE_LENGTH + 1],
             symbol_offsets: [0; MAX_CODE_LENGTH + 1],
+            scratch: TableScratch::default(),
         }
     }
 
@@ -278,7 +325,13 @@ impl HuffmanTree {
             }
         }
 
-        // Build symbol table, reusing the existing allocation.
+        // Build symbol table, reusing the existing allocation. The capacity is
+        // reserved once, rounded up to a power of two, so that a stream whose
+        // per-block `HLIT` wanders (257..=286 for the literal/length alphabet)
+        // reallocates on the first block only and never again.
+        let symbol_capacity = code_lengths.len().next_power_of_two();
+        self.symbols
+            .reserve_exact(symbol_capacity.saturating_sub(self.symbols.len()));
         self.symbols.resize(total_codes as usize, 0u16);
         self.symbols.fill(0u16);
         let symbols = &mut self.symbols;
@@ -319,58 +372,102 @@ impl HuffmanTree {
         // zeroed root table without asking the allocator for a new one.
         self.table.clear();
         self.table.resize(root_size, 0u32);
-        let table = &mut self.table;
+
+        // Codes no longer than the root index need no sub-tables at all, so
+        // both passes below collapse to the root-replication branch. The
+        // 19-symbol code-length alphabet (max 7 bits) always lands here, which
+        // is why it never touches — and never allocates — the scratch.
+        let has_long_codes = max_length > root_bits;
+
+        // Split the borrow so the decode table and the reusable scratch can be
+        // held at the same time.
+        let Self { table, scratch, .. } = self;
+        if has_long_codes {
+            scratch.prepare(root_size);
+        }
+        let TableScratch {
+            max_len: sub_max_len,
+            offset: sub_offset,
+        } = scratch;
 
         // Pass 1: size the sub-tables. For every code longer than
         // `root_bits`, the first `root_bits` bits (in stream order, i.e. the
         // low bits of the reversed canonical code) select a root slot; that
         // slot needs a sub-table wide enough for the longest code sharing the
         // prefix.
-        let mut sub_max_len = vec![0u8; root_size];
-        let mut assign = next_code;
-        for (symbol, &len) in code_lengths.iter().enumerate() {
-            let _ = symbol;
-            if len == 0 {
-                continue;
-            }
-            let len_us = len as usize;
-            let reversed = Self::reverse_bits(assign[len_us] as u16, len);
-            assign[len_us] += 1;
-            if len > root_bits {
-                let slot = (reversed as u32 & root_mask) as usize;
-                // Deliberately nested rather than an `if let ... && ...`
-                // chain: let-chains need Rust 1.88 and this workspace's MSRV
-                // is 1.85.
-                if let Some(cur) = sub_max_len.get_mut(slot) {
-                    if *cur < len {
-                        *cur = len;
+        if has_long_codes {
+            let mut assign = next_code;
+            for &len in code_lengths.iter() {
+                if len == 0 {
+                    continue;
+                }
+                let len_us = len as usize;
+                let reversed = Self::reverse_bits(assign[len_us] as u16, len);
+                assign[len_us] += 1;
+                if len > root_bits {
+                    let slot = (reversed as u32 & root_mask) as usize;
+                    // Deliberately nested rather than an `if let ... && ...`
+                    // chain: let-chains need Rust 1.88 and this workspace's MSRV
+                    // is 1.85.
+                    if let Some(cur) = sub_max_len.get_mut(slot) {
+                        if *cur < len {
+                            *cur = len;
+                        }
                     }
                 }
             }
-        }
 
-        // Allocate the sub-tables contiguously after the root table and
-        // install the pointer entries.
-        let mut sub_offset = vec![0u32; root_size];
-        for slot in 0..root_size {
-            let longest = sub_max_len.get(slot).copied().unwrap_or(0);
-            if longest == 0 {
-                continue;
-            }
-            let sub_bits = longest - root_bits;
-            let offset = table.len();
-            if offset > MAX_TABLE_INDEX {
-                return Err(OxiArcError::invalid_header(
-                    "Huffman decode table too large",
-                ));
-            }
-            table.resize(offset + (1usize << sub_bits), 0u32);
-            if let Some(slot_entry) = table.get_mut(slot) {
-                *slot_entry =
-                    ENTRY_SUBTABLE | ((offset as u32) << ENTRY_PAYLOAD_SHIFT) | (sub_bits as u32);
-            }
-            if let Some(off) = sub_offset.get_mut(slot) {
-                *off = offset as u32;
+            // Reserve the decode table once, for the *worst* code this
+            // alphabet admits, so no later block can grow it.
+            //
+            // A root slot that is completely filled by its codes needs a
+            // sub-table of `1 << k` entries (`k = max_length - root_bits`) and,
+            // to reach that width, at least `k + 1` codes: one at each of the
+            // lengths `root_bits+1 ..= root_bits+k`, plus a second at the
+            // longest. So the sub-tables together cost at most
+            // `ceil(long_codes * 2^k / (k + 1))` entries, and at most one slot
+            // (the last) can be partially filled and pay a further `2^k`.
+            // Independently, no slot's sub-table exceeds `1 << k` entries, so
+            // the total is also capped at `root_size << k`.
+            // For DEFLATE (k = 5) that is 2582 entries for the 286-symbol
+            // literal/length alphabet and 1216 for the 30-symbol distance
+            // alphabet — 10 KiB and 5 KiB, paid once per tree.
+            let k = usize::from(max_length - root_bits);
+            let widest = 1usize << k;
+            let long_codes: usize = bl_count
+                .iter()
+                .skip(root_bits as usize + 1)
+                .take(max_length as usize - root_bits as usize)
+                .map(|&c| c as usize)
+                .sum();
+            let sub_worst = ((long_codes * widest).div_ceil(k + 1) + widest)
+                .min(root_size.saturating_mul(widest));
+            let worst = (root_size + sub_worst).min(MAX_TABLE_INDEX + 1);
+            table.reserve_exact(worst.saturating_sub(table.len()));
+
+            // Allocate the sub-tables contiguously after the root table and
+            // install the pointer entries.
+            for slot in 0..root_size {
+                let longest = sub_max_len.get(slot).copied().unwrap_or(0);
+                if longest == 0 {
+                    continue;
+                }
+                let sub_bits = longest - root_bits;
+                let offset = table.len();
+                if offset > MAX_TABLE_INDEX {
+                    return Err(OxiArcError::invalid_header(
+                        "Huffman decode table too large",
+                    ));
+                }
+                table.resize(offset + (1usize << sub_bits), 0u32);
+                if let Some(slot_entry) = table.get_mut(slot) {
+                    *slot_entry = ENTRY_SUBTABLE
+                        | ((offset as u32) << ENTRY_PAYLOAD_SHIFT)
+                        | (sub_bits as u32);
+                }
+                if let Some(off) = sub_offset.get_mut(slot) {
+                    *off = offset as u32;
+                }
             }
         }
 
@@ -557,63 +654,6 @@ impl HuffmanTree {
 
         Err(OxiArcError::invalid_huffman(reader.bit_position()))
     }
-}
-
-/// Build a bit-cost table from code lengths.
-///
-/// Returns a Vec where `result[symbol] = lengths[symbol] as u32`.
-/// Symbols with length 0 are unreachable and get cost `u32::MAX`.
-pub(crate) fn cost_table_from_lengths(lengths: &[u8]) -> Vec<u32> {
-    lengths
-        .iter()
-        .map(|&l| if l == 0 { u32::MAX } else { l as u32 })
-        .collect()
-}
-
-/// Compute the total bit cost for encoding a (length, distance) match.
-///
-/// Returns `u32::MAX` if any required symbol is unreachable (cost == `u32::MAX`)
-/// or if integer overflow would occur.
-pub(crate) fn cost_of_match(
-    length: u16,
-    distance: u16,
-    litlen_costs: &[u32],
-    dist_costs: &[u32],
-) -> u32 {
-    use crate::tables::{DISTANCE_EXTRA_BITS, LENGTH_EXTRA_BITS, distance_to_code, length_to_code};
-
-    let (len_code, len_extra_bits, _) = length_to_code(length);
-    let len_sym_cost = litlen_costs
-        .get(len_code as usize)
-        .copied()
-        .unwrap_or(u32::MAX);
-    if len_sym_cost == u32::MAX {
-        return u32::MAX;
-    }
-
-    let (dist_code, dist_extra_bits, _) = distance_to_code(distance);
-    let dist_sym_cost = dist_costs
-        .get(dist_code as usize)
-        .copied()
-        .unwrap_or(u32::MAX);
-    if dist_sym_cost == u32::MAX {
-        return u32::MAX;
-    }
-
-    // Extra bits come from the tables; sanity-check the indices.
-    let len_eb = LENGTH_EXTRA_BITS
-        .get((len_code as usize).saturating_sub(257))
-        .copied()
-        .unwrap_or(len_extra_bits) as u32;
-    let dist_eb = DISTANCE_EXTRA_BITS
-        .get(dist_code as usize)
-        .copied()
-        .unwrap_or(dist_extra_bits) as u32;
-
-    len_sym_cost
-        .saturating_add(len_eb)
-        .saturating_add(dist_sym_cost)
-        .saturating_add(dist_eb)
 }
 
 /// Builder for creating Huffman code lengths from frequencies.
@@ -1046,5 +1086,124 @@ mod tests {
         // break fixed-Huffman decompression.
         let fixed_dist = [5u8; 30];
         assert!(HuffmanTree::from_code_lengths(&fixed_dist).is_ok());
+    }
+
+    /// A tree rebuilt in place must be indistinguishable from a fresh one.
+    ///
+    /// [`HuffmanTree::build_into`] reuses `table`, `symbols` and the
+    /// [`TableScratch`] buffers across builds. Any byte of stale state left in
+    /// them — most dangerously a non-zero `sub_max_len[slot]` from a previous,
+    /// deeper code — would reserve a sub-table for a slot that has no long
+    /// codes and install a sub-table pointer that the second pass never
+    /// overwrites, corrupting lookups in ways a single round-trip would not
+    /// reliably surface. This walks a deliberately hostile *sequence* of code
+    /// shapes through one reused tree and compares every field against a tree
+    /// built from scratch.
+    #[test]
+    fn rebuilding_in_place_matches_a_fresh_build_field_for_field() {
+        /// A canonical code with `count[len]` codes of each length, laid out
+        /// over `n` symbols. Returns `None` when the shape is not realisable.
+        fn shape(n: usize, counts: &[(u8, usize)]) -> Option<Vec<u8>> {
+            let mut lengths = vec![0u8; n];
+            let mut kraft = 0u64;
+            let mut next = 0usize;
+            for &(len, count) in counts {
+                for _ in 0..count {
+                    *lengths.get_mut(next)? = len;
+                    next += 1;
+                    kraft += 1u64 << (MAX_CODE_LENGTH as u32 - u32::from(len));
+                }
+            }
+            if kraft > 1u64 << MAX_CODE_LENGTH {
+                return None;
+            }
+            Some(lengths)
+        }
+
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        // Fixed literal/length and distance codes.
+        cases.push({
+            let mut v = vec![8u8; 144];
+            v.extend(std::iter::repeat_n(9u8, 112));
+            v.extend(std::iter::repeat_n(7u8, 24));
+            v.extend(std::iter::repeat_n(8u8, 8));
+            v
+        });
+        cases.push(vec![5u8; 30]);
+        // The code-length alphabet: never deeper than the root table.
+        cases.push(vec![3u8; 8]);
+        cases.push(vec![7u8; 19]);
+        // Single symbol, two symbols, a maximally deep code.
+        cases.push(vec![1u8, 0, 0, 0]);
+        cases.push(vec![1u8, 1]);
+        // Depth exactly at the root boundary, one below, one above.
+        for depth in [9u8, 10, 11, 15] {
+            if let Some(v) = shape(300, &[(depth, 1 << (depth - 1))]) {
+                cases.push(v);
+            }
+        }
+        // A ragged deep code: one code at each length, which forces a chain of
+        // differently-sized sub-tables.
+        if let Some(v) = shape(
+            300,
+            &[
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (6, 1),
+                (7, 1),
+                (8, 1),
+                (9, 1),
+                (10, 1),
+                (11, 1),
+                (12, 1),
+                (13, 1),
+                (14, 1),
+                (15, 2),
+            ],
+        ) {
+            cases.push(v);
+        }
+        // Deep-and-wide: 240 long codes spread over many root slots.
+        if let Some(v) = shape(286, &[(11, 240), (15, 30)]) {
+            cases.push(v);
+        }
+        // Incomplete but legal.
+        cases.push(vec![15u8, 15, 15]);
+        cases.push(vec![2u8, 2, 2]);
+
+        // Walk the whole sequence through ONE reused tree, in both directions,
+        // so every case is preceded by every other.
+        let order: Vec<usize> = (0..cases.len()).chain((0..cases.len()).rev()).collect();
+        let mut reused = HuffmanTree::degenerate();
+        for &i in &order {
+            let lengths = &cases[i];
+            let fresh = HuffmanTree::from_code_lengths(lengths)
+                .expect("every case in this table is a legal code");
+            reused
+                .rebuild_from_code_lengths(lengths)
+                .expect("rebuild must accept what a fresh build accepts");
+            assert_eq!(reused.table, fresh.table, "case {i}: decode table differs");
+            assert_eq!(reused.symbols, fresh.symbols, "case {i}: symbols differ");
+            assert_eq!(reused.root_bits, fresh.root_bits, "case {i}: root_bits");
+            assert_eq!(reused.root_mask, fresh.root_mask, "case {i}: root_mask");
+            assert_eq!(
+                reused.max_code_length, fresh.max_code_length,
+                "case {i}: max_code_length"
+            );
+            assert_eq!(reused.base_codes, fresh.base_codes, "case {i}: base_codes");
+            assert_eq!(
+                reused.symbol_offsets, fresh.symbol_offsets,
+                "case {i}: symbol_offsets"
+            );
+        }
+
+        // A rejected rebuild must leave the tree decoding nothing, not half a
+        // table from the previous code.
+        let mut tree = HuffmanTree::from_code_lengths(&[1u8, 1]).expect("build");
+        assert!(tree.rebuild_from_code_lengths(&[1u8, 1, 1, 1]).is_err());
+        assert_eq!(tree.max_code_length(), 0);
     }
 }

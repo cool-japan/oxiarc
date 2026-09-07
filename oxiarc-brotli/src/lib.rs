@@ -130,6 +130,8 @@ mod block_split;
 pub mod compress;
 /// Context modeling for prefix code selection.
 pub mod context;
+/// `Content-Encoding: dcb` framing (RFC 9842).
+pub mod dcb;
 /// Brotli decompression.
 pub mod decompress;
 /// Static dictionary (RFC 7932 Appendix A).
@@ -140,6 +142,9 @@ pub mod error;
 pub mod huffman;
 /// LZ77 matching engine.
 pub mod lz77;
+/// Shared (custom LZ77) dictionaries: the `brotli --dictionary` / RFC 9842
+/// `dcb` mechanism.
+pub mod shared_dict;
 /// Bounded, truly incremental Brotli decoding.
 pub mod stream;
 /// Streaming compression and decompression.
@@ -159,9 +164,21 @@ pub mod pool;
 pub mod async_brotli;
 
 // Re-export primary API.
-pub use compress::{BrotliParams, compress, compress_with_params};
+pub use compress::{BrotliParams, compress, compress_with_dictionary, compress_with_params};
+// `Content-Encoding: dcb` (RFC 9842). The module keeps the short names
+// (`dcb::parse_header`); at the crate root they are prefixed so a reader of a
+// call site knows which framing is meant. `compress`/`decompress` are not
+// re-exported bare because the crate root already owns those names for plain
+// Brotli.
+pub use dcb::{
+    DCB_HEADER_LEN, DCB_MAGIC, compress as compress_dcb, decompress as decompress_dcb,
+    decompress_with_limit as decompress_dcb_with_limit, dictionary_id,
+    parse_header as parse_dcb_header, verify_header as verify_dcb_header,
+    write_header as write_dcb_header,
+};
 pub use decompress::{
-    MetaBlockShape, decompress, decompress_reporting_shapes, decompress_with_limit,
+    MetaBlockShape, decompress, decompress_reporting_shapes, decompress_with_dictionary,
+    decompress_with_dictionary_and_limit, decompress_with_limit,
 };
 pub use error::{BrotliError, BrotliResult};
 pub use pool::{BrotliPool, PoolStats};

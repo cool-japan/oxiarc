@@ -101,6 +101,15 @@ pub struct TableSet {
     ///
     /// Parsed and re-emitted whether or not arithmetic decoding is available,
     /// so a table stream survives a round-trip unchanged.
+    ///
+    /// [`TableSet::parse`] can only ever produce values inside T.81 B.2.4.3's
+    /// bounds (`0 <= L <= U <= 15` per DC slot, `1 <= Kx <= 63` per AC slot)
+    /// and [`Default`] is inside them, but the field is public: a caller that
+    /// writes an out-of-range value here and calls [`TableSet::emit`] produces
+    /// a `DAC` segment that [`TableSet::parse`] — and every conforming decoder
+    /// — refuses. [`crate::table_set`] and [`crate::Encoder::write_tables_only`]
+    /// build the set from [`crate::EncodeOptions`] and validate it, so the
+    /// TIFF `JPEGTables` path cannot reach that state.
     pub arithmetic: ArithmeticConditioning,
 }
 
@@ -164,6 +173,13 @@ impl TableSet {
     /// The byte layout matches libtiff's `JPEGTables` tag exactly: `DQT`
     /// segments in `Tq` order, then `DHT` segments in slot order with each
     /// slot's DC table immediately before its AC table (`DC0 AC0 DC1 AC1`).
+    ///
+    /// `mode` selects only the two families libtiff's `JPEGTablesMode` knows
+    /// about. `DRI` and `DAC` are written whenever the set carries them,
+    /// which no libtiff-produced blob does: the T.81 default conditioning
+    /// emits nothing at all. [`TableSet::arithmetic`] must hold values inside
+    /// T.81 B.2.4.3's bounds; this method has no way to report that it does
+    /// not.
     #[must_use]
     pub fn emit(&self, mode: TablesMode) -> Vec<u8> {
         let mut out = Vec::with_capacity(640);

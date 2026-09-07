@@ -10,8 +10,10 @@
 //! * a caller-supplied `&mut [u8]`
 //!   ([`crate::decompress_tiff_into`]), which allocates nothing at all.
 
+use crate::bits::LzwCodeReader;
+use crate::bitstream_lsb::LsbBitReader;
 use crate::bitstream_msb::MsbBitReader;
-use crate::config::LzwConfig;
+use crate::config::{LzwBitOrder, LzwConfig};
 use crate::dictionary::LzwDictionary;
 use crate::error::{LzwError, Result};
 
@@ -139,9 +141,9 @@ const COPY_BACK_THRESHOLD: usize = 16;
 /// an error. Running out of input while the sink still has space is an
 /// error ([`LzwError::UnexpectedEof`]) — a truncated stream is never
 /// reported as success.
-pub(crate) fn decode_into_sink<S: LzwSink>(
+pub(crate) fn decode_into_sink<S: LzwSink, R: LzwCodeReader>(
     dict: &mut LzwDictionary,
-    reader: &mut MsbBitReader<'_>,
+    reader: &mut R,
     sink: &mut S,
 ) -> Result<()> {
     dict.reset();
@@ -152,7 +154,7 @@ pub(crate) fn decode_into_sink<S: LzwSink>(
     let mut prev_code: Option<u16> = None;
 
     while sink.space() > 0 {
-        let code = reader.read_bits(dict.current_bits())?;
+        let code = reader.read_code(dict.current_bits())?;
 
         if code == clear_code {
             // TIFF 6.0 mandates a ClearCode at the start of every strip and
@@ -161,7 +163,7 @@ pub(crate) fn decode_into_sink<S: LzwSink>(
             // compression-ratio checkpoint resets), so accept it anywhere.
             if !uses_clear_code {
                 return Err(LzwError::InvalidClearCode {
-                    position: reader.bits_read(),
+                    position: reader.code_bits_read(),
                 });
             }
             dict.reset();
@@ -176,18 +178,18 @@ pub(crate) fn decode_into_sink<S: LzwSink>(
         match prev_code {
             None => {
                 // The first code after a reset must already be in the table.
-                if code >= dict.next_code() {
+                if u32::from(code) >= dict.next_code() {
                     return Err(LzwError::InvalidCode(code));
                 }
             }
             Some(prev) => {
-                if code < dict.next_code() {
+                if u32::from(code) < dict.next_code() {
                     // Ordinary case: the new entry is prev ++ first(code).
                     if !dict.is_full() {
                         let byte = dict.first_byte(code);
                         dict.add_entry_decode(prev, byte)?;
                     }
-                } else if code == dict.next_code() {
+                } else if u32::from(code) == dict.next_code() {
                     // KwKwK: the code being read is the entry we are about
                     // to create, so create it first and then emit it.
                     if dict.is_full() {
@@ -316,9 +318,17 @@ impl LzwDecoder {
         // Clamp the up-front reservation: `expected_size` is untrusted (see
         // MAX_INITIAL_CAPACITY). The Vec grows on demand beyond this.
         let mut output = Vec::with_capacity(expected_size.min(MAX_INITIAL_CAPACITY));
-        let mut reader = MsbBitReader::new(input);
         let mut sink = VecSink::new(&mut output, expected_size);
-        decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+        match self.dict.config().bit_order {
+            LzwBitOrder::Msb => {
+                let mut reader = MsbBitReader::new(input);
+                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+            }
+            LzwBitOrder::Lsb => {
+                let mut reader = LsbBitReader::new(input);
+                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+            }
+        }
         Ok(output)
     }
 
@@ -332,9 +342,17 @@ impl LzwDecoder {
     ///
     /// Same as [`LzwDecoder::decode`].
     pub fn decode_into(&mut self, input: &[u8], dst: &mut [u8]) -> Result<usize> {
-        let mut reader = MsbBitReader::new(input);
         let mut sink = SliceSink::new(dst);
-        decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+        match self.dict.config().bit_order {
+            LzwBitOrder::Msb => {
+                let mut reader = MsbBitReader::new(input);
+                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+            }
+            LzwBitOrder::Lsb => {
+                let mut reader = LsbBitReader::new(input);
+                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+            }
+        }
         Ok(sink.written())
     }
 

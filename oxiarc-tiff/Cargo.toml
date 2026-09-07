@@ -29,8 +29,9 @@ packbits = []
 # Compression 2 / 3 / 4 / 32771 (CCITT MH, Group 3, Group 4, RLE word).
 # In-crate, no dependency.
 ccitt = []
-# Compression 50000 (Zstandard), through `oxiarc-zstd`.
-zstd = ["dep:oxiarc-zstd"]
+# Compression 50000 (Zstandard), through `oxiarc-zstd`. `oxiarc-core` comes
+# with it for `FlushMode`, which the reusable `ZstdStream` push decoder takes.
+zstd = ["dep:oxiarc-zstd", "dep:oxiarc-core"]
 # Compression 34925 (LZMA2 in an `.xz` stream per chunk), through
 # `oxiarc-lzma`.
 lzma = ["dep:oxiarc-lzma"]

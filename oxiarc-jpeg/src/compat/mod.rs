@@ -20,6 +20,15 @@
 //! native [`crate::Encoder`] is a strictly larger API — progressive, lossless,
 //! twelve-bit, restart intervals, custom scan scripts and TIFF's abbreviated
 //! mode all live there and have no `image` equivalent.
+//!
+//! [`zune`] and [`jpeg_decoder`] are the decode-side counterparts, shaped
+//! after the `zune_jpeg` and `jpeg-decoder` crates respectively — the same
+//! "drop in with a `use` change, then reach for [`crate::Decoder`] once you
+//! need what those crates cannot express" migration aid, for decoding
+//! instead of encoding.
+
+pub mod jpeg_decoder;
+pub mod zune;
 
 use std::io::Write;
 

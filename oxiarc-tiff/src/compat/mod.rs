@@ -13,10 +13,23 @@
 //! ```
 //!
 //! See the crate's top-level docs for the full migration guide, and
-//! `tests/compat_api.rs` for the exact call sequence
-//! `image-0.25.10/src/codecs/tiff.rs` performs against this module,
-//! reproduced and asserted so an accidental shape break fails a test rather
-//! than surfacing downstream.
+//! `tests/compat_api.rs`, which reproduces `image-0.25.10/src/codecs/tiff.rs`'s
+//! calls against this module -- `Limits` then `Decoder::new` +
+//! `with_limits`, `dimensions`, `colortype`,
+//! `find_tag_unsigned_vec::<u16>(SampleFormat)`, `read_image_to_buffer`,
+//! the exhaustive `DecodingResult`/`ColorType`/`TiffError` matches,
+//! `get_tag_u8_vec(IccProfile)`, `get_tag`/`find_tag` with
+//! `RequiredTagNotFound`, `into_u16`, and the encoder's
+//! `new_image`/`write_tag_u8_vec`/`write_data` -- so an accidental shape
+//! break fails a test rather than surfacing downstream.
+//!
+//! It is a *shape* pin, not a proof that `image` builds against this module
+//! unmodified: [`decoder::DecodingBuffer`] deliberately spells upstream's
+//! `as_bytes` as [`to_bytes`](decoder::DecodingBuffer::to_bytes) (see the
+//! deviations below), and `image`'s planar path chains
+//! `as_bytes().chunks_exact(..).collect()` on the borrowed view that spelling
+//! cannot return. `image` consumers are served by the `oxiarc-image` facade
+//! crate, not by patching `image` to sit on this module.
 //!
 //! # What this is, and is not
 //!
@@ -37,21 +50,32 @@
 //!   exhaustively matchable.
 //! * [`TiffError`] has exactly the six upstream variants, also not
 //!   `#[non_exhaustive]`.
+//! * [`decoder::BufferLayoutPreference`]'s `len`, `row_stride`,
+//!   `plane_stride` and `complete_len` are **byte** counts, exactly as
+//!   upstream documents and consumes them.
 //! * [`decoder::DecodingResult::F16`] carries real `half::f16` values (the
 //!   `half` dependency is pulled in **only** by this feature -- the native
 //!   API's [`crate::Samples::F16`] stays raw `u16` bits, see its own docs).
 //!
 //! # Deliberate deviations from upstream (documented, not accidental)
 //!
-//! * [`encoder::ImageEncoder`]'s `resolution*` setters return
-//!   [`TiffResult<()>`](error::TiffResult) instead of `unwrap()`-ing
-//!   internally the way upstream's do (`encoder/mod.rs:826-851` in the real
-//!   crate) -- `image` never calls them, so this is a safe, policy-required
-//!   change (no `unwrap()` in library code).
-//! * [`decoder::DecodingBuffer::to_bytes`] returns an owned `Vec<u8>`
-//!   instead of upstream's zero-copy `&[u8]` view, because that view needs
-//!   an `unsafe` reinterpret-cast this crate does not permit. See its own
-//!   docs.
+//! * [`encoder::ImageEncoder`]'s setters are *by-value* builder methods
+//!   returning `Self` (or [`TiffResult<Self>`](error::TiffResult) for
+//!   [`rows_per_strip`](encoder::ImageEncoder::rows_per_strip)), where
+//!   upstream's take `&mut self`, return `()` and `unwrap()` internally
+//!   (`encoder/mod.rs:826-851` in the real crate). `image` never calls them,
+//!   so this is a safe, policy-required change (no `unwrap()` in library
+//!   code). Each of `x_resolution`, `y_resolution` and `resolution_unit`
+//!   stays independent, as upstream: setting one alone does not materialise
+//!   the other two tags.
+//! * [`decoder::DecodingBuffer::to_bytes`] is named `to_bytes`, not
+//!   upstream's `as_bytes`, and returns an owned `Vec<u8>` instead of a
+//!   zero-copy `&[u8]` view, because that view needs an `unsafe`
+//!   reinterpret-cast this crate does not permit. A ported call site that
+//!   *chains* off the result (`as_bytes().chunks_exact(n).collect()`) must
+//!   bind the `Vec` to a local first; one that only reads a length can use
+//!   [`decoder::DecodingBuffer::byte_len`], which copies nothing. See its
+//!   own docs.
 //! * `encoder::Predictor` is a re-export of [`tags::Predictor`] rather than
 //!   a second, independent enum -- upstream has two nominally distinct
 //!   `Predictor` types (`tags::Predictor` and `encoder::Predictor`) that are

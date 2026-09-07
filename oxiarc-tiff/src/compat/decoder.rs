@@ -113,6 +113,20 @@ impl DecodingSampleType {
         }
     }
 
+    /// Bytes one sample of this type occupies.
+    ///
+    /// The multiplier between a [`DecodingResult`]'s sample count and the
+    /// byte counts [`BufferLayoutPreference`] reports.
+    #[must_use]
+    pub const fn byte_width(self) -> usize {
+        match self {
+            Self::U8 | Self::I8 => 1,
+            Self::U16 | Self::I16 | Self::F16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::U64 | Self::I64 | Self::F64 => 8,
+        }
+    }
+
     /// The equivalent native [`crate::SampleType`].
     #[must_use]
     pub const fn to_native(self) -> crate::SampleType {
@@ -213,7 +227,16 @@ impl DecodingResult {
         }
     }
 
-    /// A borrowed, mutable view of this buffer, for reuse across chunks.
+    /// A borrowed, mutable view of this buffer from sample `start` on, for
+    /// reuse across chunks.
+    ///
+    /// # Panics
+    /// When `start` exceeds [`Self::len`] -- upstream's slices the same way
+    /// and panics identically, and a compat caller ported from it relies on
+    /// the index being a *sample* offset, so silently clamping here would
+    /// hand back a shorter buffer than the caller believes it has. `start`
+    /// comes from the caller, never from the file, so no malformed input can
+    /// reach this.
     #[must_use]
     pub fn as_buffer(&mut self, start: usize) -> DecodingBuffer<'_> {
         match self {
@@ -330,23 +353,41 @@ impl DecodingBuffer<'_> {
 /// What [`Decoder::read_image_to_buffer`] actually produced, since a
 /// caller-supplied [`DecodingResult`] may be a different shape (or too
 /// small) for the image just read.
+///
+/// **Every length here is a count of bytes, not of samples** -- upstream
+/// documents these fields that way (`complete_len` is "number of bytes of
+/// data when reading all planes"), and upstream's own
+/// `DecodingResult::resize_to` feeds `complete_len` straight into
+/// `extent_for_bytes`, so a sample count here would size a ported caller's
+/// buffer at 1/2, 1/4 or 1/8 of what it needs with nothing to catch it. The
+/// documented upstream idiom
+/// `if result.as_buffer(0).as_bytes().len() < layout.complete_len { .. }`
+/// therefore compares like with like ([`DecodingBuffer::to_bytes`] is this
+/// crate's spelling of `as_bytes`; [`DecodingBuffer::byte_len`] avoids the
+/// copy).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BufferLayoutPreference {
-    /// Total samples across every plane.
+    /// Minimum **bytes** needed to hold one plane of the decoded image.
     pub len: usize,
     /// The tag-level numeric format the samples were decoded as.
     pub sample_format: SampleFormat,
     /// The concrete Rust type, when [`DecodingResult`] could represent it
     /// directly (always `Some` for anything this crate produces).
     pub sample_type: Option<DecodingSampleType>,
-    /// Samples per image row, per plane, when the layout is regular.
+    /// **Bytes** per image row, per plane, when the layout is regular.
     pub row_stride: Option<NonZeroUsize>,
-    /// Number of planes (1 for chunky).
+    /// Number of planes.
+    ///
+    /// Always 1 here: this crate's decoder interleaves a
+    /// `PlanarConfiguration = 2` file back into chunky order while placing
+    /// each chunk (`decode::place_chunk_in_rect` scatters a planar chunk
+    /// into its channel slot), so a caller never has to interleave planes
+    /// itself.
     pub planes: usize,
-    /// Samples between the start of consecutive planes, when `planes > 1`.
+    /// **Bytes** between the start of consecutive planes.
     pub plane_stride: Option<NonZeroUsize>,
-    /// Total samples a full, successful decode needs -- may exceed `len`
+    /// Total **bytes** a full, successful decode needs -- may exceed `len`
     /// when the caller's buffer was undersized.
     pub complete_len: usize,
 }
@@ -389,7 +430,7 @@ impl<R: Read + Seek> Decoder<R> {
     /// The same set as [`crate::reader::Decoder::new`], translated.
     pub fn new(r: R) -> TiffResult<Decoder<R>> {
         let mut inner = crate::reader::Decoder::new(r).map_err(TiffError::from_native)?;
-        let has_more_cached = inner.more_images().unwrap_or(false);
+        let has_more_cached = next_ifd_exists(&mut inner);
         Ok(Self {
             inner,
             limits: Limits::default(),
@@ -434,6 +475,19 @@ impl<R: Read + Seek> Decoder<R> {
     }
 
     /// `true` when another image follows the current one in the IFD chain.
+    ///
+    /// Answers the same question upstream's `next_ifd.is_some()` does: is
+    /// there a *pointer* to another IFD? It deliberately does **not** try to
+    /// parse that IFD first. A file whose trailing next-IFD pointer is
+    /// non-zero but corrupt therefore reports `true` here and fails in
+    /// [`Self::next_image`], rather than reporting `false` and silently
+    /// truncating the page list of a multi-page file under a caller's
+    /// `while decoder.more_images() { .. }` loop.
+    ///
+    /// Cached, because upstream's takes `&self` while the native
+    /// [`crate::reader::Decoder`] needs `&mut self` to reach the current
+    /// directory; the cache is refreshed by [`Self::next_image`] and
+    /// [`Self::seek_to_image`].
     #[must_use]
     pub fn more_images(&self) -> bool {
         self.has_more_cached
@@ -451,7 +505,7 @@ impl<R: Read + Seek> Decoder<R> {
                 "no more images in this file".to_string(),
             )));
         }
-        self.has_more_cached = self.inner.more_images().unwrap_or(false);
+        self.has_more_cached = next_ifd_exists(&mut self.inner);
         Ok(())
     }
 
@@ -463,7 +517,7 @@ impl<R: Read + Seek> Decoder<R> {
         self.inner
             .seek_to_image(index)
             .map_err(TiffError::from_native)?;
-        self.has_more_cached = self.inner.more_images().unwrap_or(false);
+        self.has_more_cached = next_ifd_exists(&mut self.inner);
         Ok(())
     }
 
@@ -578,15 +632,29 @@ impl<R: Read + Seek> Decoder<R> {
         &mut self,
         result: &mut DecodingResult,
     ) -> TiffResult<BufferLayoutPreference> {
+        let (_, height) = self.dimensions()?;
         let decoded = self.read_image()?;
+        let sample_type = decoded.sample_type();
+        let byte_len = decoded
+            .len()
+            .checked_mul(sample_type.byte_width())
+            .ok_or(TiffError::IntSizeError)?;
+        // Derived from the decoded length rather than from `width x
+        // SamplesPerPixel`, so it stays right for every path that changes
+        // the channel count on the way out (palette expansion, YCbCr
+        // upsampling) instead of quietly disagreeing with the buffer.
+        let row_stride = match usize::try_from(height) {
+            Ok(rows) if rows > 0 && byte_len % rows == 0 => NonZeroUsize::new(byte_len / rows),
+            _ => None,
+        };
         let layout = BufferLayoutPreference {
-            len: decoded.len(),
+            len: byte_len,
             sample_format: sample_format_of(&decoded),
-            sample_type: Some(decoded.sample_type()),
-            row_stride: None,
+            sample_type: Some(sample_type),
+            row_stride,
             planes: 1,
-            plane_stride: None,
-            complete_len: decoded.len(),
+            plane_stride: NonZeroUsize::new(byte_len),
+            complete_len: byte_len,
         };
         *result = decoded;
         Ok(layout)
@@ -595,20 +663,19 @@ impl<R: Read + Seek> Decoder<R> {
     /// Decodes the whole current image into caller-owned native-endian
     /// bytes.
     ///
+    /// Decodes *straight into* `buffer` through the native byte path, so the
+    /// peak allocation is `buffer` and one chunk -- not the whole image
+    /// twice, which is what decoding to a [`DecodingResult`] and then
+    /// serialising it would cost (and would put the real peak at twice the
+    /// [`Limits::decoding_buffer_size`] a caller configured).
+    ///
     /// # Errors
     /// The same set as [`Self::read_image`], plus a too-small `buffer`.
     pub fn read_image_bytes(&mut self, buffer: &mut [u8]) -> TiffResult<()> {
-        let samples = self.read_image()?;
-        let bytes = samples_to_native_bytes(&samples);
-        if buffer.len() < bytes.len() {
-            return Err(TiffError::UsageError(super::error::usage_error(format!(
-                "buffer too small: needed {}, got {}",
-                bytes.len(),
-                buffer.len()
-            ))));
-        }
-        buffer[..bytes.len()].copy_from_slice(&bytes);
-        Ok(())
+        self.inner
+            .read_image_bytes(buffer)
+            .map(|_| ())
+            .map_err(TiffError::from_native)
     }
 
     /// Reads a named tag, erroring when it is absent.
@@ -635,26 +702,71 @@ impl<R: Read + Seek> Decoder<R> {
     /// Reads a named tag as raw bytes (the `UNDEFINED`/`BYTE` payload) --
     /// `image` 0.25.10's ICC-profile accessor (`codecs/tiff.rs:313`).
     ///
+    /// Like upstream (`self.get_tag(tag)?.into_u8_vec()`) this is a
+    /// `get_tag`, not a `find_tag`: an **absent** tag is
+    /// `RequiredTagNotFound`, never `Ok(vec![])`. The distinction is
+    /// load-bearing for the ICC call site above, which is written
+    /// `decoder.get_tag_u8_vec(Tag::IccProfile).ok()` -- an empty-vector
+    /// success would attach a zero-length ICC profile to every file that has
+    /// none.
+    ///
     /// # Errors
-    /// The same set as [`Self::find_tag`].
+    /// The same set as [`Self::get_tag`], plus `InvalidTypeForTag` when the
+    /// tag is present but not byte-shaped.
     pub fn get_tag_u8_vec(&mut self, tag: Tag) -> TiffResult<Vec<u8>> {
-        Ok(self
-            .inner
-            .get_tag_bytes(tag.to_native())
-            .map_err(TiffError::from_native)?
-            .unwrap_or_default())
+        self.get_tag(tag)?.into_u8_vec()
     }
 
     /// Reads a named tag as an ASCII string.
     ///
+    /// A `get_tag`, not a `find_tag` -- see [`Self::get_tag_u8_vec`].
+    ///
     /// # Errors
-    /// The same set as [`Self::find_tag`].
+    /// The same set as [`Self::get_tag`], plus `InvalidTypeForTag` when the
+    /// tag is present but not `ASCII`.
     pub fn get_tag_ascii_string(&mut self, tag: Tag) -> TiffResult<String> {
-        Ok(self
-            .inner
-            .get_tag_ascii(tag.to_native())
-            .map_err(TiffError::from_native)?
-            .unwrap_or_default())
+        self.get_tag(tag)?.into_string()
+    }
+
+    /// Reads a named tag and narrows its **first** value to any unsigned
+    /// type, `Ok(None)` when the tag is absent.
+    ///
+    /// # Errors
+    /// The same set as [`Self::find_tag`], plus `InvalidTypeForTag` when the
+    /// value has no unsigned reading or does not fit `T`.
+    pub fn find_tag_unsigned<T: TryFrom<u64>>(&mut self, tag: Tag) -> TiffResult<Option<T>> {
+        match self.find_tag(tag)? {
+            Some(value) => narrow_unsigned::<T>(value).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads a named tag and narrows **every** value to any unsigned type,
+    /// `Ok(None)` when the tag is absent.
+    ///
+    /// `image` 0.25.10's first call against a freshly opened decoder
+    /// (`find_tag_unsigned_vec::<u16>(Tag::SampleFormat)`,
+    /// `codecs/tiff.rs:50`).
+    ///
+    /// # Errors
+    /// The same set as [`Self::find_tag_unsigned`].
+    pub fn find_tag_unsigned_vec<T: TryFrom<u64>>(
+        &mut self,
+        tag: Tag,
+    ) -> TiffResult<Option<Vec<T>>> {
+        match self.find_tag(tag)? {
+            Some(value) => narrow_unsigned_vec::<T>(value).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::find_tag_unsigned`], erroring instead of reporting `None`
+    /// when the tag is absent.
+    ///
+    /// # Errors
+    /// The same set as [`Self::get_tag`], plus `InvalidTypeForTag`.
+    pub fn get_tag_unsigned<T: TryFrom<u64>>(&mut self, tag: Tag) -> TiffResult<T> {
+        narrow_unsigned::<T>(self.get_tag(tag)?)
     }
 
     /// Every tag in the current image's directory.
@@ -676,6 +788,43 @@ impl<R: Read + Seek> Decoder<R> {
     pub fn into_inner(self) -> R {
         self.inner.into_inner()
     }
+}
+
+/// `true` when the current directory carries a non-zero next-IFD pointer.
+///
+/// `false` when the current directory cannot be read at all -- there is no
+/// error channel on upstream's `more_images`, and "cannot even read this
+/// image" is not a state in which claiming a *next* one helps.
+fn next_ifd_exists<R: Read + Seek>(inner: &mut crate::reader::Decoder<R>) -> bool {
+    inner
+        .directory()
+        .map(|dir| dir.next_ifd().is_some())
+        .unwrap_or(false)
+}
+
+/// Narrows a tag's first value to `T`, reporting upstream's
+/// `InvalidTypeForTag` rather than silently truncating or defaulting.
+fn narrow_unsigned<T: TryFrom<u64>>(value: super::tags::ValueBuffer) -> TiffResult<T> {
+    let found = value.ty_raw();
+    value.into_u64().and_then(|wide| {
+        T::try_from(wide)
+            .map_err(|_| TiffError::FormatError(TiffFormatError::InvalidTypeForTag { found }))
+    })
+}
+
+/// [`narrow_unsigned`] over every value of the tag.
+fn narrow_unsigned_vec<T: TryFrom<u64>>(value: super::tags::ValueBuffer) -> TiffResult<Vec<T>> {
+    let found = value.ty_raw();
+    let wide = value.into_u64_vec()?;
+    let mut out = Vec::with_capacity(wide.len());
+    for item in wide {
+        out.push(
+            T::try_from(item).map_err(|_| {
+                TiffError::FormatError(TiffFormatError::InvalidTypeForTag { found })
+            })?,
+        );
+    }
+    Ok(out)
 }
 
 fn samples_to_native_bytes(result: &DecodingResult) -> Vec<u8> {

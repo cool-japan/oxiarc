@@ -29,8 +29,9 @@ use crate::block_split;
 use crate::context::{ContextMode, distance_context_id, literal_context_id};
 use crate::error::{BrotliError, BrotliResult};
 use crate::huffman::{HuffmanTree, build_and_write_prefix_code};
-use crate::lz77::{Lz77Command, Lz77Params, lz77_compress_pooled};
+use crate::lz77::{Lz77Command, Lz77Params, lz77_compress_pooled, lz77_compress_with_prefix};
 use crate::pool::BrotliPool;
+use crate::shared_dict;
 use crate::tables::{
     block_count_to_code, compose_command, copy_length_to_code, insert_length_to_code,
 };
@@ -120,6 +121,190 @@ pub fn compress(data: &[u8], quality: u32) -> BrotliResult<Vec<u8>> {
 /// Compress data using Brotli with full parameter control.
 pub fn compress_with_params(data: &[u8], params: &BrotliParams) -> BrotliResult<Vec<u8>> {
     compress_with_hooks(data, params, None, None)
+}
+
+/// Compress data against a *shared* (custom LZ77) dictionary.
+///
+/// `dictionary` is content both peers already have. Its bytes seed the match
+/// finder, so the produced stream can reference them at distances beyond
+/// everything it has itself produced — beyond its declared window, in fact.
+/// This is the encoding half of the reference `brotli --dictionary=FILE`
+/// option and of `Content-Encoding: dcb` bodies (RFC 9842); see
+/// [`crate::shared_dict`] for the distance space, which was established by
+/// measurement against `brotli 1.1.0` rather than assumed.
+///
+/// The result is decoded with
+/// [`decompress_with_dictionary`](crate::decompress_with_dictionary) or
+/// [`BrotliStream::with_dictionary`](crate::BrotliStream::with_dictionary), and
+/// **only** with the same dictionary: the bytes are meaningless without it.
+///
+/// An empty `dictionary` produces byte-identical output to
+/// [`compress_with_params`].
+///
+/// # Errors
+///
+/// The errors of [`compress_with_params`], plus
+/// [`BrotliError::DictionaryError`] when `dictionary` exceeds
+/// [`crate::shared_dict::MAX_SHARED_DICTIONARY`].
+///
+/// # Performance
+///
+/// The match finder is seeded with the dictionary once per meta-block, so the
+/// encode cost carries an `O(dictionary length x meta-blocks)` term. For the
+/// transport dictionaries this is built for (kilobytes to a few megabytes)
+/// that is negligible; it is worth knowing before attaching a very large
+/// dictionary to a very large input.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_brotli::{compress_with_dictionary, compress_with_params,
+///                     decompress_with_dictionary, BrotliParams};
+///
+/// let dictionary = b"<html><head><title>".repeat(64);
+/// let page = b"<html><head><title>Home</title></head></html>";
+/// let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+///
+/// let with = compress_with_dictionary(page, &dictionary, &params).expect("compress");
+/// let without = compress_with_params(page, &params).expect("compress");
+/// assert!(with.len() < without.len(), "the dictionary must pay for itself");
+/// assert_eq!(decompress_with_dictionary(&with, &dictionary).expect("decode"), page);
+/// ```
+pub fn compress_with_dictionary(
+    data: &[u8],
+    dictionary: &[u8],
+    params: &BrotliParams,
+) -> BrotliResult<Vec<u8>> {
+    shared_dict::check_dictionary_len(dictionary.len())?;
+    if dictionary.is_empty() {
+        return compress_with_params(data, params);
+    }
+    params.validate()?;
+
+    let output = encode_stream_with_dictionary(data, dictionary, params)?;
+
+    // The same defense in depth the dictionary-free encoder applies: an
+    // encoder must never emit a stream that does not decode back to its input.
+    match crate::decompress::decompress_with_dictionary(&output, dictionary) {
+        Ok(ref decoded) if decoded == data => Ok(output),
+        _ => {
+            debug_assert!(
+                false,
+                "dictionary encoder self-check failed; stored fallback used"
+            );
+            encode_stored_stream(data, params)
+        }
+    }
+}
+
+/// Encode a complete stream whose meta-blocks may reference `dictionary`.
+fn encode_stream_with_dictionary(
+    data: &[u8],
+    dictionary: &[u8],
+    params: &BrotliParams,
+) -> BrotliResult<Vec<u8>> {
+    let mut writer = BitWriter::with_capacity(data.len() / 2 + 64);
+    write_window_bits(&mut writer, params.lgwin)?;
+
+    let mut state = EncoderState::new();
+    let block_size = params.block_size().max(1);
+    // `combined` is `dictionary || chunk`, rebuilt per meta-block by truncating
+    // back to the dictionary and appending the next chunk — one allocation for
+    // the whole encode rather than one per meta-block.
+    let mut combined = Vec::with_capacity(dictionary.len() + block_size.min(data.len().max(1)));
+    combined.extend_from_slice(dictionary);
+
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let end = (offset + block_size).min(data.len());
+        let chunk = &data[offset..end];
+        combined.truncate(dictionary.len());
+        combined.extend_from_slice(chunk);
+        encode_meta_block_with_dictionary(
+            &mut writer,
+            &combined,
+            dictionary.len(),
+            offset,
+            params,
+            &mut state,
+        )?;
+        offset = end;
+    }
+    if data.is_empty() {
+        // An empty input still needs a well-formed stream; the dictionary-free
+        // encoder gets this from `chunks()` yielding nothing plus the empty
+        // last meta-block below, and so do we.
+    }
+
+    // Empty last meta-block: ISLAST = 1, ISLASTEMPTY = 1.
+    writer.write_bit(true)?;
+    writer.write_bit(true)?;
+    Ok(writer.finish())
+}
+
+/// One meta-block of the dictionary encoder: the smaller of a compressed and a
+/// stored representation, exactly as [`encode_meta_block`] chooses.
+fn encode_meta_block_with_dictionary(
+    writer: &mut BitWriter,
+    combined: &[u8],
+    prefix_len: usize,
+    data_offset: usize,
+    params: &BrotliParams,
+    state: &mut EncoderState,
+) -> BrotliResult<()> {
+    let chunk = &combined[prefix_len..];
+    if params.quality == 0 {
+        write_stored_meta_blocks(writer, chunk)?;
+        return Ok(());
+    }
+    let saved_state = *state;
+
+    // Encode the meta-block *with* the dictionary and, separately, without it,
+    // and keep whichever is smaller — the same measure-don't-guess rule the
+    // block splitter uses. It matters: a dictionary match is longer but sits at
+    // a much larger distance, and on data that is already highly self-similar
+    // (especially with a small declared window) paying for those distances can
+    // cost more than the match saves. Measuring makes attaching a dictionary
+    // safe: it can cost encode time, never compression ratio.
+    let mut with_dict = BitWriter::with_capacity(chunk.len() / 2 + 64);
+    let mut state_with = saved_state;
+    encode_compressed_meta_block(
+        &mut with_dict,
+        combined,
+        prefix_len,
+        data_offset,
+        params,
+        &mut state_with,
+        None,
+    )?;
+
+    let mut without_dict = BitWriter::with_capacity(chunk.len() / 2 + 64);
+    let mut state_without = saved_state;
+    encode_compressed_meta_block(
+        &mut without_dict,
+        chunk,
+        0,
+        data_offset,
+        params,
+        &mut state_without,
+        None,
+    )?;
+
+    let (tmp, chosen_state) = if with_dict.bits_written() <= without_dict.bits_written() {
+        (with_dict, state_with)
+    } else {
+        (without_dict, state_without)
+    };
+
+    let stored_bits = chunk.len() * 8 + 48 * chunk.len().div_ceil(1 << 24).max(1);
+    if tmp.bits_written() < stored_bits {
+        *state = chosen_state;
+        writer.append(&tmp)?;
+    } else {
+        *state = saved_state;
+        write_stored_meta_blocks(writer, chunk)?;
+    }
+    Ok(())
 }
 
 /// Compress data with optional per-meta-block progress and cancellation hooks.
@@ -241,7 +426,7 @@ pub(crate) fn encode_meta_block(
     // `bits_written()` (which grows without bound) would break the choice.
     let saved_state = *state;
     let mut tmp = BitWriter::with_capacity(chunk.len() / 2 + 64);
-    encode_compressed_meta_block(&mut tmp, chunk, params, state, pool)?;
+    encode_compressed_meta_block(&mut tmp, chunk, 0, 0, params, state, pool)?;
     // Stored cost upper bound: payload + per-16MB-sub-block header.
     let stored_bits = chunk.len() * 8 + 48 * chunk.len().div_ceil(1 << 24).max(1);
     if tmp.bits_written() < stored_bits {
@@ -350,13 +535,23 @@ struct Command {
 }
 
 /// Encode one compressed meta-block (ISLAST=0) for `chunk`.
+/// Encode one compressed meta-block (ISLAST=0).
+///
+/// `combined` is `shared dictionary || chunk`; `prefix_len` is the dictionary's
+/// length (0 when none is attached, which is the frozen dictionary-free path)
+/// and `data_offset` is how many bytes of the whole input precede this chunk,
+/// needed because the decoder resolves a shared-dictionary distance relative to
+/// `min(window_size, total bytes produced so far)`.
 fn encode_compressed_meta_block(
     writer: &mut BitWriter,
-    chunk: &[u8],
+    combined: &[u8],
+    prefix_len: usize,
+    data_offset: usize,
     params: &BrotliParams,
     state: &mut EncoderState,
     pool: Option<&BrotliPool>,
 ) -> BrotliResult<()> {
+    let chunk = &combined[prefix_len..];
     // ── LZ77 ─────────────────────────────────────────────────────────────
     let lz77_params = Lz77Params {
         quality: params.quality,
@@ -364,7 +559,11 @@ fn encode_compressed_meta_block(
         min_match_len: 4,
         max_match_len: 16 * 1024,
     };
-    let lz_commands = lz77_compress_pooled(chunk, &lz77_params, pool);
+    let lz_commands = if prefix_len == 0 {
+        lz77_compress_pooled(chunk, &lz77_params, pool)
+    } else {
+        lz77_compress_with_prefix(combined, prefix_len, &lz77_params, pool)
+    };
 
     // ── Command construction + histograms ────────────────────────────────
     // Frequency scratch: literals (256) + insert-and-copy (704) + distance
@@ -393,15 +592,29 @@ fn encode_compressed_meta_block(
                 let (ins_code, ins_extra_bits, ins_base) = insert_length_to_code(insert_len as u32);
                 let (copy_code, copy_extra_bits, copy_base) = copy_length_to_code(copy_len as u32);
 
-                let implicit = *distance == state.last_distance && ins_code < 8 && copy_code < 16;
+                // Translate the match-finder's distance (measured inside
+                // `combined`) into the distance the decoder will compute. A
+                // match into the shared dictionary is addressed relative to
+                // `min(window_size, bytes produced)`, not to a fixed position,
+                // so it cannot be used verbatim once either the window or an
+                // earlier meta-block is in play. See `crate::shared_dict`.
+                let source = prefix_len + pos - *distance;
+                let emitted = if source < prefix_len {
+                    let max_backward = params.window_size().min(data_offset + pos);
+                    max_backward + (prefix_len - source)
+                } else {
+                    *distance
+                };
+
+                let implicit = emitted == state.last_distance && ins_code < 8 && copy_code < 16;
                 let ic_symbol = compose_command(ins_code, copy_code, implicit);
 
                 let distance_field = if implicit {
                     None
                 } else {
-                    let (dsym, dextra, dbits) = distance_symbol(*distance)?;
+                    let (dsym, dextra, dbits) = distance_symbol(emitted)?;
                     dist_freqs[dsym as usize] += 1;
-                    state.last_distance = *distance;
+                    state.last_distance = emitted;
                     Some((dsym, dextra, dbits))
                 };
 

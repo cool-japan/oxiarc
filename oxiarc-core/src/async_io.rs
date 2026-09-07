@@ -384,7 +384,8 @@ impl<C: Compressor + Send> AsyncCompressor for AsyncCompressorWrapper<C> {
                             } else if flush_stalled_once {
                                 return Err(OxiArcError::corrupted(
                                     total_written as u64,
-                                    "async compress: compressor emitted nothing on two                                      consecutive final-flush calls",
+                                    "async compress: compressor emitted nothing on two \
+                                     consecutive final-flush calls",
                                 ));
                             } else {
                                 flush_stalled_once = true;

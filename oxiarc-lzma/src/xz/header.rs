@@ -157,6 +157,30 @@ pub struct XzReader<R: Read> {
     /// Uncompressed bytes produced by blocks completed so far. Used both
     /// for the running budget check and for progress reporting.
     produced: u64,
+    /// A reusable LZMA2 decoder, carried across blocks (and, when installed
+    /// from outside via [`Self::install_lzma2_cache`], across separate
+    /// [`XzReader`] values too — see [`super::decoder::XzDecoder`]).
+    ///
+    /// Keyed by the dictionary size the decoder was built with: a block
+    /// whose declared dictionary size does not match forces a fresh
+    /// decoder (see [`Self::decode_lzma2_payload`]), which is always
+    /// correct, just not free — matching dictionary sizes is the common
+    /// case for repeated calls from the same caller (e.g. every strip of
+    /// one TIFF image), so the cache-hit path is what matters for
+    /// throughput. `None` means "no cached decoder yet", exactly the state
+    /// a plain `XzReader::new()` starts in, so behaviour with no cache
+    /// installed is identical to allocating fresh per block, as before.
+    lzma2_cache: Option<(u32, Lzma2Decoder)>,
+    /// How many blocks this reader decoded with a *reused* LZMA2 decoder
+    /// rather than a freshly allocated one.
+    ///
+    /// Test-only observability. Reuse is deliberately unobservable from a
+    /// decoder's output and errors (that is the whole safety property), so
+    /// without a counter a broken reuse predicate would silently disable
+    /// the cache and every correctness test would still pass. See
+    /// `super::decoder`'s `reuse_actually_happens_for_real_xz_streams`.
+    #[cfg(test)]
+    lzma2_reuses: u32,
 }
 
 impl<R: Read> XzReader<R> {
@@ -196,7 +220,43 @@ impl<R: Read> XzReader<R> {
             index_size: 0,
             max_output: None,
             produced: 0,
+            lzma2_cache: None,
+            #[cfg(test)]
+            lzma2_reuses: 0,
         })
+    }
+
+    /// Replace this reader's reusable LZMA2 decoder cache, returning
+    /// whatever was there before.
+    ///
+    /// Crate-private plumbing for [`super::decoder::XzDecoder`]: installing
+    /// a decoder here before [`Self::decompress`] lets the block-decode
+    /// path in [`Self::decode_lzma2_payload`] reuse it (dictionary size
+    /// permitting) instead of always allocating fresh, and the caller
+    /// retrieves the (possibly now-populated, or repopulated) cache
+    /// afterwards via [`Self::take_lzma2_cache`] to carry into the next
+    /// `XzReader`. Not exposed publicly: every public constructor
+    /// (`XzReader::new`) starts with an empty cache, so this has no effect
+    /// on the reader's documented public behaviour, only on what it
+    /// allocates internally.
+    pub(super) fn install_lzma2_cache(&mut self, cache: Option<(u32, Lzma2Decoder)>) {
+        self.lzma2_cache = cache;
+    }
+
+    /// Take this reader's reusable LZMA2 decoder cache, leaving `None`
+    /// behind.
+    ///
+    /// See [`Self::install_lzma2_cache`].
+    pub(super) fn take_lzma2_cache(&mut self) -> Option<(u32, Lzma2Decoder)> {
+        self.lzma2_cache.take()
+    }
+
+    /// How many of this reader's blocks decoded with a reused LZMA2 decoder.
+    ///
+    /// See [`Self::lzma2_reuses`] for why this exists.
+    #[cfg(test)]
+    pub(super) fn lzma2_reuses(&self) -> u32 {
+        self.lzma2_reuses
     }
 
     /// Attach a progress sink. Notified after each block is decompressed with
@@ -640,14 +700,14 @@ impl<R: Read> XzReader<R> {
                 }
                 let mut expected = [0u8; 32];
                 expected.copy_from_slice(&check_bytes[..32]);
-                let computed = super::sha256::Sha256::compute(data);
+                let computed = oxiarc_core::sha256::Sha256::compute(data);
                 if computed != expected {
                     return Err(OxiArcError::corrupted(
                         0,
                         format!(
                             "SHA-256 mismatch: expected {}, computed {}",
-                            super::sha256::hex32(&expected),
-                            super::sha256::hex32(&computed),
+                            oxiarc_core::sha256::hex32(&expected),
+                            oxiarc_core::sha256::hex32(&computed),
                         ),
                     ));
                 }
@@ -854,25 +914,98 @@ impl<R: Read> XzReader<R> {
     /// `Lzma2Decoder::decode` would expand the whole payload before any cap
     /// could be applied; decoding chunk by chunk keeps peak memory bounded
     /// by the budget (plus one chunk) even for a hostile stream.
-    fn decode_lzma2_payload(&self, compressed: &[u8], dict_size: u32) -> Result<(Vec<u8>, usize)> {
-        let mut decoder = Lzma2Decoder::new(dict_size);
+    ///
+    /// # Decoder reuse
+    ///
+    /// Reuses [`Self::lzma2_cache`] only when **both** of these hold:
+    ///
+    /// * its dictionary size matches this block's declared dictionary size
+    ///   (the common case: every strip of one TIFF image, or every block of
+    ///   one stream, shares the same LZMA2 properties), and
+    /// * this block's payload opens with a chunk that resets *everything* a
+    ///   reused decoder could otherwise carry over — an LZMA chunk whose
+    ///   reset field is `3` (state + new properties + dictionary), which is
+    ///   what every independent block a real encoder emits actually opens
+    ///   with ([`block_opener_permits_decoder_reuse`]).
+    ///
+    /// Anything else falls back to a fresh [`Lzma2Decoder`], exactly as
+    /// this method behaved before the cache existed — see
+    /// [`super::decoder::XzDecoder`] for why the cache exists at all.
+    ///
+    /// That second condition is what makes reuse *unobservable*, which is
+    /// the only acceptable bar for a cache: after a `reset == 3` opener the
+    /// decoder's dictionary contents, dictionary position and length, LZMA
+    /// properties, probability model, coder state, rep distances and
+    /// uncompressed position are all reset from this block's own bytes, so
+    /// a reused decoder is indistinguishable from a fresh one. A weaker
+    /// condition is not enough, and the two shapes that prove it are worth
+    /// spelling out:
+    ///
+    /// * a block opening with a chunk that does not reset the dictionary at
+    ///   all (uncompressed control `0x02`, or an LZMA chunk with reset
+    ///   field < 3) would decode against whatever dictionary the *previous,
+    ///   unrelated* block left behind, instead of being rejected the way a
+    ///   fresh decoder's `need_dict_reset` flag rejects it;
+    /// * a block opening with an uncompressed chunk that *does* reset the
+    ///   dictionary (control `0x01`) resets the dictionary but **not** the
+    ///   LZMA properties, so a following LZMA chunk with reset field `1`
+    ///   (state reset, no new properties) would silently decode using the
+    ///   previous block's `lc`/`lp`/`pb` — while a fresh decoder, having no
+    ///   properties at all, correctly rejects the stream. That is a
+    ///   malformed stream being accepted, and producing plausible-looking
+    ///   output, purely because an unrelated earlier block happened to be
+    ///   decoded by the same reader.
+    ///
+    /// Both are regression-tested in `super::decoder`.
+    fn decode_lzma2_payload(
+        &mut self,
+        compressed: &[u8],
+        dict_size: u32,
+    ) -> Result<(Vec<u8>, usize)> {
+        let reusable = self.lzma2_cache.take_if(|(cached_dict_size, _)| {
+            *cached_dict_size == dict_size && block_opener_permits_decoder_reuse(compressed)
+        });
+        let mut decoder = match reusable {
+            Some((_, decoder)) => {
+                #[cfg(test)]
+                {
+                    self.lzma2_reuses = self.lzma2_reuses.saturating_add(1);
+                }
+                decoder
+            }
+            None => Lzma2Decoder::new(dict_size),
+        };
+
         let mut cursor = std::io::Cursor::new(compressed);
         let mut data = Vec::new();
-        loop {
-            let more = decoder.decode_chunk(&mut cursor, &mut data)?;
-            if let Some(max) = self.max_output {
-                let total = self.produced.saturating_add(data.len() as u64);
-                if total > max {
-                    return Err(OxiArcError::memory_budget_exceeded(
-                        usize::try_from(max).unwrap_or(usize::MAX),
-                        usize::try_from(total).unwrap_or(usize::MAX),
-                    ));
+        let outcome: Result<()> = (|| {
+            loop {
+                let more = decoder.decode_chunk(&mut cursor, &mut data)?;
+                if let Some(max) = self.max_output {
+                    let total = self.produced.saturating_add(data.len() as u64);
+                    if total > max {
+                        return Err(OxiArcError::memory_budget_exceeded(
+                            usize::try_from(max).unwrap_or(usize::MAX),
+                            usize::try_from(total).unwrap_or(usize::MAX),
+                        ));
+                    }
+                }
+                if !more {
+                    return Ok(());
                 }
             }
-            if !more {
-                break;
-            }
-        }
+        })();
+
+        // Keep the decoder for reuse regardless of outcome, including after
+        // an error: whatever block this cache is next offered to -- another
+        // block of this stream, or, via `XzDecoder`, a completely unrelated
+        // stream -- is only allowed to reuse it if that block opens by
+        // resetting dictionary, properties, model and state from its own
+        // bytes, so however unfinished this decoder's state is, nothing can
+        // read it back.
+        self.lzma2_cache = Some((dict_size, decoder));
+        outcome?;
+
         let consumed = usize::try_from(cursor.position()).unwrap_or(compressed.len());
         Ok((data, consumed))
     }
@@ -1063,6 +1196,33 @@ impl<R: Read> XzReader<R> {
     }
 }
 
+/// Whether `compressed`'s first LZMA2 chunk resets enough decoder state for
+/// this block to be decoded by a *reused* [`Lzma2Decoder`] without that
+/// reuse being observable (see [`XzReader::decode_lzma2_payload`]).
+///
+/// Only one chunk shape qualifies: an LZMA chunk whose reset field (bits
+/// 5-6 of the control byte) is `3` — state reset + new properties +
+/// dictionary reset. That is what an independent XZ block emitted by any
+/// real encoder opens with, and it re-derives every piece of decoder state
+/// a previous, unrelated block could have left behind (dictionary contents
+/// and position, `lc`/`lp`/`pb` properties, probability model, coder state,
+/// rep distances, uncompressed position) from this block's own bytes.
+///
+/// Everything else — an uncompressed chunk (`0x01`/`0x02`), an LZMA chunk
+/// with a weaker reset field, the end-of-stream marker, an empty payload,
+/// an invalid control byte — gets a freshly allocated decoder, so those
+/// blocks behave exactly as they did before the reuse cache existed. In
+/// particular this is *not* a validity check: rejecting a block that fails
+/// to reset its dictionary stays [`Lzma2Decoder`]'s own job (its
+/// `need_dict_reset` flag), reported with its own message, so there is only
+/// ever one enforcement site and no chance of the two drifting apart.
+fn block_opener_permits_decoder_reuse(compressed: &[u8]) -> bool {
+    match compressed.first() {
+        Some(&control) if control >= 0x80 => (control >> 5) & 0x03 == 3,
+        _ => false,
+    }
+}
+
 /// Fill `buf` from `reader`, returning how many bytes were read before the
 /// end of input.
 ///
@@ -1133,29 +1293,15 @@ pub fn decompress<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 /// # Ok::<(), oxiarc_core::error::OxiArcError>(())
 /// ```
 pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
-    let mut reader = XzReader::new(std::io::Cursor::new(src))?.with_max_output(dst.len() as u64);
-    // The cap is `dst.len()`, so an oversized stream trips the running
-    // budget check inside the decoder rather than this function's own
-    // post-hoc comparison. Report it the way this entry point documents it
-    // (and the way `oxiarc_deflate::inflate_into` reports the same
-    // condition) instead of leaking a budget the caller never configured;
-    // `requested` is the running total that crossed the limit, i.e. a lower
-    // bound on what `dst` would have needed.
-    let data = reader.decompress().map_err(|err| match err {
-        OxiArcError::MemoryBudgetExceeded { requested, .. } => OxiArcError::BufferTooSmall {
-            needed: requested,
-            available: dst.len(),
-        },
-        other => other,
-    })?;
-    if data.len() > dst.len() {
-        return Err(OxiArcError::BufferTooSmall {
-            needed: data.len(),
-            available: dst.len(),
-        });
-    }
-    dst[..data.len()].copy_from_slice(&data);
-    Ok(data.len())
+    // A thin wrapper over `XzDecoder`: a throwaway context, used for exactly
+    // one stream, behaves identically to this function's own pre-`XzDecoder`
+    // body (same cap derivation, same `MemoryBudgetExceeded` ->
+    // `BufferTooSmall` remapping, same length check before the copy) since a
+    // fresh `XzDecoder` starts with no cached LZMA2 decoder and no configured
+    // `with_max_output`. Callers that decode many streams sharing a
+    // dictionary size should hold their own `XzDecoder` instead, so its
+    // cache survives across calls -- see the [module documentation](self).
+    super::decoder::XzDecoder::new().decompress_into(src, dst)
 }
 
 /// Decompress a complete `.xz` stream with an explicit output cap.

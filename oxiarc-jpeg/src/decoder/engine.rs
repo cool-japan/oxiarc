@@ -205,9 +205,20 @@ impl Engine {
             };
         }
 
+        // T.81 lossless has no DCT to scale; `Planes::allocate` hardwires the
+        // same "no scaling" rule for it, so `ImageInfo` must agree or the two
+        // would disagree about a lossless decode's own output size.
+        let scale_numerator = if frame.is_lossless() {
+            8
+        } else {
+            self.options.scale.numerator()
+        };
+
         ImageInfo {
             width: frame.width,
             height: frame.height,
+            scaled_width: super::scaled_dim(frame.width, scale_numerator),
+            scaled_height: super::scaled_dim(frame.height, scale_numerator),
             precision: frame.precision,
             num_components: frame.components.len() as u8,
             components,
@@ -238,7 +249,7 @@ impl Engine {
             return Err(JpegError::Unsupported(UnsupportedFeature::ArithmeticCoding));
         }
 
-        self.planes = Planes::allocate(frame, &self.options.limits)?;
+        self.planes = Planes::allocate(frame, self.options.scale, &self.options.limits)?;
         if frame.is_progressive() {
             self.coefficients = Coefficients::allocate(frame, &self.options.limits)?;
         }
@@ -362,6 +373,7 @@ impl Engine {
                     restart_interval,
                     entropy,
                     &mut self.planes,
+                    self.options.scale,
                     &limits,
                     tolerate,
                 )

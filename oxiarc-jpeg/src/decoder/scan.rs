@@ -4,7 +4,7 @@ use super::planes::Planes;
 use crate::error::{JpegError, Result, TableKind};
 use crate::frame::{Component, FrameHeader, ScanHeader};
 use crate::huffman::{BitReader, HuffmanTable};
-use crate::idct::idct_islow_into;
+use crate::idct::idct_scaled_into;
 use crate::quant::QuantTable;
 use crate::tables::ZIGZAG_TO_NATURAL;
 
@@ -243,8 +243,11 @@ pub(crate) fn decode_sequential(
 
         let unit_result = geometry.blocks_of_unit(frame, scan, unit, |k, bcol, brow| {
             let index = scan.component_indices[k];
+            let output_size = planes.output_size(index);
+            let size = usize::from(output_size);
             let stride = planes.stride(index);
-            let offset = planes.offset(index) + brow as usize * 8 * stride + bcol as usize * 8;
+            let offset =
+                planes.offset(index) + brow as usize * size * stride + bcol as usize * size;
             decode_block(
                 &mut reader,
                 dc_tables[k],
@@ -253,7 +256,7 @@ pub(crate) fn decode_sequential(
                 &mut block,
                 unit,
             )?;
-            idct_islow_into(
+            idct_scaled_into(
                 &block,
                 quant_tables[k].natural(),
                 planes.data_mut(),
@@ -261,6 +264,7 @@ pub(crate) fn decode_sequential(
                 stride,
                 center,
                 maxval,
+                output_size,
             );
             Ok(())
         });

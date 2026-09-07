@@ -116,12 +116,20 @@
 //! [`Samples::F16`], which stays raw `u16` bits so the native API needs no
 //! `half` dependency), `compat::ColorType` (all ten upstream variants) and
 //! `compat::TiffError` (exactly six variants). `tests/compat_api.rs`
-//! reproduces `image` 0.25.10's exact call sequence against this module, so
-//! a shape break fails a compile or a test in this crate, never downstream.
-//! See the `compat` module's own docs (`cargo doc --features compat`) for
-//! the full contract, including the deliberate, documented deviations from
-//! upstream (never a silent behaviour change). This paragraph names it as
-//! plain text, not a doc link, because it is only compiled when the
+//! reproduces the calls `image` 0.25.10 makes against this module — the
+//! `Limits` setup, `dimensions`, `colortype`,
+//! `find_tag_unsigned_vec::<u16>(SampleFormat)`, `read_image_to_buffer`, the
+//! ICC and orientation tag reads, both exhaustive `TiffError` match sites and
+//! the encoder path — so a shape break fails a compile or a test in this
+//! crate, never downstream. It pins the *shape*; it is not a claim that
+//! `image` itself builds against this module unmodified (one of the
+//! documented deviations, the owned `to_bytes` in place of upstream's
+//! borrowed `as_bytes`, makes that impossible under
+//! `#![forbid(unsafe_code)]`), which is what the `oxiarc-image` facade is
+//! for. See the `compat` module's own docs (`cargo doc --features compat`)
+//! for the full contract, including the deliberate, documented deviations
+//! from upstream (never a silent behaviour change). This paragraph names it
+//! as plain text, not a doc link, because it is only compiled when the
 //! `compat` feature is on, and this paragraph is not.
 //!
 //! # Guarding untrusted input

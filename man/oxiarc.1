@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc 1  "oxiarc 0.3.6" 
+.TH oxiarc 1  "oxiarc 0.4.2" 
 .SH NAME
 oxiarc \- The Oxidized Archiver \- Pure Rust archive utility
 .SH SYNOPSIS
@@ -36,6 +36,8 @@ Examples:
   oxiarc convert archive.7z output.zip
   oxiarc test archive.lzh
   oxiarc info archive.7z
+  oxiarc detect photo.jpg
+  oxiarc info image.png
   oxiarc man ./man
 .SH OPTIONS
 .TP
@@ -80,10 +82,10 @@ oxiarc\-add(1)
 Add files to an existing archive (ZIP, TAR, LZH)
 .TP
 oxiarc\-info(1)
-Show information about an archive
+Show information about an archive, or a PNG/JPEG/TIFF image
 .TP
 oxiarc\-detect(1)
-Detect archive format
+Detect archive format, or a PNG/JPEG/TIFF image
 .TP
 oxiarc\-convert(1)
 Convert archive to another format
@@ -94,6 +96,6 @@ Generate man pages for all subcommands
 oxiarc\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.3.6
+v0.4.2
 .SH AUTHORS
 COOLJAPAN OU (Team KitaSan)

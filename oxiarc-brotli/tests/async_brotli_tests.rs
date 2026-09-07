@@ -404,3 +404,73 @@ async fn test_async_decodes_reference_streams() {
         .expect("decompress_async");
     assert_eq!(out, expected);
 }
+
+/// A shared (custom LZ77) dictionary reaches the async adapter, and the same
+/// body decoded without it does not silently produce the input.
+///
+/// The body is compressed against the dictionary at a ratio the dictionary-free
+/// encoder cannot approach, so a `with_dictionary` that quietly did nothing
+/// would fail the first assertion rather than pass the round trip.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_async_decompressor_accepts_a_shared_dictionary() {
+    let dictionary: Vec<u8> = (0..600u32)
+        .flat_map(|i| format!("<li class=\"row-{i}\">item number {i}</li>\n").into_bytes())
+        .collect();
+    let data = dictionary[1000..12_000].to_vec();
+    let params = BrotliParams {
+        quality: 9,
+        lgwin: 22,
+        lgblock: 0,
+    };
+    let compressed =
+        oxiarc_brotli::compress_with_dictionary(&data, &dictionary, &params).expect("compress -D");
+    let plain = compress_with_params(&data, &params).expect("compress");
+    assert!(
+        compressed.len() * 4 < plain.len(),
+        "the dictionary must be doing the work: {} with vs {} without",
+        compressed.len(),
+        plain.len()
+    );
+
+    // Trickled 7 bytes at a time through a 256-byte staging buffer: the
+    // dictionary has to survive every resumption point, not just a whole-body
+    // decode.
+    let mut dec = BrotliAsyncDecompressor::new().with_dictionary(dictionary.clone());
+    let mut source = AsyncTrickle {
+        data: compressed.clone(),
+        pos: 0,
+        step: 7,
+    };
+    let mut out = Vec::new();
+    dec.decompress_async_with_buffer(&mut source, &mut out, 256)
+        .await
+        .expect("decompress_async with a dictionary");
+    assert_eq!(out, data);
+
+    // Without the dictionary the distances mean something else entirely; the
+    // stream stays structurally decodable, so the assertion is that it does not
+    // reproduce the input, not that it errors.
+    let mut bare = BrotliAsyncDecompressor::new();
+    let mut source = Cursor::new(compressed.clone());
+    let mut bare_out = Vec::new();
+    let bare_result = bare.decompress_async(&mut source, &mut bare_out).await;
+    assert!(
+        bare_result.is_err() || bare_out != data,
+        "a dictionary-compressed body must not decode without the dictionary"
+    );
+
+    // The output cap is enforced with a dictionary attached, too.
+    let mut capped = BrotliAsyncDecompressor::new()
+        .with_dictionary(dictionary)
+        .with_max_output(64);
+    let mut source = Cursor::new(compressed);
+    let mut capped_out = Vec::new();
+    let err = capped
+        .decompress_async(&mut source, &mut capped_out)
+        .await
+        .expect_err("64-byte cap on an 11 KiB body");
+    assert!(
+        err.to_string().contains("exceed") || err.to_string().contains("limit"),
+        "unexpected error: {err}"
+    );
+}

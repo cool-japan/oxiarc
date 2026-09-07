@@ -4,6 +4,8 @@
 //! Work is done a row at a time into a single reusable buffer, so a decode
 //! allocates the component planes and nothing else per row.
 
+#[cfg(test)]
+use super::Scale;
 use super::planes::Planes;
 use crate::color::ColorSpace;
 use crate::color::cmyk::{cmyk_passthrough, ycck_to_cmyk};
@@ -77,17 +79,35 @@ impl OutputPlan {
             Mode::YcckToCmyk => 4,
         };
 
+        // libjpeg's `jinit_upsampler`: an upsampler compares each component's
+        // *scaled* ratio to the frame maximum, not its raw `Hi`/`Vi` — a
+        // subsampled component whose own `Planes::output_size` was bumped up
+        // (see `component_output_size` in `planes.rs`) can arrive already at
+        // full resolution, in which case it must be treated as `Identity`
+        // even though `component.h != frame.hmax`. `min_size` is libjpeg's
+        // `_min_DCT_scaled_size`, always the requested `Scale::numerator`
+        // (`8` outside a scaled decode and always for a lossless frame).
+        let min_size = u32::from(planes.min_output_size());
+        // `jdsample.c`: "jdmainct.c doesn't support context rows when
+        // min_DCT_scaled_size == 1, so don't ask for it" — the vertical
+        // fancy kernel needs a row *above and below* the current MCU row,
+        // which the `1/8`-scale band layout cannot supply. `djpeg -scale
+        // 1/8` therefore never installs a fancy kernel, `-nosmooth` or not.
+        let do_fancy = fancy_upsampling && min_size > 1;
         let mut upsamplers = Vec::with_capacity(count);
         for (index, component) in frame.components.iter().enumerate() {
+            let component_size = u32::from(planes.output_size(index));
+            let h_in_group = (u32::from(component.h) * component_size / min_size) as u8;
+            let v_in_group = (u32::from(component.v) * component_size / min_size) as u8;
             upsamplers.push(Upsampler::new(
                 planes.width(index),
                 planes.height(index),
                 planes.stride(index),
-                component.h,
-                component.v,
+                h_in_group,
+                v_in_group,
                 frame.hmax,
                 frame.vmax,
-                fancy_upsampling,
+                do_fancy,
             ));
         }
 
@@ -99,8 +119,8 @@ impl OutputPlan {
         };
 
         Ok(Self {
-            width: usize::from(frame.width),
-            height: usize::from(frame.height),
+            width: super::scaled_dim(frame.width, planes.min_output_size()) as usize,
+            height: super::scaled_dim(frame.height, planes.min_output_size()) as usize,
             components,
             mode,
             upsamplers,
@@ -215,7 +235,7 @@ mod tests {
     }
 
     fn planes_for(frame: &FrameHeader) -> Planes {
-        Planes::allocate(frame, &DecodeLimits::default()).expect("planes")
+        Planes::allocate(frame, Scale::FULL, &DecodeLimits::default()).expect("planes")
     }
 
     #[test]

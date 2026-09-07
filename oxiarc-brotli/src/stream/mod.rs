@@ -221,6 +221,12 @@ pub struct BrotliStream {
     p2: u8,
     /// Scratch for the transformed static-dictionary word being emitted.
     dict_buf: Vec<u8>,
+    /// Attached shared (custom LZ77) dictionary; empty when none.
+    shared: Vec<u8>,
+    /// Commands the no-checkpoint fast path has run on this stream. See
+    /// `command::CommandCtx::fast_path_commands`.
+    #[cfg(test)]
+    fast_path_commands: u64,
     /// Total output cap.
     budget: OutputBudget,
     /// Largest window allocation this stream will accept.
@@ -282,6 +288,9 @@ impl BrotliStream {
             p1: 0,
             p2: 0,
             dict_buf: Vec::new(),
+            shared: Vec::new(),
+            #[cfg(test)]
+            fast_path_commands: 0,
             budget: OutputBudget::default_guard(),
             max_window: DEFAULT_MAX_WINDOW,
             total_in: 0,
@@ -321,6 +330,53 @@ impl BrotliStream {
     pub fn with_max_window(mut self, bytes: usize) -> Self {
         self.max_window = bytes;
         self
+    }
+
+    /// Attach a shared (custom LZ77) dictionary.
+    ///
+    /// The stream's backward references may then reach into `dictionary` at
+    /// distances beyond everything it has produced itself — beyond its declared
+    /// window, in fact. This is the decoding half of the reference
+    /// `brotli --dictionary=FILE` option and of `Content-Encoding: dcb`
+    /// (RFC 9842); [`crate::shared_dict`] documents the distance space.
+    ///
+    /// The dictionary survives [`BrotliStream::reset`], so one configured
+    /// decoder can decode many streams against the same dictionary. An empty
+    /// dictionary is the default and changes nothing.
+    ///
+    /// A dictionary larger than
+    /// [`crate::shared_dict::MAX_SHARED_DICTIONARY`] is not rejected here (this
+    /// is an infallible builder); the first [`BrotliStream::decode`] call fails
+    /// with [`BrotliError::DictionaryError`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_brotli::{compress_with_dictionary, BrotliParams, BrotliStatus, BrotliStream};
+    /// use oxiarc_core::traits::FlushMode;
+    ///
+    /// let dictionary = b"shared vocabulary for both peers".repeat(32);
+    /// let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+    /// let compressed =
+    ///     compress_with_dictionary(b"shared vocabulary for both peers!", &dictionary, &params)
+    ///         .expect("compress");
+    ///
+    /// let mut stream = BrotliStream::new().with_dictionary(dictionary);
+    /// let mut out = vec![0u8; 128];
+    /// let progress = stream.decode(&compressed, &mut out, FlushMode::Finish).expect("decode");
+    /// assert_eq!(progress.status, BrotliStatus::StreamEnd);
+    /// assert_eq!(&out[..progress.produced], b"shared vocabulary for both peers!");
+    /// ```
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Vec<u8>) -> Self {
+        self.shared = dictionary;
+        self
+    }
+
+    /// The attached shared dictionary, empty when none was set.
+    #[must_use]
+    pub fn dictionary(&self) -> &[u8] {
+        &self.shared
     }
 
     /// Record the [`MetaBlockShape`] of every compressed meta-block, readable
@@ -410,6 +466,10 @@ impl BrotliStream {
         self.header_retry_at = 0;
         self.header_attempts = 0;
         self.fault = None;
+        #[cfg(test)]
+        {
+            self.fast_path_commands = 0;
+        }
     }
 
     /// How many times an atomic meta-block prelude parse has been attempted.
@@ -499,6 +559,10 @@ impl BrotliStream {
         if let Some(err) = &self.fault {
             return Err(duplicate_error(err));
         }
+        if let Err(err) = crate::shared_dict::check_dictionary_len(self.shared.len()) {
+            self.fault = Some(duplicate_error(&err));
+            return Err(err);
+        }
 
         // Take only as much as the bounded carry can hold. In the steady
         // state the carry has drained to a few bytes and this is all of
@@ -507,7 +571,6 @@ impl BrotliStream {
         let mut carry = std::mem::take(&mut self.carry);
         let unconsumed = carry.len() - self.cursor.bits_consumed() / 8;
         let take = input.len().min(MAX_CARRY.saturating_sub(unconsumed));
-        carry.extend_from_slice(&input[..take]);
         self.total_in += take as u64;
 
         // "More input may still arrive" is true when the caller said so *or*
@@ -515,18 +578,40 @@ impl BrotliStream {
         // behind. Only when neither holds does the decoder switch to the
         // one-shot reader semantics, where running short is truncation.
         let more_possible = flush != FlushMode::Finish || take < input.len();
-        let outcome = self.run(&carry, output, more_possible);
 
-        // Compact the carry in place up to the resume point, amortised: never
-        // a `remove(0)`, and never past a position the decoder may rewind to.
-        let consumed_bytes = self.cursor.bits_consumed() / 8;
-        if consumed_bytes > 0 && consumed_bytes * 2 > carry.len() {
-            let remaining = carry.len() - consumed_bytes;
-            carry.copy_within(consumed_bytes.., 0);
-            carry.truncate(remaining);
+        let outcome = if unconsumed == 0 {
+            // Nothing is being held back, so decode straight out of the
+            // caller's slice and copy only what this call could not finish.
+            // `unconsumed == 0` forces `byte_pos == carry.len()` and
+            // `bits_in_buf == 0` (the bit accumulator is fed from bytes
+            // already counted in `byte_pos`), so the cursor really does start
+            // over on a fresh buffer — and a stored meta-block, which consumes
+            // everything it is offered, then never copies its bytes at all.
+            carry.clear();
+            self.cursor = BitCursorState::start();
+            let outcome = self.run(&input[..take], output, more_possible);
+            let consumed_bytes = self.cursor.bits_consumed() / 8;
+            carry.extend_from_slice(&input[consumed_bytes..take]);
             self.cursor = BitReader::rebase_state(self.cursor, consumed_bytes);
-        }
-        self.carry = carry;
+            self.carry = carry;
+            outcome
+        } else {
+            carry.extend_from_slice(&input[..take]);
+            let outcome = self.run(&carry, output, more_possible);
+
+            // Compact the carry in place up to the resume point, amortised:
+            // never a `remove(0)`, and never past a position the decoder may
+            // rewind to.
+            let consumed_bytes = self.cursor.bits_consumed() / 8;
+            if consumed_bytes > 0 && consumed_bytes * 2 > carry.len() {
+                let remaining = carry.len() - consumed_bytes;
+                carry.copy_within(consumed_bytes.., 0);
+                carry.truncate(remaining);
+                self.cursor = BitReader::rebase_state(self.cursor, consumed_bytes);
+            }
+            self.carry = carry;
+            outcome
+        };
 
         match outcome {
             Ok((produced, status)) => Ok(BrotliProgress {
@@ -539,6 +624,25 @@ impl BrotliStream {
                 Err(err)
             }
         }
+    }
+
+    /// Tell the window how much this meta-block will add, so the ring is
+    /// allocated once at the size the stream actually needs rather than
+    /// doubling its way to the declared window.
+    ///
+    /// A 1 MiB body that declares `lgwin = 22` gets a 1 MiB ring, not 4 MiB —
+    /// and the ring is never allocated at all until a byte is produced.
+    fn announce_meta_block(&mut self, mlen: usize) {
+        if let Some(window) = self.window.as_mut() {
+            let held = usize::try_from(self.total_out).unwrap_or(usize::MAX);
+            window.expect_total(held.saturating_add(mlen));
+        }
+    }
+
+    /// Commands the no-checkpoint fast path has run on this stream.
+    #[cfg(test)]
+    pub(crate) fn fast_path_commands(&self) -> u64 {
+        self.fast_path_commands
     }
 
     /// The state machine proper. `carry` is the whole received-but-unconsumed
@@ -622,6 +726,7 @@ impl BrotliStream {
                         }
                         Ok(MetaBlockStart::Uncompressed { mlen }) => {
                             self.header_retry_at = 0;
+                            self.announce_meta_block(mlen);
                             self.state = State::Uncompressed { remaining: mlen };
                         }
                         Ok(MetaBlockStart::Compressed {
@@ -630,6 +735,7 @@ impl BrotliStream {
                             header,
                         }) => {
                             self.header_retry_at = 0;
+                            self.announce_meta_block(mlen);
                             self.meta = Some(MetaBlockState {
                                 header,
                                 mlen,
@@ -691,7 +797,12 @@ impl BrotliStream {
                     if taken > 0 {
                         let chunk = &output[written..written + taken];
                         if let Some(w) = self.window.as_mut() {
-                            w.push_slice(chunk);
+                            // The stored bytes went straight to the caller;
+                            // the ring only ever needs the last window's worth
+                            // of them, so a meta-block longer than the declared
+                            // window is mirrored once, at its tail, instead of
+                            // being copied through the ring in full.
+                            w.push_slice_tail(chunk, remaining - taken);
                         }
                         note_output(&mut self.p1, &mut self.p2, chunk);
                         self.total_out += taken as u64;
@@ -719,6 +830,9 @@ impl BrotliStream {
                         p1: &mut self.p1,
                         p2: &mut self.p2,
                         dict_buf: &mut self.dict_buf,
+                        shared: &self.shared,
+                        #[cfg(test)]
+                        fast_path_commands: &mut self.fast_path_commands,
                     };
                     let (produced, status) =
                         run_commands(&mut reader, meta, &mut ctx, &mut output[written..])?;
@@ -966,6 +1080,72 @@ mod tests {
             matches!(err, BrotliError::WindowTooLarge { .. }),
             "unexpected error: {err}"
         );
+    }
+
+    /// The no-checkpoint fast command path must actually engage. Every other
+    /// test in the suite compares output, and a fast path that silently never
+    /// runs produces exactly the same output — so this is the only test that
+    /// can fail when it stops working.
+    #[test]
+    fn the_fast_command_path_engages_on_ordinary_data() {
+        // Log-shaped text: compressible, but with enough entropy that the
+        // compressed stream is tens of kilobytes. A payload that compresses to
+        // a few dozen bytes cannot exercise the fast path at all — there is
+        // never `FAST_COMMAND_BITS` of input left to guarantee a whole command
+        // — and that is a property of tiny streams, not of the fast path.
+        let mut data = Vec::new();
+        let mut state = 0x1234_5678u64;
+        for i in 0..6000u32 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let v = (state >> 33) as u32;
+            data.extend_from_slice(
+                format!(
+                    "2026-09-08T{:02}:{:02}:{:02} req={i} path=/a/{}/b status={} bytes={}\n",
+                    v % 24,
+                    (v >> 5) % 60,
+                    (v >> 11) % 60,
+                    v % 9973,
+                    200 + (v % 5) * 100,
+                    v % 65536
+                )
+                .as_bytes(),
+            );
+        }
+        let compressed = compress(&data, 5).expect("compress");
+        let mut stream = BrotliStream::new();
+        let got = decode_all_with(&mut stream, &compressed).expect("decode");
+        assert_eq!(got, data);
+        assert!(
+            stream.fast_path_commands() >= 1000,
+            "fast command path ran only {} times",
+            stream.fast_path_commands()
+        );
+
+        // And it must survive a one-byte-at-a-time drive too: the path is
+        // re-entered at every command boundary, not once per call.
+        let mut trickle = BrotliStream::new();
+        let mut out = [0u8; 512];
+        let mut decoded = Vec::new();
+        let mut fed = 0usize;
+        loop {
+            let end = (fed + 1).min(compressed.len());
+            let flush = if end == compressed.len() {
+                FlushMode::Finish
+            } else {
+                FlushMode::None
+            };
+            let progress = trickle
+                .decode(&compressed[fed..end], &mut out, flush)
+                .expect("decode");
+            fed += progress.consumed;
+            decoded.extend_from_slice(&out[..progress.produced]);
+            if progress.status == BrotliStatus::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(decoded, data);
     }
 
     #[test]

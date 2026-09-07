@@ -18,14 +18,6 @@ fn unsupported_format(format: ImageFormat) -> ImageError {
     ))
 }
 
-fn decode_via<D: ImageDecoder>(decoder: D) -> ImageResult<DynamicImage> {
-    let (width, height) = decoder.dimensions();
-    let color_type = decoder.color_type();
-    let mut buf = vec![0u8; decoder.total_bytes() as usize];
-    decoder.read_image(&mut buf)?;
-    DynamicImage::from_decoded(color_type, width, height, buf)
-}
-
 /// A multi-format image reader: wraps a source, figures out (or is told)
 /// its format, and dispatches to the matching `codecs::*` decoder.
 ///
@@ -114,7 +106,7 @@ impl<R: BufRead + Seek> ImageReader<R> {
     /// # Errors
     /// No format is known, the format is not one this crate decodes, or
     /// the header is malformed.
-    pub fn into_dimensions(mut self) -> ImageResult<(u32, u32)> {
+    pub fn into_dimensions(self) -> ImageResult<(u32, u32)> {
         match self.require_format()? {
             ImageFormat::Png => Ok(codecs::png::PngDecoder::new(self.inner)?.dimensions()),
             ImageFormat::Jpeg => Ok(codecs::jpeg::JpegDecoder::new(self.inner)?.dimensions()),
@@ -130,9 +122,15 @@ impl<R: BufRead + Seek> ImageReader<R> {
     /// decode failure.
     pub fn decode(self) -> ImageResult<DynamicImage> {
         match self.require_format()? {
-            ImageFormat::Png => decode_via(codecs::png::PngDecoder::new(self.inner)?),
-            ImageFormat::Jpeg => decode_via(codecs::jpeg::JpegDecoder::new(self.inner)?),
-            ImageFormat::Tiff => decode_via(codecs::tiff::TiffDecoder::new(self.inner)?),
+            ImageFormat::Png => {
+                DynamicImage::from_decoder(codecs::png::PngDecoder::new(self.inner)?)
+            }
+            ImageFormat::Jpeg => {
+                DynamicImage::from_decoder(codecs::jpeg::JpegDecoder::new(self.inner)?)
+            }
+            ImageFormat::Tiff => {
+                DynamicImage::from_decoder(codecs::tiff::TiffDecoder::new(self.inner)?)
+            }
             other => Err(unsupported_format(other)),
         }
     }

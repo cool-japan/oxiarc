@@ -207,23 +207,37 @@ What is frozen, byte-for-byte, because downstream code (`image` 0.25.10's
 - `compat::TiffError` — exactly the six upstream variants
   (`IoError`/`FormatError`/`IntSizeError`/`UsageError`/`UnsupportedError`/`LimitsExceeded`)
 
-`tests/compat_api.rs` reproduces the exact call sequence `image` 0.25.10
-performs (dimensions, colour type, `read_image_to_buffer`, the ICC-profile
-and orientation tag reads, both exhaustive-`TiffError`-match sites, the
-`TiffEncoder`/`ImageEncoder` write path with an ICC tag) so a shape break
-fails a compile or a test here, not downstream. `compat::encoder::colortype`
-carries all thirty upstream colour-type marker types
-(`Gray8` .. `CMYKA8`), not only the eight `image` names directly.
+`tests/compat_api.rs` reproduces the calls `image` 0.25.10 makes against this
+module — `Limits` then `Decoder::new` + `with_limits`, dimensions, colour
+type, `find_tag_unsigned_vec::<u16>(SampleFormat)`, `read_image_to_buffer`,
+the ICC-profile and orientation tag reads (`get_tag_u8_vec`, `into_u16`),
+both exhaustive-`TiffError`-match sites, and the `TiffEncoder`/`ImageEncoder`
+write path with an ICC tag — so a shape break fails a compile or a test here,
+not downstream. It is a **shape** pin, not a claim that `image` builds against
+this module unmodified: `image`'s planar branch chains
+`as_bytes().chunks_exact(..).collect()` off a *borrowed* byte view, which
+`#![forbid(unsafe_code)]` cannot hand back (see the deviations below).
+`compat::encoder::colortype` carries all thirty upstream colour-type marker
+types (`Gray8` .. `CMYKA8`), not only the eight `image` names directly.
+
+`BufferLayoutPreference`'s `len`, `row_stride`, `plane_stride` and
+`complete_len` are **byte** counts, exactly as upstream documents and consumes
+them, so the idiom upstream documents on `read_image_to_buffer`
+(`if buffer.byte_len() < layout.complete_len { /* a plane is missing */ }`)
+compares like with like.
 
 Deliberate, documented deviations (never a silent behaviour change):
-`ImageEncoder`'s `resolution*` setters return `TiffResult<()>` instead of
-`unwrap()`-ing internally (this crate has no `unwrap()` in library code, and
-upstream's own users never call these); `DecodingBuffer::to_bytes` returns an
-owned `Vec<u8>` rather than a zero-copy view (this crate is
+`ImageEncoder`'s setters are by-value builders returning `Self`
+(`rows_per_strip` returns `TiffResult<Self>`) where upstream's take
+`&mut self`, return `()` and `unwrap()` internally — this crate has no
+`unwrap()` in library code, and upstream's own users never call these;
+`DecodingBuffer::to_bytes` is named `to_bytes`, not upstream's `as_bytes`, and
+returns an owned `Vec<u8>` rather than a zero-copy view (this crate is
 `#![forbid(unsafe_code)]`, and a zero-copy numeric-slice-to-bytes view needs
-one); `encoder::Predictor` is a re-export of `tags::Predictor` rather than a
-second, independently-defined enum of the same shape. See the `compat` module
-docs (`cargo doc --features compat --open`) for the complete list.
+one — use `byte_len()` when only the length is wanted); `encoder::Predictor`
+is a re-export of `tags::Predictor` rather than a second,
+independently-defined enum of the same shape. See the `compat` module docs
+(`cargo doc --features compat --open`) for the complete list.
 
 If you are migrating through `image` rather than `tiff` directly, the sibling
 [`oxiarc-image`](https://docs.rs/oxiarc-image) crate is the facade for
@@ -375,25 +389,44 @@ Subtracting this crate's own no-codec decode time from each figure leaves
 essentially the whole gap inside the codec crate, so closing it is work for
 `oxiarc-lzw` / `oxiarc-zstd`, not for `oxiarc-tiff`.
 
-**`rayon` on/off**, 4096x4096 Gray8, PackBits, 256x256 tiles (`tiff_rayon_decode`/
-`tiff_rayon_encode` groups, `--quick`, Apple M-series). Measure these on an
-**idle** machine: they are the most load-sensitive numbers in this file, since
-the parallel arm needs free cores and the serial arm does not. Re-runs on a
-loaded 8-core box (load average 19-32) moved the untouched *encode* pair by 3x
-between consecutive runs and inverted the decode pair outright, so treat any
-single reading taken under load as noise rather than as a regression:
+**`rayon` on/off — parallel decode is not a uniform win; it depends on the
+codec *and* on how compressible the data is.** 4096x4096 Gray8, release build,
+8 cores at load average 6-10; serial and parallel measured *interleaved in the
+same loop*, medians of nine rounds:
 
-| Group | Serial | Parallel | Speedup |
+| Fixture | Serial | Parallel | Ratio |
 |---|---|---|---|
-| decode | 6.6 ms | 4.0 ms | 1.7x |
-| encode | 16.8 ms | 5.4 ms | 3.1x |
+| LZW, 256x256 tiles, incompressible | 114 ms | 32 ms | **3.6x faster** |
+| LZW, 256x256 tiles, compressible | 26.6 ms | 10.4 ms | **2.6x faster** |
+| Deflate, 64-row strips | 60 ms | 62 ms | 0.98x |
+| PackBits, 256x256 tiles, compressible | 2.6 ms | 2.4 ms | 1.09x |
+| PackBits, 256x256 tiles, incompressible | 3.8 ms | 4.2 ms | 0.90x |
+| uncompressed, 64-row strips | 2.1 ms | 3.1 ms | **0.66x (slower)** |
 
-Encode gains more than decode because compression (PackBits here; the effect
-is larger still for Deflate/LZMA/ZSTD) dominates encode time and parallelises
-cleanly, while decode's win is capped by the serial fetch pass (one `Read +
-Seek` handle) and — for codecs whose scratch lives behind `CodecState`'s
-`Mutex` (Deflate, CCITT) — by that lock. See the `rayon_support` module docs
-for the full breakdown of which codecs benefit.
+The win is exactly the CPU cost of a chunk's decompress step; the serial fetch
+pass (one `Read + Seek` handle), the `memcpy` placement and the thread-pool
+dispatch are overhead on top of it. In three groups:
+
+- **Worth it** — LZW, and by the same argument ZSTD, LZMA and JPEG. LZW came
+  out faster in every run, including a repeat at load average 30 on 8 cores
+  where it still managed 1.3x.
+- **No gain** — Deflate and CCITT: their scratch lives behind `CodecState`'s
+  `Mutex`, so the workers serialise on the codec anyway.
+- **No reliable gain, sometimes a loss** — uncompressed and PackBits. These are
+  `memcpy`-bound, so overhead is a large fraction of the total; repeated runs
+  straddled 1.0 (PackBits ranged 0.32x-1.12x with data compressibility and free
+  cores). Use plain `read_image` for these.
+
+Absolute times move with machine load — the parallel arm needs free cores and
+the serial arm does not, so a busy box penalises it even in an interleaved
+measurement. Only the LZW direction held under every load tested.
+
+Encode is the easier direction: every chunk's compression is independent CPU
+work with no shared lock, so it parallelises for every codec. The
+`tiff_rayon_encode` bench group measured 16.8 ms serial vs 5.4 ms parallel
+(3.1x) on a PackBits tile fixture; as criterion numbers taken under load they
+are far less trustworthy than the interleaved decode table above, so
+re-measure on an idle machine before quoting them.
 
 ## Status
 

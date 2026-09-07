@@ -7,8 +7,9 @@
 //! upsampler reads only the unpadded extent, so the padding never reaches the
 //! output.
 
+use super::Scale;
 use crate::error::{JpegError, LimitKind, Result};
-use crate::frame::FrameHeader;
+use crate::frame::{Component, FrameHeader};
 use crate::limits::{DecodeLimits, checked_product3};
 
 /// One decode's component planes.
@@ -20,22 +21,57 @@ pub(crate) struct Planes {
     padded_heights: Vec<usize>,
     widths: Vec<usize>,
     heights: Vec<usize>,
+    /// Samples per axis the scaled IDCT writes for one `8x8` coefficient
+    /// block of this component — libjpeg's `_DCT_scaled_size`. `8` for every
+    /// component at [`Scale::FULL`] and always for a lossless frame; a
+    /// subsampled component's own value can exceed the frame's requested
+    /// [`Scale::numerator`] (see [`component_output_size`]).
+    output_sizes: Vec<u8>,
 }
 
 impl Planes {
     /// Allocate the planes a frame needs, checking the total against
     /// [`DecodeLimits::max_output_bytes`] first.
-    pub(crate) fn allocate(frame: &FrameHeader, limits: &DecodeLimits) -> Result<Self> {
+    ///
+    /// `scale` is ignored for a lossless frame — see [`super::DecodeOptions::scale`].
+    pub(crate) fn allocate(
+        frame: &FrameHeader,
+        scale: Scale,
+        limits: &DecodeLimits,
+    ) -> Result<Self> {
         let count = frame.components.len();
         let mut offsets = Vec::with_capacity(count);
         let mut strides = Vec::with_capacity(count);
         let mut padded_heights = Vec::with_capacity(count);
         let mut widths = Vec::with_capacity(count);
         let mut heights = Vec::with_capacity(count);
+        let mut output_sizes = Vec::with_capacity(count);
         let mut samples: u64 = 0;
 
+        // T.81 lossless has no DCT to scale, and libjpeg hardwires "no
+        // scaling" for it (`jdmaster.c`: "Hardwire it to 'no scaling'");
+        // every component simply renders at its native block size.
+        let numerator = if frame.is_lossless() {
+            8
+        } else {
+            scale.numerator()
+        };
+
         for component in &frame.components {
-            let (padded_width, padded_height) = padded_extent(frame, component);
+            let output_size = if frame.is_lossless() {
+                8
+            } else {
+                component_output_size(component, frame, numerator)
+            };
+            let (width, height) = if frame.is_lossless() {
+                (component.width_samples, component.height_samples)
+            } else {
+                (
+                    component_downsampled_dim(frame.width, component.h, output_size, frame.hmax),
+                    component_downsampled_dim(frame.height, component.v, output_size, frame.vmax),
+                )
+            };
+            let (padded_width, padded_height) = padded_extent(frame, component, output_size);
             let plane_samples = checked_product3(
                 u64::from(padded_width),
                 u64::from(padded_height),
@@ -53,8 +89,9 @@ impl Planes {
 
             strides.push(padded_width as usize);
             padded_heights.push(padded_height as usize);
-            widths.push(component.width_samples as usize);
-            heights.push(component.height_samples as usize);
+            widths.push(width as usize);
+            heights.push(height as usize);
+            output_sizes.push(output_size);
         }
 
         let samples = usize::try_from(samples)
@@ -66,6 +103,7 @@ impl Planes {
             padded_heights,
             widths,
             heights,
+            output_sizes,
         })
     }
 
@@ -105,7 +143,10 @@ impl Planes {
     /// planes.
     ///
     /// `first_row` is the destination row of each component's band, which for
-    /// a band of whole MCU rows is `mcu_row * v * 8`. Rows past the
+    /// a band of whole MCU rows is `mcu_row * v * output_size` — the
+    /// component's own [`Planes::output_size`], **not** a hardwired `8`, or a
+    /// reduced-scale decode would scatter every band but the first across the
+    /// wrong plane rows. Rows past the
     /// destination's padded extent are dropped: the last band of a frame
     /// whose height is not a whole number of MCUs decodes padding rows that
     /// the full-frame planes do not carry.
@@ -132,6 +173,32 @@ impl Planes {
         self.padded_heights[index]
     }
 
+    /// Samples per axis the scaled IDCT wrote for one coefficient block of
+    /// component `index` — `8` unless [`super::DecodeOptions::scale`]
+    /// requested otherwise.
+    pub(crate) fn output_size(&self, index: usize) -> u8 {
+        self.output_sizes[index]
+    }
+
+    /// Every component's [`Planes::output_size`], in component order.
+    ///
+    /// The parallel band merge needs the whole array before it starts, to
+    /// place each band's rows at `mcu_row * Vi * output_size(i)` in the
+    /// destination plane rather than at the unscaled `mcu_row * Vi * 8`.
+    #[cfg(feature = "rayon")]
+    pub(crate) fn output_sizes(&self) -> &[u8] {
+        &self.output_sizes
+    }
+
+    /// The smallest [`Planes::output_size`] over every component — libjpeg's
+    /// `_min_DCT_scaled_size`, always equal to the requested
+    /// [`Scale::numerator`] (a subsampled component's size only ever grows
+    /// past it, never shrinks below it — see [`component_output_size`]).
+    /// `8` when there are no components, matching [`Scale::FULL`].
+    pub(crate) fn min_output_size(&self) -> u8 {
+        self.output_sizes.iter().copied().min().unwrap_or(8)
+    }
+
     /// `true` when no plane has been allocated.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
@@ -141,11 +208,15 @@ impl Planes {
 
 /// Padded plane extent for one component, in samples.
 ///
-/// DCT frames pad to whole MCUs of 8x8 blocks; lossless frames have no
-/// blocks, so they pad to whole MCUs of `Hi` x `Vi` samples.
+/// DCT frames pad to whole MCUs of `output_size x output_size` blocks
+/// (`output_size` is `8` unless [`super::DecodeOptions::scale`] requested
+/// otherwise); lossless frames have no blocks, so they pad to whole MCUs of
+/// `Hi` x `Vi` samples and `output_size` is ignored (pass `8`, the caller's
+/// unconditional value for a lossless frame).
 pub(crate) fn padded_extent(
     frame: &FrameHeader,
-    component: &crate::frame::Component,
+    component: &Component,
+    output_size: u8,
 ) -> (u32, u32) {
     if frame.is_lossless() {
         (
@@ -154,10 +225,51 @@ pub(crate) fn padded_extent(
         )
     } else {
         (
-            component.blocks_per_line_padded * 8,
-            component.blocks_per_column_padded * 8,
+            component.blocks_per_line_padded * u32::from(output_size),
+            component.blocks_per_column_padded * u32::from(output_size),
         )
     }
+}
+
+/// libjpeg's per-component IDCT-scaled-size selection
+/// (`jdmaster.c::jpeg_calc_output_dimensions`'s first loop, transcribed
+/// exactly): try to grow a subsampled component's own output block size so
+/// that, after scaling, its pixel width and height match the frame's full
+/// resolution — which lets the upsampler treat it as already full size
+/// instead of resampling. Doubling only continues while it keeps *both* axes
+/// exactly divisible, so an odd sampling ratio (or one that only matches on
+/// one axis) simply keeps `numerator`, which is what the loop's C original
+/// does too (a component's block is `N x N`; the two axes cannot be grown
+/// independently).
+///
+/// A no-op whenever `numerator >= 8` (`_min_DCT_scaled_size` is already the
+/// native block size, so nothing can grow into it) and for the frame's own
+/// most-sampled component (its ratio to `hmax`/`vmax` is `1`, which never
+/// clears the divisibility check either) — both exactly matching libjpeg.
+fn component_output_size(component: &Component, frame: &FrameHeader, numerator: u8) -> u8 {
+    let hmax = u32::from(frame.hmax);
+    let vmax = u32::from(frame.vmax);
+    let h = u32::from(component.h).max(1);
+    let v = u32::from(component.v).max(1);
+    let n = u32::from(numerator);
+    let mut size = n;
+    while size < 8 && (hmax * n) % (h * size * 2) == 0 && (vmax * n) % (v * size * 2) == 0 {
+        size *= 2;
+    }
+    // Unreachable past 14 (the largest value any `numerator in 1..=7` can
+    // double to before the `size < 8` guard stops it), far under `u8::MAX`.
+    size as u8
+}
+
+/// libjpeg's `downsampled_width` / `downsampled_height`
+/// (`jdmaster.c::jpeg_calc_output_dimensions`'s second loop): a component's
+/// true (unpadded) sample count on one axis once its own
+/// [`component_output_size`] is applied — `ceil(dim * h_or_v * output_size /
+/// (hmax_or_vmax * 8))`.
+fn component_downsampled_dim(dim: u16, h_or_v: u8, output_size: u8, hmax_or_vmax: u8) -> u32 {
+    let numerator = u64::from(dim) * u64::from(h_or_v) * u64::from(output_size);
+    let denominator = u64::from(hmax_or_vmax.max(1)) * 8;
+    numerator.div_ceil(denominator) as u32
 }
 
 #[cfg(test)]
@@ -181,7 +293,8 @@ mod tests {
     #[test]
     fn allocates_mcu_padded_planes() {
         let frame = frame(0xC0, 97, 131, &[(1, 2, 2, 0), (2, 1, 1, 1), (3, 1, 1, 1)]);
-        let planes = Planes::allocate(&frame, &DecodeLimits::default()).expect("allocate");
+        let planes =
+            Planes::allocate(&frame, Scale::FULL, &DecodeLimits::default()).expect("allocate");
         // Luma: 9 MCUs across x 2 blocks x 8 = 144 wide, 7 x 2 x 8 = 112 tall.
         assert_eq!(planes.stride(0), 144);
         assert_eq!(planes.width(0), 131);
@@ -198,7 +311,8 @@ mod tests {
     #[test]
     fn lossless_planes_are_not_block_padded() {
         let frame = frame(0xC3, 10, 10, &[(1, 1, 1, 0)]);
-        let planes = Planes::allocate(&frame, &DecodeLimits::default()).expect("allocate");
+        let planes =
+            Planes::allocate(&frame, Scale::FULL, &DecodeLimits::default()).expect("allocate");
         assert_eq!(planes.stride(0), 10);
         assert_eq!(planes.plane(0).len(), 100);
     }
@@ -208,7 +322,8 @@ mod tests {
         let frame = frame(0xC3, 9, 9, &[(1, 2, 2, 0), (2, 1, 1, 0)]);
         // Hmax = Vmax = 2 so there are 5 MCUs across and down.
         assert_eq!(frame.mcus_per_line, 5);
-        let planes = Planes::allocate(&frame, &DecodeLimits::default()).expect("allocate");
+        let planes =
+            Planes::allocate(&frame, Scale::FULL, &DecodeLimits::default()).expect("allocate");
         assert_eq!(planes.stride(0), 10);
         assert_eq!(planes.stride(1), 5);
         assert_eq!(planes.width(0), 9);
@@ -228,7 +343,7 @@ mod tests {
             ..DecodeLimits::default()
         };
         assert!(matches!(
-            Planes::allocate(&frame, &limits),
+            Planes::allocate(&frame, Scale::FULL, &limits),
             Err(JpegError::LimitExceeded(LimitKind::OutputBytes))
         ));
     }
@@ -236,7 +351,8 @@ mod tests {
     #[test]
     fn zero_height_frame_allocates_nothing() {
         let frame = frame(0xC0, 0, 16, &[(1, 1, 1, 0)]);
-        let planes = Planes::allocate(&frame, &DecodeLimits::default()).expect("allocate");
+        let planes =
+            Planes::allocate(&frame, Scale::FULL, &DecodeLimits::default()).expect("allocate");
         assert_eq!(planes.plane(0).len(), 0);
         assert!(!planes.is_empty());
     }

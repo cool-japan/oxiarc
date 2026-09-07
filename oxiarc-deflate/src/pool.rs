@@ -34,7 +34,7 @@
 //! assert!(pool.stats().window_hits >= 1);
 //! ```
 
-use crate::lz77::{HASH_SIZE, WINDOW_SIZE};
+use crate::encoder::pool_buffer_lengths;
 
 use std::sync::{
     Arc, Mutex,
@@ -46,9 +46,9 @@ use std::sync::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sizes (in element counts) of each pool bucket.
-const WINDOW_BUF_LEN: usize = WINDOW_SIZE * 2; // bytes
-const HASH_HEAD_LEN: usize = HASH_SIZE; // u16 entries
-const HASH_PREV_LEN: usize = WINDOW_SIZE; // u16 entries
+const WINDOW_BUF_LEN: usize = pool_buffer_lengths().0; // bytes (window + scan slack)
+const HASH_HEAD_LEN: usize = pool_buffer_lengths().1; // u16 entries
+const HASH_PREV_LEN: usize = pool_buffer_lengths().2; // u16 entries
 
 #[derive(Debug)]
 struct PoolInner {

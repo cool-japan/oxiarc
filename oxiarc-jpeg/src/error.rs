@@ -238,6 +238,16 @@ pub enum JpegError {
         /// Why it was rejected.
         reason: &'static str,
     },
+
+    /// A [`crate::DecodeOptions`] value is out of range or contradicts
+    /// another one, e.g. [`crate::Scale::new`] outside `1..=16`.
+    #[error("invalid decoder setting {parameter}: {reason}")]
+    InvalidDecodeParameter {
+        /// Which setting is at fault, e.g. `"scale"`.
+        parameter: &'static str,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
 
 impl JpegError {
@@ -312,6 +322,9 @@ impl From<JpegError> for OxiArcError {
             },
             JpegError::InvalidEncodeParameter { parameter, reason } => OxiArcError::InvalidHeader {
                 message: format!("invalid JPEG encoder setting {parameter}: {reason}"),
+            },
+            JpegError::InvalidDecodeParameter { parameter, reason } => OxiArcError::InvalidHeader {
+                message: format!("invalid JPEG decoder setting {parameter}: {reason}"),
             },
         }
     }

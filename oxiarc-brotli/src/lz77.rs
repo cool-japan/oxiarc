@@ -59,14 +59,35 @@ pub(crate) fn lz77_compress_pooled(
     params: &Lz77Params,
     pool: Option<&BrotliPool>,
 ) -> Vec<Lz77Command> {
-    if data.is_empty() {
+    lz77_compress_with_prefix(data, 0, params, pool)
+}
+
+/// Perform LZ77 compression over `data[prefix_len..]`, allowed to match back
+/// into `data[..prefix_len]`.
+///
+/// The prefix is a *shared dictionary* ([`crate::shared_dict`]): its bytes seed
+/// the match finder but produce no commands, and matches into it may reach
+/// farther back than `params.window_size`, because a shared dictionary sits
+/// beyond the declared window in Brotli's distance space. A match that starts
+/// in the prefix is capped at the prefix's end, so no command ever straddles
+/// the boundary — which keeps the emitted distance a single well-defined value.
+///
+/// `prefix_len == 0` reproduces [`lz77_compress_pooled`] exactly, bit for bit;
+/// that is what keeps the dictionary-free encoder's output frozen.
+pub(crate) fn lz77_compress_with_prefix(
+    data: &[u8],
+    prefix_len: usize,
+    params: &Lz77Params,
+    pool: Option<&BrotliPool>,
+) -> Vec<Lz77Command> {
+    if data.len() <= prefix_len {
         return Vec::new();
     }
 
     match params.quality {
-        0 => lz77_no_compression_pooled(data, pool),
-        1..=3 => lz77_fast_pooled(data, params, pool),
-        _ => lz77_standard_pooled(data, params, pool),
+        0 => lz77_no_compression_pooled(&data[prefix_len..], pool),
+        1..=3 => lz77_fast_pooled(data, prefix_len, params, pool),
+        _ => lz77_standard_pooled(data, prefix_len, params, pool),
     }
 }
 
@@ -89,6 +110,7 @@ fn lz77_no_compression_pooled(data: &[u8], pool: Option<&BrotliPool>) -> Vec<Lz7
 /// Uses a simple hash table for O(1) match finding.
 fn lz77_fast_pooled(
     data: &[u8],
+    prefix_len: usize,
     params: &Lz77Params,
     pool: Option<&BrotliPool>,
 ) -> Vec<Lz77Command> {
@@ -102,13 +124,29 @@ fn lz77_fast_pooled(
         })
         .unwrap_or_default();
 
-    let mut pos = 0;
+    let mut pos = prefix_len;
 
     // Hash table: maps 4-byte hash to position.
     let hash_bits = 15;
     let hash_size = 1usize << hash_bits;
     let hash_mask = hash_size - 1;
     let mut hash_table = vec![0u32; hash_size];
+
+    // The shared-dictionary prefix gets its *own* table rather than seeding the
+    // main one. With a single slot per hash, seeding would evict the recent,
+    // cheap-to-code positions this matcher depends on, and a distant dictionary
+    // match would then replace a nearby in-data one of the same length — which
+    // measurably makes the output *larger*. Keeping them apart lets the near
+    // match win every tie.
+    let dict_table = if prefix_len == 0 {
+        Vec::new()
+    } else {
+        let mut t = vec![u32::MAX; hash_size];
+        for p in 0..prefix_len.saturating_sub(params.min_match_len - 1) {
+            t[hash4(&data[p..]) & hash_mask] = p as u32;
+        }
+        t
+    };
 
     while pos < data.len() {
         if pos + params.min_match_len > data.len() {
@@ -123,26 +161,50 @@ fn lz77_fast_pooled(
         let prev_pos = hash_table[hash] as usize;
         hash_table[hash] = pos as u32;
 
-        // Check if we have a match.
+        // In-data candidate first: it is the cheaper distance whenever both
+        // match equally far.
+        let mut best: Option<(usize, usize)> = None; // (length, source position)
         let distance = pos - prev_pos;
-        if prev_pos < pos
+        if prev_pos >= prefix_len
+            && prev_pos < pos
             && distance <= params.window_size
             && distance > 0
             && prev_pos + params.min_match_len <= data.len()
             && data[prev_pos..prev_pos + params.min_match_len]
                 == data[pos..pos + params.min_match_len]
         {
-            // Extend the match.
-            let max_len = params.max_match_len.min(data.len() - pos);
-            let mut length = params.min_match_len;
-            while length < max_len
-                && prev_pos + length < data.len()
-                && data[prev_pos + length] == data[pos + length]
-            {
-                length += 1;
-            }
+            best = Some((
+                extend_match(data, prev_pos, pos, params, usize::MAX),
+                prev_pos,
+            ));
+        }
 
-            commands.push(Lz77Command::Reference { length, distance });
+        // Shared-dictionary candidate: taken only when strictly longer. The
+        // match stops at the end of the prefix so no command straddles the
+        // dictionary boundary.
+        if !dict_table.is_empty() {
+            let cand = dict_table[hash] as usize;
+            if cand != u32::MAX as usize
+                && cand + params.min_match_len <= prefix_len
+                && pos - cand <= params.window_size + prefix_len
+                && data[cand..cand + params.min_match_len] == data[pos..pos + params.min_match_len]
+            {
+                let length = extend_match(data, cand, pos, params, prefix_len - cand);
+                if length >= params.min_match_len
+                    && best.is_none_or(|(best_len, best_src)| {
+                        match_gain(length, pos - cand) > match_gain(best_len, pos - best_src)
+                    })
+                {
+                    best = Some((length, cand));
+                }
+            }
+        }
+
+        if let Some((length, source)) = best {
+            commands.push(Lz77Command::Reference {
+                length,
+                distance: pos - source,
+            });
             pos += length;
         } else {
             commands.push(Lz77Command::Literal(data[pos]));
@@ -153,17 +215,51 @@ fn lz77_fast_pooled(
     commands
 }
 
+/// Approximate bit saving of coding `length` bytes as a match at `distance`
+/// instead of as literals.
+///
+/// Eight bits saved per byte matched, minus a `log2(distance)` estimate of what
+/// the distance code costs. It exists to arbitrate between a *near* match and a
+/// *shared dictionary* match: dictionary distances are inherently large, so
+/// picking the longer match unconditionally can (and measurably does) make the
+/// output bigger than not using the dictionary at all. Only consulted when a
+/// dictionary is attached, so the dictionary-free encoder's output is untouched.
+fn match_gain(length: usize, distance: usize) -> i64 {
+    (length as i64) * 8 - (usize::BITS - distance.leading_zeros()) as i64
+}
+
+/// Longest match between `data[source..]` and `data[pos..]`, capped at
+/// `params.max_match_len`, the end of `data` and `boundary` bytes.
+fn extend_match(
+    data: &[u8],
+    source: usize,
+    pos: usize,
+    params: &Lz77Params,
+    boundary: usize,
+) -> usize {
+    let max_len = params.max_match_len.min(data.len() - pos).min(boundary);
+    let mut length = 0;
+    while length < max_len
+        && source + length < data.len()
+        && data[source + length] == data[pos + length]
+    {
+        length += 1;
+    }
+    length
+}
+
 /// Standard LZ77 matching (quality 4+), optionally reusing the hash-head buffer.
 ///
 /// The hash-head table is `1 << 17 = 131 072` u32 entries (512 KiB).  Pooling it
 /// avoids a large fresh allocation on every quality-4+ encode call.
 fn lz77_standard_pooled(
     data: &[u8],
+    prefix_len: usize,
     params: &Lz77Params,
     pool: Option<&BrotliPool>,
 ) -> Vec<Lz77Command> {
     let mut commands = Vec::new();
-    let mut pos = 0;
+    let mut pos = prefix_len;
 
     let hash_bits = 17;
     let hash_size = 1usize << hash_bits;
@@ -188,6 +284,14 @@ fn lz77_standard_pooled(
     };
 
     let mut hash_chain = vec![u32::MAX; data.len()]; // data-length-sized: not poolable
+
+    // Seed the chains with the shared-dictionary prefix. It produces no
+    // commands but is a legal match source.
+    for p in 0..prefix_len.saturating_sub(params.min_match_len - 1) {
+        let h = hash4(&data[p..]) & hash_mask;
+        hash_chain[p] = hash_head[h];
+        hash_head[h] = p as u32;
+    }
 
     let max_chain = match params.quality {
         4..=5 => 16,
@@ -214,15 +318,35 @@ fn lz77_standard_pooled(
             let candidate = chain_pos as usize;
             let distance = pos - candidate;
 
-            if distance > params.window_size || distance == 0 {
+            if distance == 0 || distance > params.window_size + prefix_len {
                 break;
+            }
+            if distance > params.window_size && candidate >= prefix_len {
+                // Outside the window and not in the shared dictionary. Older
+                // candidates in this chain may still be *inside* the
+                // dictionary, so keep walking rather than stopping — except
+                // with no dictionary, where nothing older can qualify and
+                // stopping is both correct and what the frozen encoder does.
+                if prefix_len == 0 {
+                    break;
+                }
+                chain_pos = hash_chain[candidate];
+                chain_count += 1;
+                continue;
             }
 
             if candidate + best_length < data.len()
                 && pos + best_length < data.len()
                 && data[candidate + best_length] == data[pos + best_length]
             {
-                let max_len = params.max_match_len.min(data.len() - pos);
+                // Stop a dictionary match at the end of the prefix so no
+                // command straddles the boundary.
+                let boundary = if candidate < prefix_len {
+                    prefix_len - candidate
+                } else {
+                    usize::MAX
+                };
+                let max_len = params.max_match_len.min(data.len() - pos).min(boundary);
                 let mut length = 0;
                 while length < max_len
                     && candidate + length < data.len()
@@ -231,7 +355,17 @@ fn lz77_standard_pooled(
                     length += 1;
                 }
 
-                if length > best_length {
+                let better = if prefix_len == 0 {
+                    length > best_length
+                } else {
+                    // With a dictionary attached, a longer match at a much
+                    // larger distance can cost more than it saves.
+                    length >= params.min_match_len
+                        && (best_distance == 0
+                            || match_gain(length, distance)
+                                > match_gain(best_length, best_distance))
+                };
+                if better {
                     best_length = length;
                     best_distance = distance;
 
@@ -258,10 +392,23 @@ fn lz77_standard_pooled(
                 while next_chain != u32::MAX && nc < max_chain / 2 {
                     let nc_pos = next_chain as usize;
                     let nd = pos + 1 - nc_pos;
-                    if nd > params.window_size || nd == 0 {
+                    if nd == 0 || nd > params.window_size + prefix_len {
                         break;
                     }
-                    let max_len = params.max_match_len.min(data.len() - pos - 1);
+                    if nd > params.window_size && nc_pos >= prefix_len {
+                        if prefix_len == 0 {
+                            break;
+                        }
+                        next_chain = hash_chain[nc_pos];
+                        nc += 1;
+                        continue;
+                    }
+                    let boundary = if nc_pos < prefix_len {
+                        prefix_len - nc_pos
+                    } else {
+                        usize::MAX
+                    };
+                    let max_len = params.max_match_len.min(data.len() - pos - 1).min(boundary);
                     let mut length = 0;
                     while length < max_len
                         && nc_pos + length < data.len()

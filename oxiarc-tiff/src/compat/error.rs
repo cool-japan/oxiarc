@@ -114,6 +114,18 @@ pub enum TiffFormatError {
     /// distinct from every other format defect
     /// (`codecs/tiff.rs:326`).
     RequiredTagNotFound(Tag),
+    /// A tag was present but carried a field type the requested conversion
+    /// cannot read (upstream's own error for this), or a value too wide for
+    /// the requested width.
+    ///
+    /// Produced by the `into_*` conversions on
+    /// [`ValueBuffer`](super::tags::ValueBuffer); `found` is the raw TIFF
+    /// field-type code that was actually there (0 for a value this crate
+    /// synthesised without one).
+    InvalidTypeForTag {
+        /// The raw TIFF field-type code present in the file.
+        found: u16,
+    },
     /// Every other malformed-file defect, carrying the native message.
     Other(String),
 }
@@ -133,6 +145,9 @@ impl fmt::Display for TiffFormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RequiredTagNotFound(tag) => write!(f, "required tag not found: {tag}"),
+            Self::InvalidTypeForTag { found } => {
+                write!(f, "invalid field type {found} for the requested conversion")
+            }
             Self::Other(message) => write!(f, "{message}"),
         }
     }

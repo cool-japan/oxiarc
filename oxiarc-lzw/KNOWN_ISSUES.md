@@ -91,7 +91,8 @@ written by older versions must be rewritten.
 
 `LzwConfig::new(0, 12).clear_code()` panicked with subtract-with-overflow in
 debug builds (and returned bogus values in release). `LzwConfig::new` now
-validates `9 <= min_bits <= max_bits <= 12` and returns `Result`;
+validates `9 <= min_bits <= max_bits <= 16` (the ceiling was 12 before
+0.4.2, which raised it to the UNIX `compress` maximum) and returns `Result`;
 `clear_code`/`eoi_code`/`first_code`/`max_code` use saturating arithmetic so
 even an invalid struct-literal config cannot panic, and
 `LzwConfig::validate()` is the authoritative gate (called by
@@ -104,9 +105,11 @@ even an invalid struct-literal config cannot panic, and
 - **Horizontal-differencing predictor (TIFF tag 317)**: out of scope for
   this crate. Predictor pre/post-processing is a container-level transform
   that callers (e.g. OxiGDAL) must apply around the raw LZW codec.
-- **Old-style LSB-first TIFF LZW**: pre-TIFF-6.0 writers that packed codes
-  LSB-first are not supported (libtiff only reads, never writes, that
-  variant).
+- **Old-style LSB-first TIFF LZW**: supported since 0.4.2 via
+  `LzwConfig::TIFF_COMPAT_LSB` (libtiff's `LZWDecodeCompat` variant: the
+  standard late width change plus LSB-first packing). libtiff only ever
+  reads that variant, so this crate reads it too and never writes it — the
+  TIFF encoder stays on `LzwConfig::TIFF`.
 - **Streaming frame format**: the `LzwStreamEncoder`/`LzwStreamDecoder`
   framing is private to this crate (it is not part of the TIFF or GIF file
   formats) and changed in v0.3.6 (Issue 4 above).
@@ -122,6 +125,21 @@ even an invalid struct-literal config cannot panic, and
 - Truncated/corrupted strips: return `Err` (or detectably short data),
   never panic, never full-length wrong bytes
 - GIF LZW round-trip suite (`gif_lzw`): PASS (unchanged by this pass)
+
+## Added 2026-09-08 (0.4.2, track LZW3)
+
+- Code widths 9-16 and an explicit `LzwConfig::bit_order`; `LzwConfig::GIF`
+  is LSB-first and no longer identical to `LzwConfig::TIFF_OLD_STYLE` (a
+  documented footgun, now closed and pinned by a behavioural test).
+- UNIX `compress` / `.Z` container (`oxiarc_lzw::z`), byte-identical to
+  `compress -b N -c` in both directions; `gzip -dc` and `uncompress -c`
+  reproduce this crate's streams for every width those tools accept
+  (they refuse `max_bits < 12` on macOS/BSD, which is their limitation, not
+  this crate's).
+- `.Z` truncation is deliberately **not** an error: the format has no
+  end-of-information code, so a truncated stream decodes to a prefix, the
+  same way `gzip -dc` behaves. Callers that need completeness must get it
+  from the transport.
 
 ## Production Readiness
 

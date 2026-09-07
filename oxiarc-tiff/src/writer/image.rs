@@ -526,6 +526,7 @@ pub(crate) fn build_shared_jpeg_tables_tag(
             } else {
                 (1, 1)
             },
+            jpeg_restart_rows: spec.jpeg_restart_rows,
             jpeg_tables: None,
             old_jpeg: None,
             endian,
@@ -667,6 +668,7 @@ pub(crate) fn encode_chunk_pure(
         } else {
             (1, 1)
         },
+        jpeg_restart_rows: spec.jpeg_restart_rows,
         jpeg_tables,
         old_jpeg: None,
         endian,

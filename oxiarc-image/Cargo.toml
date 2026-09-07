@@ -23,9 +23,6 @@ default = []
 oxiarc-png = { workspace = true }
 oxiarc-jpeg = { workspace = true }
 oxiarc-tiff = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
 
 [lints]
 workspace = true

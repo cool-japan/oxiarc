@@ -440,6 +440,16 @@ fn bench_lzw_strip(c: &mut Criterion) {
 /// Serial versus `rayon`-parallel decode and encode, on an image large
 /// enough (4096x4096, tiled) that per-chunk work dominates fixed overhead.
 ///
+/// **The decode half of this pair is the feature's weakest case, not its
+/// best.** The fixture is PackBits, whose decode is `memcpy`-bound, so the
+/// serial fetch pass and the thread-pool dispatch are most of what the
+/// parallel arm adds: an interleaved A/B puts parallel PackBits decode
+/// somewhere around 0.9x-1.1x of serial depending on how compressible the
+/// pixels are, and uncompressed at ~0.66x, while LZW tiles come out 2.6x-3.6x
+/// *faster*. Quote the README's by-codec table, not a single number from this
+/// group. The encode half has no such caveat -- every codec parallelises
+/// there.
+///
 /// tiff-design.md P7 asks for this pair specifically. The other numeric gate
 /// -- critique.md section 7's "whole-image decode within 1.25x of `tiffcp`" --
 /// is *not* measured here, because it needs an external binary rather than a

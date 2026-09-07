@@ -23,6 +23,11 @@ oxiarc-lzhuf = { path = "../oxiarc-lzhuf" }
 oxiarc-lzw = { path = "../oxiarc-lzw" }
 oxiarc-szip = { path = "../oxiarc-szip" }
 oxiarc-archive = { path = "../oxiarc-archive" }
+oxiarc-http = { path = "../oxiarc-http", features = ["brotli", "zstd"] }
+oxiarc-png = { path = "../oxiarc-png" }
+oxiarc-jpeg = { path = "../oxiarc-jpeg" }
+oxiarc-tiff = { path = "../oxiarc-tiff" }
+oxiarc-image = { path = "../oxiarc-image" }
 
 # Prevent this from interfering with workspace resolution: this crate is
 # intentionally excluded from the root `[workspace]` (see /notebooks/oxiarc/Cargo.toml)
@@ -168,6 +173,113 @@ bench = false
 [[bin]]
 name = "fuzz_archive_detect"
 path = "fuzz_targets/fuzz_archive_detect.rs"
+test = false
+doc = false
+bench = false
+
+# --- Phase 8 wave-3 workspace-integration targets (track FUZZCLI) ---------
+
+[[bin]]
+name = "fuzz_inflate_stream"
+path = "fuzz_targets/fuzz_inflate_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wrapped_inflate"
+path = "fuzz_targets/fuzz_wrapped_inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_inflate_reader"
+path = "fuzz_targets/fuzz_inflate_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_zstd_stream"
+path = "fuzz_targets/fuzz_zstd_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_brotli_stream"
+path = "fuzz_targets/fuzz_brotli_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_http_decode"
+path = "fuzz_targets/fuzz_http_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_http_headers"
+path = "fuzz_targets/fuzz_http_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_png_decode"
+path = "fuzz_targets/fuzz_png_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_png_limits"
+path = "fuzz_targets/fuzz_png_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_png_streaming"
+path = "fuzz_targets/fuzz_png_streaming.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jpeg_decode"
+path = "fuzz_targets/fuzz_jpeg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_jpeg_tables"
+path = "fuzz_targets/fuzz_jpeg_tables.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tiff_read"
+path = "fuzz_targets/fuzz_tiff_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tiff_ifd"
+path = "fuzz_targets/fuzz_tiff_ifd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_image_open"
+path = "fuzz_targets/fuzz_image_open.rs"
 test = false
 doc = false
 bench = false

@@ -1,7 +1,39 @@
 //! Pure-Rust FIPS 180-4 SHA-256 implementation.
 //!
-//! Supports incremental (`update`) and one-shot (`compute`) hashing.
-//! No external dependencies, no `unsafe`, no `unwrap`.
+//! Supports incremental ([`Sha256::update`]) and one-shot
+//! ([`Sha256::compute`]) hashing. No external dependencies, no `unsafe`, no
+//! `unwrap`.
+//!
+//! # Where this is used
+//!
+//! This module started as a private helper inside `oxiarc-lzma`'s `.xz`
+//! reader/writer (the XZ container format's `CheckType::Sha256` block
+//! check, xz spec §2.1.2). It moved here so it can be shared: `oxiarc-lzma`
+//! still uses it for that check, and `oxiarc-http` can use it for the
+//! dictionary-hash matching RFC 9842 (Compression Dictionary Transport)
+//! defines for the `dcb`/`dcz` content codings, without either crate
+//! depending on the other.
+//!
+//! # Example
+//!
+//! ```rust
+//! use oxiarc_core::sha256::Sha256;
+//!
+//! // One-shot:
+//! let digest = Sha256::compute(b"abc");
+//! assert_eq!(
+//!     oxiarc_core::sha256::hex32(&digest),
+//!     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+//! );
+//!
+//! // Incremental, in arbitrary chunk sizes -- the result does not depend on
+//! // how the input was split:
+//! let mut hasher = Sha256::new();
+//! hasher.update(b"a");
+//! hasher.update(b"b");
+//! hasher.update(b"c");
+//! assert_eq!(hasher.finalize(), digest);
+//! ```
 
 // ────────────────────────────────────────────────────────────
 // FIPS 180-4 §5.3.3 — initial hash values H[0..8]:
@@ -356,80 +388,20 @@ mod tests {
         );
     }
 
-    // ── XZ integration test ──────────────────────────────────
+    #[test]
+    fn default_matches_new() {
+        assert_eq!(Sha256::default().finalize(), Sha256::new().finalize());
+    }
 
-    /// Build a minimal valid XZ stream using SHA-256 as the check type.
-    /// The stream is constructed by hand so we can control exactly what
-    /// check bytes are written, independent of the XzWriter check-type fix.
-    ///
-    /// Layout (single-block XZ):
-    ///   Stream header (12)
-    ///   Block header (variable)
-    ///   Compressed data + padding
-    ///   SHA-256 check (32)
-    ///   Index
-    ///   Stream footer (12)
-    #[cfg(test)]
-    #[allow(unused_imports)]
-    mod xz_integration {
-        use super::*;
-        use crate::xz::header::{CheckType, decompress};
-        use crate::xz::writer::XzWriter;
-        use oxiarc_core::error::OxiArcError;
-
-        #[test]
-        fn sha256_roundtrip_via_writer_fix() {
-            // Use the fixed XzWriter (which now emits real SHA-256 check bytes).
-            // Use a highly compressible repeated-byte payload, consistent with
-            // what the existing XZ roundtrip tests exercise successfully.
-            let payload: Vec<u8> = (0..500).map(|_| b'A').collect();
-            let compressed = XzWriter::new(crate::LzmaLevel::new(1))
-                .with_check_type(CheckType::Sha256)
-                .compress(&payload)
-                .expect("XzWriter::compress with SHA-256 check");
-
-            let decompressed =
-                decompress(&mut std::io::Cursor::new(&compressed)).expect("decompress SHA-256 XZ");
-            assert_eq!(decompressed, payload, "roundtrip payload mismatch");
-        }
-
-        #[test]
-        fn sha256_corrupt_check_detected() {
-            let payload: Vec<u8> = (0..500).map(|_| b'A').collect();
-            let mut compressed = XzWriter::new(crate::LzmaLevel::new(1))
-                .with_check_type(CheckType::Sha256)
-                .compress(&payload)
-                .expect("compress for corruption test");
-
-            // Locate the 32-byte SHA-256 field. It lives immediately after
-            // the compressed data + 4-byte alignment padding, and before the index.
-            // We know the stream structure, so we flip one byte near the end of
-            // the block area (before the 12-byte footer and index).
-            // The index starts with 0x00 and the footer ends with [0x59,0x5A].
-            // Walk backwards from the footer magic to find and corrupt the check.
-            let len = compressed.len();
-            // Footer is last 12 bytes: [crc32(4)] [backward_size(4)] [flags(2)] [magic(2)]
-            // Immediately before footer is the index.
-            // Immediately before the index are the 32 SHA-256 bytes.
-            // We just corrupt the byte at position len-12-1 (last byte of the index
-            // area) — but a simpler, reliable approach: flip a byte inside the
-            // range [header..len-12-index_size]. Since we can't easily calculate
-            // index_size without parsing, corrupt a byte in the SHA-256 field
-            // found by scanning backwards past the footer (12 bytes) and index.
-            //
-            // Simplest reliable approach: corrupt byte at offset (len - 12 - 32 - 4).
-            // (12 = footer, 4 = index minimum, 32 = SHA-256 field).  The index for
-            // a single-block stream is always > 4 bytes, so this hits inside the
-            // check field with high probability. If it accidentally hits the index
-            // we still get a corrupted-stream error (different message, same type).
-            let corrupt_pos = len.saturating_sub(12 + 32 + 8);
-            compressed[corrupt_pos] ^= 0xFF;
-
-            let result = decompress(&mut std::io::Cursor::new(&compressed));
-            assert!(
-                matches!(result, Err(OxiArcError::CorruptedData { .. })),
-                "expected CorruptedData error after SHA-256 check corruption, got: {result:?}"
-            );
-        }
+    #[test]
+    fn hex32_formats_lowercase() {
+        let digest = Sha256::compute(b"");
+        let formatted = hex32(&digest);
+        assert_eq!(formatted.len(), 64);
+        assert!(
+            formatted
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 }

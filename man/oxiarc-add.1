@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-add 1  "oxiarc-add " 
+.TH oxiarc-add 1  "oxiarc-add 0.4.2" 
 .SH NAME
 oxiarc\-add \- Add files to an existing archive (ZIP, TAR, LZH)
 .SH SYNOPSIS
-\fBoxiarc\-add\fR [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
+\fBoxiarc\-add\fR [\fB\-l\fR|\fB\-\-compression\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
 .SH DESCRIPTION
 Add files to an existing archive (ZIP, TAR, LZH)
 .SH OPTIONS
@@ -35,8 +35,13 @@ Dry run: show planned changes without modifying the archive
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIARCHIVE\fR>
 Existing archive file to append to
 .TP
 [\fIFILES\fR]
 Files to add to the archive
+.SH VERSION
+v0.4.2

@@ -1,7 +1,8 @@
+use crate::image_probe::{self, ImageKind};
 use crate::style::Styler;
-use crate::utils::{input_display_name, open_input};
+use crate::utils::{input_display_name, open_input, sniff_image_kind};
 use oxiarc_archive::{ArchiveFormat, CabReader, IsoReader, SevenZReader, ZipReader};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 pub fn cmd_info(
     archive: &str,
@@ -24,8 +25,25 @@ pub fn cmd_info(
     // An unrecognized input has no "archive information" to report, so fail
     // loudly (non-zero exit) instead of printing `Format: Unknown` and exiting
     // 0 — matching `list`/`test`. `detect` stays exempt: reporting `Unknown` is
-    // literally that command's job.
+    // literally that command's job. PNG/JPEG/TIFF are checked first: they are
+    // real, recognisable input `oxiarc-archive` correctly reports `Unknown`
+    // for (an image is neither an archive nor a bare compression stream), so
+    // `info` reports their contents instead of treating them as an error —
+    // see `image_probe`'s module docs.
     if format == ArchiveFormat::Unknown {
+        // Magic first, on a 16-byte prefix; the file is only pulled into
+        // memory once that prefix already says it is an image, so pointing
+        // `info` at a large non-image blob still costs one short read rather
+        // than a full buffering pass.
+        if let Some(kind) = sniff_image_kind(&mut reader) {
+            if quiet {
+                return Ok(());
+            }
+            reader.seek(SeekFrom::Start(0))?;
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            return print_image_info(kind, &data, archive, size, styler);
+        }
         return Err(format!(
             "unsupported or unrecognized archive format for {}: {}",
             input_display_name(archive),
@@ -173,6 +191,54 @@ pub fn cmd_info(
             );
         }
         _ => {}
+    }
+
+    Ok(())
+}
+
+/// The `info` report for a PNG/JPEG/TIFF file: dimensions, colour type/bit
+/// depth, compression, and the chunk/segment/IFD summary `detect` never
+/// shows.
+fn print_image_info(
+    kind: ImageKind,
+    data: &[u8],
+    path: &str,
+    size: u64,
+    styler: &Styler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", styler.header("Image Information"));
+    println!("{}", styler.header("=================="));
+    println!("File: {}", styler.path(&input_display_name(path)));
+    println!("Format: {}", kind.label());
+    println!("Size: {}", styler.size(&format!("{size} bytes")));
+
+    let summary = image_probe::describe(kind, data, true)
+        .map_err(|e| format!("{}: {e}", input_display_name(path)))?;
+
+    println!();
+    println!(
+        "Dimensions: {}x{}",
+        summary.dimensions.0, summary.dimensions.1
+    );
+    println!("Colour type: {}", summary.colour);
+    println!("Bit depth: {}", summary.bit_depth);
+    println!("Compression: {}", summary.compression);
+
+    if !summary.chunks.is_empty() {
+        println!();
+        let heading = match kind {
+            ImageKind::Png => "Chunks:",
+            ImageKind::Jpeg => "Segments:",
+            ImageKind::Tiff => "IFD tags:",
+        };
+        println!("{}", styler.header(heading));
+        for line in &summary.chunks {
+            if line.detail.is_empty() {
+                println!("  {}", line.label);
+            } else {
+                println!("  {}: {}", line.label, line.detail);
+            }
+        }
     }
 
     Ok(())

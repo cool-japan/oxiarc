@@ -280,6 +280,172 @@ fn jpeg_recodings_decode_close_to_the_reference() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The `JPEGTables` (347) blob of a file on disk, or `None` when it has none.
+#[cfg(feature = "jpeg")]
+fn tables_tag(path: &Path) -> Option<Vec<u8>> {
+    let bytes = fs::read(path).expect("read tiff");
+    let mut decoder = Decoder::new(Cursor::new(bytes)).expect("decoder");
+    decoder.info().expect("info").jpeg_tables.clone()
+}
+
+/// The `JPEGTables` (347) blob this crate writes for one page shape.
+#[cfg(feature = "jpeg")]
+fn our_tables_tag(dir: &Path, label: &str, spec: ImageSpec, samples: &[u8]) -> Vec<u8> {
+    let path = dir.join(format!("ours_{label}.tif"));
+    let file = fs::File::create(&path).expect("create");
+    let mut encoder = Encoder::new(std::io::BufWriter::new(file)).expect("encoder");
+    encoder.write_image(&spec, samples).expect("write");
+    encoder.finish().expect("finish");
+    tables_tag(&path).expect("our own tag 347")
+}
+
+/// Tag 347 must be what libtiff writes, byte for byte, at the same quality.
+///
+/// The tables are the whole compatibility contract of TTN2's shared-table
+/// mode: every strip of the page is an abbreviated datastream that means
+/// nothing without them, so a single byte of drift here is a file libtiff
+/// decodes differently from this crate. Quality 75 is libtiff's
+/// `JPEGQUALITY` default and this crate's, so `tiffcp -c jpeg` and
+/// `Compression::Jpeg { quality: 75, .. }` have to agree.
+#[test]
+fn our_jpeg_tables_tag_matches_libtiffs_byte_for_byte() {
+    #[cfg(not(feature = "jpeg"))]
+    {
+        eprintln!("skipping: built without the `jpeg` feature");
+    }
+    #[cfg(feature = "jpeg")]
+    {
+        let Some(python) = find_python() else {
+            eprintln!("skipping: python3 with numpy + tifffile is not available");
+            return;
+        };
+        let Some(tiffcp) = find_tool("tiffcp") else {
+            eprintln!("skipping: libtiff's tiffcp is not on PATH");
+            return;
+        };
+        let dir = scratch_dir("jpegtables");
+        let driver = write_driver(&dir);
+        run_driver(&python, &driver, "gen", &dir);
+
+        let mut checked = 0usize;
+        for (fixture, label, spec) in [
+            (
+                "gray8_strips",
+                "gray",
+                ImageSpec::new(16, 16, ColorType::Gray(8)),
+            ),
+            (
+                // `tiffcp -c jpeg` turns an RGB page into subsampled YCbCr,
+                // which is the two-table shape (luma *and* chroma).
+                "rgb8_strips",
+                "ycbcr",
+                ImageSpec::new(16, 16, ColorType::YCbCr(8)).with_ycbcr_subsampling(2, 2),
+            ),
+        ] {
+            let source = dir.join(format!("{fixture}.tif"));
+            if !source.exists() {
+                continue;
+            }
+            let target = dir.join(format!("{fixture}_jpeg.tif"));
+            let output = Command::new(&tiffcp)
+                .args(["-c", "jpeg", "-r", "16"])
+                .arg(&source)
+                .arg(&target)
+                .output()
+                .expect("spawn tiffcp");
+            if !output.status.success() {
+                continue;
+            }
+            let Some(theirs) = tables_tag(&target) else {
+                continue;
+            };
+            let spp = usize::from(spec.samples_per_pixel);
+            let samples = vec![128u8; 16 * 16 * spp];
+            let ours = our_tables_tag(
+                &dir,
+                label,
+                spec.with_compression(Compression::Jpeg {
+                    quality: 75,
+                    shared_tables: true,
+                })
+                .with_layout(Layout::Strips { rows_per_strip: 16 }),
+                &samples,
+            );
+            assert_eq!(
+                ours.len(),
+                theirs.len(),
+                "{label}: tag 347 is {} bytes, libtiff writes {}",
+                ours.len(),
+                theirs.len()
+            );
+            assert_eq!(ours, theirs, "{label}: tag 347 differs from libtiff's");
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no fixture exercised the JPEGTables comparison"
+        );
+    }
+}
+
+/// libtiff must read a JPEG page whose strips carry restart markers.
+#[test]
+fn libtiff_reads_our_jpeg_strips_with_restart_markers() {
+    #[cfg(not(feature = "jpeg"))]
+    {
+        eprintln!("skipping: built without the `jpeg` feature");
+    }
+    #[cfg(feature = "jpeg")]
+    {
+        let Some(tiffcp) = find_tool("tiffcp") else {
+            eprintln!("skipping: libtiff's tiffcp is not on PATH");
+            return;
+        };
+        let dir = scratch_dir("jpegrestart");
+        let pixels: Vec<u8> = (0..64 * 64u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let path = dir.join("restart.tif");
+        let file = fs::File::create(&path).expect("create");
+        let mut encoder = Encoder::new(std::io::BufWriter::new(file)).expect("encoder");
+        let spec = ImageSpec::new(64, 64, ColorType::Gray(8))
+            .with_compression(Compression::Jpeg {
+                quality: 75,
+                shared_tables: true,
+            })
+            .with_layout(Layout::Strips { rows_per_strip: 16 })
+            .with_jpeg_restart_rows(1);
+        encoder.write_image(&spec, &pixels).expect("write");
+        encoder.finish().expect("finish");
+
+        // The strips really carry `DRI`, which is what makes the test about
+        // restart markers rather than about JPEG in general.
+        let bytes = fs::read(&path).expect("read");
+        let mut decoder = Decoder::new(Cursor::new(bytes)).expect("decoder");
+        let strip = decoder.read_chunk_raw(0).expect("raw strip");
+        assert!(
+            strip.windows(2).any(|w| w == [0xFF, 0xDD]),
+            "no DRI segment in the strip"
+        );
+
+        // libtiff's own decode of the page, through a re-code to uncompressed.
+        let plain = dir.join("restart_none.tif");
+        let recode = Command::new(&tiffcp)
+            .args(["-c", "none"])
+            .arg(&path)
+            .arg(&plain)
+            .output()
+            .expect("spawn tiffcp");
+        assert!(
+            recode.status.success(),
+            "libtiff refused our restart-marked JPEG: {}",
+            String::from_utf8_lossy(&recode.stderr)
+        );
+        let reference = decode_file(&plain);
+        let ours = decoder.read_image().expect("decode").to_native_bytes();
+        assert_eq!(ours.len(), reference.len());
+        assert_eq!(ours, reference, "our decode differs from libtiff's");
+    }
+}
+
 /// Splits a complete JPEG datastream into a TTN2 `JPEGTables` blob and the
 /// per-strip stream that refers to it.
 ///

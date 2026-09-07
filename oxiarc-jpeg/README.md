@@ -8,8 +8,9 @@ no `unsafe`.
 ![Status](https://img.shields.io/badge/status-codec%20complete-yellow)
 
 **Version 0.4.2 (unreleased)** — the decoder and the encoder are both complete
-and byte-parity verified against libjpeg-turbo. The arithmetic entropy coder
-lands in follow-on work in the same development cycle.
+and byte-parity verified against libjpeg-turbo, including the arithmetic
+entropy coder, reduced-/enlarged-scale decode and the `zune_jpeg` /
+`jpeg-decoder` migration facades below.
 
 ## Overview
 
@@ -41,6 +42,76 @@ EXIF, XMP, ICC (`APP2` chunk reassembly) and Adobe `APP14` recognition, and
 
 Legacy **OJPEG** (TIFF `Compression = 6`) is reconstructed and decoded by
 `oxiarc_jpeg::tiff` — see below.
+
+## Reduced- and enlarged-scale decode
+
+`DecodeOptions::scale` is libjpeg's `-scale M/N` with `N` fixed at 8 (the DCT
+block size): set `Scale::new(M)` for any `M` in `1..=16` and every `8x8`
+coefficient block reconstructs to `M x M` output samples through the scaled
+IDCT instead of the native `8x8` — the entropy decode is completely
+unaffected, every coefficient is still decoded, only the final reconstruction
+changes. `M` in `1..=7` shrinks the image, `8` is native resolution (the
+default, `Scale::FULL`), `9..=16` enlarges it. Output dimensions are
+`ceil(width * M / 8)` / `ceil(height * M / 8)`, exactly as libjpeg computes
+them — read them from `ImageInfo::scaled_width`/`ImageInfo::scaled_height`
+rather than from `width`/`height`, which stay the frame's native, unscaled
+size.
+
+```rust
+use oxiarc_jpeg::{DecodeOptions, Decoder, JpegError, Scale};
+
+fn main() -> Result<(), JpegError> {
+    let bytes: &[u8] = &oxiarc_jpeg::sample::RGB_8X8_420;
+    let options = DecodeOptions {
+        scale: Scale::ONE_QUARTER,
+        ..Default::default()
+    };
+    let mut decoder = Decoder::with_options(bytes, options);
+    let info = decoder.read_info()?;
+    assert_eq!((info.scaled_width, info.scaled_height), (2, 2)); // ceil(8 * 2 / 8)
+
+    let pixels = decoder.decode()?;
+    assert_eq!(pixels.len(), decoder.output_buffer_size().unwrap_or(0));
+    Ok(())
+}
+```
+
+`M` in `{1, 2, 4, 8}` — the four sizes libjpeg itself reconstructs with a
+dedicated fixed-point kernel (`jpeg_idct_1x1`/`_2x2`/`_4x4` in `jidctred.c`,
+plus the native `jpeg_idct_islow` at `8`) — are ported line for line and held
+to the same **byte-identical to `djpeg -dct int -scale M/8`** standard as the
+rest of the crate: `tests/scale_oracle.rs` (feature `jpeg-oracle`) checks
+baseline and progressive frames, 4:4:4 / 4:2:0 / 4:2:2 sampling, both
+aligned and odd (not a multiple of 8) dimensions, twelve-bit frames
+(`cjpeg -precision 12`, which take libjpeg's `PASS1_BITS = 1` branch through
+five different shift amounts), and — over a 320x256 source, large enough for
+the `rayon` feature to split the scan into bands — restart-marker streams in
+colour and grayscale, with no failure observed on this machine
+(libjpeg-turbo 3.1.4.1). The other twelve values (`{3, 5, 6, 7,
+9..=16}`) get one general kernel instead of twelve hand-derived ones —
+`idct/scaled.rs`'s module doc explains why that is a real algorithmic
+difference (a low-pass truncation to the lowest `M` frequencies per axis for
+`M < 8`, matching `jidctint.c`'s own separate `M < 8` family, not an
+approximation) — and are checked to a numeric tolerance instead of byte
+parity: measured over 216 encoder/scale/sampling configurations and
+2 141 046 samples, **peak error 3, MSE 0.0531** against the same reference.
+
+Subsampled chroma is handled at every scale: a component whose own block size
+would end up smaller than the frame's most-sampled component is bumped up
+(libjpeg's `jdmaster.c` `_DCT_scaled_size` loop) so its post-scale pixel
+width already matches the frame's, letting the upsampler skip a real
+resample rather than reproducing the ratio mismatch. Lossless frames
+(`SOF3`/`SOF11`) ignore `scale` entirely — T.81's lossless mode has no DCT to
+scale, and libjpeg hardwires "no scaling" there too, so `scaled_width` /
+`scaled_height` equal `width` / `height` regardless of what was requested.
+
+`benches/decode_bench.rs`'s `scaled_decode` group times `M` in `{1, 2, 4, 8}`
+against `djpeg -dct int -scale M/8` over 4:2:0 and 4:4:4 512x512 sources; run
+`cargo bench -p oxiarc-jpeg --bench decode_bench -- scaled_decode` on an
+otherwise idle machine to reproduce it (this crate's entropy decode cost does
+not shrink with `M`, only the IDCT/upsample/colour-conversion tail does, so
+`djpeg`'s own process-spawn overhead makes its column an unreliable ratio at
+small `M` — read the absolute times, not a ratio, for that reason).
 
 ## Accuracy: byte parity, not a tolerance
 
@@ -147,6 +218,101 @@ wants libjpeg's colours must do the conversion itself.
 
 Writing `Compression = 6` is not supported and never will be: TTN2 deprecates
 it and libtiff itself refuses.
+
+## Compat facades
+
+`oxiarc_jpeg::compat` holds three migration aids, one per crate a call site is
+likely to be pulling in today, each named and shaped after the real crate's
+own API so the move is a `use` change — not a reimplementation, and not
+`#[deprecated]`: `oxiarc_jpeg::Decoder`/`oxiarc_jpeg::Encoder` stay the
+strictly larger native API (progressive, lossless, twelve-bit, restart
+intervals, custom scan scripts, `DecodeOptions::scale` and TIFF's
+abbreviated mode) for whatever a facade cannot express. All three are
+feature-free — always compiled, no Cargo feature to enable.
+
+* **`compat::JpegEncoder`**, shaped after `image::codecs::jpeg::JpegEncoder`:
+
+  ```rust
+  use oxiarc_jpeg::compat::{ColorType, JpegEncoder};
+  use oxiarc_jpeg::JpegError;
+
+  fn main() -> Result<(), JpegError> {
+      let mut out = Vec::new();
+      let mut encoder = JpegEncoder::new_with_quality(&mut out, 85);
+      encoder.encode(&[128u8; 8 * 8 * 3], 8, 8, ColorType::Rgb8)?;
+      assert_eq!(&out[..2], &[0xFF, 0xD8]);
+      Ok(())
+  }
+  ```
+
+* **`compat::zune::JpegDecoder`**, shaped after `zune_jpeg::JpegDecoder` 0.5
+  (`new`, `decode`, `decode_headers`, `info`, `dimensions`,
+  `output_buffer_size`, `input_colorspace`, `output_colorspace`,
+  `set_options`, `icc_profile`, `exif`), with an output-colorspace enum
+  covering `Rgb`/`Rgba`/`Luma`/`YCbCr` (the `Rgba` byte is a synthesised
+  `255`, matching `zune_jpeg`'s own alpha; `YCbCr` is this crate's
+  `DecodeOptions::raw()`, so it passes *the source's* components through
+  untransformed — one for a grayscale frame, four for CMYK, which is what
+  `output_buffer_size` reports for it rather than the enum's nominal three):
+
+  ```rust
+  use oxiarc_jpeg::JpegError;
+  use oxiarc_jpeg::compat::zune::JpegDecoder;
+
+  fn main() -> Result<(), JpegError> {
+      let bytes: &[u8] = &oxiarc_jpeg::sample::RGB_8X8_420;
+      let mut decoder = JpegDecoder::new(bytes);
+      let pixels = decoder.decode()?;
+      let info = decoder.info().expect("decode() populates it");
+      assert_eq!(pixels.len(), usize::from(info.width) * usize::from(info.height) * 3);
+      Ok(())
+  }
+  ```
+
+* **`compat::jpeg_decoder::Decoder`**, shaped after `jpeg-decoder` 0.3
+  (`new`, `read_info`, `info`, `decode`, `icc_profile`, `exif_data`), with
+  `ImageInfo { width, height, pixel_format, coding_process }`,
+  `PixelFormat::{L8, L16, Rgb24, Cmyk32}` and
+  `CodingProcess::{DctSequential, DctProgressive, Lossless}` matching the
+  real crate's shapes exactly:
+
+  ```rust
+  use oxiarc_jpeg::JpegError;
+  use oxiarc_jpeg::compat::jpeg_decoder::Decoder;
+
+  fn main() -> Result<(), JpegError> {
+      let bytes: &[u8] = &oxiarc_jpeg::sample::RGB_8X8_420;
+      let mut decoder = Decoder::new(bytes);
+      decoder.read_info()?;
+      let info = decoder.info()?.expect("read_info populates it");
+      let pixels = decoder.decode()?;
+      assert_eq!(
+          pixels.len(),
+          usize::from(info.width) * usize::from(info.height) * info.pixel_format.pixel_bytes()
+      );
+      Ok(())
+  }
+  ```
+
+  **One deliberate signature change.** Real `jpeg_decoder::Decoder::info()`
+  is infallible and **panics** for a component count outside `{1, 3, 4}`;
+  this crate decodes `Nf` up to `4` for combinations the real crate never
+  produces, and its no-panic policy means that case must be a value, not a
+  crash. `Decoder::info` here therefore returns
+  `Result<Option<ImageInfo>, JpegError>` — `Err(Unsupported(ComponentCount(_)))`
+  where the real crate would abort the process — everything else matches.
+
+  **One capability limit, reported rather than mis-sized.** `PixelFormat`'s
+  only wide variant is `L16`, which is single-component, so a frame with a
+  sample precision above eight *and* more than one component (a twelve-bit
+  colour `SOF1`) has no `PixelFormat` at all: `info()` and `decode()` both
+  return `Err(Unsupported(SamplePrecision(_)))` for it, in step with each
+  other. `oxiarc_jpeg::Decoder::decode_u16` (reachable through
+  `Decoder::inner_mut`) decodes those frames as it always has.
+
+Every method named above is exercised by at least one test in
+`src/compat/{mod,zune,jpeg_decoder}.rs`, not merely constructed and decoded
+once.
 
 ## Quick start
 
@@ -269,6 +435,19 @@ rather than committing. `tests/fixture_streams.rs` decodes the five intact
 first, so the sweep cannot quietly start sweeping something that is no longer
 a valid JPEG.
 
+`tests/adversarial.rs` covers the shapes a mutation sweep cannot reach,
+because each one needs a *valid* structure carrying a hostile value rather
+than a corrupted byte: a 16-bit `DQT` (`Pq = 1`) whose quantisers are all
+`0xFFFF` together with a DC prediction accumulated past `i16` (the product
+`65_534 * 65_535` does not fit an `i32`), the progressive spelling of the same
+attack through `Al = 13`, a `stride` no allocation could satisfy, a
+caller-supplied quantisation table containing a zero, and `DAC` conditioning
+outside T.81 B.2.4.3. It also runs the parallel decoder's fixtures in child
+processes at six values of `RAYON_NUM_THREADS`: the band layout is a function
+of `rayon::current_num_threads()` (measured: 2 bands at one thread, 4 at
+three, up to 32 at seventeen), and every layout has to produce the same
+samples.
+
 `tests/fuzz_seeds.rs` is the fuzz corpus generator, and nothing is committed:
 it builds around 130 seeds spanning every `SOF`, both entropy coders, both
 halves of the abbreviated (TIFF) pair, metadata and the awkward sizes, and
@@ -341,6 +520,25 @@ The gap is widest exactly where that SIMD applies (large baseline frames) and
 closes where it does not (optimised tables, progressive, lossless). Splitting
 the coefficient pipeline per MCU row, so a large frame's coefficients never
 leave cache, is the obvious next step and is not done.
+
+### Reduced- and enlarged-scale decode
+
+`benches/decode_bench.rs`'s `scaled_decode` group measures `M` in `{1, 2, 4,
+8}` over 4:2:0 and 4:4:4 512x512 sources, with a `reference/…` row that times
+`djpeg -dct int -scale M/8` over the same encoded file the same way
+`encode_bench.rs`'s `reference/…` group times `cjpeg`. No number is
+published here: this session's runs measured a system load average above 80
+(confirmed via `uptime` and `ps`, from unrelated concurrent builds elsewhere
+in the workspace) and the two attempts disagreed with each other by more
+than an order of magnitude on the same case, which is noise, not signal.
+Publishing a number known to be contaminated would be worse than publishing
+none. Run `cargo bench -p oxiarc-jpeg --bench decode_bench -- scaled_decode`
+yourself on an otherwise idle machine — read the absolute time per `M`, not
+the ratio to `djpeg`: the entropy decode this crate performs does not shrink
+with `M` (every coefficient is still decoded regardless of scale), only the
+IDCT/upsample/colour-conversion tail does, so only the *shape* of the curve
+across `M` is the reduced-scale story, and `djpeg`'s own process-spawn
+overhead swamps its column at the small end of that range.
 
 ### Arithmetic coding
 

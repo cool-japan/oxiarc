@@ -21,6 +21,7 @@
 //! bytes *and* of the decoded samples that were measured in a build without
 //! this feature and are asserted in builds with and without it.
 
+use super::Scale;
 use super::planes::Planes;
 use super::scan::{ScanOutcome, ScanTables};
 use crate::error::Result;
@@ -101,11 +102,18 @@ fn restart_marker_end(entropy: &[u8], at: usize) -> Option<usize> {
 ///
 /// Returns `None` when the shape rules parallelism out, in which case the
 /// caller decodes serially.
+/// `output_sizes` is the destination [`Planes`]' own per-component
+/// [`Planes::output_sizes`] — libjpeg's `_DCT_scaled_size` — which is what a
+/// band's rows are placed at multiples of. Reading it from the destination
+/// rather than recomputing it from the [`Scale`] is deliberate: the two can
+/// never disagree, and a disagreement would silently misplace every band but
+/// the first.
 fn plan_bands<'a>(
     frame: &FrameHeader,
     scan: &ScanHeader,
     restart_interval: u16,
     entropy: &'a [u8],
+    output_sizes: &[u8],
 ) -> Option<Vec<Band<'a>>> {
     if restart_interval == 0 {
         return None;
@@ -187,7 +195,15 @@ fn plan_bands<'a>(
         let first_rows = frame
             .components
             .iter()
-            .map(|component| (first_row * u64::from(component.v) * 8) as usize)
+            .enumerate()
+            .map(|(index, component)| {
+                // The component's own IDCT output block size, not `8`: at
+                // `Scale::FULL` they are the same, and at every other scale
+                // the plane rows this band owns start at
+                // `mcu_row * Vi * _DCT_scaled_size`.
+                let size = u64::from(output_sizes.get(index).copied().unwrap_or(8));
+                (first_row * u64::from(component.v) * size) as usize
+            })
             .collect();
         bands.push(Band {
             first_rows,
@@ -215,17 +231,27 @@ pub(crate) fn decode_sequential_parallel(
     restart_interval: u16,
     entropy: &[u8],
     planes: &mut Planes,
+    scale: Scale,
     limits: &DecodeLimits,
     tolerate_truncated: bool,
 ) -> Option<Result<ScanOutcome>> {
-    let bands = plan_bands(frame, scan, restart_interval, entropy)?;
+    let bands = plan_bands(
+        frame,
+        scan,
+        restart_interval,
+        entropy,
+        planes.output_sizes(),
+    )?;
 
     // Each band decodes into planes of its own, which is what keeps this free
-    // of shared mutable state — and so of `unsafe`.
+    // of shared mutable state — and so of `unsafe`. `band.frame` keeps the
+    // parent frame's sampling factors (only its height changes), so it
+    // resolves to the same per-component output sizes as `planes` did —
+    // required for `Planes::copy_band_from` below to align.
     let results: Vec<Result<(Planes, ScanOutcome)>> = bands
         .par_iter()
         .map(|band| {
-            let mut band_planes = Planes::allocate(&band.frame, limits)?;
+            let mut band_planes = Planes::allocate(&band.frame, scale, limits)?;
             let outcome = decode_band(
                 &band.frame,
                 scan,
@@ -509,7 +535,7 @@ mod differential {
         };
         let limits = DecodeLimits::default();
 
-        let mut serial_planes = Planes::allocate(&frame, &limits).expect("planes");
+        let mut serial_planes = Planes::allocate(&frame, Scale::FULL, &limits).expect("planes");
         let serial = decode_serial(
             &frame,
             &scan,
@@ -522,7 +548,7 @@ mod differential {
         )
         .expect("serial decode");
 
-        let mut parallel_planes = Planes::allocate(&frame, &limits).expect("planes");
+        let mut parallel_planes = Planes::allocate(&frame, Scale::FULL, &limits).expect("planes");
         let outcome = decode_sequential_parallel(
             &frame,
             &scan,
@@ -531,6 +557,7 @@ mod differential {
             restart_interval,
             entropy,
             &mut parallel_planes,
+            Scale::FULL,
             &limits,
             false,
         );
@@ -635,6 +662,69 @@ mod differential {
         }
     }
 
+    /// The band merge must place a band's rows at
+    /// `mcu_row * Vi * _DCT_scaled_size`, not at the unscaled
+    /// `mcu_row * Vi * 8`.
+    ///
+    /// Regression test for a real defect: `plan_bands` hardwired `8`, so with
+    /// `rayon` on, every band but the first landed eight times too far down
+    /// the plane at `Scale::ONE_EIGHTH` and the decode came out almost
+    /// entirely wrong (measured before the fix: 2686 of 3072 output bytes
+    /// differed from the same image decoded without restart markers, at every
+    /// sampling ratio and both entropy coders). `Scale::FULL` hid it
+    /// completely, which is why every pre-existing differential in this file
+    /// passed. `320x256` with `Mcus(16)` clears `MINIMUM_UNITS` and splits
+    /// into several bands whichever ratio is in use.
+    #[test]
+    fn bands_land_on_the_right_plane_rows_at_every_scale() {
+        let entropies: &[EntropyCoding] = &[
+            EntropyCoding::Huffman,
+            #[cfg(feature = "arithmetic")]
+            EntropyCoding::Arithmetic,
+        ];
+        let source = pixels(320, 256, 3);
+        for &entropy in entropies {
+            for &subsampling in &[Subsampling::S444, Subsampling::S422, Subsampling::S420] {
+                let jpeg = encode_to_vec_with_options(
+                    &source,
+                    320,
+                    256,
+                    InputColor::Rgb,
+                    &EncodeOptions {
+                        quality: 80,
+                        subsampling,
+                        entropy,
+                        restart_interval: RestartInterval::Mcus(16),
+                        ..Default::default()
+                    },
+                )
+                .expect("encode");
+                let (frame, scan, tables, start) = dissect(&jpeg);
+                let interval = tables.restart_interval.unwrap_or(0);
+                let mut split = 0usize;
+                for numerator in 1u8..=16 {
+                    let scale = Scale::new(numerator).expect("1..=16");
+                    if compare_paths_at(
+                        scale,
+                        &frame,
+                        &scan,
+                        &tables,
+                        interval,
+                        &jpeg[start..],
+                        false,
+                    ) {
+                        split += 1;
+                    }
+                }
+                assert_eq!(
+                    split, 16,
+                    "{entropy:?} {subsampling:?}: the parallel path declined at some scale, so \
+                     the differential compared nothing there"
+                );
+            }
+        }
+    }
+
     /// The planner must decline anything it cannot prove independent, and the
     /// caller then decodes serially.
     #[test]
@@ -654,7 +744,7 @@ mod differential {
         )
         .expect("encode");
         let (frame, scan, _tables, start) = dissect(&jpeg);
-        assert!(plan_bands(&frame, &scan, 0, &jpeg[start..]).is_none());
+        assert!(plan_bands(&frame, &scan, 0, &jpeg[start..], &full_scale_sizes(&frame)).is_none());
 
         // A tiny image, below the threshold.
         let small = pixels(32, 32, 3);
@@ -672,7 +762,16 @@ mod differential {
         .expect("encode");
         let (frame, scan, tables, start) = dissect(&jpeg);
         let interval = tables.restart_interval.unwrap_or(0);
-        assert!(plan_bands(&frame, &scan, interval, &jpeg[start..]).is_none());
+        assert!(
+            plan_bands(
+                &frame,
+                &scan,
+                interval,
+                &jpeg[start..],
+                &full_scale_sizes(&frame)
+            )
+            .is_none()
+        );
     }
 
     /// Whatever the markers do, the two paths must agree.
@@ -745,15 +844,63 @@ mod differential {
             let cut = entropy.len() * numerator / 8;
             for tolerate in [false, true] {
                 compare_paths(&frame, &scan, &tables, interval, &entropy[..cut], tolerate);
+                // A truncated scan at a reduced scale takes the same merge
+                // path, over planes whose row pitch is not `8` — the one a
+                // hardwired `8` used to corrupt.
+                for scaled in [Scale::ONE_EIGHTH, Scale::ONE_QUARTER, Scale::ONE_HALF] {
+                    compare_paths_at(
+                        scaled,
+                        &frame,
+                        &scan,
+                        &tables,
+                        interval,
+                        &entropy[..cut],
+                        tolerate,
+                    );
+                }
             }
         }
     }
 
-    /// Run both paths over the same bytes and insist they agree.
+    /// Every component's output size at [`Scale::FULL`], for the
+    /// [`plan_bands`] call sites that only care whether it returns `Some`.
+    fn full_scale_sizes(frame: &FrameHeader) -> Vec<u8> {
+        vec![8u8; frame.components.len()]
+    }
+
+    /// Run both paths over the same bytes and insist they agree, at
+    /// [`Scale::FULL`].
     ///
     /// Returns `true` when the parallel path actually ran, so a caller can
     /// assert that a case it means to cover really is covered.
     fn compare_paths(
+        frame: &FrameHeader,
+        scan: &ScanHeader,
+        tables: &TableSet,
+        interval: u16,
+        entropy: &[u8],
+        tolerate: bool,
+    ) -> bool {
+        compare_paths_at(
+            Scale::FULL,
+            frame,
+            scan,
+            tables,
+            interval,
+            entropy,
+            tolerate,
+        )
+    }
+
+    /// [`compare_paths`] at an arbitrary [`Scale`].
+    ///
+    /// A band's rows land at `mcu_row * Vi * _DCT_scaled_size` in the
+    /// destination plane; getting that multiplier wrong is invisible at
+    /// [`Scale::FULL`] (where it is `8` either way) and scrambles every band
+    /// but the first at every other scale.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_paths_at(
+        scale: Scale,
         frame: &FrameHeader,
         scan: &ScanHeader,
         tables: &TableSet,
@@ -768,7 +915,7 @@ mod differential {
         };
         let limits = DecodeLimits::default();
 
-        let mut serial_planes = Planes::allocate(frame, &limits).expect("planes");
+        let mut serial_planes = Planes::allocate(frame, scale, &limits).expect("planes");
         let serial = decode_serial(
             frame,
             scan,
@@ -780,7 +927,7 @@ mod differential {
             tolerate,
         );
 
-        let mut parallel_planes = Planes::allocate(frame, &limits).expect("planes");
+        let mut parallel_planes = Planes::allocate(frame, scale, &limits).expect("planes");
         let parallel = decode_sequential_parallel(
             frame,
             scan,
@@ -789,6 +936,7 @@ mod differential {
             interval,
             entropy,
             &mut parallel_planes,
+            scale,
             &limits,
             tolerate,
         );
@@ -894,7 +1042,14 @@ mod differential {
                 let interval = tables.restart_interval.unwrap_or(0);
                 assert!(interval > 0, "{args:?} wrote no DRI");
                 assert!(
-                    plan_bands(&frame, &scan, interval, &jpeg[start..]).is_some(),
+                    plan_bands(
+                        &frame,
+                        &scan,
+                        interval,
+                        &jpeg[start..],
+                        &full_scale_sizes(&frame)
+                    )
+                    .is_some(),
                     "{args:?}: a conforming libjpeg stream must still split"
                 );
                 assert!(

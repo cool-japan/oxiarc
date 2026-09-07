@@ -39,17 +39,13 @@ impl Primitive for f32 {
     const DEFAULT_MIN_VALUE: Self = 0.0;
 }
 
-/// Scale one sample from `S::DEFAULT_MAX_VALUE` down to a `u8`.
-pub(crate) fn sample_to_u8<S: Primitive + Into<f64>>(v: S) -> u8 {
-    let max: f64 = S::DEFAULT_MAX_VALUE.into();
-    if max <= 0.0 {
-        return 0;
-    }
-    let scaled = (v.into() / max) * 255.0;
-    scaled.round().clamp(0.0, 255.0) as u8
-}
-
 /// Scale one sample from `S::DEFAULT_MAX_VALUE` up to a `u16`.
+///
+/// The one remaining floating-point scaling step in the crate: every
+/// integer-to-integer conversion in [`crate::dynamic`] is exact integer
+/// arithmetic, and only an `f32` source still needs a real multiply. A
+/// sample outside `[0.0, 1.0]` saturates (the `clamp`) rather than
+/// wrapping, and a NaN sample scales to `0` (`f64 as u16` saturates).
 pub(crate) fn sample_to_u16<S: Primitive + Into<f64>>(v: S) -> u16 {
     let max: f64 = S::DEFAULT_MAX_VALUE.into();
     if max <= 0.0 {
@@ -486,11 +482,61 @@ mod tests {
 
     #[test]
     fn sample_scaling_round_trips_at_the_endpoints() {
-        assert_eq!(sample_to_u8(0u16), 0);
-        assert_eq!(sample_to_u8(65535u16), 255);
         assert_eq!(sample_to_u16(0u8), 0);
         assert_eq!(sample_to_u16(255u8), 65535);
-        assert_eq!(sample_to_u8(1.0f32), 255);
-        assert_eq!(sample_to_u8(0.0f32), 0);
+        assert_eq!(sample_to_u16(0.0f32), 0);
+        assert_eq!(sample_to_u16(1.0f32), 65535);
+        // Out-of-range and non-finite float samples saturate rather than
+        // wrapping or panicking.
+        assert_eq!(sample_to_u16(2.0f32), 65535);
+        assert_eq!(sample_to_u16(-1.0f32), 0);
+        assert_eq!(sample_to_u16(f32::INFINITY), 65535);
+        assert_eq!(sample_to_u16(f32::NEG_INFINITY), 0);
+        assert_eq!(sample_to_u16(f32::NAN), 0);
+    }
+
+    /// The float reference formula the crate's conversions used before they
+    /// were rewritten in integer arithmetic: `(v / max * 255).round()`.
+    /// Kept here, and only here, so the two integer helpers in
+    /// [`crate::dynamic`] can be proven byte-identical to it exhaustively.
+    fn reference_float_narrow_u16(v: u16) -> u8 {
+        let scaled = (f64::from(v) / 65535.0) * 255.0;
+        scaled.round().clamp(0.0, 255.0) as u8
+    }
+
+    #[test]
+    fn integer_narrowing_agrees_with_the_float_formula_on_every_u16() {
+        for v in 0..=u16::MAX {
+            let integer = ((u32::from(v) * 255 + 32767) / 65535) as u8;
+            assert_eq!(
+                integer,
+                reference_float_narrow_u16(v),
+                "u16 sample {v} narrows differently"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_widening_agrees_with_sample_to_u16_on_every_u8() {
+        for v in 0..=u8::MAX {
+            assert_eq!(
+                u16::from(v) * 257,
+                sample_to_u16(v),
+                "u8 sample {v} widens differently"
+            );
+        }
+    }
+
+    /// Widening a `u8` to `u16` and narrowing straight back must be the
+    /// identity — the property the rewritten `to_rgba8` relies on when it
+    /// copies an 8-bit source's samples across untouched instead of routing
+    /// them through the 16-bit form.
+    #[test]
+    fn widening_then_narrowing_a_u8_is_the_identity() {
+        for v in 0..=u8::MAX {
+            let wide = u16::from(v) * 257;
+            let back = ((u32::from(wide) * 255 + 32767) / 65535) as u8;
+            assert_eq!(back, v, "u8 sample {v} did not survive the round trip");
+        }
     }
 }

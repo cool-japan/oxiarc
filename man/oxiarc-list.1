@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-list 1  "oxiarc-list " 
+.TH oxiarc-list 1  "oxiarc-list 0.4.2" 
 .SH NAME
 oxiarc\-list \- List contents of an archive
 .SH SYNOPSIS
-\fBoxiarc\-list\fR [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-j\fR|\fB\-\-json\fR] [\fB\-T\fR|\fB\-\-tree\fR] [\fB\-s\fR|\fB\-\-sort\fR] [\fB\-r\fR|\fB\-\-reverse\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> 
+\fBoxiarc\-list\fR [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-j\fR|\fB\-\-json\fR] [\fB\-T\fR|\fB\-\-tree\fR] [\fB\-s\fR|\fB\-\-sort\fR] [\fB\-r\fR|\fB\-\-reverse\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> 
 .SH DESCRIPTION
 List contents of an archive
 .SH OPTIONS
@@ -53,5 +53,10 @@ Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIARCHIVE\fR>
-Archive file to list
+Archive file to list (use "\-" for stdin)
+.SH VERSION
+v0.4.2

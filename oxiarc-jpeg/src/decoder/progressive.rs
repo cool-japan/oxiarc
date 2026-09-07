@@ -13,7 +13,7 @@ use super::scan::{ScanGeometry, ScanOutcome, ScanTables, huffman_table, take_res
 use crate::error::{JpegError, LimitKind, Result, TableKind};
 use crate::frame::{FrameHeader, ScanHeader};
 use crate::huffman::BitReader;
-use crate::idct::idct_islow_into;
+use crate::idct::idct_scaled_into;
 use crate::limits::{DecodeLimits, checked_product3};
 use crate::tables::ZIGZAG_TO_NATURAL;
 
@@ -316,6 +316,8 @@ pub(crate) fn render_coefficients(
             })?;
         let stride = planes.stride(index);
         let base = planes.offset(index);
+        let output_size = planes.output_size(index);
+        let size = usize::from(output_size);
         let block_stride = coefficients.strides[index];
         let rows = component.blocks_per_column_padded as usize;
         for brow in 0..rows {
@@ -325,14 +327,15 @@ pub(crate) fn render_coefficients(
                     continue;
                 }
                 block.copy_from_slice(&coefficients.planes[index][offset..offset + 64]);
-                idct_islow_into(
+                idct_scaled_into(
                     &block,
                     quant.natural(),
                     planes.data_mut(),
-                    base + brow * 8 * stride + bcol * 8,
+                    base + brow * size * stride + bcol * size,
                     stride,
                     center,
                     maxval,
+                    output_size,
                 );
             }
         }

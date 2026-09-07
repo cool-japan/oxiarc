@@ -12,6 +12,20 @@
 //! `oxiarc-archive` uses for `.xz` files — so a TIFF strip and an `.xz` file
 //! cannot drift apart.
 //!
+//! # Reused state
+//!
+//! [`XzDecoder`] keeps the LZMA2 dictionary of the last stream it decoded and
+//! hands it to the next one whose declared dictionary size matches, so a page
+//! of a thousand strips grows the dictionary `Vec` once instead of a thousand
+//! times. The decoder is cached in the image's
+//! [`CodecState`](super::CodecState); without a state the codec still works,
+//! it just builds one per chunk, which is exactly what the free function
+//! [`oxiarc_lzma::xz::decompress_into`] does (it *is*
+//! `XzDecoder::new().decompress_into(..)`). Reuse is therefore
+//! behaviour-identical by construction, and `oxiarc-lzma`'s own reuse-safety
+//! predicate refuses to carry state into a block that does not open with a
+//! full reset; `tests/codec_reuse.rs` asserts the byte identity here as well.
+//!
 //! ```
 //! use oxiarc_tiff::compression::{decode_into, encode, CodecContext, CodecLevel};
 //! use oxiarc_tiff::{CompressionMethod, Endian};
@@ -26,8 +40,9 @@
 //! # Ok::<(), oxiarc_tiff::TiffError>(())
 //! ```
 
-use oxiarc_lzma::xz;
+use oxiarc_lzma::xz::{self, XzDecoder};
 
+use super::pool::Pool;
 use super::{CodecContext, CodecLevel, codec_error};
 use crate::error::Result;
 use crate::tags::CompressionMethod;
@@ -35,12 +50,49 @@ use crate::tags::CompressionMethod;
 /// libtiff's default `LZMA_PRESET`.
 const DEFAULT_PRESET: u8 = 6;
 
+/// Cached [`XzDecoder`]s, kept across the chunks of one image.
+///
+/// A [`Pool`] rather than a single slot, for the same reason the zstd one is:
+/// the lock is held only while a decoder is taken and put back, so a parallel
+/// decode of an LZMA page keeps one decoder per worker instead of serialising
+/// every worker behind one.
+#[derive(Default)]
+pub(crate) struct XzSlot(Pool<XzDecoder>);
+
+impl core::fmt::Debug for XzSlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let held = self.0.inspect(<[XzDecoder]>::len);
+        f.debug_tuple("XzSlot").field(&held).finish()
+    }
+}
+
+impl XzSlot {
+    /// Decodes one complete `.xz` stream through a pooled decoder.
+    ///
+    /// No `reset()`: carrying the dictionary allocation from the previous
+    /// strip is the entire point, and `oxiarc-lzma` decides for itself
+    /// whether a given block may reuse the *state* behind it.
+    fn decompress_into(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        let mut decoder = self.0.take().unwrap_or_default();
+        let out = decoder
+            .decompress_into(src, dst)
+            .map_err(|error| codec_error(CompressionMethod::Lzma, error));
+        self.0.put(decoder);
+        out
+    }
+}
+
 /// Decodes one `.xz` stream into `dst`.
 ///
 /// # Errors
 /// [`crate::FormatError::Codec`] for a corrupt or truncated stream.
 pub fn decode_into(src: &[u8], dst: &mut [u8], cx: &CodecContext<'_>) -> Result<usize> {
-    match xz::decompress_into(src, dst) {
+    let decoded = match cx.state {
+        Some(state) => state.xz().decompress_into(src, dst),
+        None => xz::decompress_into(src, dst)
+            .map_err(|error| codec_error(CompressionMethod::Lzma, error)),
+    };
+    match decoded {
         Ok(written) => Ok(written),
         Err(error) => {
             if cx.leniency.is_lenient() {
@@ -53,7 +105,7 @@ pub fn decode_into(src: &[u8], dst: &mut [u8], cx: &CodecContext<'_>) -> Result<
                 }
                 return Ok(0);
             }
-            Err(codec_error(CompressionMethod::Lzma, error))
+            Err(error)
         }
     }
 }

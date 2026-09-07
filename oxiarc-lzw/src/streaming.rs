@@ -37,6 +37,9 @@
 //! - **TIFF**: MSB-first bit order, early code change, clear codes
 //!   (TIFF 6.0 / libtiff-compatible).
 //! - **GIF**: LSB-first bit order, clear codes, standard code change.
+//! - **Config**: an explicit [`crate::LzwConfig`], which is how a streamed
+//!   frame gets a bit order ([`crate::LzwBitOrder`]) and a code width above
+//!   12 (new in 0.4.2).
 //!
 //! # Example
 //!
@@ -56,8 +59,9 @@
 //! assert_eq!(output, "Hello, streaming LZW!");
 //! ```
 
+use crate::config::LzwConfig;
 use crate::gif_lzw::{gif_compress, gif_decompress};
-use crate::{compress_tiff, decompress_tiff};
+use crate::{compress, compress_tiff, decompress, decompress_tiff};
 use std::io::{self, Read, Write};
 
 /// Default block size for incremental encoder flushing (128 KiB).
@@ -81,6 +85,25 @@ pub enum LzwStreamMode {
     /// The inner `u8` is the GIF `minimum_code_size` (typically 8 for
     /// 256-colour images). Must satisfy `2 <= value <= 11`.
     Gif(u8),
+    /// An explicit [`LzwConfig`], so a stream can use any supported code
+    /// width (9-16) and either bit order (new in 0.4.2).
+    ///
+    /// [`LzwStreamMode::Tiff`] and [`LzwStreamMode::Gif`] each hard-code one
+    /// packing; this variant is what carries
+    /// [`crate::LzwBitOrder`] — and `max_bits` above 12 — through the
+    /// streaming API. Frames are produced by [`crate::compress`] and read
+    /// back by [`crate::decompress`], so
+    /// `LzwStreamMode::Config(LzwConfig::TIFF)` is byte-identical to
+    /// [`LzwStreamMode::Tiff`].
+    ///
+    /// An invalid configuration (see [`LzwConfig::validate`]) surfaces as an
+    /// [`io::Error`] from the first `write`/`read`, not as a panic.
+    ///
+    /// Note that `LzwStreamMode::Config(LzwConfig::TIFF)` and
+    /// [`LzwStreamMode::Tiff`] are **not** equal under `PartialEq` even
+    /// though they produce identical bytes: compare the produced streams, or
+    /// match on the variant, rather than testing modes for equality.
+    Config(LzwConfig),
 }
 
 impl LzwStreamMode {
@@ -195,6 +218,9 @@ impl<W: Write> LzwStreamEncoder<W> {
             LzwStreamMode::Tiff => compress_tiff(data).map_err(|e| io::Error::other(e.to_string())),
             LzwStreamMode::Gif(min_code_size) => {
                 gif_compress(data, min_code_size).map_err(|e| io::Error::other(e.to_string()))
+            }
+            LzwStreamMode::Config(config) => {
+                compress(data, config).map_err(|e| io::Error::other(e.to_string()))
             }
         }
     }
@@ -390,6 +416,8 @@ impl<R: Read> LzwStreamDecoder<R> {
             LzwStreamMode::Gif(min_code_size) => {
                 gif_decompress(data, min_code_size).map_err(|e| io::Error::other(e.to_string()))
             }
+            LzwStreamMode::Config(config) => decompress(data, uncompressed_len, config)
+                .map_err(|e| io::Error::other(e.to_string())),
         }
     }
 

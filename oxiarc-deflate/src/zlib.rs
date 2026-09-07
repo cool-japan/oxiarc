@@ -44,14 +44,24 @@ pub enum ZlibLevel {
 }
 
 impl ZlibLevel {
-    /// Convert from compression level (0-9) to zlib level indicator.
+    /// Convert from compression level (0-9) to the zlib header's `FLEVEL`
+    /// hint, using zlib's own `deflateInit2` mapping (levels 0-1 → 0, 2-5 → 1,
+    /// 6 → 2, 7-9 → 3).
+    ///
+    /// The field is advisory — no decoder acts on it — but matching zlib means
+    /// `zlib_compress(data, level)` is byte-identical to
+    /// `zlib.compress(data, level)` at levels 1..=9, which is what the encoder
+    /// oracle asserts. (Level 0 is excluded on purpose: zlib sizes each stored
+    /// block to the room left in its output buffer, so its level-0 bytes depend
+    /// on the caller. This encoder writes into an unbounded sink and emits the
+    /// format maximum, which is never larger — see
+    /// `tests/zlib_encoder_oracle.rs`.)
     fn from_level(level: u8) -> Self {
         match level {
-            0..=2 => Self::Fastest,
-            3..=5 => Self::Fast,
+            0..=1 => Self::Fastest,
+            2..=5 => Self::Fast,
             6 => Self::Default,
-            7..=9 => Self::Maximum,
-            _ => Self::Default,
+            _ => Self::Maximum,
         }
     }
 }

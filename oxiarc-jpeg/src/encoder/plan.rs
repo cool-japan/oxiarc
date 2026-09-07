@@ -430,6 +430,12 @@ pub(crate) fn build_plan(
 
     let quant = build_quant_tables(options, &components, precision)?;
 
+    // Only an arithmetic frame writes `DAC`; a Huffman plan ignores the field
+    // entirely, so an out-of-range value there is not an error.
+    if options.entropy == EntropyCoding::Arithmetic {
+        options.arithmetic.validate()?;
+    }
+
     // Progressive frames and wide precisions both need generated tables:
     // libjpeg forces `optimize_coding` for progressive (`jcmaster.c`'s
     // "TEMPORARY HACK"), and Annex K.3's tables stop at DC category 11 and AC
@@ -522,10 +528,21 @@ fn build_quant_tables(
                 QuantTable::from_natural([clamped; 64])
             }
             QuantTableSource::Custom(tables) => {
-                tables[slot].ok_or(JpegError::InvalidEncodeParameter {
+                let table = tables[slot].ok_or(JpegError::InvalidEncodeParameter {
                     parameter: "quant_tables",
                     reason: "a component references a table slot that was left empty",
-                })?
+                })?;
+                // T.81 B.2.4.1 gives `Qk` the range 1..=255 (`Pq = 0`) or
+                // 1..=65535 (`Pq = 1`); zero is not a quantiser. Without this
+                // the forward quantiser divides by it, and a caller-supplied
+                // table would panic the encoder rather than be rejected.
+                if table.natural().contains(&0) {
+                    return Err(JpegError::InvalidEncodeParameter {
+                        parameter: "quant_tables",
+                        reason: "a quantiser value is zero; T.81 requires 1..=65535",
+                    });
+                }
+                table
             }
         });
     }

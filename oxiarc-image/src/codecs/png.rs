@@ -24,7 +24,7 @@ use oxiarc_png::{BitDepth as PngBitDepth, ColorType as PngColorType, Transformat
 use crate::color::{ColorType, ExtendedColorType};
 use crate::error::{ImageError, ImageResult, unsupported_color};
 use crate::format::ImageFormat;
-use crate::traits::{ImageDecoder, ImageEncoder};
+use crate::traits::{ImageDecoder, ImageEncoder, check_read_buffer};
 
 fn expanded_to_color_type(color: PngColorType, depth: PngBitDepth) -> ImageResult<ColorType> {
     Ok(match (color, depth) {
@@ -89,6 +89,27 @@ fn native_pairs_to_be(buf: &[u8]) -> Vec<u8> {
 /// transformation `image::codecs::png::PngDecoder` applies, so the same ten
 /// (colour type, bit depth) combinations are the only ones that can reach
 /// [`ColorType`] here.
+///
+/// This is the entry point [`crate::codecs::png`] wraps; most callers reach
+/// it indirectly through [`crate::DynamicImage`]/[`crate::ImageReader`] and
+/// only need this type directly for the PNG-specific encoder options below.
+///
+/// ```
+/// use oxiarc_image::codecs::png::{PngDecoder, PngEncoder};
+/// use oxiarc_image::traits::{ImageDecoder, ImageEncoder};
+/// use oxiarc_image::ExtendedColorType;
+/// use std::io::Cursor;
+///
+/// let mut bytes = Vec::new();
+/// PngEncoder::new(&mut bytes).write_image(&[0, 128, 255, 64], 2, 2, ExtendedColorType::L8)?;
+///
+/// let decoder = PngDecoder::new(Cursor::new(bytes))?;
+/// assert_eq!(decoder.dimensions(), (2, 2));
+/// let mut pixels = vec![0u8; decoder.total_bytes() as usize];
+/// decoder.read_image(&mut pixels)?;
+/// assert_eq!(pixels, vec![0, 128, 255, 64]);
+/// # Ok::<(), oxiarc_image::ImageError>(())
+/// ```
 pub struct PngDecoder<R: Read> {
     reader: oxiarc_png::Reader<R>,
     color_type: ColorType,
@@ -129,6 +150,7 @@ impl<R: Read> ImageDecoder for PngDecoder<R> {
     }
 
     fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()> {
+        check_read_buffer(buf, self.total_bytes())?;
         self.reader.next_frame(buf)?;
         if matches!(
             self.color_type,
@@ -154,7 +176,28 @@ pub enum CompressionType {
     /// Store, uncompressed.
     Uncompressed,
     /// An explicit `oxiarc-deflate` level in `0..=9`.
+    ///
+    /// A level above 9 is clamped to 9 rather than passed through (see the
+    /// private `deflate_level` helper), since `oxiarc-deflate` has no
+    /// defined meaning above 9.
     Level(u8),
+}
+
+impl CompressionType {
+    /// The `oxiarc-deflate` level this setting asks for, `None` for the
+    /// named presets that map onto an `oxiarc_png::Compression` instead.
+    ///
+    /// [`CompressionType::Level`] documents a `0..=9` range but is a plain
+    /// `u8`, so a caller can construct `Level(200)`. Clamping here keeps
+    /// that from reaching `oxiarc_png::DeflateCompression::Level`, whose own
+    /// range is the same `0..=9` and which has no defined meaning above it.
+    const fn deflate_level(self) -> Option<u8> {
+        match self {
+            Self::Level(0) => None,
+            Self::Level(level) => Some(if level > 9 { 9 } else { level }),
+            _ => None,
+        }
+    }
 }
 
 /// Which filter heuristic to use. Matches
@@ -240,7 +283,7 @@ impl<W: Write> ImageEncoder for PngEncoder<W> {
             CompressionType::Level(0) => oxiarc_png::Compression::NoCompression,
             CompressionType::Level(_) => oxiarc_png::Compression::Balanced,
         });
-        if let CompressionType::Level(level @ 1..) = self.compression {
+        if let Some(level) = self.compression.deflate_level() {
             encoder.set_deflate_compression(oxiarc_png::DeflateCompression::Level(level));
         }
         encoder.set_filter(match self.filter {
@@ -332,6 +375,49 @@ mod tests {
             .write_image(&[0u8; 1], 1, 1, ExtendedColorType::Cmyk8)
             .unwrap_err();
         assert!(matches!(err, ImageError::Unsupported(_)));
+    }
+
+    #[test]
+    fn an_out_of_range_compression_level_is_clamped_not_passed_through() {
+        assert_eq!(CompressionType::Level(0).deflate_level(), None);
+        assert_eq!(CompressionType::Level(1).deflate_level(), Some(1));
+        assert_eq!(CompressionType::Level(9).deflate_level(), Some(9));
+        assert_eq!(CompressionType::Level(10).deflate_level(), Some(9));
+        assert_eq!(CompressionType::Level(u8::MAX).deflate_level(), Some(9));
+        assert_eq!(CompressionType::Best.deflate_level(), None);
+
+        // And end to end: an absurd level still produces a file this crate's
+        // own decoder reads back byte-for-byte.
+        let pixels = [7u8, 200, 3, 90];
+        let mut out = Vec::new();
+        PngEncoder::new_with_quality(&mut out, CompressionType::Level(200), FilterType::Adaptive)
+            .write_image(&pixels, 2, 2, ExtendedColorType::L8)
+            .expect("an out-of-range level must still encode");
+        let decoder = PngDecoder::new(Cursor::new(out)).expect("decode");
+        let mut buf = vec![0u8; decoder.total_bytes() as usize];
+        decoder.read_image(&mut buf).expect("read");
+        assert_eq!(buf, pixels);
+    }
+
+    #[test]
+    fn read_image_rejects_a_buffer_that_is_not_exactly_total_bytes() {
+        let png = encode_l8(2, 2, &[0, 64, 128, 255]);
+
+        let decoder = PngDecoder::new(Cursor::new(png.clone())).expect("decode header");
+        let mut too_small = vec![0u8; 3];
+        assert!(matches!(
+            decoder.read_image(&mut too_small),
+            Err(ImageError::Parameter(_))
+        ));
+
+        // The over-sized case is the one that used to succeed silently,
+        // leaving the tail of the caller's buffer untouched with no error.
+        let decoder = PngDecoder::new(Cursor::new(png)).expect("decode header");
+        let mut too_big = vec![0u8; 4 + 16];
+        assert!(matches!(
+            decoder.read_image(&mut too_big),
+            Err(ImageError::Parameter(_))
+        ));
     }
 
     #[test]

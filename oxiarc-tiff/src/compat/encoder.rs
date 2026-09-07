@@ -207,6 +207,17 @@ pub struct ImageEncoder<'a, W: Write + Seek, C: ColorType> {
     encoder: &'a mut crate::writer::Encoder<W>,
     spec: crate::ImageSpec,
     overrides: Vec<(u16, Value)>,
+    /// `XResolution`, `YResolution` and `ResolutionUnit` are tracked
+    /// **separately** rather than folded straight into
+    /// [`crate::ImageSpec::resolution`], because that native field is one
+    /// `Option<(x, y, unit)>` and setting it emits all three tags. Upstream
+    /// lets a caller set any one of the three alone, so folding early made
+    /// `.resolution_unit(Centimeter)` (or `.x_resolution(..)`) silently emit
+    /// a bogus `0/1` sibling into the file. They are resolved in
+    /// [`Self::write_data`] instead.
+    resolution_x: Option<Rational>,
+    resolution_y: Option<Rational>,
+    resolution_unit: Option<ResolutionUnit>,
     _marker: PhantomData<C>,
 }
 
@@ -220,11 +231,24 @@ impl<'a, W: Write + Seek, C: ColorType> ImageEncoder<'a, W, C> {
     ) -> Self {
         let spec = crate::ImageSpec::new(width, height, C::NATIVE)
             .with_compression(compression.to_native())
-            .with_predictor(predictor);
+            .with_predictor(predictor)
+            // Load-bearing: `ImageSpec::new` defaults every channel to
+            // `Uint`, so without this a `Gray32Float`/`RGBA32Float` page is
+            // written with `SampleFormat = 1` and reads back as `u32`
+            // everywhere (and a `GrayI16` page reads `-5` as `65531`), with
+            // nothing anywhere reporting an error. Ordering matters: this
+            // fills one entry per channel from the spec's *current*
+            // `samples_per_pixel`, and `with_bits_per_sample` both changes
+            // that count and resets every entry to `Uint`, so it must never
+            // be chained after this one.
+            .with_sample_format(C::SAMPLE_FORMAT);
         Self {
             encoder,
             spec,
             overrides: Vec::new(),
+            resolution_x: None,
+            resolution_y: None,
+            resolution_unit: None,
             _marker: PhantomData,
         }
     }
@@ -246,52 +270,64 @@ impl<'a, W: Write + Seek, C: ColorType> ImageEncoder<'a, W, C> {
     /// Sets `XResolution` and `YResolution` together.
     #[must_use]
     pub fn resolution(mut self, x: Rational, y: Rational) -> Self {
-        let unit = self.current_resolution_unit();
-        self.spec = self.spec.with_resolution(x, y, unit);
+        self.resolution_x = Some(x);
+        self.resolution_y = Some(y);
         self
     }
 
     /// Sets `XResolution` alone, keeping any previously-set `YResolution`.
     #[must_use]
     pub fn x_resolution(mut self, x: Rational) -> Self {
-        let (_, y, unit) = self.spec.resolution.unwrap_or((
-            Rational { num: 0, den: 1 },
-            Rational { num: 0, den: 1 },
-            ResolutionUnit::Inch.into(),
-        ));
-        self.spec = self.spec.with_resolution(x, y, unit);
+        self.resolution_x = Some(x);
         self
     }
 
     /// Sets `YResolution` alone, keeping any previously-set `XResolution`.
     #[must_use]
     pub fn y_resolution(mut self, y: Rational) -> Self {
-        let (x, _, unit) = self.spec.resolution.unwrap_or((
-            Rational { num: 0, den: 1 },
-            Rational { num: 0, den: 1 },
-            ResolutionUnit::Inch.into(),
-        ));
-        self.spec = self.spec.with_resolution(x, y, unit);
+        self.resolution_y = Some(y);
         self
     }
 
-    /// Sets `ResolutionUnit`.
+    /// Sets `ResolutionUnit`, with or without a resolution to go with it.
     #[must_use]
     pub fn resolution_unit(mut self, unit: ResolutionUnit) -> Self {
-        let (x, y, _) = self.spec.resolution.unwrap_or((
-            Rational { num: 0, den: 1 },
-            Rational { num: 0, den: 1 },
-            unit.into(),
-        ));
-        self.spec = self.spec.with_resolution(x, y, unit.into());
+        self.resolution_unit = Some(unit);
         self
     }
 
-    fn current_resolution_unit(&self) -> crate::tags::ResolutionUnit {
-        self.spec
-            .resolution
-            .map(|(_, _, unit)| unit)
-            .unwrap_or(ResolutionUnit::Inch.into())
+    /// Folds the three independently-settable resolution knobs into the one
+    /// native [`crate::ImageSpec::resolution`] field, without inventing a
+    /// tag the caller never asked for.
+    ///
+    /// * neither axis set -> no `XResolution`/`YResolution` at all; a lone
+    ///   `ResolutionUnit` still reaches the file, as an extra tag;
+    /// * one axis set -> the other takes the same value (square pixels),
+    ///   because TIFF 6.0 makes the two a required pair once either is
+    ///   present, and a `0/1` filler would be a *wrong* resolution rather
+    ///   than an absent one;
+    /// * unit unset -> `Inch` (2), the TIFF 6.0 default.
+    fn apply_resolution(&mut self) {
+        let unit: crate::tags::ResolutionUnit =
+            self.resolution_unit.unwrap_or(ResolutionUnit::Inch).into();
+        match (self.resolution_x, self.resolution_y) {
+            (None, None) => {
+                if let Some(explicit) = self.resolution_unit {
+                    self.overrides.push((
+                        crate::tags::Tag::ResolutionUnit.to_u16(),
+                        Value::Short(vec![explicit.to_u16()]),
+                    ));
+                }
+            }
+            (x, y) => {
+                let fallback = x.or(y).unwrap_or(Rational { num: 1, den: 1 });
+                self.spec = self.spec.clone().with_resolution(
+                    x.unwrap_or(fallback),
+                    y.unwrap_or(fallback),
+                    unit,
+                );
+            }
+        }
     }
 
     /// A handle for setting arbitrary extra tags (ICC profiles, XMP, ...)
@@ -308,7 +344,9 @@ impl<'a, W: Write + Seek, C: ColorType> ImageEncoder<'a, W, C> {
     /// [`TiffError::UsageError`] when `data`'s length disagrees with the
     /// page's declared dimensions, plus every native encode/I/O failure.
     pub fn write_data(mut self, data: &[C::Inner]) -> TiffResult<()> {
-        for (tag, value) in self.overrides.drain(..) {
+        self.apply_resolution();
+        let overrides = std::mem::take(&mut self.overrides);
+        for (tag, value) in overrides {
             self.spec = self.spec.with_extra_tag(tag, value);
         }
         let mut bytes = Vec::with_capacity(std::mem::size_of_val(data));

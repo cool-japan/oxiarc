@@ -1334,9 +1334,10 @@ fn extract_archive_format<R: Read + Seek>(
             pb.finish_with_message("Done");
         }
         _ => {
+            let hint = crate::utils::image_format_hint(&mut reader);
             return Err(format!(
                 "Unsupported archive format: {}; supported formats: \
-                 zip, gzip, tar, lzh, xz, lz4, zstd, bzip2, brotli, snappy, 7z, cab, iso9660",
+                 zip, gzip, tar, lzh, xz, lz4, zstd, bzip2, brotli, snappy, 7z, cab, iso9660{hint}",
                 format
             )
             .into());

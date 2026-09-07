@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxiarc_brotli::{
-    BrotliParams, BrotliStatus, BrotliStream, MetaBlockShape, compress_with_params, decompress,
-    decompress_reporting_shapes,
+    BrotliParams, BrotliStatus, BrotliStream, MetaBlockShape, compress_with_dictionary,
+    compress_with_params, decompress, decompress_reporting_shapes, decompress_with_dictionary,
 };
 use oxiarc_core::traits::FlushMode;
 
@@ -1065,4 +1065,262 @@ fn test_oracle_reference_truncations_rejected_incrementally() {
         failures.join("\n")
     );
     eprintln!("[brotli-oracle] every reference-stream prefix rejected by the incremental decoder");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared (custom LZ77) dictionaries — `brotli -D FILE`, both directions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether this `brotli` build understands `-D/--dictionary`. The option has
+/// been present since 1.0, but a build without it must skip rather than fail.
+fn brotli_supports_dictionary(brotli: &Path) -> bool {
+    let Ok(out) = Command::new(brotli).arg("--help").output() else {
+        return false;
+    };
+    // `brotli --help` writes to stdout on 1.1.0 and to stderr on some builds.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    text.contains("--dictionary")
+}
+
+/// Reference-compress `data` against `dict_path` at (quality, lgwin).
+fn reference_compress_with_dictionary(
+    brotli: &Path,
+    dir: &Path,
+    dict_path: &Path,
+    data: &[u8],
+    q: u32,
+    w: u32,
+) -> Vec<u8> {
+    let input = dir.join("din.bin");
+    let output = dir.join("din.bin.br");
+    std::fs::write(&input, data).expect("write input");
+    let _ = std::fs::remove_file(&output);
+    let status = Command::new(brotli)
+        .args(["-f", "-k", "-q"])
+        .arg(q.to_string())
+        .arg("-w")
+        .arg(w.to_string())
+        .arg("-D")
+        .arg(dict_path)
+        .arg(&input)
+        .status()
+        .expect("spawn brotli -D");
+    assert!(status.success(), "reference brotli -D -q {q} -w {w} failed");
+    std::fs::read(&output).expect("read reference output")
+}
+
+/// Reference-decompress `compressed` against `dict_path`; `None` if rejected.
+fn reference_decompress_with_dictionary(
+    brotli: &Path,
+    dir: &Path,
+    dict_path: &Path,
+    compressed: &[u8],
+) -> Option<Vec<u8>> {
+    let input = dir.join("doxi.br");
+    let output = dir.join("doxi");
+    std::fs::write(&input, compressed).expect("write compressed");
+    let _ = std::fs::remove_file(&output);
+    let status = Command::new(brotli)
+        .args(["-d", "-f", "-k", "-D"])
+        .arg(dict_path)
+        .arg(&input)
+        .status()
+        .expect("spawn brotli -d -D");
+    if !status.success() {
+        return None;
+    }
+    Some(std::fs::read(&output).expect("read decompressed output"))
+}
+
+/// A structured dictionary plus the payloads worth coding against it.
+fn dictionary_corpus() -> (Vec<u8>, Vec<(&'static str, Vec<u8>)>) {
+    let mut dict = Vec::new();
+    for i in 0..2000u32 {
+        dict.extend_from_slice(
+            format!("line {i:06}: the quick brown fox jumps over the lazy dog\n").as_bytes(),
+        );
+    }
+    let payloads: Vec<(&'static str, Vec<u8>)> = vec![
+        (
+            "one_line",
+            b"line 000042: the quick brown fox jumps over the lazy dog\n".to_vec(),
+        ),
+        ("dict_head", dict[..4096].to_vec()),
+        ("dict_tail", dict[dict.len() - 4096..].to_vec()),
+        ("dict_middle", dict[20_000..60_000].to_vec()),
+        ("whole_dictionary", dict.clone()),
+        ("dict_then_novel", {
+            let mut v = dict[1000..9000].to_vec();
+            v.extend_from_slice(english_text(20_000).as_slice());
+            v
+        }),
+        ("novel_then_dict", {
+            let mut v = english_text(200_000);
+            v.extend_from_slice(&dict[..8000]);
+            v
+        }),
+        ("unrelated", random_bytes(20_000, 77)),
+    ];
+    (dict, payloads)
+}
+
+/// Decode direction with a shared dictionary: every reference `-D` stream must
+/// decode byte-identically through both this crate's decoders.
+#[test]
+fn test_oracle_reference_dictionary_encode_oxiarc_decode() {
+    let Some(brotli) = find_brotli() else {
+        eprintln!("[brotli-oracle] `brotli` not on PATH; skipping (not a failure)");
+        return;
+    };
+    if !brotli_supports_dictionary(&brotli) {
+        eprintln!("[brotli-oracle] `brotli` has no --dictionary; skipping (not a failure)");
+        return;
+    }
+    let dir = scratch_dir("dictdec");
+    let (dict, payloads) = dictionary_corpus();
+    let dict_path = dir.join("dict.bin");
+    std::fs::write(&dict_path, &dict).expect("write dictionary");
+
+    let mut total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (name, data) in payloads {
+        for q in [5u32, 9, 11] {
+            // lgwin 10 is a 1008-byte window, far below the 114 KB dictionary:
+            // the case that proves shared-dictionary distances legitimately
+            // exceed the declared window.
+            for w in [10u32, 16, 22] {
+                total += 1;
+                let compressed =
+                    reference_compress_with_dictionary(&brotli, &dir, &dict_path, &data, q, w);
+                match decompress_with_dictionary(&compressed, &dict) {
+                    Ok(got) if got == data => {}
+                    Ok(got) => failures.push(format!(
+                        "{name} q{q} w{w}: SILENT MISMATCH ({} vs {} bytes)",
+                        got.len(),
+                        data.len()
+                    )),
+                    Err(e) => failures.push(format!("{name} q{q} w{w}: one-shot error {e}")),
+                }
+                // The push decoder must agree, at an awkward chunking.
+                let mut stream = BrotliStream::new().with_dictionary(dict.clone());
+                let mut out = vec![0u8; 4096];
+                let mut got = Vec::new();
+                let mut pos = 0usize;
+                let mut calls = 0u64;
+                let verdict = loop {
+                    calls += 1;
+                    if calls > (compressed.len() as u64 + 1) * 8 + 100_000 {
+                        break Some("push decoder did not terminate".to_string());
+                    }
+                    let end = (pos + 61).min(compressed.len());
+                    let flush = if end == compressed.len() {
+                        FlushMode::Finish
+                    } else {
+                        FlushMode::None
+                    };
+                    match stream.decode(&compressed[pos..end], &mut out, flush) {
+                        Ok(p) => {
+                            pos += p.consumed;
+                            got.extend_from_slice(&out[..p.produced]);
+                            if p.status == BrotliStatus::StreamEnd && pos == compressed.len() {
+                                break None;
+                            }
+                        }
+                        Err(e) => break Some(format!("push error {e}")),
+                    }
+                };
+                match verdict {
+                    Some(msg) => failures.push(format!("{name} q{q} w{w}: {msg}")),
+                    None if got != data => {
+                        failures.push(format!("{name} q{q} w{w}: push decoder MISMATCH"));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "{}/{total} reference dictionary streams failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert!(
+        total >= 60,
+        "dictionary decode oracle only ran {total} cases"
+    );
+    eprintln!("[brotli-oracle] {total} reference `-D` streams decoded byte-identically");
+}
+
+/// Encode direction with a shared dictionary: the reference decoder must
+/// accept everything `compress_with_dictionary` produces.
+#[test]
+fn test_oracle_oxiarc_dictionary_encode_reference_decode() {
+    let Some(brotli) = find_brotli() else {
+        eprintln!("[brotli-oracle] `brotli` not on PATH; skipping (not a failure)");
+        return;
+    };
+    if !brotli_supports_dictionary(&brotli) {
+        eprintln!("[brotli-oracle] `brotli` has no --dictionary; skipping (not a failure)");
+        return;
+    }
+    let dir = scratch_dir("dictenc");
+    let (dict, payloads) = dictionary_corpus();
+    let dict_path = dir.join("dict.bin");
+    std::fs::write(&dict_path, &dict).expect("write dictionary");
+
+    let mut total = 0usize;
+    let mut smaller = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (name, data) in payloads {
+        for q in [1u32, 5, 9, 11] {
+            for w in [10u32, 16, 22] {
+                total += 1;
+                let params = BrotliParams {
+                    quality: q,
+                    lgwin: w,
+                    lgblock: 0,
+                };
+                let compressed =
+                    compress_with_dictionary(&data, &dict, &params).expect("oxiarc compress -D");
+                match reference_decompress_with_dictionary(&brotli, &dir, &dict_path, &compressed) {
+                    Some(got) if got == data => {}
+                    Some(got) => failures.push(format!(
+                        "{name} q{q} w{w}: reference decoded {} bytes, wanted {}",
+                        got.len(),
+                        data.len()
+                    )),
+                    None => failures.push(format!(
+                        "{name} q{q} w{w}: reference `brotli -d -D` rejected the stream"
+                    )),
+                }
+                if compressed.len() < compress_with_params(&data, &params).expect("plain").len() {
+                    smaller += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "{}/{total} oxiarc dictionary streams failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    // Anti-vacuity: the dictionary must actually be reaching the wire, not
+    // merely being ignored in favour of the dictionary-free encoding.
+    assert!(
+        smaller * 2 >= total,
+        "only {smaller}/{total} dictionary streams beat the dictionary-free encoder: \
+         the dictionary is not reaching the wire"
+    );
+    eprintln!(
+        "[brotli-oracle] {total} oxiarc `-D` streams accepted by the reference decoder \
+         ({smaller} smaller than the dictionary-free encoding)"
+    );
 }

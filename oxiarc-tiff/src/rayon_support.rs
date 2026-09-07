@@ -64,9 +64,51 @@
 //! [`crate::compression::CodecState`] (shared, read-only, across every
 //! worker of one call) serialises the handful of codecs whose scratch is a
 //! `Mutex` (the Deflate window, the CCITT changing-element buffers); the LZW
-//! code-width rule is a lock-free `AtomicU8`. A decode or encode that is
-//! dominated by one of those codecs will not gain much from this feature;
-//! LZW, PackBits, uncompressed and the CPU-bound part of JPEG do.
+//! code-width rule is a lock-free `AtomicU8`.
+//!
+//! # When parallel decode is worth it (measured, not assumed)
+//!
+//! The win is whatever CPU cost a chunk's *decompress* step carries; the
+//! serial fetch pass, the `memcpy` placement and the thread-pool dispatch are
+//! overhead added on top. So this feature is **not** a uniform win, and it is
+//! not even purely a property of the codec: PackBits over incompressible data
+//! is nearly a byte copy, while the same codec over long literal runs has
+//! real expansion work to do.
+//!
+//! Interleaved A/B (serial and parallel timed in the same loop), 4096x4096
+//! Gray8, medians of nine rounds, release build, 8 cores at load average
+//! 6-10:
+//!
+//! | Fixture | Serial | Parallel | Ratio |
+//! |---|---|---|---|
+//! | LZW, 256x256 tiles, incompressible | 114 ms | 32 ms | **3.6x faster** |
+//! | LZW, 256x256 tiles, compressible | 26.6 ms | 10.4 ms | **2.6x faster** |
+//! | Deflate, 64-row strips | 60 ms | 62 ms | 0.98x |
+//! | PackBits, 256x256 tiles, compressible | 2.6 ms | 2.4 ms | 1.09x |
+//! | PackBits, 256x256 tiles, incompressible | 3.8 ms | 4.2 ms | 0.90x |
+//! | uncompressed, 64-row strips | 2.1 ms | 3.1 ms | **0.66x, slower** |
+//!
+//! Read that as three groups rather than six numbers:
+//!
+//! * **Worth it**: codecs whose per-chunk decompress is real CPU work -- LZW
+//!   measured here, and ZSTD, LZMA and JPEG by the same argument. LZW came out
+//!   faster in every run, including a repeat at load average 30 on 8 cores
+//!   where it still managed 1.3x.
+//! * **No gain**: Deflate and CCITT, whose scratch lives behind
+//!   [`crate::compression::CodecState`]'s `Mutex`, so the workers serialise on
+//!   the codec anyway.
+//! * **No reliable gain, sometimes a loss**: uncompressed, and PackBits.
+//!   These are `memcpy`-bound, so the overhead is a large fraction of the
+//!   total; repeated runs straddled 1.0 (0.32x to 1.12x for PackBits,
+//!   depending on how compressible the data was and how many cores were
+//!   free). Prefer [`crate::Decoder::read_image`] for these.
+//!
+//! Absolute times and the size of the win move with machine load -- the
+//! parallel arm needs free cores and the serial arm does not, so a busy box
+//! penalises it even in an interleaved measurement. Only the LZW direction
+//! held under every load tested. Encode is the easier direction: every chunk's
+//! compression is independent CPU work with no shared lock, so it
+//! parallelises for every codec.
 
 use std::io::{Read, Seek, Write};
 

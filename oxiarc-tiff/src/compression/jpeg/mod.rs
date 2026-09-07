@@ -257,61 +257,6 @@ fn check_subsampling(cx: &CodecContext<'_>, facts: &scan::FrameFacts) -> Result<
     Ok(())
 }
 
-/// Builds the frame layout one chunk of this image needs.
-fn layout(cx: &CodecContext<'_>) -> Result<encode::Layout> {
-    let width = u16::try_from(cx.width).map_err(|_| TiffError::IntOverflow)?;
-    let height = u16::try_from(cx.height).map_err(|_| TiffError::IntOverflow)?;
-    let count = usize::from(cx.samples_per_pixel).max(1);
-    if count > 4 {
-        return Err(TiffError::Unsupported(UnsupportedError::Conversion(
-            "JPEG frames carry at most four components",
-        )));
-    }
-    if cx.bits_per_sample.iter().any(|bits| *bits != 8) {
-        return Err(TiffError::Unsupported(UnsupportedError::BitsPerSample(
-            cx.bits_per_sample.to_vec(),
-        )));
-    }
-    let component = |id: u8, h: u8, v: u8, chroma: bool| encode::Component {
-        id,
-        h,
-        v,
-        quant: u8::from(chroma),
-        dc: u8::from(chroma),
-        ac: u8::from(chroma),
-    };
-    let components = match (cx.photometric, count) {
-        (PhotometricInterpretation::YCbCr, 3) => {
-            let h = u8::try_from(cx.ycbcr_subsampling.0.max(1)).unwrap_or(1);
-            let v = u8::try_from(cx.ycbcr_subsampling.1.max(1)).unwrap_or(1);
-            vec![
-                component(1, h, v, false),
-                component(2, 1, 1, true),
-                component(3, 1, 1, true),
-            ]
-        }
-        (PhotometricInterpretation::Rgb, 3) => vec![
-            component(b'R', 1, 1, false),
-            component(b'G', 1, 1, false),
-            component(b'B', 1, 1, false),
-        ],
-        (PhotometricInterpretation::Separated, 4) => vec![
-            component(b'C', 1, 1, false),
-            component(b'M', 1, 1, false),
-            component(b'Y', 1, 1, false),
-            component(b'K', 1, 1, false),
-        ],
-        _ => (0..count)
-            .map(|index| component((index + 1) as u8, 1, 1, false))
-            .collect(),
-    };
-    Ok(encode::Layout {
-        width,
-        height,
-        components,
-    })
-}
-
 /// The `JPEGTables` (347) blob for this image, or `None` when the caller asked
 /// for self-contained chunks.
 ///
@@ -322,9 +267,7 @@ fn layout(cx: &CodecContext<'_>) -> Result<encode::Layout> {
 /// # Errors
 /// The same set as [`encode`].
 pub fn shared_tables(cx: &CodecContext<'_>, level: CodecLevel) -> Result<Vec<u8>> {
-    let layout = layout(cx)?;
-    let tables = encode::table_set(quality(level), &layout);
-    Ok(encode::tables_blob(&tables))
+    encode::tables_blob(&encode::plan(cx, quality(level))?)
 }
 
 /// The quality one [`CodecLevel`] selects.
@@ -344,19 +287,11 @@ fn quality(level: CodecLevel) -> u8 {
 ///
 /// # Errors
 /// [`UnsupportedError::BitsPerSample`] for anything but 8-bit samples and
-/// [`UnsupportedError::Conversion`] for more than four channels.
+/// [`UnsupportedError::Conversion`] for a channel count JPEG has no colour
+/// space for (two, or more than four).
 pub fn encode(src: &[u8], cx: &CodecContext<'_>, level: CodecLevel) -> Result<Vec<u8>> {
-    let layout = layout(cx)?;
-    let tables = encode::table_set(quality(level), &layout);
-    let blob;
-    let inline = if cx.jpeg_tables.is_some() {
-        None
-    } else {
-        blob = encode::tables_blob(&tables);
-        // The blob is a complete tables-only stream; the chunk needs its body.
-        blob.get(2..blob.len().saturating_sub(2))
-    };
-    Ok(encode::encode_chunk(src, &layout, &tables, inline))
+    let plan = encode::plan(cx, quality(level))?;
+    encode::encode_chunk(src, &plan, cx.jpeg_tables.is_some())
 }
 
 #[cfg(test)]

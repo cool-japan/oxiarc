@@ -9,15 +9,12 @@
 //! `oxiarc-image` actually support this one", and every entry point that
 //! dispatches on format ([`crate::open`], [`crate::load_from_memory`],
 //! [`ImageReader`](crate::ImageReader)) returns
-//! [`ImageError::Unsupported`](crate::ImageError::Unsupported) by name for
-//! the eleven it does not.
+//! [`ImageError::Unsupported`] by name for the eleven it does not.
 
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::error::{
-    ImageError, ImageFormatHint, ImageResult, UnsupportedError, UnsupportedErrorKind,
-};
+use crate::error::{ImageError, ImageFormatHint, ImageResult};
 
 /// An enumeration of image container formats.
 ///
@@ -90,11 +87,15 @@ static MAGIC_BYTES: &[MagicRow] = &[
     (b"BM", b"", ImageFormat::Bmp),
     (&[0, 0, 1, 0], b"", ImageFormat::Ico),
     (b"#?RADIANCE", b"", ImageFormat::Hdr),
-    (
-        b"\0\0\0\0ftypavif",
-        b"\xFF\xFF\0\0\0\0\0\0\0\0\0\0",
-        ImageFormat::Avif,
-    ),
+    // The mask is deliberately *shorter* than the signature: bytes past its
+    // end are matched with an implicit `0xFF` (see `guess_format_impl`), so
+    // this reads "the first two bytes of the box size must be zero, the next
+    // two are anything, and bytes 4..12 must be `ftypavif`" -- `image`
+    // 0.25's own row, byte for byte. A mask padded out to the signature's
+    // full length with zeros would instead demand `byte & 0 == b'f'` at
+    // offset 4, which no input can satisfy, and the row would never match
+    // anything at all.
+    (b"\0\0\0\0ftypavif", b"\xFF\xFF\0\0", ImageFormat::Avif),
     (&[0x76, 0x2f, 0x31, 0x01], b"", ImageFormat::OpenExr),
     (b"qoif", b"", ImageFormat::Qoi),
     (b"P1", b"", ImageFormat::Pnm),
@@ -170,7 +171,7 @@ impl ImageFormat {
     ///
     /// ```
     /// use oxiarc_image::ImageFormat;
-    /// assert_eq!(ImageFormat::from_path("photo.png").unwrap(), ImageFormat::Png);
+    /// assert_eq!(ImageFormat::from_path("photo.png").expect("recognised"), ImageFormat::Png);
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> ImageResult<Self> {
         let path = path.as_ref();
@@ -267,7 +268,7 @@ impl ImageFormat {
 /// ```
 /// use oxiarc_image::guess_format;
 /// let png_sig = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-/// assert_eq!(guess_format(&png_sig).unwrap(), oxiarc_image::ImageFormat::Png);
+/// assert_eq!(guess_format(&png_sig).expect("sniff"), oxiarc_image::ImageFormat::Png);
 /// assert!(guess_format(b"not an image").is_err());
 /// ```
 pub fn guess_format(buffer: &[u8]) -> ImageResult<ImageFormat> {
@@ -388,6 +389,61 @@ mod tests {
     fn guess_format_recognises_unsupported_formats_by_name() {
         assert_eq!(guess_format(b"GIF89a").unwrap(), ImageFormat::Gif);
         assert_eq!(guess_format(b"BM\x00\x00").unwrap(), ImageFormat::Bmp);
+    }
+
+    /// The masked rows (`WebP`, `Avif`) are the ones a wrong mask length
+    /// silently kills: `byte & mask == signature` can never hold at an
+    /// offset where the mask byte is `0` but the signature byte is not, so a
+    /// mask padded to the signature's length turns the whole row into dead
+    /// code that reports nothing and fails no test. Both directions are
+    /// pinned here: the real header must match, and near-misses must not.
+    #[test]
+    fn guess_format_sniffs_the_masked_rows_webp_and_avif() {
+        let mut avif = Vec::new();
+        avif.extend_from_slice(&[0x00, 0x00, 0x00, 0x20]); // box size: don't care
+        avif.extend_from_slice(b"ftypavif");
+        assert_eq!(guess_format(&avif).expect("sniff avif"), ImageFormat::Avif);
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&1234u32.to_le_bytes()); // file size: don't care
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(guess_format(&webp).expect("sniff webp"), ImageFormat::WebP);
+    }
+
+    #[test]
+    fn guess_format_does_not_over_match_the_masked_rows() {
+        // All-zero bytes share the AVIF row's two leading zeros but carry no
+        // `ftypavif` brand: the mask must still reject them.
+        assert!(guess_format(&[0u8; 32]).is_err());
+        // The right brand at the wrong offset is not AVIF either.
+        let mut shifted = vec![0u8; 3];
+        shifted.extend_from_slice(b"ftypavif");
+        shifted.extend_from_slice(&[0u8; 8]);
+        assert!(guess_format(&shifted).is_err());
+        // `RIFF` with a non-`WEBP` form type is some other RIFF file.
+        let mut riff = Vec::new();
+        riff.extend_from_slice(b"RIFF");
+        riff.extend_from_slice(&8u32.to_le_bytes());
+        riff.extend_from_slice(b"WAVE");
+        assert!(guess_format(&riff).is_err());
+    }
+
+    /// A buffer shorter than a masked row's signature must not match it,
+    /// and must not panic either.
+    #[test]
+    fn guess_format_handles_buffers_shorter_than_every_signature() {
+        let full: &[u8] = b"\0\0\0\x20ftypavif";
+        for n in 0..full.len() {
+            assert!(
+                guess_format(&full[..n]).is_err(),
+                "a {n}-byte prefix of an AVIF header must not sniff as AVIF"
+            );
+        }
+        assert_eq!(
+            guess_format(full).expect("the whole header does sniff"),
+            ImageFormat::Avif
+        );
     }
 
     #[test]

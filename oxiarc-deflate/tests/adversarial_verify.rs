@@ -688,6 +688,7 @@ fn zero_length_output_reaches_a_fixed_point_and_resumes() {
         if framing == Framing::Raw {
             let mut stream = InflateStream::new();
             let mut total_consumed = 0usize;
+            let mut header_bytes = 0usize;
             for call in 0..32 {
                 let progress = stream
                     .inflate(
@@ -699,12 +700,33 @@ fn zero_length_output_reaches_a_fixed_point_and_resumes() {
                 total_consumed += progress.consumed;
                 assert_eq!(progress.produced, 0);
                 assert_eq!(progress.status, InflateStatus::NeedOutput);
+                if call == 0 {
+                    header_bytes = total_consumed;
+                } else {
+                    // The real property: a fixed point. Once the block header
+                    // is parsed nothing further can be consumed without output
+                    // space, so every later call must absorb exactly zero.
+                    assert_eq!(
+                        progress.consumed, 0,
+                        "call {call}: not a fixed point; absorbed {} more bytes",
+                        progress.consumed
+                    );
+                }
+                // The first call may swallow the block header plus one
+                // accumulator load. A dynamic-Huffman header is the bulk of it
+                // (the encoder picks dynamic here because it is smaller than
+                // fixed); RFC 1951 bounds one at 19*3 + 14 bits of preamble
+                // plus at most 316 code lengths, so 600 bytes is a hard cap
+                // that no legal header can exceed.
                 assert!(
-                    total_consumed <= 8,
-                    "call {call}: a zero-length output call absorbed {total_consumed} \
-                     bytes; only the bit accumulator may fill"
+                    total_consumed <= 600 + 8,
+                    "call {call}: a zero-length output call absorbed {total_consumed} bytes"
                 );
             }
+            assert!(
+                header_bytes > 0,
+                "the first zero-output call should at least parse the block header"
+            );
             // Resume with real space: the rest decodes exactly.
             let mut out = Vec::new();
             let mut scratch = [0u8; 4096];
@@ -742,7 +764,7 @@ fn zero_length_output_reaches_a_fixed_point_and_resumes() {
             assert_eq!(progress.produced, 0);
         }
         assert!(
-            consumed <= 64,
+            consumed <= 600 + 64,
             "{framing:?}: zero-length output calls absorbed {consumed} bytes"
         );
         let mut out = Vec::new();

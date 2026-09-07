@@ -76,11 +76,11 @@
 //! | `image::open`, `load_from_memory`, `load_from_memory_with_format` | yes | PNG/JPEG/TIFF only |
 //! | `ImageReader::{open,new,with_guessed_format,format,decode,into_dimensions}` | yes | `R: BufRead + Seek`, same as upstream |
 //! | `ImageFormat` (all 15 variants), `from_extension`/`from_path`/`from_mime_type`/`to_mime_type` | yes | only Png/Jpeg/Tiff decode or encode |
-//! | `DynamicImage` (all 10 variants), `to_rgba8`/`to_rgb8`/`to_luma8`/`to_rgba16`/`into_*`/`width`/`height`/`dimensions`/`color` | yes | see [`DynamicImage`] for the exact conversion set |
+//! | `DynamicImage` (all 10 variants), `to_rgba8`/`to_rgb8`/`to_luma8`/`to_rgba16`/`into_*`/`width`/`height`/`dimensions`/`color` | yes | see [`DynamicImage`] for the exact conversion set; grayscale uses `image`'s own sRGB/Rec. 709 luma weights, see [`DynamicImage::to_luma8`] |
 //! | `save`/`save_with_format`/`write_to`/`write_with_encoder` | yes | |
 //! | `ImageBuffer<P, Vec<S>>`, `RgbImage`/`RgbaImage`/`GrayImage`/... type aliases | yes | container is always `Vec<S>` (not the fully generic `Container` of upstream) |
 //! | `ImageBuffer::{from_raw,into_raw,as_raw,dimensions,get_pixel,put_pixel,pixels,from_fn,new}` | yes | `get_pixel`/`pixels` return **owned** pixels, not references — see [`ImageBuffer`] docs |
-//! | `codecs::{png,jpeg,tiff}::{Encoder,Decoder}`, `ImageEncoder`/`ImageDecoder` traits | yes | trimmed: no ICC/EXIF/XMP encoder passthrough, no `ImageDecoderRect` |
+//! | `codecs::{png,jpeg,tiff}::{Encoder,Decoder}`, `ImageEncoder`/`ImageDecoder` traits | yes | trimmed: no ICC/EXIF/XMP encoder passthrough, no `ImageDecoderRect`; [`ImageDecoder::read_image`] errors on a wrong-length buffer where `image` panics |
 //! | `ColorType`, `ExtendedColorType` | yes | |
 //! | `ImageError`/`ImageResult`, six variants | yes | opaque wrapper structs are trimmed of HDR/CICP-only kinds |
 //! | `imageops::*`, `GenericImage(View)`, `resize`/`blur`/`crop`/`rotate*`/`flip*`/`filter3x3`/animation | **no** | out of scope by design, see the crate-level "What this is not" above |
@@ -92,6 +92,19 @@
 //! `oxiarc-tiff`'s own bounded decoders — this crate adds no additional
 //! buffering of its own before dispatching, so the same
 //! `DecodeLimits`/`Limits` guarantees those crates document apply here.
+//! [`DynamicImage::from_decoder`] does allocate
+//! [`ImageDecoder::total_bytes`] up front, but only *after* the decoder's
+//! own constructor has accepted the header, and that constructor is where a
+//! hostile size is rejected: `tests/adversarial.rs` builds PNG and TIFF
+//! headers declaring up to `u32::MAX` in both axes and proves every one is
+//! an error before the allocation is reached.
+//!
+//! Decode failures are always one of [`ImageError`]'s six variants, never a
+//! panic. `tests/adversarial.rs` carries the bulk evidence: truncation at
+//! every offset, single-byte corruption at every offset, byte drops and
+//! inserts, randomised truncation with trailing garbage, degenerate 0-4
+//! byte buffers, and one-byte-at-a-time readers whose output must match a
+//! single-read decode exactly — for real encodings of all three formats.
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]

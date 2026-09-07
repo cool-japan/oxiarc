@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 334 tests passing | Reference-interop verified (both directions)**
+**Version: 0.4.2 (2026-09-08) | 343 tests + 21 doctests passing | Reference-interop verified (both directions)**
 
 ## Features
 
@@ -39,6 +39,17 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
   built on `BrotliStream`)
 - **One-shot API** — Convenient `compress` / `decompress` functions
 - **Configurable window** — `lgwin` 10–24; window size is `(1 << lgwin) - 16` bytes (RFC 9.1)
+- **Shared (custom LZ77) dictionaries** — both directions, and interoperable
+  with the reference `brotli --dictionary=FILE` in both: content both peers
+  already hold is preloaded as the LZ77 history, so a stream's backward
+  distances may reach past everything it has itself produced and past its own
+  declared window. `compress_with_dictionary` / `decompress_with_dictionary`,
+  `BrotliStream::with_dictionary`, and the same on the `Read` and async
+  adapters.
+- **`Content-Encoding: dcb` framing (RFC 9842)** — the `dcb` module parses and
+  writes the 4-byte magic plus the 32-byte SHA-256 dictionary id that precedes
+  a dictionary-compressed Brotli body, and verifies the id against the
+  dictionary the caller holds.
 
 ## Quick Start
 
@@ -151,6 +162,60 @@ declares its exact `MLEN`, the check is an exact projection made *before* the
 offending meta-block is decoded: a bomb is refused with none of its expansion
 produced, and without the rest of the body being read.
 
+### Shared dictionaries and `Content-Encoding: dcb`
+
+A *shared* dictionary is content both ends already have — last week's copy of a
+page, a common JSON schema, a JavaScript bundle. It is preloaded as the LZ77
+history, so the encoder can reference it and the body shrinks to the delta:
+
+```rust
+use oxiarc_brotli::{compress_with_dictionary, decompress_with_dictionary, BrotliParams};
+
+let dictionary = std::fs::read("previous-version.html")?;
+let page = std::fs::read("current-version.html")?;
+
+let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+let body = compress_with_dictionary(&page, &dictionary, &params)?;
+assert_eq!(decompress_with_dictionary(&body, &dictionary)?, page);
+```
+
+The same dictionary can be attached to the push decoder, so an HTTP body that
+arrives in pieces is decoded against it without buffering:
+
+```rust
+use oxiarc_brotli::BrotliStream;
+
+let dictionary: Vec<u8> = /* ... */;
+let mut stream = BrotliStream::new()
+    .with_dictionary(dictionary)      // survives `reset()`
+    .with_max_output(64 << 20);
+```
+
+RFC 9842 (Compression Dictionary Transport) wraps such a stream in a 36-byte
+preamble — `FF 44 43 42` and the SHA-256 of the dictionary — and calls the
+result `Content-Encoding: dcb`. The `dcb` module is that framing:
+
+```rust
+use oxiarc_brotli::{dcb, BrotliParams};
+
+let dictionary = b"<nav class=\"site\"><a href=\"/\">home</a>".repeat(32);
+let page = b"<nav class=\"site\"><a href=\"/\">home</a><main>hi</main>";
+
+let body = dcb::compress(page, &dictionary, &BrotliParams::default())?;
+assert_eq!(&body[..4], &dcb::DCB_MAGIC);
+assert_eq!(&body[4..36], &dcb::dictionary_id(&dictionary));   // Available-Dictionary
+assert_eq!(dcb::decompress(&body, &dictionary)?, page);
+
+// Or strip the header yourself and stream the rest:
+let stream_bytes = dcb::verify_header(&body, &dictionary)?;
+```
+
+Both directions are checked against the reference CLI: every
+`brotli -D dict` stream decodes byte-identically here, and every stream this
+encoder produces with a dictionary is accepted by `brotli -d -D dict`
+(`--features brotli-oracle`; the tests self-skip when the binary is absent or
+too old for `--dictionary`).
+
 ## API Overview
 
 | Item | Kind | Description |
@@ -175,6 +240,21 @@ produced, and without the rest of the body being read.
 | `BrotliStream::reset()` | method | Return to the initial state and clear the fault latch |
 | `BrotliStream::with_max_output(n)` | method | Exact per-meta-block output cap |
 | `BrotliStream::with_max_window(n)` | method | Declared-window ceiling, checked before allocation |
+| `compress_with_dictionary(data, dict, params)` | function | Compress against a shared (custom LZ77) dictionary |
+| `decompress_with_dictionary(data, dict)` | function | Decompress a stream whose distances reach into `dict` |
+| `decompress_with_dictionary_and_limit(data, dict, n)` | function | The same, with an output budget |
+| `BrotliStream::with_dictionary(dict)` | method | Attach a shared dictionary to the push decoder (survives `reset()`) |
+| `BrotliStream::dictionary()` | method | The attached dictionary, empty when none |
+| `BrotliDecompressor::with_dictionary(dict)` | method | The same on the `Read` adapter |
+| `BrotliAsyncDecompressor::with_dictionary(dict)` | method | The same on the async adapter (`async-io`) |
+| `shared_dict::MAX_SHARED_DICTIONARY` | const | 16 MiB — largest dictionary any entry point accepts |
+| `dcb::DCB_MAGIC` / `dcb::DCB_HEADER_LEN` | const | `FF 44 43 42`; 36 bytes of preamble |
+| `dcb::dictionary_id(dict)` | function | The 32-byte SHA-256 that names a dictionary (RFC 9842) |
+| `dcb::write_header(dict)` / `dcb::parse_header(body)` | function | Build / split the `dcb` preamble |
+| `dcb::verify_header(body, dict)` | function | Check the id and return the Brotli stream that follows |
+| `dcb::compress` / `dcb::decompress` / `dcb::decompress_with_limit` | function | Whole-body `dcb` round trip |
+| `parse_dcb_header` / `verify_dcb_header` / `write_dcb_header` | function | The same three at the crate root, under names that say what they frame |
+| `compress_dcb` / `decompress_dcb` / `decompress_dcb_with_limit` | function | The whole-body round trip at the crate root (`compress`/`decompress` there stay plain Brotli) |
 | `BrotliProgress` | struct | `{ consumed, produced, status }` returned by `decode` |
 | `BrotliStatus` | enum | `NeedInput` / `NeedOutput` / `StreamEnd` |
 | `DEFAULT_MAX_WINDOW` | const | 16 MiB — the default `with_max_window` ceiling |
@@ -221,50 +301,82 @@ reference encoder produces.
 
 ## Performance
 
-Decode throughput, best of 12 runs per configuration, Apple Silicon, release
-build (`cargo run --release --example decode_profile`). "one-shot" is
-`decompress` over the complete slice. Two streaming columns are reported
-because they do different amounts of *output-side* work: `decompress` allocates
-and grows a `Vec` for the whole body, so the **Vec sink** column is the
-apples-to-apples comparison, while the **64 KiB buffer** column is the API's own
-shape — a caller that owns a fixed buffer and consumes each chunk, which is what
-an HTTP body reader does.
+Decode throughput, interleaved A/B, Apple Silicon, release build
+(`cargo run --release --example decode_profile`). "one-shot" is `decompress`
+over the complete slice; the streaming column is the API's own shape — a caller
+that owns a fixed 64 KiB buffer and consumes each chunk, which is what an HTTP
+body reader does. Every figure below is the **median of five runs of 25
+interleaved repetitions**, taken on a machine carrying other work (load average
+~35); the harness reports the median of the *paired* per-repetition ratios,
+which is what stays put when the machine does not.
 
-| Payload (lgwin 22, q5) | one-shot | Vec sink | 64 KiB buffer |
-|---|---|---|---|
-| 1.08 MB repetitive text | 616 µs | 112 µs (**5.5×**) | 94 µs (**6.6×**) |
-| 1.05 MB single repeated byte | 565 µs | 137 µs (**4.1×**) | 107 µs (**5.3×**) |
-| 2.94 MB hex-dump text (literal-dense) | 16.1 ms | 25.4 ms (0.63×) | 25.4 ms (0.63×) |
-| 1.05 MB incompressible (stored meta-blocks) | 14.4 µs | 125 µs (0.12×) | 97 µs (0.15×) |
+| Payload (q5) | window | one-shot | `BrotliStream`, 64 KiB buffer | ratio |
+|---|---|---|---|---|
+| 1.08 MB repetitive text | lgwin 22 | 606 µs | 62 µs | **9.5×** |
+| 1.08 MB repetitive text | lgwin 10 | 609 µs | 23 µs | **24.9×** |
+| 1.05 MB single repeated byte | lgwin 22 | 517 µs | 35 µs | **19.7×** |
+| 1.05 MB single repeated byte | lgwin 10 | 524 µs | 18 µs | **29.6×** |
+| 2.94 MB hex dump, literal-dominated stream | lgwin 10 | 14.29 ms | 12.74 ms | **1.21×** |
+| 2.94 MB hex dump, copy-dense stream | lgwin 22 | 15.55 ms | 20.92 ms | 0.76× |
+| 1.05 MB incompressible (stored meta-blocks) | lgwin 10 | 14.1 µs | 14.3 µs | 1.01× (floor 1.01×) |
+| 1.05 MB incompressible (stored meta-blocks) | lgwin 22 | 13.7 µs | 41.0 µs | 0.33× (floor 0.34×) |
 
-Two things are worth reading off that table.
+**Where the push decoder wins, it wins by a lot.** It resolves matches with bulk
+runs and tiles short-distance (periodic) matches, whereas the one-shot decoder
+appends backward references one byte at a time; repetitive content — which is
+most real web content — is 9–28× faster, and the advantage grows as the declared
+window shrinks.
 
-**Where the push decoder wins**, it wins by a lot: it resolves matches with
-bulk `copy_within` runs and tiles short-distance (periodic) matches, whereas
-the one-shot decoder appends backward references one byte at a time. Repetitive
-content — which is most real web content — is 5–6× faster.
+**The window is not the cost, and that is measured.** An earlier edition of this
+section blamed the second write per byte: a bounded decoder puts every byte in
+the caller's buffer *and* in its window, where the one-shot decoder's output
+`Vec` *is* its window. That story is wrong for everything except stored blocks.
+With the ring mirror compiled out entirely (an incorrect build, for timing only)
+the copy-dense row moved from 21.9 ms to 22.1 ms — nothing. The command loop
+resolves a match's *source* across the boundary between the ring and the bytes
+already produced into the caller's slice, and mirrors the whole slice into the
+ring with one bulk copy per `decode` call; that copy is streaming memory traffic
+the machine absorbs behind the decode work.
 
-**Where it loses, it loses to the same trade that makes it bounded.** The
-one-shot decoder uses its output `Vec` *as* the sliding window, so it touches
-each byte once and keeps the whole body resident. `BrotliStream` maintains a
-real ring and hands the caller a copy, so it touches each byte twice and pays
-the memory traffic of the declared window. Re-running the same two payloads at
-`lgwin = 10` — a 1 KiB, cache-resident ring — isolates that cost exactly:
+**The stored shape is at a measured floor.** Uncompressed meta-blocks are the
+one case where the second write really is the whole job, so the harness prints a
+`copy floor` row: the same one-shot decode in one column, and in the other a
+model that does exactly the irreducible work of a bounded push decoder — copy
+every byte into the caller's fixed buffer, and copy the part still reachable
+afterwards (the last `1 << WBITS` bytes) into a freshly allocated ring. It is
+timed against the same one-shot decode as every row above, so its ratio and the
+decoder's are directly comparable. The decoder sits **on** that floor: 0.33×
+against a 0.34× floor at lgwin 22, and 1.01× against a 1.01× floor at lgwin 10
+— 97-100 % of the achievable figure. A bounded push decoder cannot do better
+without holding the whole body in memory, which is the thing it exists not to
+do.
 
-| Payload (64 KiB buffer) | lgwin 22 (4 MiB ring) | lgwin 10 (1 KiB ring) |
-|---|---|---|
-| hex-dump text (literal-dense) | 0.63× | 0.80× |
-| incompressible (stored meta-blocks) | 0.15× | **0.36×** |
+**What is still open** is the copy-dense row, and its shape is worth naming
+precisely, because the payload's name is misleading. The 2.94 MB hex dump is
+literal-dominated only at small windows: at lgwin 10 its stream carries 95,605
+copy commands (73 % of the output is literals) and decodes *faster* than the
+one-shot decoder, at 1.21×. At lgwin 22 the encoder finds a match nearly
+everywhere, and the same payload becomes
+**570,440 copy commands of a mean 5.0 bytes at a mean distance of 116,525** —
+97 % of the output — of which 65 % must read their source out of the ring,
+because the distance reaches back past everything produced in the current call.
+(That census was taken on 2026-09-08 with temporary in-tree counters in
+`copy_into_pending`, and the function shares below with `sample`, run against
+each decoder alone via `PROFILE_PUSH_ONLY` / `PROFILE_ONE_SHOT_ONLY`; neither
+instrument is in the shipped code, so `decode_profile` alone will not reproduce
+them.) Profiling shows the Huffman work is *identical* in the two decoders
+(`decode_symbol` 29 vs 30.6 units of a normalised 100, `decode_distance` 19.1 vs
+19.6); the entire difference is the resumable command machinery around it,
+spread thinly over half a million 5-byte commands rather than concentrated
+anywhere a single fix would reach. Removing the per-copy
+`memmove` call (7.9 % of the profile) was tried and reverted: three loop shapes
+were measured, LLVM rewrites two of them back into the same call, and the third
+— a wrapping-index byte loop that really does remove it — costs exactly what the
+call cost.
 
-Shrinking the ring recovers a large part of the gap in both rows, which
-localises the cost to the window's memory traffic rather than to the decode
-loop. The stored-meta-block row is the effect at its extreme: it is essentially
-a memcpy benchmark (12 GB/s in absolute terms) in which the one-shot decoder
-performs one copy — its output `Vec` *is* the window — and the bounded decoder
-performs two, into the ring and out to the caller. That second copy is not a
-defect to be optimised away; it is the price of not holding the whole body in
-memory. Run `cargo run --release --example decode_profile` to reproduce the
-whole table, including the window sweep, and
+Run `cargo run --release --example decode_profile` to reproduce the whole table
+(`PROFILE_ONLY`, `PROFILE_LGWIN`, `PROFILE_REPS`, and `PROFILE_PUSH_ONLY` /
+`PROFILE_ONE_SHOT_ONLY` for profiling one decoder at a time), and
 `cargo bench --bench brotli_bench -- brotli_decode_window` for the criterion
 version.
 

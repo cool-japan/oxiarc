@@ -15,14 +15,26 @@
 /// `ImageEncoder::write_data` can serialise a `&[C::Inner]` without a match
 /// on ten primitive types at every call site.
 pub trait TiffSample: Copy + 'static {
+    /// The `SampleFormat` (339) value a page of these samples must declare.
+    ///
+    /// Load-bearing, not decorative: the tag is what tells every reader
+    /// whether the bytes are unsigned, two's-complement or IEEE-754. A
+    /// `Gray32Float` page tagged `Uint` decodes as `u32` everywhere, with no
+    /// error to notice -- so this const is derived from the Rust sample type
+    /// here, once, rather than repeated on each of the thirty colour markers
+    /// where one could be wrong.
+    const SAMPLE_FORMAT: crate::tags::SampleFormat;
+
     /// Appends this value's native-endian bytes to `out`.
     fn push_ne_bytes(self, out: &mut Vec<u8>);
 }
 
 macro_rules! tiff_sample_impl {
-    ($($ty:ty),+ $(,)?) => {
+    ($($ty:ty => $format:expr),+ $(,)?) => {
         $(
             impl TiffSample for $ty {
+                const SAMPLE_FORMAT: crate::tags::SampleFormat = $format;
+
                 fn push_ne_bytes(self, out: &mut Vec<u8>) {
                     out.extend_from_slice(&self.to_ne_bytes());
                 }
@@ -31,7 +43,18 @@ macro_rules! tiff_sample_impl {
     };
 }
 
-tiff_sample_impl!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+tiff_sample_impl!(
+    u8 => crate::tags::SampleFormat::Uint,
+    i8 => crate::tags::SampleFormat::Int,
+    u16 => crate::tags::SampleFormat::Uint,
+    i16 => crate::tags::SampleFormat::Int,
+    u32 => crate::tags::SampleFormat::Uint,
+    i32 => crate::tags::SampleFormat::Int,
+    u64 => crate::tags::SampleFormat::Uint,
+    i64 => crate::tags::SampleFormat::Int,
+    f32 => crate::tags::SampleFormat::IeeeFp,
+    f64 => crate::tags::SampleFormat::IeeeFp,
+);
 
 /// A colour-type marker for [`super::encoder::TiffEncoder::new_image`].
 ///
@@ -44,6 +67,16 @@ pub trait ColorType {
     /// [`super::encoder::TiffEncoder::new_image`] builds an
     /// [`crate::ImageSpec`] from.
     const NATIVE: crate::ColorType;
+
+    /// The `SampleFormat` (339) value every channel of this marker declares.
+    ///
+    /// Upstream spells this `&'static [SampleFormat]`, one entry per
+    /// channel. Every marker in this module is homogeneous -- all channels
+    /// share [`Self::Inner`] -- so this is the single value, which the
+    /// encoder expands to one entry per channel. Defaulted from
+    /// [`Self::Inner`] so the thirty markers below cannot disagree with
+    /// their own sample type.
+    const SAMPLE_FORMAT: crate::tags::SampleFormat = <Self::Inner as TiffSample>::SAMPLE_FORMAT;
 }
 
 macro_rules! colortype_marker {

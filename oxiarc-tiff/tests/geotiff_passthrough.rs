@@ -1,5 +1,6 @@
 //! GeoTIFF tag passthrough against an external oracle: a fixture written by
-//! `tifffile` carries the six GeoTIFF tags, our reader loads them via
+//! `tifffile` carries four GeoTIFF tags (33550 `ModelPixelScale`, 33922
+//! `ModelTiepoint`, 34735 `GeoKeyDirectory`, 34737 `GeoAsciiParams`), our reader loads them via
 //! [`Decoder::geo_tags`], our writer re-emits them via
 //! [`GeoTags::to_extra_tags`], and `tiffinfo -D` -- an independent reader
 //! this crate did not write -- must print byte-identical tag *values* for
@@ -66,7 +67,7 @@ fn geotiff_tags_survive_tifffile_to_oxiarc_to_tiffinfo() {
     let source = dir.join("source.tif");
 
     // A source fixture only `tifffile` can write here (arbitrary numbered
-    // extra tags): the six-tag GeoTIFF core set, with real-looking values
+    // extra tags): the four GeoTIFF tags above, with real-looking values
     // -- not all-zero, so a transcription bug (byte order, count, a
     // truncated string) has something to actually get wrong.
     let script = format!(

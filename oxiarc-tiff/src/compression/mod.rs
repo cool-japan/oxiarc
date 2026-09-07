@@ -53,6 +53,13 @@ use crate::tags::{
     T6Options,
 };
 
+#[cfg(any(
+    feature = "deflate",
+    feature = "ccitt",
+    feature = "zstd",
+    feature = "lzma"
+))]
+mod pool;
 mod state;
 
 pub use state::CodecState;
@@ -85,6 +92,16 @@ pub struct CodecContext<'a> {
     pub t6_options: T6Options,
     /// `YCbCrSubSampling` (530), or `(1, 1)` when the image is not subsampled.
     pub ycbcr_subsampling: (u16, u16),
+    /// How often the JPEG encoder writes a restart marker, in **MCU rows**.
+    ///
+    /// `0` (the default, and libtiff's) writes no `DRI` segment and no
+    /// `RSTn` markers at all; `n` is `cjpeg -restart n`, resolved per scan.
+    /// Restart markers cost a few bytes per row and let a decoder resynchronise
+    /// after a corrupt MCU instead of losing the rest of the chunk.
+    ///
+    /// Decode ignores it: the interval a stream was coded with is in its own
+    /// `DRI` segment.
+    pub jpeg_restart_rows: u16,
     /// The abbreviated JPEG table stream from tag 347, if any.
     pub jpeg_tables: Option<&'a [u8]>,
     /// The old-style JPEG (compression 6) parameter tags, if any.
@@ -147,6 +164,7 @@ impl<'a> CodecContext<'a> {
             t4_options: T4Options::default(),
             t6_options: T6Options::default(),
             ycbcr_subsampling: (1, 1),
+            jpeg_restart_rows: 0,
             jpeg_tables: None,
             old_jpeg: None,
             endian,

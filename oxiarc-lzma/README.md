@@ -7,10 +7,47 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-07) — 252 tests passing (+ 10 doctests).
+**Version 0.4.2** (2026-09-07) — 275 tests passing (+ 11 doctests, 13 with
+`--all-features`).
 
 **What's new in 0.4.2**:
 
+- **A reusable decoder context, `xz::XzDecoder`.** `xz::decompress_into` is a
+  thin one-shot wrapper: every call parses a fresh `XzReader`, which starts
+  with no cached LZMA2 decoder and so rebuilds its dictionary buffer from
+  nothing. `XzDecoder::new()` / `.with_max_output(u64)` /
+  `.decompress_into(&mut self, src, dst)` / `.reset()` keeps that decoder
+  (dictionary buffer, probability model, coder state) allocated across
+  calls instead — the case this targets is TIFF `Compression = 34925`,
+  where every strip or tile of one image is its own complete `.xz` stream
+  and a large image can carry thousands of them, all sharing one dictionary
+  size. A stream declaring a different dictionary size still decodes
+  correctly; it just falls back to a fresh allocation, exactly like the
+  free function always does. `xz::decompress_into` /
+  `xz::decompress_with_limit` are unchanged, existing one-shot entry
+  points — `XzDecoder` is additive, not a replacement. Reuse is proven
+  byte-identical to always-fresh decoding (including across a dictionary
+  *size mismatch* mid-sequence) before it is measured for speed; a
+  criterion bench (`benches/xz_decoder_reuse.rs`, 1000 × 64 KiB same-shape
+  streams) compares reuse against fresh-per-call — on an otherwise-idle
+  machine this has measured as modestly faster (low single digits to
+  ~18%), but run it yourself for a number you can trust on your own
+  hardware rather than trusting a figure quoted here, since a build
+  machine under concurrent load can easily swing the two comparisons in
+  either direction. The LZMA2 probability model is reallocated fresh per
+  block by the format itself regardless of reuse (an independent XZ block
+  must reset its dictionary, state *and* properties), so only the
+  dictionary buffer's allocation is actually avoided; the win is real but
+  bounded at this payload size, and is reported honestly rather
+  than engineered to look larger.
+- **SHA-256 moved to `oxiarc_core::sha256`.** The `.xz` container's
+  `CheckType::Sha256` block check used to carry its own private FIPS 180-4
+  implementation; it now shares `oxiarc_core::sha256::Sha256` (`new`,
+  `update`, `finalize`, one-shot `compute`) with the rest of the ecosystem
+  — `oxiarc-http` can use the same implementation for the dictionary-hash
+  matching RFC 9842 (Compression Dictionary Transport) defines, without
+  depending on `oxiarc-lzma`. No wire-format or behavioural change; the
+  bytes a `CheckType::Sha256` stream carries are identical to before.
 - **New `oxiarc_lzma::xz` module — the `.xz` container lives here now.** The
   stream/block framing, index, and CRC-32 / CRC-64 / SHA-256 checks moved out
   of `oxiarc-archive/src/xz/`, which now re-exports this module unchanged

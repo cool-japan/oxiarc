@@ -202,8 +202,8 @@ pub mod tiff;
 
 pub use color::ColorSpace;
 pub use decoder::{
-    ComponentInfo, DecodeOptions, Decoder, ImageInfo, PixelFormat, Upsampling, decode_abbreviated,
-    decode_abbreviated_into, decode_abbreviated_into_u16,
+    ComponentInfo, DecodeOptions, Decoder, ImageInfo, PixelFormat, Scale, Upsampling,
+    decode_abbreviated, decode_abbreviated_into, decode_abbreviated_into_u16,
 };
 pub use downsample::Downsampling;
 pub use encoder::{

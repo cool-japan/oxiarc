@@ -527,6 +527,39 @@ impl<R: Read> BrotliDecompressor<R> {
         self
     }
 
+    /// Attach a shared (custom LZ77) dictionary.
+    ///
+    /// The source's backward references may then reach into `dictionary`; this
+    /// is the `Read`-shaped counterpart of
+    /// [`BrotliStream::with_dictionary`](crate::BrotliStream::with_dictionary)
+    /// and is what an HTTP client feeds a `Content-Encoding: dcb` body after
+    /// stripping its 36-byte header (see [`crate::dcb`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io::Read;
+    /// use oxiarc_brotli::{compress_with_dictionary, BrotliDecompressor, BrotliParams};
+    ///
+    /// let dictionary = b"a dictionary both peers hold".repeat(16);
+    /// let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+    /// let compressed =
+    ///     compress_with_dictionary(b"a dictionary both peers hold!", &dictionary, &params)
+    ///         .expect("compress");
+    ///
+    /// let mut out = Vec::new();
+    /// BrotliDecompressor::new(&compressed[..])
+    ///     .with_dictionary(dictionary)
+    ///     .read_to_end(&mut out)
+    ///     .expect("decompress");
+    /// assert_eq!(out, b"a dictionary both peers hold!");
+    /// ```
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Vec<u8>) -> Self {
+        self.stream = std::mem::take(&mut self.stream).with_dictionary(dictionary);
+        self
+    }
+
     /// Apply the builder settings to the decoder on first use.
     fn configure(&mut self) {
         if self.configured {

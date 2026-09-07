@@ -279,6 +279,146 @@ impl ByteOrder {
     }
 }
 
+/// `tiff`-0.11-shaped conversions on the tag-value type.
+///
+/// [`ValueBuffer`] is a re-export of the native [`crate::ifd::Value`], whose
+/// own accessors borrow and return `Option` (`as_bytes`, `first_u16`, ...).
+/// Upstream's are *consuming* and *fallible* (`into_u8_vec`, `into_u16`, ...),
+/// and callers ported from the `tiff` crate write them by those names -- for
+/// example `image` 0.25.10's XMP accessor is
+/// `decoder.get_tag(TAG_XML_PACKET)?.into_u8_vec()` and its orientation
+/// accessor is `v.into_u16()` (`codecs/tiff.rs:331` and `:341`).
+///
+/// These inherent methods are compiled **only** with the `compat` feature, so
+/// the native API keeps exactly one spelling per accessor when the facade is
+/// not built. Every one of them fails with
+/// [`TiffFormatError::InvalidTypeForTag`](super::error::TiffFormatError::InvalidTypeForTag)
+/// -- upstream's own error for this -- rather than returning `None`, and none
+/// of them can panic.
+impl crate::ifd::Value {
+    /// The `BYTE`/`UNDEFINED`/unknown-typed payload, as bytes.
+    ///
+    /// # Errors
+    /// [`TiffError::FormatError`](super::TiffError::FormatError) carrying
+    /// `InvalidTypeForTag` when the value is not byte-shaped.
+    pub fn into_u8_vec(self) -> super::error::TiffResult<Vec<u8>> {
+        match self {
+            Self::Byte(v) | Self::Undefined(v) | Self::Unknown { bytes: v, .. } => Ok(v),
+            other => Err(invalid_type_for_tag(&other)),
+        }
+    }
+
+    /// Every value widened to `u16`, when each one fits.
+    ///
+    /// # Errors
+    /// As [`Self::into_u8_vec`], plus the same error when a value does not
+    /// fit a `u16`.
+    pub fn into_u16_vec(self) -> super::error::TiffResult<Vec<u16>> {
+        narrow_vec(self, |v| u16::try_from(v).ok())
+    }
+
+    /// Every value widened to `u32`, when each one fits.
+    ///
+    /// # Errors
+    /// As [`Self::into_u16_vec`].
+    pub fn into_u32_vec(self) -> super::error::TiffResult<Vec<u32>> {
+        narrow_vec(self, |v| u32::try_from(v).ok())
+    }
+
+    /// Every value widened to `u64`.
+    ///
+    /// # Errors
+    /// As [`Self::into_u16_vec`].
+    pub fn into_u64_vec(self) -> super::error::TiffResult<Vec<u64>> {
+        narrow_vec(self, Some)
+    }
+
+    /// Every numeric value as an `f64` (rationals resolved).
+    ///
+    /// # Errors
+    /// As [`Self::into_u8_vec`], for a value with no numeric reading.
+    pub fn into_f64_vec(self) -> super::error::TiffResult<Vec<f64>> {
+        match self.as_f64_vec() {
+            Some(values) => Ok(values),
+            None => Err(invalid_type_for_tag(&self)),
+        }
+    }
+
+    /// The first value narrowed to `u16`.
+    ///
+    /// # Errors
+    /// As [`Self::into_u16_vec`], plus the same error for an empty value.
+    pub fn into_u16(self) -> super::error::TiffResult<u16> {
+        narrow_first(self, |v| u16::try_from(v).ok())
+    }
+
+    /// The first value narrowed to `u32`.
+    ///
+    /// # Errors
+    /// As [`Self::into_u16`].
+    pub fn into_u32(self) -> super::error::TiffResult<u32> {
+        narrow_first(self, |v| u32::try_from(v).ok())
+    }
+
+    /// The first value widened to `u64`.
+    ///
+    /// # Errors
+    /// As [`Self::into_u16`].
+    pub fn into_u64(self) -> super::error::TiffResult<u64> {
+        narrow_first(self, Some)
+    }
+
+    /// The text of an `ASCII` value.
+    ///
+    /// # Errors
+    /// As [`Self::into_u8_vec`], for a value that is not `ASCII`.
+    pub fn into_string(self) -> super::error::TiffResult<String> {
+        match self {
+            Self::Ascii(text) => Ok(text),
+            other => Err(invalid_type_for_tag(&other)),
+        }
+    }
+}
+
+/// The error every conversion above reports, naming the type that was
+/// actually present so the message is diagnosable.
+fn invalid_type_for_tag(value: &crate::ifd::Value) -> super::TiffError {
+    super::TiffError::FormatError(super::error::TiffFormatError::InvalidTypeForTag {
+        found: value.ty_raw(),
+    })
+}
+
+/// Widens to `u64` then narrows every element with `narrow`, failing rather
+/// than truncating or dropping an element that does not fit.
+fn narrow_vec<T>(
+    value: crate::ifd::Value,
+    narrow: impl Fn(u64) -> Option<T>,
+) -> super::error::TiffResult<Vec<T>> {
+    let Some(wide) = value.as_u64_vec() else {
+        return Err(invalid_type_for_tag(&value));
+    };
+    let mut out = Vec::with_capacity(wide.len());
+    for item in wide {
+        match narrow(item) {
+            Some(narrowed) => out.push(narrowed),
+            None => return Err(invalid_type_for_tag(&value)),
+        }
+    }
+    Ok(out)
+}
+
+/// [`narrow_vec`] for the first element only; an empty value is an error, not
+/// a silent zero.
+fn narrow_first<T>(
+    value: crate::ifd::Value,
+    narrow: impl Fn(u64) -> Option<T>,
+) -> super::error::TiffResult<T> {
+    match value.first_u64().and_then(&narrow) {
+        Some(narrowed) => Ok(narrowed),
+        None => Err(invalid_type_for_tag(&value)),
+    }
+}
+
 impl Tag {
     pub(crate) const fn to_native(self) -> crate::tags::Tag {
         crate::tags::Tag::from_u16(self.to_u16())

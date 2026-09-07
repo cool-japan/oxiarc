@@ -7,11 +7,11 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 130 tests passing: 119 via nextest (incl. libtiff/Pillow differential oracles) + 11 doctests**
+**Version: 0.4.2 (2026-09-08) | 211 tests passing: 190 via nextest (incl. libtiff/Pillow and `compress(1)` differential oracles) + 21 doctests**
 
 ## Overview
 
-LZW is a dictionary-based compression algorithm used in TIFF images, GIF animations, and legacy Unix compress. This implementation provides both TIFF-style (MSB-first) and GIF-style (LSB-first) bit packing, with dedicated GIF LZW codec support via the `gif_lzw` module.
+LZW is a dictionary-based compression algorithm used in TIFF images, GIF animations and the legacy UNIX `compress` (`.Z`) format. This implementation provides both bit packings — MSB-first (TIFF) and LSB-first (GIF, `.Z`) — selected explicitly by `LzwConfig::bit_order`, code widths from 9 to 16 bits, a dedicated GIF LZW codec (`gif_lzw`) and a complete `.Z` container codec (`z`) that is byte-identical to `compress(1)`.
 
 
 ## Features
@@ -21,12 +21,14 @@ LZW is a dictionary-based compression algorithm used in TIFF images, GIF animati
 - **GIF support** - LSB-first bit ordering for GIF animations via `gif_lzw` module
 - **GIF LZW codec** - Dedicated `gif_compress`/`gif_decompress` functions conforming to GIF spec §22
 - **LSB bitstream** - `bitstream_lsb` module with `LsbBitWriter`/`LsbBitReader` for GIF-compatible bit packing
-- **Configurable** - Adjustable code width (9-12 bits)
+- **UNIX `compress` / `.Z`** - Complete container codec in the `z` module: `1F 9D` header, block mode, code widths 9-16, `ZReader`/`ZWriter` adapters. Output is byte-identical to `compress -b N -c` and is accepted by `gzip -dc`/`uncompress -c` (`Content-Encoding: compress`)
+- **Explicit bit order** - `LzwConfig::bit_order` (`LzwBitOrder::{Msb, Lsb}`) drives every generic entry point, so `LzwConfig::GIF` really decodes LSB-first and `LzwConfig::TIFF_COMPAT_LSB` reads libtiff's pre-1993 `LZWDecodeCompat` strips
+- **Configurable** - Adjustable code width (9-16 bits; 12 is the TIFF/GIF ceiling, 16 the `compress` one)
 - **Early change** - Code width increases before table full
 - **Zero-allocation strip decode** - `decompress_tiff_into(src, &mut dst)` expands codes straight into a caller-supplied buffer through a prefix/suffix code table; no allocation per decoded code, and none at all beyond the fixed table (see below)
 - **Old-style LZW** - `LzwConfig::TIFF_OLD_STYLE` decodes streams written with the standard (late) code-width change instead of TIFF's early change, i.e. writers that followed TIFF 6.0's pseudo-code literally
 - **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs`, `tests/tiffcp_strip_decode.rs` and the pinned fixtures in `tests/data/`)
-- **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs
+- **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs, for the generic codec and for `.Z`
 
 All features are implemented and tested. API is stable. `LzwConfig` implements `Default` (returning the TIFF preset), and `LzwError` is `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over it need a wildcard arm.
 
@@ -167,12 +169,20 @@ assert_eq!(reader.read_bits(4), Some(0b1100));
 
 ## Configuration
 
-`LzwConfig` selects clear-code/early-change semantics for the generic
-`compress`/`decompress`/`LzwEncoder`/`LzwDecoder` API, which always packs
-codes MSB-first. GIF's LSB-first bit ordering and variable minimum code size
-are handled separately by the dedicated `gif_compress`/`gif_decompress`
-functions (or `LzwStreamMode::Gif` in the streaming API) — see the GIF LZW
-Codec section above.
+`LzwConfig` selects the clear-code/early-change semantics, the code-width
+range (`min_bits` 9, `max_bits` 9-16) **and the bit order** for the generic
+`compress`/`decompress`/`decompress_into`/`LzwEncoder`/`LzwDecoder` API. GIF's
+variable minimum code size and sub-block framing are still handled separately
+by the dedicated `gif_compress`/`gif_decompress` functions (or
+`LzwStreamMode::Gif` in the streaming API) — see the GIF LZW Codec section
+above.
+
+| Preset | Bit order | Width rule |
+|---|---|---|
+| `LzwConfig::TIFF` | MSB-first | early change (libtiff/Pillow/GDAL) |
+| `LzwConfig::TIFF_OLD_STYLE` | MSB-first | standard (late) change |
+| `LzwConfig::TIFF_COMPAT_LSB` | LSB-first | standard change (libtiff `LZWDecodeCompat`) |
+| `LzwConfig::GIF` | LSB-first | standard change |
 
 ### TIFF Mode
 
@@ -186,16 +196,84 @@ let config = LzwConfig::TIFF;
 // entry 4094) and early code change — libtiff/Pillow/GDAL-compatible
 ```
 
-### GIF-flavored Mode (still MSB-first)
+### GIF-flavored Mode (LSB-first since 0.4.2)
 
 ```rust
-use oxiarc_lzw::LzwConfig;
+use oxiarc_lzw::{LzwBitOrder, LzwConfig};
 
 let config = LzwConfig::GIF;
-// MSB-first bit ordering (same bitstream as TIFF mode)
+assert_eq!(config.bit_order, LzwBitOrder::Lsb);
+// LSB-first bit ordering (GIF's packing, not TIFF's)
 // 9-12 bit codes
 // Uses a clear code; standard (non-early) code change
 ```
+
+**Breaking behaviour change in 0.4.2:** before this release `LzwConfig` had no
+`bit_order` field, so `LzwConfig::GIF` and `LzwConfig::TIFF_OLD_STYLE` were
+*literally the same value* and `decompress(_, _, LzwConfig::GIF)` silently
+decoded MSB-first. They are now different configurations that decode the same
+bytes differently. Code that used `LzwConfig::GIF` to read an MSB-first
+stream must switch to `LzwConfig::TIFF_OLD_STYLE`.
+
+### Wide code widths
+
+```rust
+use oxiarc_lzw::{LzwBitOrder, LzwConfig};
+
+let config = LzwConfig::new(9, 16)?.with_bit_order(LzwBitOrder::Lsb);
+assert_eq!(config.max_code(), 65535);
+```
+
+Widths above 12 keep the dictionary growing where the TIFF/GIF ceiling would
+force a reset; a 16-bit table costs about 640 KiB.
+
+## UNIX `compress` / `.Z` (New in 0.4.2)
+
+The `z` module is a complete codec for the container `compress(1)`,
+`ncompress` and `gzip -Z` write, and the coding HTTP calls `compress` /
+`x-compress` (RFC 9110 §8.4.1.1):
+
+```rust
+use std::io::{Read, Write};
+use oxiarc_lzw::z::{ZHeader, ZReader, ZWriter, compress, decompress, decompress_with_limit};
+
+let original = b"UNIX compress round trip. ".repeat(64);
+
+// One-shot: `compress(data, max_bits)` is `compress -b max_bits`, byte for byte.
+let stream = compress(&original, 16)?;
+assert_eq!(&stream[..2], &[0x1F, 0x9D]);
+assert_eq!(ZHeader::parse(&stream)?.max_bits, 16);
+assert_eq!(decompress(&stream)?, original);
+
+// Untrusted input: bound the output, enforced *while* decoding.
+assert!(decompress_with_limit(&stream, 8).is_err());
+
+// Streaming adapters
+let mut writer = ZWriter::new(Vec::new(), 16)?;
+writer.write_all(&original)?;
+let stream = writer.finish()?;
+let mut out = Vec::new();
+ZReader::new(&stream[..]).with_max_output(1 << 20).read_to_end(&mut out)?;
+assert_eq!(out, original);
+```
+
+Format notes that bite everyone who implements this once:
+
+- **No end-of-information code.** A truncated `.Z` decodes to a *prefix* and
+  returns `Ok` — the same thing `gzip -dc` does. Completeness has to come
+  from the transport.
+- **Codes are packed LSB-first in groups of eight.** On a width increase or a
+  block-mode reset the writer pads the group and the reader skips the padding.
+- **Block mode** (bit 7 of the third header byte, set by every `compress(1)`
+  in circulation) makes code 256 a table reset; without it 256 is an ordinary
+  entry. `compress_with_block_mode` writes either dialect.
+- **The output is unbounded** unless you ask for a limit: use
+  `decompress_with_limit`, `decompress_into` or `ZReader::with_max_output`.
+
+| | one-shot | streaming |
+|---|---|---|
+| decode | `decompress`, `decompress_with_limit`, `decompress_into` | `ZReader` |
+| encode | `compress`, `compress_with_block_mode` | `ZWriter` |
 
 ## API
 
@@ -261,13 +339,21 @@ decoder.read_to_end(&mut decompressed)?;
 assert_eq!(decompressed, data);
 ```
 
+`LzwStreamMode::Config(LzwConfig)` (new in 0.4.2) carries an explicit bit
+order and code width through the same adapters;
+`LzwStreamMode::Config(LzwConfig::TIFF)` is byte-identical to
+`LzwStreamMode::Tiff`. For `.Z` streams use `z::ZReader`/`z::ZWriter`, which
+speak the real container rather than this crate's frame header.
+
 ## Algorithm
 
 LZW builds a dictionary dynamically:
 1. **Start with single-byte codes** (0-255)
 2. **Add new patterns** to dictionary on-the-fly
-3. **Variable-width codes** - Grows from 9 to 12 bits
-4. **Table reset** - Clear dictionary when full (4096 entries)
+3. **Variable-width codes** - Grows from 9 bits to `max_bits` (12 for
+   TIFF/GIF, up to 16 for `.Z`)
+4. **Table reset** - Clear dictionary when full (4096 entries at 12 bits,
+   65536 at 16)
 
 ### Code Structure
 
@@ -275,13 +361,17 @@ LZW builds a dictionary dynamically:
 |------------|---------|
 | 0-255 | Literal bytes |
 | 256 | Clear code (reset dictionary) |
-| 257-4095 | Dictionary entries |
+| 257-4095 | Dictionary entries (257-65535 at `max_bits` 16) |
+
+`.Z` differs: there is no EOI code, and code 256 is a table reset only when
+the header's block-mode flag is set.
 
 ## Features (Cargo)
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `tiff-oracle` | off | Enables differential oracle tests (`tests/tiff_lzw_oracle.rs`) that validate TIFF-LZW interop against Pillow/libtiff in both directions; tests self-skip when `python3`+Pillow are absent. Test-only — the library compiles identically either way. |
+| `z-oracle` | off | Enables the `.Z` differential oracle (`tests/z_oracle.rs`) against the system `compress`/`uncompress`/`gzip -dc`: real `compress -b N` output must decode byte-identically, and this crate's output must be byte-identical to (and accepted by) the reference tools. Self-skips when the tools are absent. Test-only. |
 
 ```toml
 [dependencies]
@@ -292,7 +382,8 @@ oxiarc-lzw = "0.4.2"
 
 - **TIFF images** - LZW is one of the standard TIFF compression methods
 - **GIF animations** - Original GIF compression format (including full GIF LZW codec)
-- **Legacy data** - Unix `.Z` files (compress/uncompress)
+- **Legacy data** - UNIX `.Z` files (`compress`/`uncompress`), read and written natively by the `z` module
+- **HTTP** - `Content-Encoding: compress` / `x-compress` bodies
 
 ## Part of OxiArc
 

@@ -82,22 +82,22 @@ impl<'a> BitReader<'a> {
     /// followed the chunk in memory.
     pub(super) fn peek(&self, count: u8) -> u16 {
         debug_assert!(count <= 16);
-        let mut value = 0u32;
-        let mut taken = 0u8;
-        let mut bit = self.pos;
-        while taken < count {
-            let index = bit / 8;
-            let offset = bit % 8;
-            let byte = u32::from(self.byte(index));
-            let available = 8 - offset;
-            let take = u8::min(count - taken, available as u8);
-            let shift = available - take as usize;
-            let mask = (1u32 << take) - 1;
-            value = (value << take) | ((byte >> shift) & mask);
-            taken += take;
-            bit += take as usize;
+        if count == 0 {
+            return 0;
         }
-        value as u16
+        // Three bytes always cover sixteen bits at any bit offset, so one
+        // shift-and-mask replaces the byte-at-a-time loop this used to run.
+        // The fax decoder calls this once per code word — a few million times
+        // for a page — so the loop showed up in profiles.
+        let index = self.pos >> 3;
+        let offset = (self.pos & 7) as u32;
+        let window = (u32::from(self.byte(index)) << 16)
+            | (u32::from(self.byte(index + 1)) << 8)
+            | u32::from(self.byte(index + 2));
+        // `offset <= 7` and `count <= 16`, so the shift is `1..=24`.
+        let shift = 24 - offset - u32::from(count);
+        let mask = (1u32 << count) - 1;
+        ((window >> shift) & mask) as u16
     }
 
     /// Drops `count` bits.

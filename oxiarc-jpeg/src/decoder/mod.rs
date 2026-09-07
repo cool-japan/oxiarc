@@ -34,6 +34,114 @@ pub enum Upsampling {
     Box,
 }
 
+/// A reduced- or enlarged-scale IDCT output size: libjpeg's `-scale M/N`
+/// with `N` fixed at 8, the DCT block size.
+///
+/// Each `8x8` block of decoded coefficients reconstructs to `M x M` output
+/// samples instead of the native `8x8`, through the same scaled-IDCT
+/// machinery libjpeg uses — there is no separate resize pass, and the
+/// entropy decode is completely unaffected: every coefficient is still
+/// decoded, only the final reconstruction changes. `M` in `1..=4` shrinks the
+/// image (`1/8`, `1/4`, `3/8`, `1/2`, ...); `M == 8` is native resolution;
+/// `M` in `9..=16` enlarges it.
+///
+/// The frame's output dimensions are `ceil(width * M / 8)` and
+/// `ceil(height * M / 8)`, exactly as libjpeg computes them — see
+/// [`ImageInfo::scaled_width`] and [`ImageInfo::scaled_height`].
+///
+/// Byte parity with `djpeg -dct int -scale M/8` is verified for
+/// `M` in `{1, 2, 4, 8}`, which libjpeg reconstructs with dedicated `1x1`,
+/// `2x2`, `4x4` and (the native, unscaled) `8x8` kernels. The other twelve
+/// values each get their own hand-derived fixed-point kernel in libjpeg
+/// (`jidctint.c`'s `jpeg_idct_3x3` .. `jpeg_idct_16x16`); this crate uses one
+/// general kernel for all of them instead and verifies it against `djpeg`
+/// to a numeric tolerance rather than byte parity — see the crate's
+/// `README.md` for the measured error and the reasoning.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), oxiarc_jpeg::JpegError> {
+/// use oxiarc_jpeg::Scale;
+///
+/// assert_eq!(Scale::default(), Scale::FULL);
+/// assert_eq!(Scale::FULL.numerator(), 8);
+/// assert_eq!(Scale::ONE_QUARTER.numerator(), 2);
+/// assert_eq!(Scale::new(3)?.numerator(), 3);
+/// assert!(Scale::new(0).is_err());
+/// assert!(Scale::new(17).is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Scale {
+    numerator: u8,
+}
+
+impl Scale {
+    /// `8/8`: native resolution. The default, and what every release before
+    /// this option existed always produced.
+    pub const FULL: Scale = Scale { numerator: 8 };
+    /// `4/8` = `1/2`.
+    pub const ONE_HALF: Scale = Scale { numerator: 4 };
+    /// `2/8` = `1/4`.
+    pub const ONE_QUARTER: Scale = Scale { numerator: 2 };
+    /// `1/8`.
+    pub const ONE_EIGHTH: Scale = Scale { numerator: 1 };
+
+    /// `numerator / 8`, matching libjpeg's `-scale numerator/8`.
+    ///
+    /// # Errors
+    ///
+    /// [`JpegError::InvalidDecodeParameter`] when `numerator` is `0` or
+    /// greater than `16` — the range every reduced- and enlarged-scale IDCT
+    /// kernel libjpeg defines covers, and the only range this crate
+    /// implements a kernel for.
+    pub fn new(numerator: u8) -> Result<Self> {
+        if (1..=16).contains(&numerator) {
+            Ok(Self { numerator })
+        } else {
+            Err(JpegError::InvalidDecodeParameter {
+                parameter: "scale",
+                reason: "numerator must be 1..=16 (libjpeg's -scale M/8)",
+            })
+        }
+    }
+
+    /// The `M` in `M/8`, always `1..=16`.
+    #[must_use]
+    pub const fn numerator(self) -> u8 {
+        self.numerator
+    }
+
+    /// Always `8`: this crate exposes libjpeg's `-scale M/N` only for the
+    /// `N == 8` family (every `M` libjpeg itself defines a kernel for).
+    #[must_use]
+    pub const fn denominator(self) -> u8 {
+        8
+    }
+
+    /// `true` for [`Scale::FULL`], the only value that changes nothing.
+    #[must_use]
+    pub const fn is_full(self) -> bool {
+        self.numerator == 8
+    }
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        Scale::FULL
+    }
+}
+
+/// `ceil(dim * numerator / 8)`, libjpeg's `jdiv_round_up` applied to its
+/// `output_width`/`output_height` formula. `numerator` is a [`Scale`]'s, so
+/// `1..=16`; `dim` is a frame's `width` or `height`, so the product fits
+/// comfortably in `u32` (`0xFFFF * 16 = 0xFFFF0`).
+pub(crate) const fn scaled_dim(dim: u16, numerator: u8) -> u32 {
+    (dim as u32 * numerator as u32).div_ceil(8)
+}
+
 /// Options that control one decode.
 ///
 /// The struct is deliberately *not* `#[non_exhaustive]` so that callers can
@@ -56,6 +164,15 @@ pub struct DecodeOptions {
     pub raw_components: bool,
     /// Which upsampling kernel to use.
     pub upsampling: Upsampling,
+    /// Reduced- or enlarged-scale decode via the scaled IDCT, libjpeg's
+    /// `-scale M/8`. [`Scale::FULL`] (the default) decodes at native
+    /// resolution, unchanged from every release before this option existed.
+    ///
+    /// Ignored for a lossless frame (`SOF3`/`SOF11`): T.81's lossless mode has
+    /// no DCT to scale, and libjpeg hardwires "no scaling" for it too, so a
+    /// lossless decode always produces `width x height` regardless of this
+    /// field.
+    pub scale: Scale,
     /// Return what was decoded when the entropy data ends early, instead of
     /// reporting [`JpegError::UnexpectedEof`].
     pub tolerate_truncated: bool,
@@ -68,6 +185,7 @@ impl Default for DecodeOptions {
             output_color_space: None,
             raw_components: false,
             upsampling: Upsampling::Fancy,
+            scale: Scale::FULL,
             tolerate_truncated: false,
         }
     }
@@ -110,10 +228,25 @@ pub struct ComponentInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ImageInfo {
-    /// Frame width `X`.
+    /// Frame width `X`, as the `SOF` (and `DNL`, if any) declared it —
+    /// **not** affected by [`DecodeOptions::scale`]. Use
+    /// [`ImageInfo::scaled_width`] to size a decode buffer.
     pub width: u16,
     /// Frame height `Y`, already resolved through `DNL` if the `SOF` said 0.
+    /// Like [`ImageInfo::width`], unaffected by [`DecodeOptions::scale`].
     pub height: u16,
+    /// Output width once [`DecodeOptions::scale`] is applied:
+    /// `ceil(width * scale.numerator() / 8)`, libjpeg's `output_width`. Equal
+    /// to `width` at [`Scale::FULL`], and always equal to `width` for a
+    /// lossless frame (`scale` is ignored there — see
+    /// [`DecodeOptions::scale`]).
+    ///
+    /// This is the width a decode actually produces: what
+    /// [`Decoder::output_buffer_size`], [`Decoder::decode`] and
+    /// [`Decoder::decode_into_strided`]'s row length are all sized from.
+    pub scaled_width: u32,
+    /// The height counterpart of [`ImageInfo::scaled_width`].
+    pub scaled_height: u32,
     /// Sample precision `P`.
     pub precision: u8,
     /// Number of components `Nf`.
@@ -312,10 +445,14 @@ impl<R: Read> Decoder<R> {
 
     /// Number of samples the decoded image occupies, or `None` before
     /// [`Decoder::read_info`].
+    ///
+    /// Reflects [`DecodeOptions::scale`]: sized from
+    /// [`ImageInfo::scaled_width`]/[`ImageInfo::scaled_height`], not
+    /// [`ImageInfo::width`]/[`ImageInfo::height`].
     #[must_use]
     pub fn output_buffer_size(&self) -> Option<usize> {
         let info = self.engine.info?;
-        Some(usize::from(info.width) * usize::from(info.height) * info.output_components())
+        Some(info.scaled_width as usize * info.scaled_height as usize * info.output_components())
     }
 
     /// The pixel format a decode will produce.
@@ -353,6 +490,20 @@ impl<R: Read> Decoder<R> {
     ///
     /// This is the entry point a tiled TIFF reader wants: the destination can
     /// be a sub-rectangle of a larger image, so no per-tile copy is needed.
+    ///
+    /// `stride` is in **samples**, so it is `width * components` for a packed
+    /// destination and larger for a sub-rectangle. Only the first
+    /// `width * components` samples of each row are written; the padding
+    /// between rows is left exactly as the caller left it.
+    ///
+    /// # Errors
+    ///
+    /// [`JpegError::BufferTooSmall`] when `stride` is narrower than one row,
+    /// when `out` holds fewer than `stride * (height - 1) + width * components`
+    /// samples, or when that product does not fit a `usize` — an absurd
+    /// `stride` is reported, never multiplied.
+    /// [`JpegError::PrecisionMismatch`] for a frame wider than eight bits; use
+    /// [`Decoder::decode_into_u16_strided`] for those.
     pub fn decode_into_strided(&mut self, out: &mut [u8], stride: usize) -> Result<()> {
         self.run()?;
         let plan = self.engine.plan()?;
@@ -381,6 +532,9 @@ impl<R: Read> Decoder<R> {
 
     /// Decode into a caller-owned 16-bit buffer whose rows are `stride`
     /// elements apart.
+    ///
+    /// The bounds rules of [`Decoder::decode_into_strided`] apply unchanged,
+    /// counted in `u16` elements rather than bytes.
     pub fn decode_into_u16_strided(&mut self, out: &mut [u16], stride: usize) -> Result<()> {
         self.run()?;
         let plan = self.engine.plan()?;
@@ -483,7 +637,10 @@ impl<R: Read> Decoder<R> {
                 got: stride,
             });
         }
-        let need = required_len(stride, width, plan.height);
+        let need = required_len(stride, width, plan.height).ok_or(JpegError::BufferTooSmall {
+            need: usize::MAX,
+            got: out.len(),
+        })?;
         if out.len() < need {
             return Err(JpegError::BufferTooSmall {
                 need,
@@ -513,7 +670,10 @@ fn write_u16(
             got: stride,
         });
     }
-    let need = required_len(stride, width, plan.height);
+    let need = required_len(stride, width, plan.height).ok_or(JpegError::BufferTooSmall {
+        need: usize::MAX,
+        got: out.len(),
+    })?;
     if out.len() < need {
         return Err(JpegError::BufferTooSmall {
             need,
@@ -528,12 +688,15 @@ fn write_u16(
 
 /// Elements a strided destination must hold: full strides for every row but
 /// the last, which only needs its own samples.
-fn required_len(stride: usize, width: usize, height: usize) -> usize {
+///
+/// `None` when the product does not fit a `usize`, which no buffer could
+/// satisfy; the callers turn that into [`JpegError::BufferTooSmall`] rather
+/// than letting the multiplication overflow.
+fn required_len(stride: usize, width: usize, height: usize) -> Option<usize> {
     if height == 0 {
-        0
-    } else {
-        stride * (height - 1) + width
+        return Some(0);
     }
+    stride.checked_mul(height - 1)?.checked_add(width)
 }
 
 /// Decode a scan-only abbreviated datastream with out-of-band tables.
@@ -575,7 +738,10 @@ pub fn decode_abbreviated_into(
     }
     let plan = engine.plan()?;
     let width = plan.row_len();
-    let need = required_len(width, width, plan.height);
+    let need = required_len(width, width, plan.height).ok_or(JpegError::BufferTooSmall {
+        need: usize::MAX,
+        got: out.len(),
+    })?;
     if out.len() < need {
         return Err(JpegError::BufferTooSmall {
             need,
@@ -644,9 +810,12 @@ mod tests {
 
     #[test]
     fn required_len_leaves_the_last_row_short() {
-        assert_eq!(required_len(10, 6, 3), 26);
-        assert_eq!(required_len(6, 6, 3), 18);
-        assert_eq!(required_len(10, 6, 0), 0);
+        assert_eq!(required_len(10, 6, 3), Some(26));
+        assert_eq!(required_len(6, 6, 3), Some(18));
+        assert_eq!(required_len(10, 6, 0), Some(0));
+        // A stride no buffer could satisfy is reported, never multiplied.
+        assert_eq!(required_len(usize::MAX, 6, 2), None);
+        assert_eq!(required_len(usize::MAX / 2, 6, 3), None);
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub struct LsbBitReader<'a> {
     buffer: u64,
     /// Number of valid bits currently in `buffer`.
     bits_in_buffer: usize,
+    /// Total bits handed out by [`LsbBitReader::read_bits`] so far.
+    total_bits_read: u64,
 }
 
 impl<'a> LsbBitReader<'a> {
@@ -84,6 +86,7 @@ impl<'a> LsbBitReader<'a> {
             pos: 0,
             buffer: 0,
             bits_in_buffer: 0,
+            total_bits_read: 0,
         }
     }
 
@@ -108,8 +111,14 @@ impl<'a> LsbBitReader<'a> {
         let code = (self.buffer & mask) as u16;
         self.buffer >>= bits;
         self.bits_in_buffer -= bits;
+        self.total_bits_read += bits as u64;
 
         Some(code)
+    }
+
+    /// Total number of bits consumed by successful [`Self::read_bits`] calls.
+    pub fn bits_read(&self) -> u64 {
+        self.total_bits_read
     }
 
     /// Return `true` if all input bytes have been consumed and the internal

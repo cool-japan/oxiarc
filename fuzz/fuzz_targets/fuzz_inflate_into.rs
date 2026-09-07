@@ -23,7 +23,11 @@ fuzz_target!(|data: &[u8]| {
     match (&vec_result, &into_result) {
         (Ok(expected), Ok(n)) => {
             assert_eq!(expected.len(), *n, "length mismatch between decode paths");
-            assert_eq!(&expected[..], &scratch[..*n], "byte mismatch between decode paths");
+            assert_eq!(
+                &expected[..],
+                &scratch[..*n],
+                "byte mismatch between decode paths"
+            );
         }
         (Ok(expected), Err(_)) => {
             // Only a genuine overflow of the fixed buffer may differ.

@@ -1,16 +1,19 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-completion 1  "oxiarc-completion " 
+.TH oxiarc-completion 1  "oxiarc-completion 0.4.2" 
 .SH NAME
 oxiarc\-completion \- Generate shell completion scripts
 .SH SYNOPSIS
-\fBoxiarc\-completion\fR [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR> 
+\fBoxiarc\-completion\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISHELL\fR> 
 .SH DESCRIPTION
 Generate shell completion scripts
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
 .TP
 <\fISHELL\fR>
 Shell to generate completions for
@@ -30,3 +33,5 @@ powershell
 .IP \(bu 2
 zsh
 .RE
+.SH VERSION
+v0.4.2

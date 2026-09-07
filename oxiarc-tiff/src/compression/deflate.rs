@@ -25,6 +25,13 @@
 //! which keeps the window allocated. Without a state the codec still works; it
 //! just allocates per chunk.
 //!
+//! The cache is a [`Pool`](super::pool::Pool), not a single slot: a worker
+//! takes a machine out for the length of its chunk and puts it back after, so
+//! a `rayon` decode of a Deflate page runs one machine per worker instead of
+//! queueing every worker behind one mutex. `reset()` before every chunk is
+//! what makes that safe — it clears the whole stream state, so a machine
+//! carries nothing but its allocations from the chunk before.
+//!
 //! ```
 //! use oxiarc_tiff::compression::{decode_into, encode, CodecContext, CodecLevel};
 //! use oxiarc_tiff::{CompressionMethod, Endian};
@@ -38,12 +45,11 @@
 //! # Ok::<(), oxiarc_tiff::TiffError>(())
 //! ```
 
-use std::sync::{Mutex, PoisonError};
-
 use oxiarc_core::traits::FlushMode;
 use oxiarc_deflate::wrapper::{InflateWrapper, TrailingPolicy, WrappedInflate};
 use oxiarc_deflate::{InflateStatus, zlib::zlib_compress};
 
+use super::pool::Pool;
 use super::{CodecContext, CodecLevel, codec_error};
 use crate::error::Result;
 use crate::tags::CompressionMethod;
@@ -51,46 +57,44 @@ use crate::tags::CompressionMethod;
 /// The zlib level used when the caller asked for no particular effort.
 const DEFAULT_LEVEL: u8 = 6;
 
-/// A cached [`WrappedInflate`], kept across the chunks of one image.
+/// Cached [`WrappedInflate`] machines, kept across the chunks of one image.
 ///
-/// The `bool` records which `verify_checksum` setting the cached machine was
+/// The `bool` records which `verify_checksum` setting each cached machine was
 /// built with: that knob is a consuming builder, so a change of leniency
-/// rebuilds rather than mutates.
+/// rebuilds rather than mutates. Leniency is fixed for the length of one
+/// decode call, so the rebuild costs at most one machine per pool entry and
+/// never thrashes.
 #[derive(Default)]
-pub(crate) struct InflateSlot(Mutex<Option<(bool, WrappedInflate)>>);
+pub(crate) struct InflateSlot(Pool<(bool, WrappedInflate)>);
 
 impl core::fmt::Debug for InflateSlot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let held = self
-            .0
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().is_some());
+        let held = self.0.inspect(|entries| {
+            entries
+                .iter()
+                .map(|(verify, _)| *verify)
+                .collect::<Vec<_>>()
+        });
         f.debug_tuple("InflateSlot").field(&held).finish()
     }
 }
 
 impl InflateSlot {
-    /// Runs `body` on a machine configured for `verify`, reusing the cached
-    /// one when its configuration matches.
+    /// Runs `body` on a machine configured for `verify`, reusing a pooled one
+    /// when its configuration matches.
     fn with<T>(&self, verify: bool, body: impl FnOnce(&mut WrappedInflate) -> T) -> T {
-        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let rebuild = match guard.as_ref() {
-            Some((cached, _)) => *cached != verify,
-            None => true,
+        let mut stream = match self.0.take() {
+            Some((cached, stream)) if cached == verify => stream,
+            // Either the pool was empty or the machine in it was built for the
+            // other leniency; a rebuilt machine replaces it.
+            _ => build(verify),
         };
-        if rebuild {
-            *guard = Some((verify, build(verify)));
-        }
-        match guard.as_mut() {
-            Some((_, stream)) => {
-                stream.reset();
-                body(stream)
-            }
-            // Unreachable: the slot was just filled. Falling back to a fresh
-            // machine keeps the function total without an `unwrap`.
-            None => body(&mut build(verify)),
-        }
+        // `reset()` before, not after: a machine put back mid-stream by a
+        // failed chunk must not hand its state to the next one.
+        stream.reset();
+        let out = body(&mut stream);
+        self.0.put((verify, stream));
+        out
     }
 }
 
@@ -319,12 +323,56 @@ mod tests {
     }
 
     #[test]
-    fn the_slot_debug_impl_reports_whether_a_machine_is_cached() {
+    fn the_pool_reports_the_machines_it_holds() {
         let slot = InflateSlot::default();
-        assert_eq!(format!("{slot:?}"), "InflateSlot(false)");
+        assert_eq!(format!("{slot:?}"), "InflateSlot([])");
         slot.with(true, |_| ());
-        assert_eq!(format!("{slot:?}"), "InflateSlot(true)");
-        // A different verify setting rebuilds rather than reuses.
+        assert_eq!(format!("{slot:?}"), "InflateSlot([true])");
+        // A different verify setting rebuilds rather than reuses, and the
+        // stale machine is not kept alongside the new one.
         slot.with(false, |stream| assert!(!stream.is_finished()));
+        assert_eq!(format!("{slot:?}"), "InflateSlot([false])");
+        // Back to the first setting: one machine again, rebuilt again.
+        slot.with(true, |_| ());
+        assert_eq!(format!("{slot:?}"), "InflateSlot([true])");
+    }
+
+    #[test]
+    fn two_borrowers_get_two_machines() {
+        // The pool property the `rayon` path depends on: a machine that is
+        // out on loan is not handed to a second caller.
+        let slot = InflateSlot::default();
+        slot.with(true, |_| {
+            slot.with(true, |_| ());
+        });
+        assert_eq!(
+            format!("{slot:?}"),
+            "InflateSlot([true, true])",
+            "the nested borrow built its own machine and both came back"
+        );
+    }
+
+    #[test]
+    fn a_pooled_decode_matches_an_unpooled_one() {
+        let data = payload();
+        let strip = encode(&data, CodecLevel::Default).expect("encode");
+        let state = CodecState::new();
+        let bits = [8u16];
+        let pooled = context(Some(&state), &bits);
+        let fresh = context(None, &bits);
+        for _ in 0..4 {
+            let mut with_pool = vec![0u8; data.len()];
+            let mut without = vec![0u8; data.len()];
+            assert_eq!(
+                decode_into(&strip, &mut with_pool, &pooled).expect("pooled"),
+                data.len()
+            );
+            assert_eq!(
+                decode_into(&strip, &mut without, &fresh).expect("fresh"),
+                data.len()
+            );
+            assert_eq!(with_pool, without);
+            assert_eq!(with_pool, data);
+        }
     }
 }
