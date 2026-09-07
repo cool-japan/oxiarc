@@ -398,6 +398,23 @@ fn arbitrary_tags_and_metadata_blobs_round_trip_byte_identically() {
         decoder.photoshop().expect("photoshop"),
         photoshop.as_bytes().map(<[u8]>::to_vec)
     );
+    // The byte content matching is not the whole story: the field *type*
+    // (UNDEFINED for ICC vs. BYTE for XMP/IPTC/Photoshop here) matters to
+    // some consumers, and a lossy round trip could silently coerce one into
+    // the other while every assertion above still passed.
+    assert_eq!(
+        decoder.find_tag(Tag::InterColorProfile).expect("icc tag"),
+        Some(icc)
+    );
+    assert_eq!(decoder.find_tag(Tag::Xmp).expect("xmp tag"), Some(xmp));
+    assert_eq!(
+        decoder.find_tag(Tag::IptcNaa).expect("iptc tag"),
+        Some(iptc)
+    );
+    assert_eq!(
+        decoder.find_tag(Tag::Photoshop).expect("photoshop tag"),
+        Some(photoshop)
+    );
     assert_eq!(
         decoder.get_tag_ascii(Tag::DocumentName).expect("doc"),
         Some("page".to_string())

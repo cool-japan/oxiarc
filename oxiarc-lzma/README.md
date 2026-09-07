@@ -7,7 +7,7 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-07) — 235 tests passing (+ 10 doctests).
+**Version 0.4.2** (2026-09-07) — 252 tests passing (+ 10 doctests).
 
 **What's new in 0.4.2**:
 
@@ -21,12 +21,14 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
 - **`.xz` block filter chains are implemented, not ignored.** The reader used
   to parse the filter list only to find LZMA2's dictionary-size property and
   silently drop every other filter, which produced *silently wrong output*
-  rather than an error. It now implements the Delta filter and seven BCJ
-  branch converters (x86, PowerPC, IA-64, ARM, ARM-Thumb, SPARC, ARM64),
-  each validated byte-for-byte against liblzma and the `xz` CLI in both
-  directions; the RISC-V converter is reported as unsupported rather than
-  guessed at, and unknown filter IDs are a hard error. This is what makes
-  libtiff's LZMA TIFFs (`Delta(dist=1) + LZMA2`) decode correctly.
+  rather than an error. It now implements the Delta filter and all eight
+  BCJ branch converters (x86, PowerPC, IA-64, ARM, ARM-Thumb, SPARC, ARM64
+  and RISC-V), each validated byte-for-byte against liblzma and the `xz`
+  CLI in **both** directions — encode and decode are compared separately,
+  because a converter can round-trip its own output perfectly while
+  disagreeing with the reference. Unknown filter IDs are a hard error.
+  This is what makes libtiff's LZMA TIFFs (`Delta(dist=1) + LZMA2`) decode
+  correctly.
 - **The block check is verified after the filter chain**, per the xz spec —
   it covers the block's original data, not the LZMA2 output.
 - **Multi-stream `.xz` files decode completely.** A `.xz` file is one or more
@@ -43,6 +45,20 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
   index's record count with the number of blocks actually read, and the
   reserved block-header flag bits must be zero (all three were parsed and
   discarded before).
+- **Every padding and checksum field of the container is now verified.**
+  Block Padding and Index Padding must be null bytes (xz spec 3.4 / 4.4);
+  Block Padding is covered by no checksum at all, and on a
+  `LZMA_CHECK_NONE` stream — what libtiff writes — neither is the block, so
+  accepting arbitrary bytes there meant accepting bytes nothing checked.
+  The Stream Footer's own CRC-32 is verified (it was read and ignored), a
+  declared Compressed Size of zero is rejected instead of falling through
+  to the self-describing block path, and a block's LZMA2 payload must be
+  consumed exactly by the decoder.
+- **`XzWriter` writes multi-block streams.** A payload whose compressed form
+  exceeded the reader's 100 MiB per-block limit used to produce a file this
+  crate could not read back; input is now split into blocks of at most
+  `with_block_size(...)` uncompressed bytes (64 MiB by default), one index
+  record each. Streams that fit in one block are byte-identical to before.
 - **Bounded decoding**: `xz::decompress_into(src, &mut dst)` decodes a complete
   `.xz` stream into a caller-sized buffer, and `xz::decompress_with_limit(data,
   max)` caps a growable decode. Both enforce the cap *during* decoding (after

@@ -102,7 +102,8 @@ pub fn xxhash64_checksum(data: &[u8]) -> u32 {
 
 /// Incremental (streaming) XXH64 hasher.
 ///
-/// Produces exactly the same digest as [`xxhash64_with_seed`] applied to the
+/// Produces exactly the same digest as the crate-internal one-shot
+/// `xxhash64_with_seed` applied to the
 /// concatenation of every slice passed to [`update`](XxHash64::update), but
 /// without ever retaining the data.  Zstandard frame checksums are computed
 /// over the whole decompressed content, so a bounded-memory decoder needs

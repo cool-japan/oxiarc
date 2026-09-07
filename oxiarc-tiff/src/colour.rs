@@ -488,22 +488,27 @@ pub fn to_rgba8(info: &ImageInfo, samples: &Samples) -> Result<Vec<u8>> {
     } else {
         ((1u64 << bits) - 1) as f64
     };
-    let alpha_index = info
-        .extra_samples
-        .iter()
-        .position(|e| {
-            matches!(
-                e,
-                ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha
-            )
-        })
-        .map(|i| i + spp - info.extra_samples.len());
-    let associated = info
-        .extra_samples
-        .first()
-        .copied()
-        .map(|e| e == ExtraSamples::AssociatedAlpha)
-        .unwrap_or(false);
+    // `ExtraSamples` describes the *last* `extra_samples.len()` channels, so
+    // extra sample `i` is channel `spp - len + i`. A file is free to declare
+    // more extra samples than it has channels — tag 338 is never cross-checked
+    // against tag 277 by the spec — so the subtraction is checked and an
+    // impossible index makes the tag ignored rather than panicking.
+    let alpha_slot = info.extra_samples.iter().position(|e| {
+        matches!(
+            e,
+            ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha
+        )
+    });
+    let alpha_index = alpha_slot
+        .and_then(|i| (i + spp).checked_sub(info.extra_samples.len()))
+        .filter(|index| *index < spp);
+    // Whether *that* channel is premultiplied, not merely whether the first
+    // extra sample happens to be: `[Unspecified, AssociatedAlpha]` is legal.
+    let associated = alpha_index.is_some()
+        && alpha_slot
+            .and_then(|i| info.extra_samples.get(i).copied())
+            .map(|e| e == ExtraSamples::AssociatedAlpha)
+            .unwrap_or(false);
 
     let mut out = Vec::with_capacity(pixels * 4);
     match info.photometric {

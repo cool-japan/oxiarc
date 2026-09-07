@@ -18,13 +18,42 @@ all-features = true
 
 [features]
 default = []
+# Differential oracle tests (tests/pillow_oracle.rs) that shell out to `python3`
+# and its Pillow (PIL) module -- the reference PNG implementation used by the
+# wider ecosystem -- to validate both directions: PIL-encode -> oxiarc-decode
+# and oxiarc-decode -> PIL-decode, over every colour type, bit depth and
+# interlace combination. Self-skips (prints a note, does not fail) at runtime
+# if `python3` or Pillow is unavailable. Never enabled by default; not needed
+# for normal library use.
+png-oracle = []
+# Rayon-backed parallel per-row filtering on encode (src/encoder/parallel.rs).
+# DEFLATE always stays serial -- see that module's doc for why
+# `oxiarc_deflate::parallel::compress_deflate_parallel` cannot substitute for
+# driving `Deflater` directly on a PNG `IDAT`/`fdAT` stream. Off by default;
+# small frames fall back to the serial path automatically even when enabled
+# (`parallel::should_parallelize`), so turning this on never regresses them.
+parallel = ["dep:rayon"]
+# Enables the `png`-0.17-shaped call-site reproductions in
+# `tests/compat_surface.rs` (design report §11.6). The `v017` module itself
+# is always compiled -- deliberately a module, not a feature, so Cargo's
+# feature unification cannot reshape one crate's API because another crate
+# in the graph asked for the older shape. This flag only turns on the tests
+# that exercise it, and adds no code to the library.
+compat-017 = []
 
 [dependencies]
 oxiarc-core = { workspace = true }
 oxiarc-deflate = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "png_bench"
+harness = false
 
 [lints]
 workspace = true

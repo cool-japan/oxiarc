@@ -48,6 +48,7 @@ use oxiarc_core::Crc32;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::traits::FlushMode;
 
+use crate::inflate_core::Fault;
 use crate::stream::{InflateProgress, InflateStatus, InflateStream};
 use crate::zlib::Adler32;
 
@@ -170,7 +171,14 @@ pub struct WrappedInflate {
     // per-member accumulators
     crc: Crc32,
     adler: Adler32,
+    /// Output bytes decoded since the last member boundary. Doubles as the
+    /// gzip `ISIZE` accumulator, which is why it is read in `GzTrailer`
+    /// *before* the boundary re-base zeroes it.
     member_out: u64,
+    /// Input bytes consumed since the last member boundary — the streaming
+    /// equivalent of "how much of the slice is left after the last complete
+    /// member". See [`WrappedInflate::member_in`].
+    member_in: u64,
     members_done: u32,
     total_out: u64,
     total_in: u64,
@@ -182,8 +190,14 @@ pub struct WrappedInflate {
     header_crc: Crc32,
     header: Option<GzipHeaderInfo>,
     dictionary: Option<Vec<u8>>,
-    /// Latched error, replayed by every later call.
-    fault: Option<String>,
+    /// Latched error, replayed verbatim by every later call.
+    ///
+    /// A [`Fault`] rather than a message: `OxiArcError` is not `Clone`, but
+    /// collapsing a latched error into `CorruptedData` would make the
+    /// *second* `matches!(err, OxiArcError::CrcMismatch { .. })` false where
+    /// the first was true, and would map a replayed `UnexpectedEof` to
+    /// `io::ErrorKind::InvalidData` in the `Read` adapters.
+    fault: Option<Fault>,
 }
 
 impl WrappedInflate {
@@ -215,6 +229,7 @@ impl WrappedInflate {
             crc: Crc32::new(),
             adler: Adler32::new(),
             member_out: 0,
+            member_in: 0,
             members_done: 0,
             total_out: 0,
             total_in: 0,
@@ -368,6 +383,81 @@ impl WrappedInflate {
         self.active
     }
 
+    /// The [`TrailingPolicy`] currently in force.
+    ///
+    /// The builder [`WrappedInflate::trailing_policy`] takes `self` by
+    /// value, so this read-only twin carries a different name. Adapters use
+    /// it to tell a *tolerant* configuration (which may drop a short tail)
+    /// from a strict one (which must not).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_deflate::{InflateWrapper, TrailingPolicy, WrappedInflate};
+    ///
+    /// let decoder = WrappedInflate::new(InflateWrapper::Zlib);
+    /// assert_eq!(decoder.trailing_policy_in_force(), TrailingPolicy::Reject);
+    /// let decoder = decoder.trailing_policy(TrailingPolicy::Stop);
+    /// assert_eq!(decoder.trailing_policy_in_force(), TrailingPolicy::Stop);
+    /// ```
+    pub fn trailing_policy_in_force(&self) -> TrailingPolicy {
+        self.trailing
+    }
+
+    /// Input bytes consumed since the last member boundary.
+    ///
+    /// After a member completes this is re-based to the bytes that already
+    /// belong to whatever follows it — the whole bytes still sitting in the
+    /// DEFLATE bit accumulator, which were reported consumed when they were
+    /// absorbed — and it then grows with every byte the framing or the
+    /// DEFLATE core takes from `input`.
+    ///
+    /// It is the push-decoder equivalent of "how many bytes of the slice
+    /// follow the last complete member", which a whole-slice decoder gets
+    /// for free. An adapter that knows the source has ended needs exactly
+    /// this to tell a 1-5 byte fragment (too short to be another member)
+    /// from a truncated member, without which a truncated stream looks like
+    /// a clean end of stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_core::traits::FlushMode;
+    /// use oxiarc_deflate::{zlib_compress, InflateWrapper, WrappedInflate};
+    ///
+    /// let member = zlib_compress(b"one member", 6).expect("zlib");
+    /// let mut decoder = WrappedInflate::new(InflateWrapper::Zlib).multi_member(true);
+    /// let mut out = [0u8; 64];
+    /// decoder
+    ///     .inflate(&member, &mut out, FlushMode::Finish)
+    ///     .expect("inflate");
+    /// // Nothing follows the member, so nothing belongs to a successor.
+    /// assert_eq!(decoder.members_decoded(), 1);
+    /// assert_eq!(decoder.member_in(), 0);
+    /// // In general: everything consumed past the last member boundary.
+    /// assert_eq!(
+    ///     decoder.member_in(),
+    ///     decoder.total_in() - member.len() as u64
+    /// );
+    /// ```
+    pub fn member_in(&self) -> u64 {
+        self.member_in
+    }
+
+    /// Output bytes decoded since the last member boundary.
+    ///
+    /// Zero while the decoder sits between members and while the next
+    /// member's header is being read; non-zero the moment payload bytes of
+    /// an as-yet-unverified member have been handed to the caller.
+    ///
+    /// Crate-private on purpose: it exists so an adapter can tell a trailing
+    /// *fragment* (nothing decoded from it, safe to drop) from a *truncated
+    /// member* (bytes already delivered, whose checksum will never be
+    /// checked — which must be an error, not a clean end of stream).
+    pub(crate) fn member_out(&self) -> u64 {
+        self.member_out
+    }
+
     /// Return to the initial state, dropping all decoding state, counters
     /// and any latched error. Builder settings and the configured
     /// dictionary are preserved.
@@ -378,6 +468,7 @@ impl WrappedInflate {
         self.crc = Crc32::new();
         self.adler = Adler32::new();
         self.member_out = 0;
+        self.member_in = 0;
         self.members_done = 0;
         self.total_out = 0;
         self.total_in = 0;
@@ -413,15 +504,15 @@ impl WrappedInflate {
         output: &mut [u8],
         flush: FlushMode,
     ) -> Result<InflateProgress> {
-        if let Some(message) = &self.fault {
-            return Err(OxiArcError::corrupted(0, message.clone()));
+        if let Some(fault) = &self.fault {
+            return Err(fault.to_error());
         }
         let mut in_pos = 0usize;
         let mut out_pos = 0usize;
         let status = match self.drive(input, &mut in_pos, output, &mut out_pos, flush) {
             Ok(status) => status,
             Err(error) => {
-                self.fault = Some(error.to_string());
+                self.fault = Some(Fault::from_error(&error));
                 return Err(error);
             }
         };
@@ -433,9 +524,9 @@ impl WrappedInflate {
         })
     }
 
-    /// Latch `message` and build the error it stands for.
+    /// Latch `error` so every later call replays it, and close the stream.
     fn fail(&mut self, error: OxiArcError) -> OxiArcError {
-        self.fault = Some(error.to_string());
+        self.fault = Some(Fault::from_error(&error));
         self.state = WrapState::Done;
         error
     }
@@ -450,6 +541,9 @@ impl WrappedInflate {
         let byte = input.get(*in_pos).copied();
         if byte.is_some() {
             *in_pos += 1;
+            // Accumulator bytes are *not* counted here: they were already
+            // counted when the member boundary re-based `member_in`.
+            self.member_in += 1;
         }
         byte
     }
@@ -533,6 +627,7 @@ impl WrappedInflate {
                     }
                     self.state = if self.core.is_finished() {
                         self.members_done += 1;
+                        self.rebase_member_counters();
                         WrapState::Between
                     } else {
                         WrapState::Deflate
@@ -765,7 +860,12 @@ impl WrappedInflate {
                 }
 
                 WrapState::Deflate => {
+                    // Counted here rather than inside `run_deflate`, which
+                    // `RawPreamble` also calls — with `field` rather than
+                    // `input`, whose bytes `next_byte` already counted.
+                    let before = *in_pos;
                     let status = self.run_deflate(input, in_pos, output, out_pos, flush)?;
+                    self.member_in += (*in_pos - before) as u64;
                     if !self.core.is_finished() {
                         return Ok(status);
                     }
@@ -776,6 +876,7 @@ impl WrappedInflate {
                     };
                     if self.state == WrapState::Between {
                         self.members_done += 1;
+                        self.rebase_member_counters();
                     }
                 }
 
@@ -813,6 +914,7 @@ impl WrappedInflate {
                         }
                     }
                     self.members_done += 1;
+                    self.rebase_member_counters();
                     self.state = WrapState::Between;
                 }
 
@@ -834,6 +936,7 @@ impl WrappedInflate {
                         }
                     }
                     self.members_done += 1;
+                    self.rebase_member_counters();
                     self.state = WrapState::Between;
                 }
 
@@ -880,6 +983,23 @@ impl WrappedInflate {
         }
     }
 
+    /// Re-base the per-member counters at a member boundary.
+    ///
+    /// [`WrappedInflate::member_in`]: whole bytes still held in the DEFLATE
+    /// bit accumulator were reported consumed when they were absorbed and
+    /// belong to whatever follows the member that just ended, so they are
+    /// the new count's starting value. A sub-byte remainder is DEFLATE
+    /// padding, never a trailing byte, and is deliberately dropped by the
+    /// integer division.
+    ///
+    /// [`WrappedInflate::member_out`]: back to zero, because nothing of the
+    /// *next* member has been decoded yet. Every caller of this reads the
+    /// old value first where it needs it (gzip `ISIZE`).
+    fn rebase_member_counters(&mut self) {
+        self.member_in = u64::from(self.core.buffered_bits() / 8);
+        self.member_out = 0;
+    }
+
     /// Run the DEFLATE core for one member, updating the running checksums.
     fn run_deflate(
         &mut self,
@@ -895,11 +1015,17 @@ impl WrappedInflate {
         let src = input.get(*in_pos..).unwrap_or_default();
         let progress = self.core.inflate(src, dst, flush)?;
         *in_pos += progress.consumed;
-        if let Some(fresh) = dst.get(..progress.produced) {
-            match self.active {
-                InflateWrapper::Gzip => self.crc.update(fresh),
-                InflateWrapper::Zlib => self.adler.update(fresh),
-                _ => {}
+        // Skipped entirely when the comparison is off. Adler-32 costs about
+        // five times the DEFLATE decode itself on ordinary text, and PNG —
+        // the caller that turns this off — reads whole images through here.
+        // The trailer is still *consumed*: only the arithmetic goes away.
+        if self.verify_checksum {
+            if let Some(fresh) = dst.get(..progress.produced) {
+                match self.active {
+                    InflateWrapper::Gzip => self.crc.update(fresh),
+                    InflateWrapper::Zlib => self.adler.update(fresh),
+                    _ => {}
+                }
             }
         }
         *out_pos += progress.produced;
@@ -1118,12 +1244,106 @@ mod tests {
         zl[last] ^= 0xFF;
         let mut decoder = WrappedInflate::new(InflateWrapper::Zlib);
         let err = decode(&mut decoder, &zl).expect_err("bad adler");
-        assert!(matches!(err, OxiArcError::CrcMismatch { .. }));
-        // Latched.
+        let OxiArcError::CrcMismatch { expected, computed } = err else {
+            panic!("expected a CrcMismatch, got {err:?}");
+        };
+        // Latched *with its variant*: a replay that degraded into
+        // `CorruptedData` would make this `matches!` false on the second
+        // call where it was true on the first, and would mis-map a replayed
+        // `UnexpectedEof` to `InvalidData` in the `Read` adapters.
+        for _ in 0..3 {
+            let again = decoder
+                .inflate(&[], &mut [0u8; 8], FlushMode::None)
+                .expect_err("latched");
+            assert!(
+                matches!(
+                    again,
+                    OxiArcError::CrcMismatch {
+                        expected: e,
+                        computed: c,
+                    } if e == expected && c == computed
+                ),
+                "replayed error lost its variant: {again:?}"
+            );
+        }
+    }
+
+    /// Every framing error the wrapper raises must survive the latch with
+    /// its variant intact, not just the checksum one.
+    #[test]
+    fn every_framing_fault_replays_with_its_variant() {
+        // Bad gzip magic.
+        let mut decoder = WrappedInflate::new(InflateWrapper::Gzip);
+        let first = decoder
+            .inflate(b"not gzip at all", &mut [0u8; 8], FlushMode::Finish)
+            .expect_err("magic");
+        assert!(matches!(first, OxiArcError::InvalidMagic { .. }));
         let again = decoder
             .inflate(&[], &mut [0u8; 8], FlushMode::None)
             .expect_err("latched");
-        assert!(again.to_string().contains("CRC"));
+        assert!(
+            matches!(again, OxiArcError::InvalidMagic { .. }),
+            "{again:?}"
+        );
+
+        // Unsupported gzip compression method (CM != 8).
+        let mut header = vec![0x1f, 0x8b, 0x07, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        header.extend_from_slice(&[0u8; 8]);
+        let mut decoder = WrappedInflate::new(InflateWrapper::Gzip);
+        let first = decoder
+            .inflate(&header, &mut [0u8; 8], FlushMode::Finish)
+            .expect_err("method");
+        assert!(matches!(first, OxiArcError::UnsupportedMethod { .. }));
+        let again = decoder
+            .inflate(&[], &mut [0u8; 8], FlushMode::None)
+            .expect_err("latched");
+        assert!(
+            matches!(again, OxiArcError::UnsupportedMethod { .. }),
+            "{again:?}"
+        );
+
+        // Truncated member: `UnexpectedEof`, which the adapters map to
+        // `io::ErrorKind::UnexpectedEof` — but only while it stays one.
+        let zl = zlib_compress(b"truncate me please", 6).expect("zlib");
+        let mut decoder = WrappedInflate::new(InflateWrapper::Zlib);
+        let first = decoder
+            .inflate(
+                zl.get(..zl.len() - 2).unwrap_or_default(),
+                &mut [0u8; 64],
+                FlushMode::Finish,
+            )
+            .expect_err("truncated");
+        assert!(
+            matches!(first, OxiArcError::UnexpectedEof { .. }),
+            "{first:?}"
+        );
+        let again = decoder
+            .inflate(&[], &mut [0u8; 8], FlushMode::None)
+            .expect_err("latched");
+        assert!(
+            matches!(again, OxiArcError::UnexpectedEof { .. }),
+            "{again:?}"
+        );
+
+        // Trailing byte under the default `Reject` policy.
+        let mut stream = zlib_compress(b"exact", 6).expect("zlib");
+        stream.push(0x41);
+        let mut decoder = WrappedInflate::new(InflateWrapper::Zlib).multi_member(true);
+        let first = decoder
+            .inflate(&stream, &mut [0u8; 64], FlushMode::Finish)
+            .expect_err("trailing");
+        let OxiArcError::CorruptedData { offset, message } = &first else {
+            panic!("expected CorruptedData, got {first:?}");
+        };
+        let (offset, message) = (*offset, message.clone());
+        let again = decoder
+            .inflate(&[], &mut [0u8; 8], FlushMode::None)
+            .expect_err("latched");
+        assert!(
+            matches!(again, OxiArcError::CorruptedData { offset: o, message: ref m }
+                if o == offset && *m == message),
+            "{again:?}"
+        );
     }
 
     #[test]
@@ -1134,5 +1354,43 @@ mod tests {
         let mut decoder = WrappedInflate::new(InflateWrapper::Zlib).verify_checksum(false);
         assert_eq!(decode(&mut decoder, &zl).expect("decode"), b"ignore adler");
         assert_eq!(decoder.total_in(), zl.len() as u64);
+    }
+
+    /// `verify_checksum(false)` must skip the *work*, not merely the
+    /// comparison — it exists so PNG's IDAT path does not pay for an
+    /// Adler-32 it never looks at. Asserted without timing: the running
+    /// accumulator must still hold its initial value after a whole member.
+    #[test]
+    fn verify_checksum_off_skips_the_checksum_work() {
+        let payload = b"a body long enough to matter".repeat(400);
+
+        let zl = zlib_compress(&payload, 6).expect("zlib");
+        let mut decoder = WrappedInflate::new(InflateWrapper::Zlib).verify_checksum(false);
+        assert_eq!(decode(&mut decoder, &zl).expect("decode"), payload);
+        assert_eq!(
+            decoder.adler.finish(),
+            Adler32::new().finish(),
+            "Adler-32 was still updated with verify_checksum(false)"
+        );
+
+        let gz = gzip_compress(&payload, 6).expect("gzip");
+        let mut decoder = WrappedInflate::new(InflateWrapper::Gzip).verify_checksum(false);
+        assert_eq!(decode(&mut decoder, &gz).expect("decode"), payload);
+        assert_eq!(
+            decoder.crc.value(),
+            Crc32::new().value(),
+            "CRC-32 was still updated with verify_checksum(false)"
+        );
+
+        // The default still computes it, so the skip is a setting and not a
+        // regression: a corrupt trailer is caught.
+        let mut broken = zl.clone();
+        let last = broken.len() - 1;
+        broken[last] ^= 0xFF;
+        let mut decoder = WrappedInflate::new(InflateWrapper::Zlib);
+        assert!(matches!(
+            decode(&mut decoder, &broken).expect_err("bad adler"),
+            OxiArcError::CrcMismatch { .. }
+        ));
     }
 }

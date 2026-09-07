@@ -73,12 +73,31 @@ pub(crate) enum Fault {
         needed: usize,
         available: usize,
     },
+    /// Raised by the framing layer, not the DEFLATE core: a container magic
+    /// that does not match.
+    InvalidMagic {
+        expected: Vec<u8>,
+        found: Vec<u8>,
+    },
+    /// Raised by the framing layer: an unsupported container compression
+    /// method, or a missing zlib preset dictionary.
+    UnsupportedMethod(String),
+    /// Raised by the framing layer: a trailer or `FHCRC` checksum that does
+    /// not match what was decoded.
+    CrcMismatch {
+        expected: u32,
+        computed: u32,
+    },
     Other(String),
 }
 
 impl Fault {
     /// Summarise an error so it can be replayed by [`Fault::to_error`].
-    fn from_error(error: &OxiArcError) -> Self {
+    ///
+    /// Used by [`crate::wrapper::WrappedInflate`] as well as the core, so a
+    /// replayed framing error keeps its variant instead of collapsing into
+    /// `CorruptedData`.
+    pub(crate) fn from_error(error: &OxiArcError) -> Self {
         match error {
             OxiArcError::CorruptedData { offset, message } => Fault::Corrupted {
                 offset: *offset,
@@ -110,6 +129,15 @@ impl Fault {
                 needed: *needed,
                 available: *available,
             },
+            OxiArcError::InvalidMagic { expected, found } => Fault::InvalidMagic {
+                expected: expected.clone(),
+                found: found.clone(),
+            },
+            OxiArcError::UnsupportedMethod { method } => Fault::UnsupportedMethod(method.clone()),
+            OxiArcError::CrcMismatch { expected, computed } => Fault::CrcMismatch {
+                expected: *expected,
+                computed: *computed,
+            },
             other => Fault::Other(other.to_string()),
         }
     }
@@ -133,6 +161,13 @@ impl Fault {
             Fault::Bomb { ratio, threshold } => OxiArcError::zip_bomb(*ratio, *threshold),
             Fault::BufferTooSmall { needed, available } => {
                 OxiArcError::buffer_too_small(*needed, *available)
+            }
+            Fault::InvalidMagic { expected, found } => {
+                OxiArcError::invalid_magic(expected.clone(), found.clone())
+            }
+            Fault::UnsupportedMethod(method) => OxiArcError::unsupported_method(method.clone()),
+            Fault::CrcMismatch { expected, computed } => {
+                OxiArcError::crc_mismatch(*expected, *computed)
             }
             Fault::Other(message) => OxiArcError::corrupted(0, message.clone()),
         }
@@ -677,7 +712,23 @@ fn fast_symbols<S: InflateSink, const LIMITED: bool>(
             .copied()
             .unwrap_or_default();
         if extra_bits > cache.available() {
-            break FastExit::Careful;
+            // The length code above has already been consumed, so handing
+            // control back with `state == Symbol` would decode the *next*
+            // code as a fresh symbol and drop this one. Publish the pending
+            // symbol instead, exactly as the two distance exits below do.
+            //
+            // Unreachable as the margins stand (`refill_fast` has just
+            // topped the accumulator up to `match_tail_bits`, i.e. at least
+            // 33 bits, or left it with the >= 8 untouched input bytes the
+            // loop guard requires), which is why no test can drive it. It
+            // is written this way so the "no symbol is decoded twice"
+            // invariant is structural rather than a consequence of
+            // `FAST_INPUT_MARGIN` arithmetic.
+            core.cache = cache;
+            core.pending_symbol = code;
+            core.state = InflateState::LengthExtra;
+            core.total_out += (sink.written() - start_written) as u64;
+            return Ok(true);
         }
         let extra = cache.peek_bits(extra_bits);
         cache.consume(extra_bits);

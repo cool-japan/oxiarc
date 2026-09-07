@@ -2,41 +2,73 @@
 //! "Accept-Encoding").
 //!
 //! Part of the [OxiArc](https://github.com/cool-japan/oxiarc) Pure Rust
-//! archive/compression ecosystem. This crate is the headers/negotiation
+//! archive/compression ecosystem. This crate is the whole content-coding
 //! layer: parsing and rendering the two headers, RFC 9110 §12.5.3
-//! server-side negotiation, decompression-bomb limits, the shared error
-//! type, and server-side response encoding. It has **no** dependency on the
+//! server-side negotiation, streaming **decoding** of response bodies under
+//! decompression-bomb limits, server-side response encoding, and the shared
+//! error type. It has **no** dependency on the
 //! `http` crate — every header value is a plain `&str` in, an owned `String`
 //! or `Vec<u8>` out — so it works unmodified from `ureq`, `reqwest`,
 //! `oxihttp`, or any hand-rolled client or server.
 //!
-//! # What is (and is not) in this crate yet
+//! # What is in this crate
 //!
-//! This is the **headers/negotiation/encode** layer. The matching
-//! **decoder** — a `Decoder` that actually undoes `gzip`/`deflate`/`br`/`zstd`
-//! on a response body, `Read`/`BufRead`/async adapters, and a `decode_body`
-//! one-shot helper — is a separate, later wave, gated on the resumable push
-//! decoders landing in `oxiarc-deflate`/`oxiarc-brotli`/`oxiarc-zstd`. Adding
-//! it means adding new files (a `decode` module, most likely `decode/mod.rs`
-//! plus one file per coding) plus a handful of `pub use` lines in this file
-//! — nothing here needs to change shape to make room for it. Until then:
+//! | Direction | Entry points |
+//! |---|---|
+//! | Client: build the request header | [`AcceptEncoding`], [`QValue`] |
+#![cfg_attr(
+    feature = "async-io",
+    doc = "| Client: decode the response body | [`decode_body`], [`Decoder`], [`DecodedBody`], [`AsyncDecodedBody`] |"
+)]
+#![cfg_attr(
+    not(feature = "async-io"),
+    doc = "| Client: decode the response body | [`decode_body`], [`Decoder`], [`DecodedBody`], `AsyncDecodedBody` (needs `async-io`) |"
+)]
+//! | Server: choose a coding | [`negotiate`], [`parse_accept_encoding`] |
+//! | Server: encode the response body | [`encode_body`], [`Encoder`], [`negotiate_and_encode`] |
+//! | Both: parse `Content-Encoding` | [`parse_content_encoding`], [`ContentCoding`] |
+//! | Both: bound the work | [`DecodeLimits`], [`TrailingData`] |
 //!
-//! - [`ContentCoding`], [`parse_content_encoding`], [`QValue`],
-//!   [`AcceptEncoding`], [`negotiate`] and [`DecodeLimits`] are all usable
-//!   today on the client side (build the request header, parse the response
-//!   header) and the server side (negotiate, then [`encode_body`]).
-//! - [`encode_body`] and [`Encoder`] are the full server-side story: given a
-//!   coding, they produce the compressed bytes (or a streaming `Write`
-//!   wrapper that does).
-//! - There is deliberately no `Decoder` type, `decode_body` function, or
-//!   `Read`/`BufRead`/async response-body wrapper in this version.
+//! [`negotiate`] is written for the response direction (a server choosing a
+//! `Content-Encoding` against a client's `Accept-Encoding`). A server that
+//! wants to *decode* an encoded **request** body is the mirror case with no
+//! negotiation involved — the client already committed to a coding — so it
+//! uses the same [`Decoder`] machinery directly, against the request's own
+//! `Content-Encoding`.
 //!
-//! [`negotiate`] itself is written for the response direction (a server
-//! choosing a `Content-Encoding` against a client's `Accept-Encoding`); a
-//! server that wants to *decode* an encoded request body — the mirror
-//! case, with no negotiation involved, since the client already committed
-//! to a coding — will do so through the same future `Decoder` machinery
-//! mentioned above, once it exists.
+//! # Decoding is genuinely incremental
+//!
+//! Every coding is driven through a resumable push decoder
+//! (`oxiarc_deflate::WrappedInflate`, `oxiarc_brotli::BrotliStream`,
+//! `oxiarc_zstd::ZstdStream`), never through a `read_to_end`. Concretely,
+//! measured in `tests/allocations.rs`:
+//!
+//! * streaming a 16 MiB gzip body through [`DecodedBody`] with 4 KiB reads
+//!   peaks at **~210 KiB** of live allocation — two 64 KiB staging buffers,
+//!   the 32 KiB DEFLATE window and its tables;
+//! * [`Decoder::feed_into`] performs **zero allocations** per call once warm;
+//! * a decompression bomb is refused having materialised the budget, not the
+//!   bomb.
+//!
+//! The bytes are identical however the wire data is split: feeding one byte
+//! at a time, in 4 KiB chunks, or all at once produces the same output
+//! (`tests/chunking.rs`, including a proptest over arbitrary split points).
+//!
+//! # `finish` is not optional
+//!
+//! [`Decoder::finish`] / [`Decoder::close`] is what verifies gzip's CRC-32
+//! and `ISIZE`, zlib's Adler-32, zstd's XXH64 and every codec's truncation
+//! check. Skipping it silently accepts a corrupted or truncated body.
+#![cfg_attr(
+    feature = "async-io",
+    doc = "[`DecodedBody`] and [`AsyncDecodedBody`] call it for you at EOF and"
+)]
+#![cfg_attr(
+    not(feature = "async-io"),
+    doc = "[`DecodedBody`] and `AsyncDecodedBody` call it for you at EOF and"
+)]
+//! surface a failure as an `io::Error` from the final read, so a truncated
+//! response can never look like a short one.
 //!
 //! # `Transfer-Encoding` is out of scope
 //!
@@ -54,7 +86,7 @@
 //!
 //! A `Content-Encoding` header describes how a body *would be* encoded —
 //! it says nothing about whether a body is present at all. Do not feed any
-//! of the following to a decoder (once one exists) even if they carry a
+//! of the following to a [`Decoder`] (or [`decode_body`]) even if they carry a
 //! `Content-Encoding` header:
 //!
 //! - A response to a `HEAD` request: it has no body by definition, encoded
@@ -77,6 +109,56 @@
 //! limit is defense-in-depth. See that type's docs for the measurements
 //! behind the defaults.
 //!
+//! The cap is enforced **inside** a compressed block, not between blocks.
+//! That distinction is the whole design: one fixed-Huffman DEFLATE block of
+//! 812 KB expands to 123 MiB (length-258, distance-1 back-references at 13
+//! bits each — a factor of 158.8), so a decoder that checks its budget at
+//! block boundaries checks it exactly once, after the damage.
+//! `tests/limits.rs` regenerates that stream from a committed generator and
+//! asserts a 1 MiB cap stops it having produced 1 MiB.
+//!
+//! `max_ratio` cannot do this job: measured legitimate traffic reaches 411x
+//! and the classic bomb is 1029x, a gap of 2.5x that any attacker can pad
+//! their way under. Lower `max_output`, not `max_ratio`.
+//!
+//! # Security notes
+//!
+//! * **An unknown coding is refused, never passed through.** A client that
+//!   silently hands compressed bytes to a JSON parser is the failure mode
+//!   this crate exists to remove.
+//! * **Trailing data is rejected by default** ([`TrailingData::Reject`]):
+//!   bytes after a complete stream are the shape a response-splitting attack
+//!   takes. [`TrailingData::AllowZeros`] is available for peers that pad
+//!   gzip with `0x00`.
+//! * **Every allocation is bounded** by [`DecodeLimits`] or by a fixed
+//!   staging buffer. A declared zstd window above 8 MiB (the largest an HTTP
+//!   `zstd` decoder must support) is refused *before* the ring is allocated.
+//! * **Chained codings are bounded per stage**, because an intermediate
+//!   stage of `gzip, gzip` can be a bomb even when the final body is small.
+//!   [`DecodeLimits::max_codings`] bounds the number of stages.
+//! * A `finish` error means the response is corrupt — and bytes already
+//!   handed back are not trustworthy, because a checksum necessarily covers
+//!   content that has already been streamed out. Buffer until `finish`
+//!   succeeds if you must not act on unverified data.
+//!
+//! # Integration recipes
+//!
+//! Runnable, in `examples/`:
+//!
+//! | Example | Client |
+//! |---|---|
+//! | `ureq3_manual_gzip` | `ureq` 3 with `default-features = false` |
+//! | `reqwest_bytes_stream` | `reqwest` with no compression features, push decoding |
+//! | `oxihttp_client` | replacing `oxihttp`'s hand-rolled coding code |
+//!
+//! Neither `ureq` nor `reqwest` is a dependency of this crate, not even a
+//! dev-dependency: `cargo deny check bans` walks dev-dependencies, and
+//! `Cargo.lock` records a crate's optional dependencies whether or not their
+//! feature is on — so adding `ureq` would write `flate2` into this
+//! workspace's lockfile, which is exactly what the crate removes. Each
+//! example carries the real wiring in its module docs and runs the same
+//! calls against a canned response.
+//!
 //! # Cargo features
 //!
 //! | Feature | Default | Adds |
@@ -86,7 +168,15 @@
 //! | `brotli` | off | [`ContentCoding::Brotli`] via `oxiarc-brotli` |
 //! | `zstd` | off | [`ContentCoding::Zstd`] and, with a dictionary, [`ContentCoding::Dcz`], via `oxiarc-zstd` |
 //! | `compress` | off | Plumbing only — see [`ContentCoding::Compress`] |
-//! | `async-io` | off | Plumbing for the future async decoder wave |
+#![cfg_attr(
+    feature = "async-io",
+    doc = "| `async-io` | off | [`AsyncDecodedBody`], the `tokio::io::AsyncRead` adapter |"
+)]
+#![cfg_attr(
+    not(feature = "async-io"),
+    doc = "| `async-io` | off | `AsyncDecodedBody`, the `tokio::io::AsyncRead` adapter |"
+)]
+//! | `http-oracle` | off | Differential tests against python3 / the `brotli` and `zstd` CLIs |
 //!
 //! `gzip` and `deflate` are independent switches over the same
 //! `oxiarc-deflate` dependency: enabling one does not enable the other.
@@ -132,6 +222,22 @@
 //!     }
 //! }
 //! ```
+//!
+//! And the client side of the same exchange — decode a response body, with
+//! bomb limits on and checksums verified:
+//!
+//! ```
+//! use oxiarc_http::{DecodeLimits, DecodedBody};
+//!
+//! # let wire = oxiarc_deflate::gzip_compress(b"hello, world", 6).expect("compress");
+//! # let content_encoding = "gzip";
+//! // `wire` is the raw response body; `content_encoding` its header value
+//! // ("identity" when the header is absent).
+//! let mut body = DecodedBody::new(&wire[..], content_encoding, &DecodeLimits::default())?;
+//! let text = body.read_to_string()?;
+//! assert_eq!(text, "hello, world");
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -139,20 +245,40 @@
 
 mod accept;
 mod coding;
+mod decode;
 mod encode;
 mod error;
 mod header;
 mod limits;
 mod negotiate;
+mod read;
+
+#[cfg(feature = "async-io")]
+mod async_read;
 
 pub use accept::AcceptEncoding;
 pub use coding::ContentCoding;
-pub use encode::{EncodeOptions, Encoder, encode_body};
+pub use decode::{
+    DecodeStatus, Decoder, Progress, TrailingData, decode_body, decode_body_from_header,
+};
+pub use encode::{EncodeOptions, Encoder, NegotiateEncodeError, encode_body, negotiate_and_encode};
 pub use error::{HttpCodingError, LimitKind, UnsupportedReason};
 pub use header::{
     AcceptEntry, QValue, parse_accept_encoding, parse_content_encoding, parse_content_encoding_all,
 };
 pub use limits::DecodeLimits;
 pub use negotiate::{NotAcceptable, negotiate};
+pub use read::DecodedBody;
+
+#[cfg(feature = "async-io")]
+pub use async_read::AsyncDecodedBody;
+
+/// Re-exported from `oxiarc-core` so callers of [`Decoder::decode`] do not
+/// need to name that crate.
+///
+/// Only two values matter to an HTTP body: [`FlushMode::Finish`] means "this
+/// is the last wire data that will ever arrive", and everything else means
+/// "more may follow".
+pub use oxiarc_core::traits::FlushMode;
 
 pub use error::Result;

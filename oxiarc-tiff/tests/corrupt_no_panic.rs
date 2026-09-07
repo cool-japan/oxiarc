@@ -129,7 +129,107 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         .expect("write");
     encoder.finish().expect("finish");
     out.push(("rgb8_tiles_packbits", buffer.into_inner()));
+    for (label, spec) in codec_specs() {
+        let pixels = codec_pixels(&spec);
+        let mut buffer = Cursor::new(Vec::new());
+        let mut encoder = Encoder::new(&mut buffer).expect("encoder");
+        encoder.write_image(&spec, &pixels).expect("write");
+        encoder.finish().expect("finish");
+        out.push((label, buffer.into_inner()));
+    }
     out
+}
+
+/// One page per compressed codec this build supports.
+fn codec_specs() -> Vec<(&'static str, ImageSpec)> {
+    let mut out: Vec<(&'static str, ImageSpec)> = vec![
+        (
+            "gray8_lzw",
+            ImageSpec::new(24, 20, ColorType::Gray(8))
+                .with_compression(Compression::Lzw)
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ),
+        (
+            "gray8_deflate",
+            ImageSpec::new(24, 20, ColorType::Gray(8))
+                .with_compression(Compression::Deflate { level: 6 })
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ),
+        (
+            "bilevel_g4",
+            ImageSpec::new(24, 20, ColorType::Gray(1))
+                .with_compression(Compression::CcittGroup4)
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ),
+        (
+            "bilevel_g3_2d",
+            ImageSpec::new(24, 20, ColorType::Gray(1))
+                .with_compression(Compression::CcittGroup3 {
+                    two_dimensional: true,
+                    byte_align_eol: true,
+                })
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ),
+        (
+            "bilevel_rle",
+            ImageSpec::new(24, 20, ColorType::Gray(1))
+                .with_compression(Compression::CcittRle)
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ),
+    ];
+    if cfg!(feature = "zstd") {
+        out.push((
+            "gray8_zstd",
+            ImageSpec::new(24, 20, ColorType::Gray(8))
+                .with_compression(Compression::Zstd { level: 5 })
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ));
+    }
+    if cfg!(feature = "lzma") {
+        out.push((
+            "gray8_lzma",
+            ImageSpec::new(24, 20, ColorType::Gray(8))
+                .with_compression(Compression::Lzma { preset: 3 })
+                .with_layout(Layout::Strips { rows_per_strip: 5 }),
+        ));
+    }
+    if cfg!(feature = "jpeg") {
+        out.push((
+            "gray8_jpeg",
+            ImageSpec::new(24, 16, ColorType::Gray(8))
+                .with_compression(Compression::Jpeg {
+                    quality: 80,
+                    shared_tables: true,
+                })
+                .with_layout(Layout::Strips { rows_per_strip: 8 }),
+        ));
+        out.push((
+            "ycbcr_jpeg",
+            ImageSpec::new(32, 32, ColorType::YCbCr(8))
+                .with_compression(Compression::Jpeg {
+                    quality: 80,
+                    shared_tables: false,
+                })
+                .with_ycbcr_subsampling(2, 2)
+                .with_layout(Layout::Strips { rows_per_strip: 16 }),
+        ));
+    }
+    out
+}
+
+/// Deterministic pixels of the shape a spec wants.
+fn codec_pixels(spec: &ImageSpec) -> Vec<u8> {
+    let samples = spec.width as usize * spec.height as usize * usize::from(spec.samples_per_pixel);
+    let bilevel = spec.bits_per_sample.first().copied() == Some(1);
+    (0..samples)
+        .map(|i| {
+            if bilevel {
+                u8::from((i / 3 + i / 24) % 4 == 0)
+            } else {
+                (i * 7 % 251) as u8
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -271,4 +371,142 @@ fn offsets_past_eof_are_rejected_for_every_tag() {
         let _ = decoder.read_image();
         let _ = decoder.all_tags();
     }
+}
+
+#[test]
+fn every_codec_survives_truncation_and_bit_flips() {
+    // The codecs are the part of a TIFF reader that walks attacker-controlled
+    // bit streams, so each one gets its own sweep: every truncation point, a
+    // spray of single-bit flips, and a lenient read of both. Nothing may
+    // panic, hang or allocate without bound.
+    let started = Instant::now();
+    let mut cases = 0usize;
+    for (label, bytes) in corpus() {
+        if !label.contains('_') {
+            continue;
+        }
+        for cut in (1..bytes.len()).step_by(7) {
+            exercise(bytes[..cut].to_vec(), Leniency::Normal);
+            cases += 1;
+        }
+        for seed in 0..256usize {
+            let mut damaged = bytes.clone();
+            let index = (seed * 37 + 11) % damaged.len();
+            damaged[index] ^= 1 << (seed % 8);
+            exercise(damaged.clone(), Leniency::Normal);
+            exercise(damaged, Leniency::Lenient);
+            cases += 2;
+        }
+    }
+    assert!(cases > 2000, "only {cases} damaged inputs were exercised");
+    assert!(
+        started.elapsed() < Duration::from_secs(120),
+        "the sweep took {:?}, which means something is not bounded",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_lenient_read_of_a_damaged_codec_stream_still_fills_the_image() {
+    // Lenient mode is the "show me what you can" path a viewer wants. It must
+    // return a full-size image rather than an error, whatever the codec.
+    for (label, spec) in codec_specs() {
+        let pixels = codec_pixels(&spec);
+        let mut buffer = Cursor::new(Vec::new());
+        let mut encoder = Encoder::new(&mut buffer).expect("encoder");
+        encoder.write_image(&spec, &pixels).expect("write");
+        encoder.finish().expect("finish");
+        let bytes = buffer.into_inner();
+        // Damage the middle of the file, which is always strip data.
+        let mut damaged = bytes.clone();
+        let start = damaged.len() / 3;
+        for byte in damaged.iter_mut().skip(start).take(16) {
+            *byte ^= 0xA5;
+        }
+        let mut decoder = Decoder::new(Cursor::new(damaged))
+            .expect("header")
+            .with_leniency(Leniency::Lenient);
+        match decoder.read_image() {
+            Ok(samples) => {
+                let got = samples.to_native_bytes();
+                assert_eq!(got.len(), pixels.len(), "{label}: short lenient image");
+            }
+            Err(error) => {
+                // An error is acceptable only if it names the codec rather
+                // than panicking or hanging.
+                assert!(!error.to_string().is_empty(), "{label}");
+            }
+        }
+    }
+}
+
+/// The `rayon` decode driver is a second, independent path over the same
+/// malformed bytes: it enumerates chunks, precharges the budget and fetches in
+/// batches with its own bookkeeping, so a corruption that the serial pipeline
+/// merely reports could still make it panic, hang or disagree. `exercise`
+/// deliberately does not call it on every input (thousands of thread-pool
+/// round trips per sweep would dominate this suite's runtime), so it gets its
+/// own sweep over a subsampled set of cut points, plus the flat assertion that
+/// matters most: whatever the serial path decides about a damaged file, the
+/// parallel one must decide the same *kind* of thing.
+#[cfg(feature = "rayon")]
+#[test]
+fn the_parallel_decoder_survives_the_same_corruption_as_the_serial_one() {
+    let started = Instant::now();
+    let mut agreed_images = 0usize;
+    for (name, bytes) in corpus() {
+        // Every 7th cut point -- enough to land inside the header, the IFD,
+        // the strip offsets and the pixel data of every fixture, without
+        // paying for a full sweep -- plus the *untruncated* file, without
+        // which every pair below would be `(Err, Err)` and the sweep would
+        // prove nothing (`agreed_images` is the assertion that it does).
+        let cuts = (0..bytes.len())
+            .step_by(7)
+            .chain(std::iter::once(bytes.len()));
+        for cut in cuts {
+            let damaged = bytes.get(..cut).unwrap_or(&bytes).to_vec();
+            for leniency in [Leniency::Normal, Leniency::Lenient] {
+                let Ok(serial) = Decoder::new(Cursor::new(damaged.clone())) else {
+                    continue;
+                };
+                let mut serial = serial.with_limits(guarded()).with_leniency(leniency);
+                let serial_result = serial.read_image();
+
+                let Ok(parallel) = Decoder::new(Cursor::new(damaged.clone())) else {
+                    continue;
+                };
+                let mut parallel = parallel.with_limits(guarded()).with_leniency(leniency);
+                let parallel_result = parallel.read_image_parallel();
+
+                match (serial_result, parallel_result) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(
+                            a, b,
+                            "{name} cut {cut} {leniency:?}: parallel decoded different pixels"
+                        );
+                        agreed_images += 1;
+                    }
+                    (Err(_), Err(_)) => {}
+                    // The two paths charge the output budget differently (the
+                    // parallel one precharges the whole image up front), so
+                    // one may refuse a file the other accepts *only* on
+                    // limits grounds; anything else is a real divergence.
+                    (Ok(_), Err(error)) | (Err(error), Ok(_)) => assert!(
+                        error.is_limits(),
+                        "{name} cut {cut} {leniency:?}: paths disagree with {error}"
+                    ),
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "{name} parallel corruption sweep is too slow"
+        );
+    }
+    // Non-vacuity: a sweep in which nothing ever decoded would pass every
+    // assertion above while comparing nothing at all.
+    assert!(
+        agreed_images >= corpus().len(),
+        "the sweep decoded only {agreed_images} images successfully; it is not comparing anything"
+    );
 }

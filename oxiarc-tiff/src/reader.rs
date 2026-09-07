@@ -49,6 +49,16 @@ impl<R: Read + Seek> ValueSource for Loader<'_, R> {
     fn load(&mut self, entry: &Entry) -> Result<Value> {
         load_value(self.reader, self.limits, entry)
     }
+
+    fn read_raw(&mut self, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+        if len == 0 || !self.reader.range_in_bounds(offset, len) {
+            return Ok(None);
+        }
+        let len = self.limits.check_value_size(0, len)?;
+        let mut bytes = vec![0u8; len];
+        self.reader.read_exact_at(offset, &mut bytes)?;
+        Ok(Some(bytes))
+    }
 }
 
 /// Materialises one entry's value, inline or out of line.
@@ -371,12 +381,15 @@ impl<R: Read + Seek> Decoder<R> {
         if self.info.is_some() {
             return Ok(());
         }
-        let offset = self.offsets.get(self.current).copied().ok_or_else(|| {
-            TiffError::Usage(UsageError::ImageIndexOutOfRange {
+        let count = self.offsets.len();
+        let offset = self
+            .offsets
+            .get(self.current)
+            .copied()
+            .ok_or(TiffError::Usage(UsageError::ImageIndexOutOfRange {
                 index: self.current,
-                count: self.offsets.len(),
-            })
-        })?;
+                count,
+            }))?;
         if offset == 0 {
             return Err(TiffError::Format(FormatError::RequiredTagNotFound(
                 Tag::ImageWidth,
@@ -535,6 +548,21 @@ impl<R: Read + Seek> Decoder<R> {
         let rect = Rect::new(x, y, width, height);
         let (sample_type, spp) = {
             let info = self.info()?;
+            // Bounds first: an out-of-image rectangle must report
+            // `RegionOutOfBounds`, and must do so *before* its area is used to
+            // size a buffer. Checking it only inside `read_region_bytes` let a
+            // 2^32-wide rectangle allocate (or trip the image-byte guard and
+            // report the wrong error) on the way there.
+            if !rect.fits_in(info.width, info.height) {
+                return Err(TiffError::Usage(UsageError::RegionOutOfBounds {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    image_width: info.width,
+                    image_height: info.height,
+                }));
+            }
             (info.sample_type()?, info.samples_per_pixel)
         };
         let count = rect
@@ -629,7 +657,155 @@ impl<R: Read + Seek> Decoder<R> {
         })
     }
 
-    /// The compressed bytes of chunk `index`, untouched.
+    /// [`Self::read_image`], with strip/tile decompression spread across a
+    /// `rayon` thread pool.
+    ///
+    /// Output is byte-identical to [`Self::read_image`]: only the CPU-bound
+    /// decompress/predictor/unpack step of the pipeline runs in parallel (a
+    /// fresh [`crate::decode::ChunkBuffers`] per chunk, never shared);
+    /// fetching bytes from the underlying reader and placing decoded pixels
+    /// into the destination both stay serial, because the reader is a single
+    /// `Read + Seek` handle and placement is cheap next to decompression.
+    /// See the [`crate::rayon_support`] module docs for the full design.
+    ///
+    /// # Errors
+    /// Every failure [`Self::read_image`] can produce.
+    #[cfg(feature = "rayon")]
+    pub fn read_image_parallel(&mut self) -> Result<Samples> {
+        let (width, height) = self.dimensions()?;
+        self.read_region_parallel(0, 0, width, height)
+    }
+
+    /// [`Self::read_image_bytes`], parallel per [`Self::read_image_parallel`].
+    ///
+    /// # Errors
+    /// Every failure [`Self::read_image_bytes`] can produce.
+    #[cfg(feature = "rayon")]
+    pub fn read_image_bytes_parallel(&mut self, dst: &mut [u8]) -> Result<ImageLayout> {
+        let (width, height) = self.dimensions()?;
+        self.read_region_bytes_parallel(Rect::new(0, 0, width, height), dst)
+    }
+
+    /// [`Self::read_region`], parallel per [`Self::read_image_parallel`].
+    ///
+    /// # Errors
+    /// Every failure [`Self::read_region`] can produce.
+    #[cfg(feature = "rayon")]
+    pub fn read_region_parallel(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Samples> {
+        let rect = Rect::new(x, y, width, height);
+        let (sample_type, spp) = {
+            let info = self.info()?;
+            if !rect.fits_in(info.width, info.height) {
+                return Err(TiffError::Usage(UsageError::RegionOutOfBounds {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    image_width: info.width,
+                    image_height: info.height,
+                }));
+            }
+            (info.sample_type()?, info.samples_per_pixel)
+        };
+        let count = rect
+            .area()
+            .checked_mul(u64::from(spp))
+            .ok_or(TiffError::IntOverflow)?;
+        let bytes = count
+            .checked_mul(sample_type.byte_width() as u64)
+            .ok_or(TiffError::IntOverflow)?;
+        let len = self.limits.check_image_bytes(bytes)?;
+        let mut buffer = vec![0u8; len];
+        self.read_region_bytes_parallel(rect, &mut buffer)?;
+        Samples::from_native_bytes(sample_type, &buffer)
+    }
+
+    /// [`Self::read_region_bytes`], parallel per [`Self::read_image_parallel`].
+    ///
+    /// # Errors
+    /// The same set as [`Self::read_region_bytes`].
+    #[cfg(feature = "rayon")]
+    pub fn read_region_bytes_parallel(
+        &mut self,
+        rect: Rect,
+        dst: &mut [u8],
+    ) -> Result<ImageLayout> {
+        self.ensure_image()?;
+        let info =
+            self.info
+                .as_ref()
+                .ok_or(TiffError::Format(FormatError::RequiredTagNotFound(
+                    Tag::ImageWidth,
+                )))?;
+        if !rect.fits_in(info.width, info.height) {
+            return Err(TiffError::Usage(UsageError::RegionOutOfBounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                image_width: info.width,
+                image_height: info.height,
+            }));
+        }
+        let sample_type = info.sample_type()?;
+        let spp = info.samples_per_pixel;
+        let row_stride = (rect.width as usize)
+            .checked_mul(usize::from(spp))
+            .and_then(|n| n.checked_mul(sample_type.byte_width()))
+            .ok_or(TiffError::IntOverflow)?;
+        let need = row_stride
+            .checked_mul(rect.height as usize)
+            .ok_or(TiffError::IntOverflow)?;
+        if dst.len() < need {
+            return Err(TiffError::Usage(UsageError::BufferTooSmall {
+                needed: need,
+                got: dst.len(),
+            }));
+        }
+
+        self.budget.reset();
+        crate::rayon_support::decode_into_parallel(
+            &mut self.reader,
+            info,
+            rect,
+            dst,
+            &self.limits,
+            self.leniency,
+            &mut self.budget,
+            self.registry.as_ref(),
+            &mut self.warnings,
+        )?;
+
+        Ok(ImageLayout {
+            width: rect.width,
+            height: rect.height,
+            sample_type,
+            samples_per_pixel: spp,
+            row_stride,
+            planes: 1,
+            plane_stride: 0,
+            total_len: need,
+        })
+    }
+
+    /// The bytes of chunk `index` exactly as they are stored in the file.
+    ///
+    /// "Raw" here means *literally as stored*: **no `FillOrder` reversal is
+    /// applied**. libtiff's `TIFFReadRawStrip` does reverse the bits when tag
+    /// 266 is 2, so a caller comparing against libtiff — or hand-decoding a
+    /// chunk while debugging a codec — must call
+    /// [`crate::sample::apply_fill_order`] on the returned bytes first when
+    /// [`ImageInfo::fill_order`](crate::ImageInfo) is
+    /// [`FillOrder::Lsb2Msb`](crate::FillOrder::Lsb2Msb) and the compression
+    /// is not one of the CCITT methods
+    /// ([`crate::compression::handles_fill_order`]). [`Self::read_chunk`] and
+    /// [`Self::read_image`] do this for you.
     ///
     /// # Errors
     /// [`FormatError::ChunkOffsetOutOfBounds`] plus I/O failures.
@@ -654,6 +830,20 @@ impl<R: Read + Seek> Decoder<R> {
     }
 
     /// Decodes chunk `index` at its coded size, without cropping.
+    ///
+    /// # Output budget
+    ///
+    /// [`Self::read_image`] and [`Self::read_region`] reset the file-level
+    /// [`OutputBudget`] before they start, so each of them is bounded by
+    /// [`Limits::max_image_bytes`] however many strips it decodes. `read_chunk`
+    /// deliberately does **not** reset it: it *adds* to the running total, so a
+    /// caller that walks the chunks itself is bounded exactly as a whole-image
+    /// read would be, and cannot get `chunk_count` times the cap by decoding one
+    /// chunk at a time. Decoding more bytes than the budget allows — by reading
+    /// the same chunk repeatedly, or by mixing `read_image` and `read_chunk` on
+    /// an image that already fills the budget — is therefore
+    /// [`crate::LimitError::OutputBudget`]; raise
+    /// [`Limits::max_image_bytes`] or re-create the decoder to start over.
     ///
     /// # Errors
     /// Every failure the decode pipeline can produce.

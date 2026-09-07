@@ -63,6 +63,34 @@ pub fn strips_for_rect(rows_per_strip: u32, height: u32, rect: Rect) -> Range<u3
     first..last.saturating_add(1)
 }
 
+/// The chunk indices, in decode order, of every strip across every plane
+/// that intersects `rect`.
+///
+/// Factored out of [`decode_into`] so a parallel driver (the `rayon`
+/// feature) enumerates *exactly* the chunks the serial path would, in the
+/// same order -- there is only one place this list is computed.
+#[must_use]
+pub fn chunk_indices_for_rect(info: &ImageInfo, rect: Rect) -> Vec<u64> {
+    let ChunkGeometry::Strips { rows_per_strip, .. } = &info.chunks else {
+        return Vec::new();
+    };
+    let range = strips_for_rect(*rows_per_strip, info.height, rect);
+    let per_plane = info.chunks_per_plane();
+    let planes = u64::from(info.plane_count());
+    let available = info.chunks.offsets().len() as u64;
+
+    let mut indices = Vec::new();
+    for plane in 0..planes {
+        for strip in range.clone() {
+            let index = plane * per_plane + u64::from(strip);
+            if index < available {
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
 /// Decodes every strip that intersects `rect` into `dst`.
 ///
 /// `dst` is laid out as `rect.width * rect.height` interleaved pixels of the
@@ -83,32 +111,18 @@ pub fn decode_into<R: Read + Seek>(
     warnings: &mut Warnings,
     buffers: &mut ChunkBuffers,
 ) -> Result<()> {
-    let ChunkGeometry::Strips { rows_per_strip, .. } = &info.chunks else {
-        return Ok(());
-    };
-    let range = strips_for_rect(*rows_per_strip, info.height, rect);
-    let per_plane = info.chunks_per_plane();
-    let planes = u64::from(info.plane_count());
-    let available = info.chunks.offsets().len() as u64;
-
-    for plane in 0..planes {
-        for strip in range.clone() {
-            let index = plane * per_plane + u64::from(strip);
-            if index >= available {
-                continue;
-            }
-            let shape = decode_chunk(
-                reader, info, index, limits, leniency, budget, registry, warnings, buffers,
-            )?;
-            place_chunk_in_rect(
-                buffers.native(),
-                &shape,
-                dst,
-                rect,
-                info.samples_per_pixel,
-                info.planar,
-            )?;
-        }
+    for index in chunk_indices_for_rect(info, rect) {
+        let shape = decode_chunk(
+            reader, info, index, limits, leniency, budget, registry, warnings, buffers,
+        )?;
+        place_chunk_in_rect(
+            buffers.native(),
+            &shape,
+            dst,
+            rect,
+            info.samples_per_pixel,
+            info.planar,
+        )?;
     }
     Ok(())
 }

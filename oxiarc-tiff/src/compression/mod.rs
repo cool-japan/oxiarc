@@ -28,17 +28,34 @@
 //! # Ok::<(), oxiarc_tiff::TiffError>(())
 //! ```
 
+#[cfg(feature = "ccitt")]
+pub mod ccitt;
+#[cfg(feature = "deflate")]
+pub mod deflate;
+#[cfg(feature = "jpeg")]
+pub mod jpeg;
+#[cfg(feature = "lzma")]
+pub mod lzma;
+#[cfg(feature = "lzw")]
+pub mod lzw;
 pub mod none;
 pub mod packbits;
+#[cfg(feature = "zstd")]
+pub mod zstd;
 
 use std::sync::Arc;
 
 use crate::byteorder::Endian;
-use crate::error::{Result, TiffError, UnsupportedError};
+use crate::error::{FormatError, Result, TiffError, UnsupportedError};
+use crate::limits::Leniency;
 use crate::tags::{
     CompressionMethod, FillOrder, PhotometricInterpretation, PlanarConfiguration, T4Options,
     T6Options,
 };
+
+mod state;
+
+pub use state::CodecState;
 
 /// Everything a codec needs to know about the chunk it is decoding.
 #[derive(Clone, Debug)]
@@ -66,10 +83,44 @@ pub struct CodecContext<'a> {
     pub t4_options: T4Options,
     /// `T6Options` for the CCITT Group 4 codec.
     pub t6_options: T6Options,
+    /// `YCbCrSubSampling` (530), or `(1, 1)` when the image is not subsampled.
+    pub ycbcr_subsampling: (u16, u16),
     /// The abbreviated JPEG table stream from tag 347, if any.
     pub jpeg_tables: Option<&'a [u8]>,
+    /// The old-style JPEG (compression 6) parameter tags, if any.
+    pub old_jpeg: Option<&'a OldJpegParams>,
     /// The file's byte order.
     pub endian: Endian,
+    /// How strictly a codec should treat a stream that disagrees with the
+    /// geometry.
+    ///
+    /// [`Leniency::Strict`] turns every deviation into an error;
+    /// [`Leniency::Lenient`] fills the shortfall (CCITT pads the row with the
+    /// background colour) and skips checksum verification.
+    pub leniency: Leniency,
+    /// Per-image codec state: decisions taken once (the LZW code-width rule)
+    /// and scratch reused across chunks (the inflate window).
+    ///
+    /// `None` means "no state available": every codec still works, it just
+    /// re-takes its decisions and re-allocates its scratch for each chunk.
+    pub state: Option<&'a CodecState>,
+    /// The largest scratch buffer a codec may allocate for this chunk, in
+    /// bytes — [`crate::Limits::intermediate_buffer_size`], forwarded.
+    ///
+    /// `dst` bounds a codec's *output*, but not every codec can decode
+    /// straight into it: a JPEG strip, for one, carries its own frame
+    /// dimensions in the `SOF` marker, and when those disagree with the
+    /// chunk's TIFF geometry the frame has to be decoded into scratch and
+    /// cropped. That scratch is sized by numbers taken from the compressed
+    /// stream, so it needs the same guard every other file-driven allocation
+    /// in this crate gets; without one, a strip whose `SOF` claims
+    /// 65535x65535 costs gigabytes before a single byte is decoded. Allocate
+    /// through [`crate::Limits::checked_alloc`] with this budget.
+    ///
+    /// The decode pipeline sets it from the reader's [`crate::Limits`];
+    /// [`CodecContext::new`] and the encoder use
+    /// `Limits::default().intermediate_buffer_size`.
+    pub max_scratch_bytes: usize,
 }
 
 impl<'a> CodecContext<'a> {
@@ -95,9 +146,20 @@ impl<'a> CodecContext<'a> {
             plane: 0,
             t4_options: T4Options::default(),
             t6_options: T6Options::default(),
+            ycbcr_subsampling: (1, 1),
             jpeg_tables: None,
+            old_jpeg: None,
             endian,
+            leniency: Leniency::Normal,
+            state: None,
+            max_scratch_bytes: crate::limits::Limits::default().intermediate_buffer_size,
         }
+    }
+
+    /// The chunk's coded pixel count, saturating instead of overflowing.
+    #[must_use]
+    pub fn pixel_count(&self) -> usize {
+        self.width.saturating_mul(self.height)
     }
 
     /// Bytes one packed row of this chunk occupies.
@@ -110,20 +172,45 @@ impl<'a> CodecContext<'a> {
     }
 }
 
+/// The old-style JPEG (compression 6) parameter tags, with every referenced
+/// table already loaded from the file.
+///
+/// TIFF 6.0 §22 described JPEG data through tags 512-521 before TTN2 replaced
+/// the whole scheme with compression 7. Tags 519/520/521 hold *file offsets*
+/// to the quantisation and Huffman tables, so they cannot be resolved from a
+/// chunk alone: [`crate::ImageInfo`] loads them while it parses the directory
+/// and hands the bytes to the codec through
+/// [`CodecContext::old_jpeg`](CodecContext::old_jpeg).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OldJpegParams {
+    /// `JPEGProc` (512): 1 = baseline sequential, 14 = lossless.
+    pub proc: u16,
+    /// `JPEGInterchangeFormat` (513) resolved to its bytes, when the offset
+    /// and length were usable.
+    pub interchange: Option<Vec<u8>>,
+    /// `JPEGRestartInterval` (515).
+    pub restart_interval: u16,
+    /// `JPEGQTables` (519), one 64-byte table per component, in tag order.
+    pub q_tables: Vec<Vec<u8>>,
+    /// `JPEGDCTables` (520), one `BITS`+`HUFFVAL` blob per component.
+    pub dc_tables: Vec<Vec<u8>>,
+    /// `JPEGACTables` (521), one `BITS`+`HUFFVAL` blob per component.
+    pub ac_tables: Vec<Vec<u8>>,
+    /// `JPEGLosslessPredictors` (517).
+    pub lossless_predictors: Vec<u16>,
+    /// `JPEGPointTransform` (518).
+    pub point_transform: Vec<u16>,
+}
+
 /// How hard an encoder should work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CodecLevel {
     /// The codec's own default effort.
+    #[default]
     Default,
     /// A numeric effort level, interpreted per codec.
     Level(i32),
-}
-
-impl Default for CodecLevel {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 /// An out-of-tree codec.
@@ -193,6 +280,54 @@ impl CodecRegistry {
     }
 }
 
+/// Whether the codec consumes `FillOrder` (tag 266) itself.
+///
+/// libtiff reverses the bits of every byte of the raw chunk when `FillOrder`
+/// is 2 — on read before the codec, on write after it — for every codec except
+/// the CCITT family, whose `Fax3SetupState` sets `TIFF_NOBITREV` because the
+/// fax decoder applies the tag while consuming the bit stream. The chunk
+/// pipeline therefore skips [`crate::sample::apply_fill_order`] for exactly
+/// these methods and passes `fill_order` down in the [`CodecContext`] instead.
+///
+/// ```
+/// use oxiarc_tiff::compression::handles_fill_order;
+/// use oxiarc_tiff::CompressionMethod;
+///
+/// assert!(handles_fill_order(CompressionMethod::CcittFax4));
+/// assert!(!handles_fill_order(CompressionMethod::PackBits));
+/// ```
+#[must_use]
+pub const fn handles_fill_order(method: CompressionMethod) -> bool {
+    matches!(
+        method,
+        CompressionMethod::CcittRle
+            | CompressionMethod::CcittFax3
+            | CompressionMethod::CcittFax4
+            | CompressionMethod::CcittRleWord
+    )
+}
+
+/// Whether the codec resolves `YCbCrSubSampling` itself.
+///
+/// The JPEG codecs do: a JPEG stream carries its own per-component sampling
+/// factors (which TIFF 6.0 TTN2 makes authoritative over tag 530), and the
+/// decoder upsamples chroma while it renders, so what comes back is
+/// full-resolution interleaved components rather than TIFF's subsampling
+/// units. Every other codec hands back units, which the chunk pipeline
+/// expands with [`crate::colour::expand_ycbcr_subsampling`].
+///
+/// ```
+/// use oxiarc_tiff::compression::expands_subsampling;
+/// use oxiarc_tiff::CompressionMethod;
+///
+/// assert!(expands_subsampling(CompressionMethod::Jpeg));
+/// assert!(!expands_subsampling(CompressionMethod::None));
+/// ```
+#[must_use]
+pub const fn expands_subsampling(method: CompressionMethod) -> bool {
+    matches!(method, CompressionMethod::Jpeg | CompressionMethod::OldJpeg)
+}
+
 /// A short human name for a compression method, used in error messages.
 #[must_use]
 pub fn method_name(method: CompressionMethod) -> &'static str {
@@ -246,6 +381,25 @@ pub fn decode_into_with(
     match cx.compression {
         CompressionMethod::None => none::decode_into(src, dst),
         CompressionMethod::PackBits => packbits::decode_into(src, dst),
+        #[cfg(feature = "lzw")]
+        CompressionMethod::Lzw => lzw::decode_into(src, dst, cx),
+        #[cfg(feature = "deflate")]
+        CompressionMethod::AdobeDeflate8 | CompressionMethod::Deflate => {
+            deflate::decode_into(src, dst, cx)
+        }
+        #[cfg(feature = "zstd")]
+        CompressionMethod::Zstd => zstd::decode_into(src, dst, cx),
+        #[cfg(feature = "lzma")]
+        CompressionMethod::Lzma => lzma::decode_into(src, dst, cx),
+        #[cfg(feature = "jpeg")]
+        CompressionMethod::Jpeg => jpeg::decode_into(src, dst, cx),
+        #[cfg(feature = "jpeg")]
+        CompressionMethod::OldJpeg => jpeg::decode_old_into(src, dst, cx),
+        #[cfg(feature = "ccitt")]
+        CompressionMethod::CcittRle
+        | CompressionMethod::CcittFax3
+        | CompressionMethod::CcittFax4
+        | CompressionMethod::CcittRleWord => ccitt::decode_into(src, dst, cx),
         other => Err(unavailable(other)),
     }
 }
@@ -268,7 +422,8 @@ pub fn encode_with(
     level: CodecLevel,
     registry: Option<&CodecRegistry>,
 ) -> Result<Vec<u8>> {
-    let _ = level;
+    // Not every build has a codec that reads the effort level.
+    let _ = &level;
     if let Some(registry) = registry {
         if let Some(codec) = registry.find(cx.compression.to_u16()) {
             return codec.encode(src, cx);
@@ -277,19 +432,72 @@ pub fn encode_with(
     match cx.compression {
         CompressionMethod::None => Ok(src.to_vec()),
         CompressionMethod::PackBits => Ok(packbits::encode(src, cx.row_bytes())),
+        #[cfg(feature = "lzw")]
+        CompressionMethod::Lzw => lzw::encode(src),
+        #[cfg(feature = "deflate")]
+        CompressionMethod::AdobeDeflate8 | CompressionMethod::Deflate => {
+            deflate::encode(src, level)
+        }
+        #[cfg(feature = "zstd")]
+        CompressionMethod::Zstd => zstd::encode(src, level),
+        #[cfg(feature = "lzma")]
+        CompressionMethod::Lzma => lzma::encode(src, level),
+        #[cfg(feature = "jpeg")]
+        CompressionMethod::Jpeg => jpeg::encode(src, cx, level),
+        #[cfg(feature = "ccitt")]
+        CompressionMethod::CcittRle
+        | CompressionMethod::CcittFax3
+        | CompressionMethod::CcittFax4
+        | CompressionMethod::CcittRleWord => ccitt::encode(src, cx),
         other => Err(unavailable(other)),
     }
 }
 
-/// The error a not-yet-wired-up or unknown compression value produces.
+/// The error a codec whose cargo feature is off produces.
+///
+/// Kept separate from [`unavailable`] so the message points at the fix (turn
+/// the feature on) rather than at the calendar.
+fn feature_missing(feature: &'static str) -> TiffError {
+    TiffError::Unsupported(UnsupportedError::FeatureNotCompiled { feature })
+}
+
+/// Wraps a codec crate's error as a TIFF stream defect.
+///
+/// The codec crates report their own error types; a TIFF caller wants to know
+/// *which compression* failed and what it said, which is exactly
+/// [`FormatError::Codec`]. Going through `Display` keeps this crate from
+/// depending on `oxiarc-core` just to name an error type.
+#[cfg_attr(
+    not(any(
+        feature = "lzw",
+        feature = "deflate",
+        feature = "zstd",
+        feature = "lzma",
+        feature = "jpeg",
+        feature = "ccitt"
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn codec_error(method: CompressionMethod, error: impl core::fmt::Display) -> TiffError {
+    TiffError::Format(FormatError::Codec {
+        method: method.to_u16(),
+        message: error.to_string(),
+    })
+}
+
+/// The error an unknown compression value produces.
+///
+/// A method this crate implements never reaches here: the dispatch has an arm
+/// for it either way, and the feature-off arm reports
+/// [`UnsupportedError::FeatureNotCompiled`] with the feature to turn on. What
+/// is left is the registered-but-not-implemented set (WebP, JPEG XL, LERC,
+/// JBIG, NeXT, ThunderScan, the IT8 and Pixar values) and genuinely unknown
+/// numbers, all of which are [`UnsupportedError::Compression`] — the invitation
+/// to register a [`Codec`] for them.
 fn unavailable(method: CompressionMethod) -> TiffError {
-    if method.is_scheduled() {
-        TiffError::Unsupported(UnsupportedError::NotYetAvailable {
-            method: method.to_u16(),
-            name: method_name(method),
-        })
-    } else {
-        TiffError::Unsupported(UnsupportedError::Compression(method.to_u16()))
+    match method.cargo_feature() {
+        Some(feature) => feature_missing(feature),
+        None => TiffError::Unsupported(UnsupportedError::Compression(method.to_u16())),
     }
 }
 
@@ -324,11 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn every_scheduled_codec_reports_not_yet_available_by_name() {
+    fn every_in_crate_codec_is_wired_up_or_names_its_feature() {
+        // Nothing this crate implements may answer `NotYetAvailable` any
+        // more: either the codec runs, or the error names the cargo feature
+        // to turn on.
         for method in [
             CompressionMethod::CcittRle,
             CompressionMethod::CcittFax3,
             CompressionMethod::CcittFax4,
+            CompressionMethod::CcittRleWord,
             CompressionMethod::Lzw,
             CompressionMethod::OldJpeg,
             CompressionMethod::Jpeg,
@@ -337,17 +549,61 @@ mod tests {
             CompressionMethod::Lzma,
             CompressionMethod::Zstd,
         ] {
+            let bilevel = [1u16];
+            let mut cx = context(method);
+            if matches!(
+                method,
+                CompressionMethod::CcittRle
+                    | CompressionMethod::CcittFax3
+                    | CompressionMethod::CcittFax4
+                    | CompressionMethod::CcittRleWord
+            ) {
+                // The fax codes are defined for single-channel bilevel data
+                // only, so give them a geometry they accept.
+                cx.bits_per_sample = &bilevel;
+                cx.width = 32;
+                cx.height = 1;
+            }
+            let mut dst = [0u8; 4];
+            let result = decode_into(&[0; 4], &mut dst, &cx);
+            let expected_feature = method.cargo_feature();
+            match result {
+                Ok(_) => assert!(method.is_available(), "{method} decoded while disabled"),
+                Err(TiffError::Unsupported(UnsupportedError::FeatureNotCompiled { feature })) => {
+                    assert!(
+                        !method.is_available(),
+                        "{method} reported its feature while on"
+                    );
+                    assert_eq!(Some(feature), expected_feature, "{method}");
+                }
+                Err(TiffError::Format(_)) => {
+                    // Four zero bytes are not a valid stream for any of these
+                    // codecs; a stream-level complaint is the right answer.
+                    assert!(method.is_available(), "{method} parsed while disabled");
+                }
+                Err(TiffError::Unsupported(UnsupportedError::OldJpeg(_))) => {
+                    assert_eq!(method, CompressionMethod::OldJpeg);
+                }
+                Err(other) => panic!("{method} produced {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_codec_reports_not_yet_available() {
+        for value in 0u16..=1024 {
+            let method = CompressionMethod::from_u16(value);
             let cx = context(method);
             let mut dst = [0u8; 4];
-            let err = decode_into(&[0; 4], &mut dst, &cx).expect_err("not available yet");
-            match err {
-                TiffError::Unsupported(UnsupportedError::NotYetAvailable { method: m, name }) => {
-                    assert_eq!(m, method.to_u16());
-                    assert!(!name.is_empty());
-                }
-                other => panic!("{method} produced {other}"),
+            if let Err(err) = decode_into(&[0; 4], &mut dst, &cx) {
+                assert!(
+                    !matches!(
+                        err,
+                        TiffError::Unsupported(UnsupportedError::NotYetAvailable { .. })
+                    ),
+                    "compression {value} still answers NotYetAvailable"
+                );
             }
-            assert!(encode(&[0; 4], &cx, CodecLevel::Default).is_err());
         }
     }
 
@@ -358,7 +614,6 @@ mod tests {
             CompressionMethod::JpegXl,
             CompressionMethod::Jbig,
             CompressionMethod::Next,
-            CompressionMethod::CcittRleWord,
             CompressionMethod::Dcs,
             CompressionMethod::It8Ctpad,
             CompressionMethod::Unknown(60000),

@@ -93,6 +93,93 @@ fn bench_decode(c: &mut Criterion) {
         });
     }
 
+    // Arithmetic coding, whose decode cost is dominated by the QM coder
+    // rather than by the IDCT: one binary decision per magnitude bit, with a
+    // data-dependent renormalisation loop.
+    #[cfg(feature = "arithmetic")]
+    {
+        let arithmetic_cases: [(&str, &[&str], usize, usize); 3] = [
+            (
+                "arithmetic_420_q75_512",
+                &["-quality", "75", "-sample", "2x2", "-arithmetic"],
+                512,
+                512,
+            ),
+            (
+                "arithmetic_444_q95_512",
+                &["-quality", "95", "-sample", "1x1", "-arithmetic"],
+                512,
+                512,
+            ),
+            (
+                "arithmetic_progressive_q75_512",
+                &["-quality", "75", "-progressive", "-arithmetic"],
+                512,
+                512,
+            ),
+        ];
+        for (name, args, width, height) in arithmetic_cases {
+            let source = source_ppm(width, height);
+            let Some(jpeg) = cjpeg(args, &source) else {
+                eprintln!("skipping {name}: cjpeg cannot write arithmetic streams");
+                continue;
+            };
+            group.throughput(Throughput::Elements((width * height) as u64));
+            group.bench_function(name, |b| {
+                b.iter(|| {
+                    let mut decoder = Decoder::new(jpeg.as_slice());
+                    black_box(decoder.decode().expect("decode"))
+                });
+            });
+        }
+    }
+
+    // Restart intervals, which the `rayon` feature decodes in parallel and
+    // which are otherwise a small overhead over the plain baseline case.
+    {
+        let source = source_ppm(1024, 1024);
+        if let Some(jpeg) = cjpeg(
+            &["-quality", "75", "-sample", "2x2", "-restart", "1"],
+            &source,
+        ) {
+            group.throughput(Throughput::Elements(1024 * 1024));
+            group.bench_function("baseline_420_restart_1024", |b| {
+                b.iter(|| {
+                    let mut decoder = Decoder::new(jpeg.as_slice());
+                    black_box(decoder.decode().expect("decode"))
+                });
+            });
+        }
+    }
+
+    // The same shape with the QM coder. Entropy coding is a far larger share
+    // of an arithmetic decode than of a Huffman one, so this is the case the
+    // `rayon` feature has the most to gain on.
+    #[cfg(feature = "arithmetic")]
+    {
+        let source = source_ppm(1024, 1024);
+        if let Some(jpeg) = cjpeg(
+            &[
+                "-quality",
+                "75",
+                "-sample",
+                "2x2",
+                "-arithmetic",
+                "-restart",
+                "1",
+            ],
+            &source,
+        ) {
+            group.throughput(Throughput::Elements(1024 * 1024));
+            group.bench_function("arithmetic_420_restart_1024", |b| {
+                b.iter(|| {
+                    let mut decoder = Decoder::new(jpeg.as_slice());
+                    black_box(decoder.decode().expect("decode"))
+                });
+            });
+        }
+    }
+
     // Always-available fallback so the harness runs on a hermetic machine.
     let sample: &[u8] = &oxiarc_jpeg::sample::GRAY_1X1;
     group.bench_function("embedded_gray_1x1", |b| {

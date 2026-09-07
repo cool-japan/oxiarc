@@ -14,8 +14,8 @@
 
 use oxiarc_core::traits::{CompressStatus, Compressor, Decompressor, FlushMode};
 use oxiarc_deflate::{
-    Deflater, InflateStatus, InflateWrapper, Inflater, WrappedInflate, ZlibStreamDecoder,
-    compress_gzip_parallel, gzip_decompress,
+    Deflater, GzipStreamDecoder, InflateReader, InflateStatus, InflateWrapper, Inflater,
+    WrappedInflate, ZlibStreamDecoder, compress_gzip_parallel, gzip_decompress,
 };
 use std::io::Read;
 use std::process::Command;
@@ -570,4 +570,263 @@ open(sys.argv[2], 'wb').write(out)
         }
     }
     eprintln!("[zlib-oracle] bounded-output push calls match CPython decompressobj(max_length=n)");
+}
+
+// ---------------------------------------------------------------------------
+// The `Read` adapters against the reference codecs
+// ---------------------------------------------------------------------------
+
+/// Read `reader` to the end `chunk` bytes at a time.
+fn read_all_chunked<R: Read>(mut reader: R, chunk: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; chunk];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// A source that hands out at most `step` bytes per `read`, so the adapter
+/// is driven with the short reads a socket really produces.
+struct DribbleSource<'a> {
+    data: &'a [u8],
+    pos: usize,
+    step: usize,
+}
+
+impl Read for DribbleSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.step).min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// `InflateReader` must decode CPython's output for all three `wbits`
+/// framings, and via `Auto`, through both a dribbling source and one-byte
+/// caller reads — the two schedules that break a naive adapter.
+#[test]
+fn oracle_python_wbits_matrix_through_the_read_adapter() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping reader wbits matrix (self-skip)");
+        return;
+    }
+
+    let script = r#"
+import sys, zlib
+data = open(sys.argv[1], 'rb').read()
+wbits = int(sys.argv[3])
+c = zlib.compressobj(6, zlib.DEFLATED, wbits)
+open(sys.argv[2], 'wb').write(c.compress(data) + c.flush())
+"#;
+
+    for (name, payload) in oracle_payloads() {
+        for (wbits, framing) in [
+            (-15i32, InflateWrapper::Raw),
+            (15, InflateWrapper::Zlib),
+            (31, InflateWrapper::Gzip),
+        ] {
+            let src = temp_path(&format!("rdwbits_src_{name}_{wbits}"));
+            let dst = temp_path(&format!("rdwbits_dst_{name}_{wbits}"));
+            std::fs::write(&src, &payload).expect("write payload");
+            run_python(
+                script,
+                &[&src, &dst, std::path::Path::new(&wbits.to_string())],
+            );
+            let compressed = std::fs::read(&dst).expect("read compressed");
+            let _ = std::fs::remove_file(&src);
+            let _ = std::fs::remove_file(&dst);
+
+            for chunk in [1usize, 65_536] {
+                let source = DribbleSource {
+                    data: &compressed,
+                    pos: 0,
+                    step: 5,
+                };
+                let decoded = read_all_chunked(InflateReader::new(source, framing), chunk)
+                    .unwrap_or_else(|e| panic!("{name} wbits {wbits} chunk {chunk}: {e}"));
+                assert_eq!(decoded, payload, "{name} wbits {wbits} chunk {chunk}");
+            }
+
+            // `Auto` must reach the same answer without being told.
+            let decoded = read_all_chunked(InflateReader::auto(&compressed[..]), 3)
+                .unwrap_or_else(|e| panic!("{name} wbits {wbits} auto: {e}"));
+            assert_eq!(decoded, payload, "{name} wbits {wbits}: Auto reader");
+        }
+    }
+    eprintln!("[zlib-oracle] CPython wbits -15/15/31 decoded through InflateReader");
+}
+
+/// The system `gzip` CLI's multi-member output (`gzip -c a b`) must decode
+/// through `GzipStreamDecoder`, `InflateReader` and the async adapter to
+/// the same bytes.
+#[test]
+fn oracle_gzip_cli_multi_member_through_the_read_adapters() {
+    if !gzip_cli_available() {
+        eprintln!("[zlib-oracle] gzip CLI not found; skipping multi-member readers (self-skip)");
+        return;
+    }
+
+    let first = b"first file from the gzip CLI\n".repeat(400);
+    let second = b"second file, quite different content\n".repeat(250);
+    let path_a = temp_path("cli_a");
+    let path_b = temp_path("cli_b");
+    std::fs::write(&path_a, &first).expect("write a");
+    std::fs::write(&path_b, &second).expect("write b");
+
+    let out = Command::new("gzip")
+        .args(["-c"])
+        .arg(&path_a)
+        .arg(&path_b)
+        .output()
+        .expect("spawn gzip");
+    assert!(out.status.success(), "gzip -c failed");
+    let compressed = out.stdout;
+    let _ = std::fs::remove_file(&path_a);
+    let _ = std::fs::remove_file(&path_b);
+
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+
+    for chunk in [1usize, 3, 65_536] {
+        let decoded = read_all_chunked(GzipStreamDecoder::new(&compressed[..]), chunk)
+            .unwrap_or_else(|e| panic!("GzipStreamDecoder chunk {chunk}: {e}"));
+        assert_eq!(decoded, expected, "GzipStreamDecoder chunk {chunk}");
+
+        let decoded = read_all_chunked(InflateReader::gzip(&compressed[..]), chunk)
+            .unwrap_or_else(|e| panic!("InflateReader chunk {chunk}: {e}"));
+        assert_eq!(decoded, expected, "InflateReader chunk {chunk}");
+    }
+
+    let mut reader = InflateReader::gzip(&compressed[..]);
+    let mut sink = Vec::new();
+    reader.read_to_end(&mut sink).expect("read_to_end");
+    assert_eq!(reader.members_decoded(), 2, "gzip -c a b emits two members");
+    assert_eq!(gzip_decompress(&compressed).expect("one-shot"), expected);
+
+    eprintln!("[zlib-oracle] `gzip -c a b` decoded through both Read adapters");
+}
+
+/// CPython's concatenated zlib members, decoded through the `Read` adapters
+/// with the trailing-fragment shapes the short-tail rule governs.
+#[test]
+fn oracle_python_concatenated_zlib_through_the_read_adapter() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping reader concatenation (self-skip)");
+        return;
+    }
+
+    let script = r#"
+import sys, zlib
+data = open(sys.argv[1], 'rb').read()
+half = len(data) // 2
+open(sys.argv[2], 'wb').write(
+    zlib.compress(data[:half], 9) + zlib.compress(data[half:], 1))
+"#;
+
+    for (name, payload) in oracle_payloads() {
+        let src = temp_path(&format!("rdcat_src_{name}"));
+        let dst = temp_path(&format!("rdcat_dst_{name}"));
+        std::fs::write(&src, &payload).expect("write payload");
+        run_python(script, &[&src, &dst]);
+        let base = std::fs::read(&dst).expect("read compressed");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+
+        for tail in [
+            &b""[..],
+            &[0x78][..],
+            &[0x78, 0x9c][..],
+            &[0x00, 0x00, 0x00][..],
+        ] {
+            let mut compressed = base.clone();
+            compressed.extend_from_slice(tail);
+            for chunk in [1usize, 65_536] {
+                let decoded = read_all_chunked(ZlibStreamDecoder::new(&compressed[..]), chunk)
+                    .unwrap_or_else(|e| panic!("{name} tail {tail:02x?} chunk {chunk}: {e}"));
+                assert_eq!(decoded, payload, "{name} tail {tail:02x?} chunk {chunk}");
+            }
+        }
+    }
+    eprintln!("[zlib-oracle] CPython concatenated zlib decoded through ZlibStreamDecoder");
+}
+
+/// D9: `Adler32` against CPython's `zlib.adler32`, directly rather than
+/// through a zlib trailer.
+///
+/// The checksum was rewritten in 0.4.2 into a lane-accumulator form that a
+/// compiler can vectorise (2.4 GB/s -> ~23 GB/s). The identity behind it is
+/// exact, so "close enough" is not a possible outcome: every length here is
+/// compared byte for byte with the reference, including the lengths that
+/// straddle the 32-byte group and the `NMAX` block, and the incremental feed
+/// that a streaming decoder actually uses.
+#[test]
+fn oracle_python_adler32_matches_at_every_boundary() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping adler32 check (self-skip)");
+        return;
+    }
+
+    let lengths: Vec<usize> = vec![
+        0, 1, 2, 31, 32, 33, 63, 64, 65, 255, 5519, 5520, 5535, 5536, 5551, 5552, 5553, 11_071,
+        11_072, 11_104, 70_000,
+    ];
+
+    for len in lengths {
+        for (tag, data) in [
+            ("max", vec![0xFFu8; len]),
+            ("zero", vec![0u8; len]),
+            (
+                "mixed",
+                (0..len)
+                    .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) as u8)
+                    .collect::<Vec<u8>>(),
+            ),
+        ] {
+            let path = temp_path(&format!("adler_{tag}_{len}"));
+            std::fs::write(&path, &data).expect("write payload");
+            let out = run_python(
+                "import sys, zlib\n\
+                 data = open(sys.argv[1], 'rb').read()\n\
+                 sys.stdout.write(str(zlib.adler32(data) & 0xFFFFFFFF))\n",
+                &[&path],
+            );
+            let _ = std::fs::remove_file(&path);
+            let expected: u32 = String::from_utf8_lossy(&out)
+                .trim()
+                .parse()
+                .expect("python adler32");
+
+            assert_eq!(
+                oxiarc_deflate::Adler32::checksum(&data),
+                expected,
+                "[zlib-oracle] one-shot adler32 differs at len={len} ({tag})"
+            );
+
+            // The streaming feed a decoder performs must agree too.
+            let mut incremental = oxiarc_deflate::Adler32::new();
+            let mut pos = 0usize;
+            let mut step = 1usize;
+            while pos < data.len() {
+                let take = step.min(data.len() - pos);
+                incremental.update(&data[pos..pos + take]);
+                pos += take;
+                step = (step * 3 + 1).min(4096);
+            }
+            assert_eq!(
+                incremental.finish(),
+                expected,
+                "[zlib-oracle] incremental adler32 differs at len={len} ({tag})"
+            );
+        }
+    }
+
+    eprintln!("[zlib-oracle] CPython zlib.adler32 agrees at every group/NMAX boundary");
 }

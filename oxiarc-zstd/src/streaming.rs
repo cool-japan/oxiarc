@@ -51,7 +51,7 @@ const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 /// called.
 ///
 /// The output is a sequence of valid concatenated Zstandard frames and can be
-/// decoded with [`decompress_multi_frame`].
+/// decoded with [`crate::decompress_multi_frame`].
 ///
 /// Supports optional progress reporting via [`ProgressHandle`] and
 /// cooperative cancellation via [`CancellationToken`] using the

@@ -271,32 +271,76 @@ raw_enum! {
 }
 
 impl CompressionMethod {
-    /// `true` when this crate can decode the method with the current features.
+    /// `true` when this build can decode the method.
     ///
-    /// Track G0 ships `None` and `PackBits`; the remaining registered codecs
-    /// return [`crate::UnsupportedError::NotYetAvailable`] from the dispatch
-    /// until their modules land.
+    /// Uncompressed and PackBits are always compiled; every other in-crate
+    /// codec sits behind the cargo feature [`Self::cargo_feature`] names, so
+    /// the answer depends on how the crate was built.
+    ///
+    /// ```
+    /// use oxiarc_tiff::CompressionMethod;
+    ///
+    /// assert!(CompressionMethod::PackBits.is_available());
+    /// assert_eq!(
+    ///     CompressionMethod::Lzw.is_available(),
+    ///     cfg!(feature = "lzw")
+    /// );
+    /// assert!(!CompressionMethod::Webp.is_available());
+    /// ```
     #[must_use]
+    // Every arm answers a different `cfg!`, so the arms are only identical in
+    // an all-features build — which is exactly when clippy proposes
+    // `matches!`.
+    #[allow(clippy::match_like_matches_macro)]
     pub const fn is_available(self) -> bool {
-        matches!(self, Self::None | Self::PackBits)
+        match self {
+            Self::None | Self::PackBits => true,
+            Self::Lzw => cfg!(feature = "lzw"),
+            Self::AdobeDeflate8 | Self::Deflate => cfg!(feature = "deflate"),
+            Self::Zstd => cfg!(feature = "zstd"),
+            Self::Lzma => cfg!(feature = "lzma"),
+            Self::Jpeg | Self::OldJpeg => cfg!(feature = "jpeg"),
+            Self::CcittRle | Self::CcittFax3 | Self::CcittFax4 | Self::CcittRleWord => {
+                cfg!(feature = "ccitt")
+            }
+            _ => false,
+        }
     }
 
-    /// `true` for the codecs whose decoders are scheduled but not yet wired up.
+    /// The cargo feature carrying this method's codec, if this crate has one.
+    ///
+    /// `None` means the crate implements no codec for the value — either
+    /// because it is unknown (`Unknown(n)`), because it needs no feature
+    /// (`None`, `PackBits`), or because it is a registered method left to an
+    /// out-of-tree [`crate::Codec`] (WebP, JPEG XL, LERC, JBIG, ...).
+    ///
+    /// ```
+    /// use oxiarc_tiff::CompressionMethod;
+    ///
+    /// assert_eq!(CompressionMethod::Lzw.cargo_feature(), Some("lzw"));
+    /// assert_eq!(CompressionMethod::PackBits.cargo_feature(), None);
+    /// assert_eq!(CompressionMethod::Webp.cargo_feature(), None);
+    /// ```
+    #[must_use]
+    pub const fn cargo_feature(self) -> Option<&'static str> {
+        match self {
+            Self::Lzw => Some("lzw"),
+            Self::AdobeDeflate8 | Self::Deflate => Some("deflate"),
+            Self::Zstd => Some("zstd"),
+            Self::Lzma => Some("lzma"),
+            Self::Jpeg | Self::OldJpeg => Some("jpeg"),
+            Self::CcittRle | Self::CcittFax3 | Self::CcittFax4 | Self::CcittRleWord => {
+                Some("ccitt")
+            }
+            _ => None,
+        }
+    }
+
+    /// `true` when this crate implements the method behind a cargo feature,
+    /// whether or not that feature is on in this build.
     #[must_use]
     pub const fn is_scheduled(self) -> bool {
-        matches!(
-            self,
-            Self::CcittRle
-                | Self::CcittFax3
-                | Self::CcittFax4
-                | Self::Lzw
-                | Self::OldJpeg
-                | Self::Jpeg
-                | Self::AdobeDeflate8
-                | Self::Deflate
-                | Self::Lzma
-                | Self::Zstd
-        )
+        self.cargo_feature().is_some()
     }
 
     /// `true` when a [`Predictor`] other than [`Predictor::None`] is defined
@@ -661,23 +705,66 @@ mod tests {
     }
 
     #[test]
-    fn only_none_and_packbits_are_available_in_this_track() {
+    fn availability_follows_the_cargo_features() {
+        // Always compiled: they need no dependency.
         assert!(CompressionMethod::None.is_available());
         assert!(CompressionMethod::PackBits.is_available());
+        assert_eq!(CompressionMethod::None.cargo_feature(), None);
+
+        let expected = [
+            (CompressionMethod::Lzw, "lzw", cfg!(feature = "lzw")),
+            (
+                CompressionMethod::Deflate,
+                "deflate",
+                cfg!(feature = "deflate"),
+            ),
+            (
+                CompressionMethod::AdobeDeflate8,
+                "deflate",
+                cfg!(feature = "deflate"),
+            ),
+            (CompressionMethod::Zstd, "zstd", cfg!(feature = "zstd")),
+            (CompressionMethod::Lzma, "lzma", cfg!(feature = "lzma")),
+            (CompressionMethod::Jpeg, "jpeg", cfg!(feature = "jpeg")),
+            (CompressionMethod::OldJpeg, "jpeg", cfg!(feature = "jpeg")),
+            (
+                CompressionMethod::CcittRle,
+                "ccitt",
+                cfg!(feature = "ccitt"),
+            ),
+            (
+                CompressionMethod::CcittFax3,
+                "ccitt",
+                cfg!(feature = "ccitt"),
+            ),
+            (
+                CompressionMethod::CcittFax4,
+                "ccitt",
+                cfg!(feature = "ccitt"),
+            ),
+            (
+                CompressionMethod::CcittRleWord,
+                "ccitt",
+                cfg!(feature = "ccitt"),
+            ),
+        ];
+        for (method, feature, on) in expected {
+            assert!(method.is_scheduled(), "{method} is implemented in-crate");
+            assert_eq!(method.cargo_feature(), Some(feature), "{method}");
+            assert_eq!(method.is_available(), on, "{method}");
+        }
+
+        // Registered but left to an out-of-tree `Codec`.
         for method in [
-            CompressionMethod::Lzw,
-            CompressionMethod::Deflate,
-            CompressionMethod::AdobeDeflate8,
-            CompressionMethod::Zstd,
-            CompressionMethod::Lzma,
-            CompressionMethod::Jpeg,
-            CompressionMethod::OldJpeg,
-            CompressionMethod::CcittRle,
-            CompressionMethod::CcittFax3,
-            CompressionMethod::CcittFax4,
+            CompressionMethod::Webp,
+            CompressionMethod::JpegXl,
+            CompressionMethod::Jbig,
+            CompressionMethod::Next,
+            CompressionMethod::Unknown(60000),
         ] {
-            assert!(!method.is_available(), "{method} must not claim support");
-            assert!(method.is_scheduled(), "{method} must be scheduled");
+            assert!(!method.is_scheduled(), "{method}");
+            assert!(!method.is_available(), "{method}");
+            assert_eq!(method.cargo_feature(), None, "{method}");
         }
     }
 

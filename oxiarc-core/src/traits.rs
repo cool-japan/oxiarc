@@ -95,9 +95,10 @@ pub enum FlushMode {
 /// error out on the first incomplete chunk instead of waiting. Callers with
 /// genuine chunks must use a codec's own push-decoder type instead, where an
 /// explicit flush parameter distinguishes "more is coming" from "this is
-/// everything" (for example `oxiarc_lz4`'s frame streaming decoder, or
-/// `StreamingLzhDecoder`; `oxiarc_deflate` is gaining a resumable
-/// `InflateStream`/`WrappedInflate` push API for exactly this purpose).
+/// everything" — `oxiarc_deflate`'s `InflateStream`/`WrappedInflate` (or its
+/// `InflateReader`/`AsyncInflateReader` adapters, which drive them from a
+/// `Read`/`AsyncRead` source), `oxiarc_lz4`'s frame streaming decoder, or
+/// `StreamingLzhDecoder`.
 ///
 /// # Contract: no silent, unbounded spinning
 ///
@@ -147,18 +148,29 @@ pub trait Decompressor {
     /// Repeatedly calls [`decompress`](Decompressor::decompress), each time
     /// passing the entire not-yet-consumed remainder of `input` — honoring
     /// the whole-remaining-input contract documented on this trait — until
-    /// the decompressor reports [`Done`](DecompressStatus::Done) or (for a
-    /// decoder that has no explicit end marker) input runs out while it
-    /// reports [`NeedsInput`](DecompressStatus::NeedsInput).
+    /// the decompressor reports [`Done`](DecompressStatus::Done), or until
+    /// input runs out while it reports
+    /// [`NeedsInput`](DecompressStatus::NeedsInput) *and*
+    /// [`is_finished`](Decompressor::is_finished) confirms the stream really
+    /// did end there (the case for a decoder with no explicit end marker).
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying [`decompress`](Decompressor::decompress)
-    /// call does, or if the decompressor makes **no progress** (consumes
-    /// zero bytes and produces zero bytes) on two consecutive calls without
-    /// reaching `Done` — a defensive guard against a non-conforming or
-    /// buggy implementation spinning this loop forever instead of erroring
-    /// or completing.
+    /// Returns an error if:
+    ///
+    /// * the underlying [`decompress`](Decompressor::decompress) call does;
+    /// * the decompressor makes **no progress** (consumes zero bytes and
+    ///   produces zero bytes) on two consecutive calls without reaching
+    ///   `Done` — a defensive guard against a non-conforming or buggy
+    ///   implementation spinning this loop forever instead of erroring or
+    ///   completing;
+    /// * `input` is exhausted while the decompressor still asks for more and
+    ///   does not consider itself finished — i.e. the compressed stream is
+    ///   **truncated**. Returning the partial output as `Ok` here (which this
+    ///   method did before 0.4.2) is silent truncation: the caller cannot
+    ///   tell a cut-short stream from a complete one. A decoder that
+    ///   legitimately ends without an end marker signals that by reporting
+    ///   `is_finished()`, and is unaffected.
     fn decompress_all(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         let mut input_pos = 0;
@@ -185,7 +197,18 @@ pub trait Decompressor {
 
             match status {
                 DecompressStatus::Done => break,
-                DecompressStatus::NeedsInput if input_pos >= input.len() => break,
+                DecompressStatus::NeedsInput if input_pos >= input.len() => {
+                    if !self.is_finished() {
+                        // Same error shape as the no-progress guard above, so
+                        // the offset a caller can act on (how far into the
+                        // compressed stream the cut was noticed) is carried.
+                        return Err(OxiArcError::corrupted(
+                            input_pos as u64,
+                            "decompress_all: input exhausted while the decoder still                              needs more (truncated stream)",
+                        ));
+                    }
+                    break;
+                }
                 DecompressStatus::NeedsOutput | DecompressStatus::NeedsInput => continue,
                 DecompressStatus::BlockEnd => continue,
             }
@@ -563,6 +586,89 @@ mod tests {
         let out = encoder
             .compress_all(&data)
             .expect("a compressor that only emits on Finish must not look stalled");
+        assert_eq!(out, data);
+    }
+
+    /// A decoder that keeps asking for input it will never get: the stream
+    /// was truncated. `decompress_all` must report that, not hand back the
+    /// partial output as a successful decode.
+    struct AlwaysNeedsMoreDecompressor {
+        consumed_any: bool,
+    }
+
+    impl Decompressor for AlwaysNeedsMoreDecompressor {
+        fn decompress(
+            &mut self,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<(usize, usize, DecompressStatus)> {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            if n > 0 {
+                self.consumed_any = true;
+            }
+            Ok((n, n, DecompressStatus::NeedsInput))
+        }
+
+        fn reset(&mut self) {
+            self.consumed_any = false;
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_decompress_all_rejects_truncated_input() {
+        let mut decoder = AlwaysNeedsMoreDecompressor {
+            consumed_any: false,
+        };
+        let result = decoder.decompress_all(b"a partial compressed stream");
+        assert!(
+            result.is_err(),
+            "input exhausted while the decoder still needs more is truncation, \
+             not a successful decode"
+        );
+    }
+
+    /// The opposite shape: a decoder with no explicit end marker that reports
+    /// `is_finished()` once it has everything. It ends on `NeedsInput` with
+    /// the input exhausted, and that must stay a clean success.
+    struct NoEndMarkerDecompressor {
+        done: bool,
+    }
+
+    impl Decompressor for NoEndMarkerDecompressor {
+        fn decompress(
+            &mut self,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<(usize, usize, DecompressStatus)> {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            if n == input.len() {
+                self.done = true;
+            }
+            Ok((n, n, DecompressStatus::NeedsInput))
+        }
+
+        fn reset(&mut self) {
+            self.done = false;
+        }
+
+        fn is_finished(&self) -> bool {
+            self.done
+        }
+    }
+
+    #[test]
+    fn test_decompress_all_accepts_a_decoder_without_an_end_marker() {
+        let mut decoder = NoEndMarkerDecompressor { done: false };
+        let data = b"no end marker here".to_vec();
+        let out = decoder
+            .decompress_all(&data)
+            .expect("a decoder that reports is_finished() must not look truncated");
         assert_eq!(out, data);
     }
 

@@ -1,4 +1,4 @@
-//! Pure Rust JPEG (ITU-T T.81 / ISO/IEC 10918-1) decoder for OxiArc.
+//! Pure Rust JPEG (ITU-T T.81 / ISO/IEC 10918-1) codec for OxiArc.
 //!
 //! Part of the [OxiArc](https://github.com/cool-japan/oxiarc) Pure Rust
 //! archive and compression ecosystem. No C, no FFI, no `unsafe`.
@@ -11,19 +11,57 @@
 //! | `SOF1` | Extended sequential DCT, 8- and 12-bit | decoded |
 //! | `SOF2` | Progressive DCT, 8- and 12-bit | decoded |
 //! | `SOF3` | Lossless predictive, 2..=16 bit | decoded |
-//! | `SOF9`/`10`/`11` | Arithmetic entropy coding | [`UnsupportedFeature::ArithmeticCoding`] |
+//! | `SOF9`/`10`/`11` | Arithmetic entropy coding, 8- and 12-bit (and 2..=16 lossless) | decoded, feature `arithmetic` |
 //! | `SOF5`/`6`/`7`/`13`/`14`/`15` | Hierarchical | [`UnsupportedFeature::Hierarchical`] |
 //!
 //! Restart markers, `DNL`-resolved heights, one to four components, every
 //! sampling factor in `1..=4` (including 4:1:1 and 1x2), `APPn`/`COM`
 //! passthrough with `JFIF`, EXIF, XMP, ICC and Adobe `APP14` recognition, and
-//! TIFF's abbreviated tables/scan split are all supported.
+//! TIFF's abbreviated tables/scan split are all supported, as is legacy
+//! OJPEG (TIFF `Compression = 6`) reconstruction — see [`tiff`].
 //!
-//! Arithmetic coding is parsed as far as the `DAC` segment — the conditioning
-//! tables are read, stored and re-emitted — so that the entropy decoder can be
-//! added without any change to the parser or to this crate's API.
+//! # Feature flags
+//!
+//! | Feature | Default | What it does |
+//! |---|---|---|
+//! | `arithmetic` | on | The QM coder of T.81 Annex D, in both directions, for `SOF9`, `SOF10` and `SOF11`, with `DAC` conditioning and restart handling. Without it those frames report [`UnsupportedFeature::ArithmeticCoding`]; the `DAC` segment is parsed, stored and re-emitted either way. |
+//! | `rayon` | off | Entropy coding across restart intervals, in parallel. The output is byte-identical with and without it. |
+//! | `jpeg-oracle` | off | Differential tests against `cjpeg`/`djpeg`/`tiffcp`/Pillow, which self-skip when the tools are absent. |
+//!
+//! # Arithmetic coding
+//!
+//! `SOF9` and `SOF10` are held to byte identity with libjpeg in both
+//! directions: our decode equals `djpeg -dct int`'s and our encode equals
+//! `cjpeg -arithmetic -dct int`'s, `DAC` segments included. `SOF11` has no
+//! reference implementation anywhere — libjpeg-turbo refuses `-lossless`
+//! with `-arithmetic` and cannot decode the process either — so it follows
+//! T.81 Annex H.1.2.3 (the two-dimensional statistical model) and is gated by
+//! exact round-tripping instead.
+//!
+//! One property differs from Huffman scans and is worth knowing: T.81 D.2.6
+//! lets an arithmetic decoder read zeros past the last coded byte, so a
+//! *truncated* arithmetic scan decodes to noise rather than to an error.
+//! Only an impossible decision sequence
+//! ([`JpegError::InvalidArithmeticCode`]) or a missing restart marker is
+//! reported. libjpeg behaves the same way.
+//!
+//! # What is encoded
+//!
+//! [`Encoder`] writes `SOF0`, `SOF1` (8- and 12-bit), `SOF2` and `SOF3`, with
+//! quality-scaled or caller-supplied quantisation tables, standard Annex K.3
+//! or generated Huffman tables, box or smoothed chroma decimation at every
+//! exact sampling ratio, restart intervals, `JFIF`/Adobe/EXIF/XMP/ICC/`COM`
+//! metadata, and TIFF's abbreviated tables-only and scan-only halves. See
+//! [`EncodeOptions`].
 //!
 //! # Accuracy
+//!
+//! Both halves are held to byte identity with libjpeg-turbo, not to a
+//! tolerance. Encoded output matches `cjpeg -dct int` byte for byte across
+//! every subsampling ratio, quality, restart spelling, `-optimize`,
+//! `-smooth`, `-progressive` (default and custom scan scripts),
+//! `-precision 12` and `-lossless`, and the `JPEGTables` blob
+//! [`table_set`] builds matches libtiff's for the same quality.
 //!
 //! The inverse DCT is libjpeg's `jpeg_idct_islow` reproduced exactly, the
 //! chroma upsamplers are libjpeg's three fancy kernels with its asymmetric
@@ -36,7 +74,7 @@
 //!
 //! # What this crate does not do
 //!
-//! It decodes JPEG and hands metadata back verbatim. It does not interpret
+//! It codes JPEG and hands metadata back verbatim. It does not interpret
 //! EXIF, apply ICC profiles, honour orientation, resize or otherwise process
 //! images.
 //!
@@ -81,14 +119,71 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Encode with the arithmetic coder and read it back (the whole example is
+//! compiled away when the `arithmetic` feature is off):
+//!
+//! ```
+//! # #[cfg(feature = "arithmetic")]
+//! # fn run() -> Result<(), oxiarc_jpeg::JpegError> {
+//! use oxiarc_jpeg::{Decoder, EncodeOptions, EntropyCoding, InputColor,
+//!                   encode_to_vec_with_options};
+//!
+//! let pixels = vec![70u8; 32 * 16 * 3];
+//! let options = EncodeOptions {
+//!     quality: 90,
+//!     entropy: EntropyCoding::Arithmetic,
+//!     ..Default::default()
+//! };
+//! let jpeg = encode_to_vec_with_options(&pixels, 32, 16, InputColor::Rgb, &options)?;
+//! // SOF9: extended sequential, arithmetic.
+//! assert!(jpeg.windows(2).any(|w| w == [0xFF, 0xC9]));
+//!
+//! let info = Decoder::new(&jpeg[..]).read_info()?;
+//! assert_eq!(info.entropy, EntropyCoding::Arithmetic);
+//! let decoded = Decoder::new(&jpeg[..]).decode()?;
+//! assert!(decoded.iter().all(|&v| v.abs_diff(70) <= 3));
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "arithmetic"))]
+//! # fn run() -> Result<(), oxiarc_jpeg::JpegError> { Ok(()) }
+//! # run().expect("arithmetic round trip");
+//! ```
+//!
+//! Encode one, and read back what was written:
+//!
+//! ```
+//! # fn main() -> Result<(), oxiarc_jpeg::JpegError> {
+//! use oxiarc_jpeg::{Decoder, InputColor, Subsampling, EncodeOptions,
+//!                   encode_to_vec_with_options};
+//!
+//! let pixels = vec![90u8; 16 * 16 * 3];
+//! let options = EncodeOptions {
+//!     quality: 92,
+//!     subsampling: Subsampling::S444,
+//!     ..Default::default()
+//! };
+//! let jpeg = encode_to_vec_with_options(&pixels, 16, 16, InputColor::Rgb, &options)?;
+//!
+//! let decoded = Decoder::new(&jpeg[..]).decode()?;
+//! assert_eq!(decoded.len(), 16 * 16 * 3);
+//! assert!(decoded.iter().all(|&v| v.abs_diff(90) <= 2));
+//! # Ok(())
+//! # }
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "arithmetic")]
+mod arith;
 mod color;
 mod decoder;
+mod downsample;
+mod encoder;
 mod error;
+mod fdct;
 mod frame;
 mod huffman;
 mod idct;
@@ -100,6 +195,7 @@ mod quant;
 mod tableset;
 mod upsample;
 
+pub mod compat;
 pub mod sample;
 pub mod tables;
 pub mod tiff;
@@ -108,6 +204,12 @@ pub use color::ColorSpace;
 pub use decoder::{
     ComponentInfo, DecodeOptions, Decoder, ImageInfo, PixelFormat, Upsampling, decode_abbreviated,
     decode_abbreviated_into, decode_abbreviated_into_u16,
+};
+pub use downsample::Downsampling;
+pub use encoder::{
+    ComponentIds, Density, EncodeOptions, EncodeProcess, Encoder, InputColor, MarkerPolicy,
+    QuantTableSource, RestartInterval, ScanSpec, Subsampling, encode_to_vec,
+    encode_to_vec_with_options, encode_u16_to_vec_with_options, table_set,
 };
 pub use error::{JpegError, LimitKind, TableKind, UnsupportedFeature};
 pub use frame::{

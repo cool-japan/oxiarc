@@ -8,7 +8,7 @@
 //! one-byte output slice produces exactly the same bytes as one call with
 //! everything.
 //!
-//! This is what [`crate::decompress`] cannot do: that decoder borrows a
+//! This is what [`crate::decompress()`] cannot do: that decoder borrows a
 //! complete `&[u8]`, resolves backward references against the growing output
 //! `Vec`, and has no way to say "I need more input" as distinct from "this
 //! stream is truncated". [`BrotliStream`] is built for HTTP bodies, pipes and

@@ -1,6 +1,7 @@
 //! Colour spaces and the fixed-point conversions between them.
 
 pub(crate) mod cmyk;
+pub(crate) mod forward;
 pub(crate) mod ycbcr;
 
 /// A colour space a JPEG datastream's components can carry, or that a decode

@@ -21,6 +21,10 @@ default = ["arithmetic"]
 # Arithmetic entropy coding (SOF9/10/11, DAC). The `DAC` segment is always
 # parsed, stored and re-emitted; this feature gates the entropy coder itself.
 arithmetic = []
+# Parallel entropy coding across restart intervals, via rayon. Decoding and
+# encoding both produce byte-identical results with and without it; the
+# feature only affects how the work is scheduled.
+rayon = ["dep:rayon"]
 # Live differential tests (tests/jpeg_oracle.rs) that shell out to
 # libjpeg-turbo's `cjpeg`/`djpeg` and to `python3`+Pillow to assert
 # byte-identical decoding against `djpeg -dct int`. The tests self-skip (they
@@ -30,6 +34,7 @@ jpeg-oracle = []
 
 [dependencies]
 oxiarc-core = { workspace = true }
+rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
@@ -38,6 +43,10 @@ proptest = { workspace = true }
 
 [[bench]]
 name = "decode_bench"
+harness = false
+
+[[bench]]
+name = "encode_bench"
 harness = false
 
 [lints]

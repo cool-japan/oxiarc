@@ -373,7 +373,8 @@ mod tests {
     #[allow(unused_imports)]
     mod xz_integration {
         use super::*;
-        use crate::xz::header::{CheckType, XzWriter, decompress};
+        use crate::xz::header::{CheckType, decompress};
+        use crate::xz::writer::XzWriter;
         use oxiarc_core::error::OxiArcError;
 
         #[test]

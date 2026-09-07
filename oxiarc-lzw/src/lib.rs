@@ -31,10 +31,10 @@
 //! let original = b"TOBEORNOTTOBEORTOBEORNOT";
 //!
 //! // Compress
-//! let compressed = compress_tiff(original).unwrap();
+//! let compressed = compress_tiff(original).expect("compress with TIFF LZW");
 //!
 //! // Decompress
-//! let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+//! let decompressed = decompress_tiff(&compressed, original.len()).expect("decompress the TIFF strip");
 //!
 //! assert_eq!(decompressed, original);
 //! ```
@@ -50,10 +50,10 @@
 //! use oxiarc_lzw::{compress_tiff, decompress_tiff_into};
 //!
 //! let strip = b"row0row0row1row1row2row2";
-//! let compressed = compress_tiff(strip).unwrap();
+//! let compressed = compress_tiff(strip).expect("compress with TIFF LZW");
 //!
 //! let mut out = vec![0u8; strip.len()];
-//! let written = decompress_tiff_into(&compressed, &mut out).unwrap();
+//! let written = decompress_tiff_into(&compressed, &mut out).expect("decode the strip");
 //! assert_eq!(written, strip.len());
 //! assert_eq!(&out[..written], strip);
 //! ```
@@ -71,8 +71,8 @@
 //! let original = b"This is a test of compression! ".repeat(10);
 //! assert_eq!(original.len(), 310);
 //!
-//! let compressed = compress_tiff(&original).unwrap();
-//! let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+//! let compressed = compress_tiff(&original).expect("compress with TIFF LZW");
+//! let decompressed = decompress_tiff(&compressed, original.len()).expect("decompress the TIFF strip");
 //!
 //! // CRITICAL: No truncation!
 //! assert_eq!(decompressed.len(), 310);
@@ -118,8 +118,8 @@ pub use streaming::{LzwStreamDecoder, LzwStreamEncoder, LzwStreamMode};
 /// use oxiarc_lzw::{decompress, compress, LzwConfig};
 ///
 /// let original = b"Hello, World!";
-/// let compressed = compress(original, LzwConfig::TIFF).unwrap();
-/// let decompressed = decompress(&compressed, original.len(), LzwConfig::TIFF).unwrap();
+/// let compressed = compress(original, LzwConfig::TIFF).expect("compress");
+/// let decompressed = decompress(&compressed, original.len(), LzwConfig::TIFF).expect("decompress");
 /// assert_eq!(decompressed, original);
 /// ```
 pub fn decompress(data: &[u8], expected_size: usize, config: LzwConfig) -> Result<Vec<u8>> {
@@ -144,7 +144,7 @@ pub fn decompress(data: &[u8], expected_size: usize, config: LzwConfig) -> Resul
 /// use oxiarc_lzw::{compress, LzwConfig};
 ///
 /// let data = b"TOBEORNOTTOBEORTOBEORNOT";
-/// let compressed = compress(data, LzwConfig::TIFF).unwrap();
+/// let compressed = compress(data, LzwConfig::TIFF).expect("compress");
 /// assert!(compressed.len() < data.len());
 /// ```
 pub fn compress(data: &[u8], config: LzwConfig) -> Result<Vec<u8>> {
@@ -171,8 +171,8 @@ pub fn compress(data: &[u8], config: LzwConfig) -> Result<Vec<u8>> {
 /// use oxiarc_lzw::{compress_tiff, decompress_tiff};
 ///
 /// let original = b"This is a TIFF LZW test";
-/// let compressed = compress_tiff(original).unwrap();
-/// let decompressed = decompress_tiff(&compressed, original.len()).unwrap();
+/// let compressed = compress_tiff(original).expect("compress with TIFF LZW");
+/// let decompressed = decompress_tiff(&compressed, original.len()).expect("decompress the TIFF strip");
 /// assert_eq!(decompressed, original);
 /// ```
 pub fn decompress_tiff(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
@@ -191,6 +191,16 @@ pub fn decompress_tiff(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
 /// - `dst`: output buffer; decoding stops once it is full
 /// - `config`: LZW configuration (see [`LzwConfig::TIFF`] and
 ///   [`LzwConfig::TIFF_OLD_STYLE`])
+///
+/// # Bit order
+///
+/// This entry point reads **MSB-first** codes, which is what TIFF uses, and
+/// [`LzwConfig`] carries no bit-order field. Passing [`LzwConfig::GIF`]
+/// therefore does *not* select GIF's LSB-first packing: `LzwConfig::GIF` and
+/// [`LzwConfig::TIFF_OLD_STYLE`] are the same four field values, so both
+/// decode an MSB-first stream under the standard (late) code-width rule.
+/// GIF data must go through [`gif_decompress`], which owns the LSB-first
+/// bit reader.
 ///
 /// # Returns
 ///
@@ -214,10 +224,10 @@ pub fn decompress_tiff(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
 /// use oxiarc_lzw::{compress, decompress_into, LzwConfig};
 ///
 /// let original = b"Hello, World! Hello, World!";
-/// let compressed = compress(original, LzwConfig::TIFF).unwrap();
+/// let compressed = compress(original, LzwConfig::TIFF).expect("compress");
 ///
 /// let mut out = vec![0u8; original.len()];
-/// let written = decompress_into(&compressed, &mut out, LzwConfig::TIFF).unwrap();
+/// let written = decompress_into(&compressed, &mut out, LzwConfig::TIFF).expect("decode into the buffer");
 /// assert_eq!(&out[..written], original);
 /// ```
 pub fn decompress_into(src: &[u8], dst: &mut [u8], config: LzwConfig) -> Result<usize> {
@@ -271,9 +281,9 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8], config: LzwConfig) -> Result<
 ///                  width has to grow, which is the only place the two \
 ///                  rules disagree at all. AAAAAAAAAABBBBBBBBBBCCCCCCCCCC";
 /// let original = original.repeat(20);
-/// let strip = compress(&original, LzwConfig::TIFF_OLD_STYLE).unwrap();
+/// let strip = compress(&original, LzwConfig::TIFF_OLD_STYLE).expect("compress");
 /// let mut out = vec![0u8; original.len()];
-/// let written = decode_strip(&strip, &mut out).unwrap();
+/// let written = decode_strip(&strip, &mut out).expect("decode the strip");
 /// assert_eq!(&out[..written], &original[..]);
 /// ```
 ///
@@ -303,10 +313,10 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8], config: LzwConfig) -> Result<
 /// use oxiarc_lzw::{compress_tiff, decompress_tiff_into};
 ///
 /// let original = b"TOBEORNOTTOBEORTOBEORNOT";
-/// let compressed = compress_tiff(original).unwrap();
+/// let compressed = compress_tiff(original).expect("compress with TIFF LZW");
 ///
 /// let mut out = vec![0u8; original.len()];
-/// let written = decompress_tiff_into(&compressed, &mut out).unwrap();
+/// let written = decompress_tiff_into(&compressed, &mut out).expect("decode the strip");
 /// assert_eq!(written, original.len());
 /// assert_eq!(&out[..], original);
 /// ```
@@ -332,7 +342,7 @@ pub fn decompress_tiff_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 /// use oxiarc_lzw::compress_tiff;
 ///
 /// let data = b"This is a TIFF LZW test";
-/// let compressed = compress_tiff(data).unwrap();
+/// let compressed = compress_tiff(data).expect("compress with TIFF LZW");
 /// assert!(!compressed.is_empty());
 /// ```
 pub fn compress_tiff(data: &[u8]) -> Result<Vec<u8>> {

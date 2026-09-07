@@ -54,6 +54,27 @@
 //! `FlushMode` is `#[non_exhaustive]`, so anything not listed above is
 //! handled by the same wildcard arm as `Full`/`Partial`.
 //!
+//! ## Which mode each consumer passes
+//!
+//! The choice is not a preference: it is fixed by whether the caller can
+//! still obtain more input. Passing `None` when no more input exists turns a
+//! truncated stream into a silent short read; passing `Finish` when more
+//! input *is* coming turns a legal chunk boundary into `UnexpectedEof`.
+//!
+//! | Consumer | `flush` |
+//! |---|---|
+//! | TIFF strip / tile (the whole compressed slice is in hand) | `Finish` on the single call |
+//! | APNG frame / PNG `fdAT` run (complete slice) | `Finish`, then [`InflateStream::reset`] |
+//! | PNG main `IDAT` chain, fed chunk by chunk | `None` until the `IDAT` run ends, then `Finish` |
+//! | HTTP response body | `None` until transport EOF, then `Finish` |
+//! | `RawInflateReader` (RFC 4978 — the peer may still send more) | `None` **always** |
+//! | `Decompressor::decompress` (whole-remaining-input contract) | `Finish` |
+//!
+//! The `Read`/`AsyncRead` adapters implement the "`None` until EOF, then
+//! `Finish`" rule by switching to `Finish` the moment the inner reader
+//! returns `Ok(0)`, which is what makes a truncated stream an error rather
+//! than a short read.
+//!
 //! # Limits
 //!
 //! [`InflateStream::with_max_output`] and
@@ -103,6 +124,19 @@ pub struct InflateProgress {
 #[non_exhaustive]
 pub enum InflateStatus {
     /// All of `input` was absorbed and the stream is not finished.
+    ///
+    /// One documented exception: under [`FlushMode::Sync`] the call also
+    /// returns at an RFC 1951 sync-flush boundary (an empty stored block),
+    /// which can happen with input still unconsumed. A caller driving
+    /// `Sync` therefore distinguishes the two with
+    /// [`InflateStream::at_sync_flush`] and must resume from
+    /// [`InflateProgress::consumed`] rather than assume the slice was
+    /// absorbed whole:
+    ///
+    /// ```text
+    /// NeedInput && !at_sync_flush()  =>  every byte of `input` was absorbed
+    /// NeedInput &&  at_sync_flush()  =>  a sync-flush unit ended at `consumed`
+    /// ```
     NeedInput,
     /// `output` is full and the stream is not finished.
     NeedOutput,
@@ -179,7 +213,7 @@ impl InflateStream {
     ///
     /// Enforced during decoding — before each write, not merely between
     /// blocks — so a single expanding block cannot overshoot. Exceeding it
-    /// is [`OxiArcError::MemoryBudgetExceeded`].
+    /// is [`MemoryBudgetExceeded`](oxiarc_core::error::OxiArcError::MemoryBudgetExceeded).
     ///
     /// Hitting the cap is a *clean* stop: the call that reaches it returns
     /// `Ok` with the bytes decoded up to the cap and
@@ -226,7 +260,7 @@ impl InflateStream {
     /// Defence in depth for callers that cannot know the decoded size in
     /// advance; [`InflateStream::with_max_output`] is the load-bearing
     /// limit. The ratio is measured against the input consumed so far.
-    /// Tripping it is [`OxiArcError::ZipBomb`].
+    /// Tripping it is [`ZipBomb`](oxiarc_core::error::OxiArcError::ZipBomb).
     #[must_use]
     pub fn with_ratio_guard(mut self, ratio: f64, min_output: u64) -> Self {
         self.core.ratio_guard = Some((ratio, min_output));
@@ -679,6 +713,87 @@ mod tests {
                 .expect_err("latched");
             assert_eq!(again.to_string(), message);
         }
+    }
+
+    /// `InflateStatus::NeedInput` documents "all of `input` was absorbed",
+    /// with one exception: under [`FlushMode::Sync`] the call stops at a
+    /// sync-flush boundary, which can leave input unconsumed. The exception
+    /// is real, so it is pinned here rather than left to a reader's trust.
+    ///
+    /// A fourth status variant was considered and rejected: the Phase 8
+    /// interface contract fixes the set at
+    /// `{NeedInput, NeedOutput, StreamEnd}`, and
+    /// [`InflateStream::at_sync_flush`] already carries the distinction.
+    #[test]
+    fn sync_flush_returns_need_input_with_bytes_left_over() {
+        // Two sync-flushed units, so the first boundary lands well before
+        // the end of the slice.
+        let mut encoder = crate::Deflater::new(6);
+        let mut stream_bytes = Vec::new();
+        encoder
+            .deflate_sync(b"first unit", &mut stream_bytes)
+            .expect("sync flush");
+        encoder
+            .deflate_sync(b"second unit", &mut stream_bytes)
+            .expect("sync flush");
+        encoder
+            .deflate(b"tail", &mut stream_bytes, true)
+            .expect("finish");
+
+        let mut stream = InflateStream::new();
+        let mut out = [0u8; 256];
+        let progress = stream
+            .inflate(&stream_bytes, &mut out, FlushMode::Sync)
+            .expect("inflate");
+        assert_eq!(progress.status, InflateStatus::NeedInput);
+        assert!(stream.at_sync_flush(), "the call stopped at a boundary");
+        assert!(
+            progress.consumed < stream_bytes.len(),
+            "the documented exception: {} of {} bytes consumed",
+            progress.consumed,
+            stream_bytes.len()
+        );
+        assert_eq!(&out[..progress.produced], b"first unit");
+
+        // Resuming from `consumed` decodes the rest, so the status is a
+        // stopping point and not a lost byte.
+        let mut fed = progress.consumed;
+        let mut decoded = out[..progress.produced].to_vec();
+        loop {
+            let p = stream
+                .inflate(
+                    stream_bytes.get(fed..).unwrap_or_default(),
+                    &mut out,
+                    FlushMode::Sync,
+                )
+                .expect("resume");
+            fed += p.consumed;
+            decoded.extend_from_slice(&out[..p.produced]);
+            if p.status == InflateStatus::StreamEnd {
+                break;
+            }
+            assert!(
+                p.consumed > 0 || p.produced > 0 || stream.at_sync_flush(),
+                "no progress"
+            );
+        }
+        assert_eq!(decoded, b"first unitsecond unittail");
+    }
+
+    /// Without `Sync` the promise is unconditional: every byte of a
+    /// well-formed slice is absorbed before `NeedInput` comes back.
+    #[test]
+    fn need_input_without_sync_means_the_slice_was_absorbed() {
+        let compressed = deflate(&b"absorbed whole".repeat(50), 6).expect("deflate");
+        let partial = compressed.get(..compressed.len() - 3).unwrap_or_default();
+        let mut stream = InflateStream::new();
+        let mut out = [0u8; 4096];
+        let progress = stream
+            .inflate(partial, &mut out, FlushMode::None)
+            .expect("inflate");
+        assert_eq!(progress.status, InflateStatus::NeedInput);
+        assert_eq!(progress.consumed, partial.len());
+        assert!(!stream.at_sync_flush());
     }
 
     #[test]

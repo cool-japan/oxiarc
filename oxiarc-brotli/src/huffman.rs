@@ -249,11 +249,11 @@ impl HuffmanTree {
     /// [`BitReader::peek_bits`] zero-pads past the end of its buffer, so two
     /// decision points can be reached by *phantom* bits: a root slot that
     /// matches no code, and the sub-table index of a code longer than
-    /// the 8-bit root table. When the reader was built with
-    /// [`BitReader::resume_partial`] — i.e. more bytes of the stream may still
-    /// arrive — both report [`BrotliError::UnexpectedEof`] instead of a
-    /// corruption error, so an incremental decoder can rewind and retry.
-    /// Over a complete buffer the behaviour is unchanged.
+    /// the 8-bit root table. When the reader was built by
+    /// [`BitReader::resume`] with `partial = true` — i.e. more bytes of the
+    /// stream may still arrive — both report [`BrotliError::UnexpectedEof`]
+    /// instead of a corruption error, so an incremental decoder can rewind and
+    /// retry. Over a complete buffer the behaviour is unchanged.
     #[inline]
     pub fn decode_symbol(&self, reader: &mut BitReader<'_>) -> BrotliResult<u16> {
         if let Some(sym) = self.degenerate {

@@ -22,7 +22,12 @@
       accepts oxiarc dictionary frames (new in 0.3.6)
 - [x] Fast decompression
 - [x] Parallel compression (Rayon)
-- [x] Dictionary support (raw-content, interoperable both directions)
+- [x] Dictionary support (raw-content, interoperable both directions). RFC 8878 §5
+      *formatted* dictionaries (`Magic_Number` `0xEC30A437`, what `zstd --train`
+      writes) are **refused with a named error** by every entry point that takes
+      a dictionary rather than being mistaken for content, and `ZstdStream`
+      refuses a frame naming a non-zero `Dictionary_ID` when no dictionary is
+      supplied (new in 0.4.2; see the scope notes below)
 - [x] Checksum support (XXH64)
 - [x] Streaming API
 - [x] **Bounded, truly incremental decoding** (new in 0.4.2, Phase 8 / W1-B):
@@ -62,7 +67,7 @@
 - [x] Every FSE/Huffman table and state index bounds-checked; malformed or
       truncated input returns `Err` (60k-case mutation fuzz: zero panics)
 - [x] `BlockType`/`LiteralsBlockType` marked `#[non_exhaustive]`; `lz77`/`bitwriter` advanced re-exports demoted to `#[doc(hidden)]` (API freeze, new in 0.3.6)
-- [x] All features tested (274 tests + 12 doctests passing; 12 of the 274 are the live `zstd-oracle` differential suite, which self-skips without the `zstd` CLI)
+- [x] All features tested (297 tests + 12 doctests passing; 13 of the 297 are the live `zstd-oracle` differential suite, which self-skips without the `zstd` CLI, and 4 are the `tests/mutation_differential.rs` mutate-and-compare suite)
 
 ## Milestone: COMPLETE
 
@@ -108,6 +113,25 @@ the table description. Measured on a 1.5 MB structured-record corpus:
   schedules with the ring never exceeding the declared window. Every other oracle
   input is smaller than zstd's 2 MiB default window, so without that leg the
   wrap arithmetic would never be exercised against real frames.
+- **Dictionaries are raw content only.** RFC 8878 §5 allows two shapes: raw
+  content (the bytes *are* the history prefix — what `train_dictionary` emits and
+  what `zstd -D` interoperates with in both directions) and *formatted* (magic
+  `0xEC30A437` + `Dictionary_ID` + a Huffman literals table + three FSE tables +
+  three repeat offsets + content). Only raw content is implemented. A formatted
+  dictionary is refused by name (`OxiArcError::UnsupportedMethod`) in
+  `ZstdStream::with_dictionary` (checked at each frame header, so it survives
+  `reset()`, which clears only the per-stream fault latch), in
+  `ZstdStreamDecoder`/the async adapters that wrap it, and in the one-shot
+  `decompress_with_dict` / `decompress_multi_frame_with_dict`. Refusing is the
+  *safe* behaviour, not a shortcut: frames built against a formatted dictionary
+  reference its entropy tables through `Repeat_Mode`, so seeding the window with
+  the dictionary's header and tables would return silently wrong bytes. Pinned by
+  `formatted_dictionary_is_rejected_rather_than_used_as_content` (hermetic) and
+  `oracle_formatted_dictionary_is_refused_not_misdecoded` (a real `zstd --train`
+  dictionary, self-skipping). Implementing the formatted shape would mean loading
+  its entropy tables into `LiteralsDecoder`/`SequencesDecoder` and its three
+  repeat offsets — a well-defined follow-up, deliberately out of the Phase 8
+  contract (which specifies `with_dictionary(Vec<u8>)` only).
 - Throughput (interleaved A/B, best of 40, 1 MiB payloads): incremental decode is
   0.92x the one-shot path on entropy-coded data — the price of the one extra
   ring-to-caller copy that bounded memory requires — and 2.10x on raw-block data.

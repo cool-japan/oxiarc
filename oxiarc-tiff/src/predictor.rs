@@ -394,6 +394,18 @@ pub fn validate(
             },
         ));
     }
+    // Both predictors are defined on rows of equally wide samples: the row
+    // length, the stride and the byte-plane transpose are all computed from a
+    // single sample width. `BitsPerSample = [8, 16, 8]` with tag 317 would
+    // otherwise be differenced across the wrong row boundaries and produce
+    // silently wrong pixels. libtiff refuses per-sample bit depths outright.
+    if let Some(first) = bits_per_sample.first() {
+        if bits_per_sample.iter().any(|b| b != first) {
+            return Err(TiffError::Unsupported(UnsupportedError::MixedBitDepths(
+                bits_per_sample.to_vec(),
+            )));
+        }
+    }
     match predictor {
         Predictor::Horizontal => {
             for bits in bits_per_sample {
@@ -692,6 +704,23 @@ mod tests {
             TiffError::Unsupported(UnsupportedError::PredictorForBitDepth { .. })
         ));
         assert!(validate(Predictor::Unknown(9), &[8], CompressionMethod::Lzw).is_err());
+
+        // Heterogeneous depths: every row-length, stride and byte-plane
+        // computation in this module assumes one sample width, so `[8, 16, 8]`
+        // with tag 317 would be differenced across the wrong row boundaries.
+        // It must be refused, not silently mis-decoded.
+        for bits in [&[8u16, 16, 8][..], &[16, 8][..], &[32, 32, 16][..]] {
+            let err = validate(Predictor::Horizontal, bits, CompressionMethod::Lzw)
+                .expect_err("mixed depths with a predictor");
+            assert!(
+                matches!(
+                    err,
+                    TiffError::Unsupported(UnsupportedError::MixedBitDepths(_))
+                ),
+                "{bits:?} produced {err}"
+            );
+            assert!(validate(Predictor::FloatingPoint, bits, CompressionMethod::Deflate).is_err());
+        }
     }
 
     #[test]

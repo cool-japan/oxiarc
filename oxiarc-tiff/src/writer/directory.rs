@@ -29,6 +29,18 @@ pub struct DirectoryWriter {
     entries: BTreeMap<u16, Value>,
 }
 
+/// One entry serialised during pass 1 of [`DirectoryWriter::write`].
+///
+/// `offset` is `Some` when the value did not fit the inline field and was
+/// written out of line at that file offset.
+struct EncodedEntry {
+    tag: u16,
+    ty_raw: u16,
+    count: u64,
+    bytes: Vec<u8>,
+    offset: Option<u64>,
+}
+
 /// Where a written directory lives and which field links to the next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrittenDirectory {
@@ -121,8 +133,7 @@ impl DirectoryWriter {
         let big = variant.is_big();
 
         // Pass 1: serialise every value and place the out-of-line ones.
-        let mut encoded: Vec<(u16, u16, u64, Vec<u8>, Option<u64>)> =
-            Vec::with_capacity(self.entries.len());
+        let mut encoded: Vec<EncodedEntry> = Vec::with_capacity(self.entries.len());
         for (tag, value) in &self.entries {
             let (bytes, count) = value.to_bytes(endian)?;
             if !big && count > u64::from(u32::MAX) {
@@ -139,7 +150,13 @@ impl DirectoryWriter {
             } else {
                 None
             };
-            encoded.push((*tag, ty_raw, count, bytes, offset));
+            encoded.push(EncodedEntry {
+                tag: *tag,
+                ty_raw,
+                count,
+                bytes,
+                offset,
+            });
         }
 
         // Pass 2: the directory.
@@ -155,7 +172,14 @@ impl DirectoryWriter {
             })?;
             writer.write_u16(count)?;
         }
-        for (tag, ty_raw, count, bytes, offset) in &encoded {
+        for entry in &encoded {
+            let EncodedEntry {
+                tag,
+                ty_raw,
+                count,
+                bytes,
+                offset,
+            } = entry;
             writer.write_u16(*tag)?;
             writer.write_u16(*ty_raw)?;
             if big {
@@ -215,7 +239,6 @@ mod tests {
                 variant.is_big(),
             )
             .expect("patch");
-        drop(writer);
         let data = buffer.into_inner();
         let mut reader =
             crate::byteorder::EndianReader::new(Cursor::new(data), endian).expect("reader");

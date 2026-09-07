@@ -8,8 +8,9 @@ pub(crate) const DEFAULT_MAX_CODINGS: usize = 4;
 
 /// Bounds applied while decoding a response body.
 ///
-/// `max_output` is enforced **during** decoding by the decoder wave's push
-/// decoders — checked on every write into the output sink — so a
+/// `max_output` is enforced **during** decoding by
+/// [`Decoder`](crate::Decoder)'s push decoders — checked on every write
+/// into the output sink, including mid-block — so a
 /// decompression bomb is rejected before its bytes are materialised, not
 /// after. It is the crate's **load-bearing** bomb control; every other field
 /// here is defense-in-depth.
@@ -46,9 +47,18 @@ pub struct DecodeLimits {
     /// above every legitimate figure measured above and below the classic
     /// bomb's ~1029x, but a heuristic, not a boundary; see the type docs.
     pub max_ratio: Option<f64>,
-    /// Maximum number of chained codings accepted from one `Content-Encoding`
-    /// value. Default **4**. Guards against `gzip, gzip, gzip, ...`
-    /// amplification chains.
+    /// Maximum number of chained codings a *decoder* will accept from one
+    /// `Content-Encoding` value. Default **4**. Guards against
+    /// `gzip, gzip, gzip, ...` amplification chains.
+    ///
+    /// [`Decoder::new`](crate::Decoder::new) checks it before building a
+    /// single stage, so an over-long chain costs nothing to refuse. Note
+    /// that [`parse_content_encoding`](crate::parse_content_encoding) takes
+    /// no `DecodeLimits` — its signature is fixed — and enforces the same
+    /// **default** of 4 as a fixed internal bound, so raising this field
+    /// does not raise what that function, or
+    /// [`Decoder::from_header`](crate::Decoder::from_header) which calls
+    /// it, will parse.
     pub max_codings: usize,
 }
 

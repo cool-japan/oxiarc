@@ -238,6 +238,120 @@ fn archive_and_lzma_paths_are_the_same_code() {
 // Oracle-gated: real `xz` CLI and libtiff `tiffcp -c lzma`
 // ---------------------------------------------------------------------------
 
+/// Number of index records in a complete `.xz` stream.
+///
+/// The Stream Footer is the last 12 bytes; its Backward Size field (bytes
+/// 4..8, stored as `size / 4 - 1`) gives the Index length, so the Index
+/// starts at `len - 12 - index_size`. After the 0x00 Index Indicator comes
+/// the record count as a multibyte integer.
+fn index_record_count(stream: &[u8]) -> u64 {
+    assert!(stream.len() > 12 + 12, "stream too short to hold an index");
+    let footer = &stream[stream.len() - 12..];
+    let backward_size_field = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
+    let index_size = (u64::from(backward_size_field) + 1) * 4;
+    let index_start = stream.len() - 12 - index_size as usize;
+    let index = &stream[index_start..];
+    assert_eq!(index[0], 0x00, "index indicator");
+
+    let mut count = 0u64;
+    let mut shift = 0u32;
+    for &byte in &index[1..] {
+        count |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return count;
+        }
+        shift += 7;
+    }
+    panic!("unterminated multibyte integer in the index");
+}
+
+/// A payload larger than the writer's block size is split across several
+/// blocks, each with its own index record, and reads back identically.
+///
+/// Before 0.4.2 `XzWriter` emitted exactly one block whatever the input
+/// size, so a payload whose compressed form passed the reader's 100 MiB
+/// per-block limit produced a file this very crate refused to read. The
+/// block size is configurable so that path is testable with kilobytes
+/// instead of gigabytes.
+#[test]
+fn writer_splits_large_input_into_blocks() {
+    for &(len, block_size) in &[
+        (64usize, 16u64),
+        (1000, 256),
+        (64 * 1024, 8 * 1024),
+        (100 * 1024, 4096),
+    ] {
+        let payload = mixed_bytes(len);
+        let stream = XzWriter::new(LzmaLevel::new(6))
+            .with_block_size(block_size)
+            .compress(&payload)
+            .expect("compress");
+
+        let expected_blocks = (len as u64).div_ceil(block_size);
+        assert_eq!(
+            index_record_count(&stream),
+            expected_blocks,
+            "len {len} block_size {block_size}"
+        );
+
+        let decoded = xz::decompress(&mut Cursor::new(&stream)).expect("decompress");
+        assert_eq!(decoded, payload, "len {len} block_size {block_size}");
+
+        let mut buffer = vec![0u8; payload.len()];
+        let written = xz::decompress_into(&stream, &mut buffer).expect("decompress_into");
+        assert_eq!(written, payload.len());
+        assert_eq!(buffer, payload);
+    }
+}
+
+/// Multi-block output works with every check type, and the check is
+/// computed per block (a wrong per-block check would fail the read).
+#[test]
+fn multi_block_streams_carry_a_check_per_block() {
+    let payload = mixed_bytes(40 * 1024);
+    for check in [
+        CheckType::None,
+        CheckType::Crc32,
+        CheckType::Crc64,
+        CheckType::Sha256,
+    ] {
+        let stream = XzWriter::new(LzmaLevel::new(6))
+            .with_check_type(check)
+            .with_block_size(3000)
+            .compress(&payload)
+            .expect("compress");
+        assert_eq!(index_record_count(&stream), 14, "{check:?}");
+        let decoded = xz::decompress(&mut Cursor::new(&stream)).expect("decompress");
+        assert_eq!(decoded, payload, "{check:?}");
+    }
+}
+
+/// The default block size leaves ordinary payloads as a single block, so
+/// the bytes written for them are unchanged.
+#[test]
+fn ordinary_payloads_stay_single_block() {
+    for len in [0usize, 1, 1000, 256 * 1024] {
+        let payload = mixed_bytes(len);
+        let stream = XzWriter::new(LzmaLevel::new(6))
+            .compress(&payload)
+            .expect("compress");
+        assert_eq!(index_record_count(&stream), 1, "len {len}");
+    }
+}
+
+/// A block size of zero must not panic (it means one byte per block).
+#[test]
+fn zero_block_size_is_clamped() {
+    let payload = b"twelve bytes".to_vec();
+    let stream = XzWriter::new(LzmaLevel::new(6))
+        .with_block_size(0)
+        .compress(&payload)
+        .expect("compress");
+    assert_eq!(index_record_count(&stream), payload.len() as u64);
+    let decoded = xz::decompress(&mut Cursor::new(&stream)).expect("decompress");
+    assert_eq!(decoded, payload);
+}
+
 #[cfg(feature = "xz-oracle")]
 mod oracle {
     use super::*;
@@ -334,7 +448,7 @@ mod oracle {
         // Synthetic streams carrying each architecture's branch encoding at
         // a high density, so the converters actually fire. The 16-byte
         // stride keeps IA-64 bundles aligned.
-        let markers: [(&str, [u8; 4]); 7] = [
+        let markers: [(&str, [u8; 4]); 9] = [
             ("x86-call", [0xE8, 0x00, 0x00, 0x00]),
             ("x86-jmp", [0xE9, 0xFF, 0xFF, 0xFF]),
             ("ppc-bl", [0x48, 0x00, 0x10, 0x01]),
@@ -342,6 +456,8 @@ mod oracle {
             ("thumb-bl", [0x11, 0xF0, 0x22, 0xF8]),
             ("sparc-call", [0x40, 0x00, 0x12, 0x34]),
             ("arm64-bl", [0x11, 0x22, 0x33, 0x94]),
+            ("riscv-auipc", [0x97, 0x20, 0x01, 0x00]),
+            ("riscv-jal", [0xEF, 0x00, 0x12, 0x34]),
         ];
 
         let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
@@ -366,6 +482,24 @@ mod oracle {
             "gradient".to_string(),
             (0..64u32 * 1024).map(|i| (i / 7) as u8).collect(),
         ));
+        // Synthetic RISC-V code: AUIPC paired with JALR/ADDI over every
+        // register, which is the shape the RISC-V converter is built for
+        // (a marker-and-noise payload only exercises its reject paths).
+        let mut riscv_code = Vec::with_capacity(64 * 1024);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        while riscv_code.len() < 64 * 1024 {
+            for register in 1..32u32 {
+                for pair_opcode in [0x67u32, 0x13] {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let auipc = 0x17 | (register << 7) | (((seed >> 32) as u32 & 0xF_FFFF) << 12);
+                    let inst2 = pair_opcode | (register << 15) | ((seed as u32 & 0xFFF) << 20);
+                    riscv_code.extend_from_slice(&auipc.to_le_bytes());
+                    riscv_code.extend_from_slice(&inst2.to_le_bytes());
+                }
+            }
+        }
+        riscv_code.truncate(64 * 1024);
+        payloads.push(("riscv-code".to_string(), riscv_code));
 
         let filter_flags = [
             "--x86",
@@ -375,6 +509,7 @@ mod oracle {
             "--armthumb",
             "--sparc",
             "--arm64",
+            "--riscv",
             "--delta=dist=1",
             "--delta=dist=3",
             "--delta=dist=256",
@@ -411,22 +546,147 @@ mod oracle {
         }
 
         eprintln!(
-            "[xz-oracle] {checked} `xz` filter-chain streams (7 BCJ converters + Delta) \
+            "[xz-oracle] {checked} `xz` filter-chain streams (8 BCJ converters + Delta) \
              decoded byte-identically"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one filter the module deliberately does not implement must be
-    /// reported as unsupported, never silently mis-decoded.
+    /// Multi-block streams, both ways.
+    ///
+    /// 1. `xz --block-size=N` (what `xz -T2` and any parallel encoder
+    ///    produce) must decode through this crate.
+    /// 2. This crate's own multi-block output must satisfy the reference
+    ///    tool: `xz -t` accepts it, `xz -dc` returns the original bytes,
+    ///    and `xz --robot -lvv` reports exactly the blocks intended. The
+    ///    last check matters because a self-consistent but non-compliant
+    ///    index would still round-trip through our own reader.
     #[test]
-    fn xz_cli_riscv_filter_is_reported_unsupported() {
+    fn multi_block_streams_interoperate_with_the_xz_cli() {
+        if !tool_available("xz", &["--version"]) {
+            eprintln!("[xz-oracle] `xz` not on PATH; skipping (self-skip, not a failure)");
+            return;
+        }
+        let dir = unique_temp_dir("multiblock");
+        let payload = mixed_bytes(200 * 1024);
+        let raw = dir.join("payload.bin");
+        std::fs::write(&raw, &payload).expect("write payload");
+
+        // 1. The CLI's multi-block output through our reader.
+        for block_size in ["4096", "16384", "65536"] {
+            let output = Command::new("xz")
+                .args(["-T1", "-c", &format!("--block-size={block_size}")])
+                .arg(&raw)
+                .output()
+                .expect("spawn xz");
+            assert!(
+                output.status.success(),
+                "xz --block-size={block_size} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let decoded = xz::decompress(&mut Cursor::new(&output.stdout))
+                .unwrap_or_else(|e| panic!("[block-size {block_size}] decompress: {e}"));
+            assert_eq!(decoded, payload, "[block-size {block_size}] wrong bytes");
+        }
+
+        // 2. Our multi-block output through the CLI.
+        for &block_size in &[4096u64, 32768, 100_000] {
+            let stream = XzWriter::new(LzmaLevel::new(6))
+                .with_block_size(block_size)
+                .compress(&payload)
+                .expect("compress");
+            let path = dir.join(format!("ours_{block_size}.xz"));
+            std::fs::write(&path, &stream).expect("write stream");
+
+            let tested = Command::new("xz")
+                .arg("-t")
+                .arg(&path)
+                .output()
+                .expect("spawn xz -t");
+            assert!(
+                tested.status.success(),
+                "[block_size {block_size}] xz -t rejected our stream: {}",
+                String::from_utf8_lossy(&tested.stderr)
+            );
+
+            let decoded = Command::new("xz")
+                .args(["-dc"])
+                .arg(&path)
+                .output()
+                .expect("spawn xz -dc");
+            assert!(
+                decoded.status.success(),
+                "[block_size {block_size}] xz -dc failed"
+            );
+            assert_eq!(
+                decoded.stdout, payload,
+                "[block_size {block_size}] xz decoded our stream to different bytes"
+            );
+
+            let listing = Command::new("xz")
+                .args(["--robot", "-lvv"])
+                .arg(&path)
+                .output()
+                .expect("spawn xz --robot -lvv");
+            assert!(
+                listing.status.success(),
+                "[block_size {block_size}] xz -l failed"
+            );
+            let text = String::from_utf8_lossy(&listing.stdout);
+            let blocks = text
+                .lines()
+                .filter(|line| line.starts_with("block\t"))
+                .count();
+            let expected = (payload.len() as u64).div_ceil(block_size) as usize;
+            assert_eq!(
+                blocks, expected,
+                "[block_size {block_size}] xz counted {blocks} blocks, expected {expected}"
+            );
+        }
+
+        eprintln!("[xz-oracle] multi-block streams interoperate with the `xz` CLI both ways");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The RISC-V converter (XZ Utils 5.6+) decodes real `xz --riscv`
+    /// streams byte-identically.
+    ///
+    /// Until 0.4.2 this filter was rejected with a named error rather than
+    /// guessed at. It is now implemented and pinned against liblzma in both
+    /// directions (see `src/xz/filters.rs`); this test covers the whole
+    /// container path a caller actually uses, over a payload of synthetic
+    /// RISC-V code so the converter genuinely fires.
+    #[test]
+    fn xz_cli_riscv_filter_streams_decode_byte_identically() {
         if !tool_available("xz", &["--version"]) {
             eprintln!("[xz-oracle] `xz` not on PATH; skipping (self-skip, not a failure)");
             return;
         }
         let dir = unique_temp_dir("riscv");
-        let payload: Vec<u8> = (0..32u32 * 1024).map(|i| (i % 251) as u8).collect();
+
+        // AUIPC+JALR/ADDI pairs across every register, plus JAL with the two
+        // convertible link registers.
+        let mut payload = Vec::with_capacity(96 * 1024);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        while payload.len() < 96 * 1024 {
+            for register in 1..32u32 {
+                for pair_opcode in [0x67u32, 0x13, 0x03] {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let auipc = 0x17 | (register << 7) | (((seed >> 32) as u32 & 0xF_FFFF) << 12);
+                    let inst2 = pair_opcode | (register << 15) | ((seed as u32 & 0xFFF) << 20);
+                    payload.extend_from_slice(&auipc.to_le_bytes());
+                    payload.extend_from_slice(&inst2.to_le_bytes());
+                }
+                for rd in [1u32, 5] {
+                    let jal = 0x6F | (rd << 7) | (((seed >> 16) as u32 & 0xF_FFFF) << 12);
+                    payload.extend_from_slice(&jal.to_le_bytes());
+                }
+            }
+        }
+        payload.truncate(96 * 1024);
+
         let raw = dir.join("payload.bin");
         std::fs::write(&raw, &payload).expect("write payload");
 
@@ -440,13 +700,29 @@ mod oracle {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
+        let stream = output.stdout;
 
-        let err = xz::decompress(&mut Cursor::new(&output.stdout))
-            .expect_err("the RISC-V filter must be reported, not guessed at");
+        // The stream must really carry filter 0x0B, or the test is vacuous:
+        // a plain LZMA2 stream would pass trivially. The block header's
+        // filter list starts at byte 14 of a single-block stream written by
+        // the CLI (12-byte stream header, then the block header's size and
+        // flags bytes); rather than parse it, check that a build without the
+        // converter could not have decoded it — the filter id byte is
+        // present in the header.
         assert!(
-            err.to_string().contains("RISC-V"),
-            "expected a named RISC-V error, got: {err}"
+            stream[12..24].contains(&0x0B),
+            "the xz CLI did not record the RISC-V filter id in the block header"
         );
+
+        let decoded = xz::decompress(&mut Cursor::new(&stream)).expect("decompress riscv stream");
+        assert_eq!(decoded, payload, "RISC-V filtered stream decoded wrongly");
+
+        let mut buffer = vec![0u8; payload.len()];
+        let written = xz::decompress_into(&stream, &mut buffer).expect("decompress_into riscv");
+        assert_eq!(written, payload.len());
+        assert_eq!(buffer, payload, "RISC-V decompress_into decoded wrongly");
+
+        eprintln!("[xz-oracle] a real `xz --riscv` stream decoded byte-identically");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

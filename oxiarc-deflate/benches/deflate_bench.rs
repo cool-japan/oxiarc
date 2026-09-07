@@ -15,10 +15,12 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxiarc_core::traits::FlushMode;
 use oxiarc_deflate::{
-    InflateStatus, InflateStream, InflateWrapper, WrappedInflate, deflate, gzip_compress, inflate,
-    inflate_into, lz77::Lz77Encoder, zlib_compress, zlib_decompress,
+    GzipStreamDecoder, InflateReader, InflateStatus, InflateStream, InflateWrapper, WrappedInflate,
+    ZlibStreamDecoder, deflate, gzip_compress, inflate, inflate_into, lz77::Lz77Encoder,
+    zlib_compress, zlib_decompress,
 };
 use std::hint::black_box;
+use std::io::Read;
 
 /// Type alias for pattern generator functions
 type PatternGenerator = fn(usize) -> Vec<u8>;
@@ -503,6 +505,146 @@ fn bench_inflate_into(c: &mut Criterion) {
     group.finish();
 }
 
+/// Streaming decode through the `Read` adapters.
+///
+/// The `read_*` parameters are the size of the *caller's* buffer, which is
+/// what the mandatory 64 KiB staging buffer exists to decouple from the
+/// decode cost: `read_3` used to mean one <=32 KiB window update per three
+/// bytes, and must now cost the same per byte as `read_65536`.
+fn bench_gzip_stream_decoder(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gzip_stream_decoder");
+
+    for (label, size) in [
+        ("64KiB", 64 * 1024usize),
+        ("1MiB", 1024 * 1024),
+        ("16MiB", 16 * 1024 * 1024),
+    ] {
+        let original = test_data::text_like(size);
+        let compressed = gzip_compress(&original, 6).unwrap();
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &compressed,
+            |b, compressed| {
+                let mut sink = vec![0u8; size];
+                b.iter(|| {
+                    let mut decoder = GzipStreamDecoder::new(black_box(&compressed[..]));
+                    let mut written = 0usize;
+                    loop {
+                        let n = decoder.read(&mut sink[written..]).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        written += n;
+                    }
+                    black_box(written);
+                });
+            },
+        );
+    }
+
+    // Caller-buffer granularity at a fixed payload size.
+    let original = test_data::text_like(data_sizes::MEDIUM);
+    let compressed = gzip_compress(&original, 6).unwrap();
+    for read_size in [3usize, 4096, 65_536] {
+        group.throughput(Throughput::Bytes(data_sizes::MEDIUM as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("read_{read_size}")),
+            &compressed,
+            |b, compressed| {
+                let mut buf = vec![0u8; read_size];
+                b.iter(|| {
+                    let mut decoder = GzipStreamDecoder::new(black_box(&compressed[..]));
+                    let mut total = 0usize;
+                    loop {
+                        let n = decoder.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    black_box(total);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// The generic `Read` adapter across framings, plus the zlib decoder, at a
+/// 64 KiB caller buffer.
+fn bench_inflate_reader(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_reader");
+    let size = data_sizes::MEDIUM;
+    let original = test_data::text_like(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    let framings: [(&str, InflateWrapper, Vec<u8>); 4] = [
+        (
+            "gzip",
+            InflateWrapper::Gzip,
+            gzip_compress(&original, 6).unwrap(),
+        ),
+        (
+            "zlib",
+            InflateWrapper::Zlib,
+            zlib_compress(&original, 6).unwrap(),
+        ),
+        ("raw", InflateWrapper::Raw, deflate(&original, 6).unwrap()),
+        (
+            "auto",
+            InflateWrapper::Auto,
+            gzip_compress(&original, 6).unwrap(),
+        ),
+    ];
+
+    for (label, wrapper, compressed) in framings {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &compressed,
+            |b, compressed| {
+                let mut buf = vec![0u8; 65_536];
+                b.iter(|| {
+                    let mut reader = InflateReader::new(black_box(&compressed[..]), wrapper);
+                    let mut total = 0usize;
+                    loop {
+                        let n = reader.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
+                    }
+                    black_box(total);
+                });
+            },
+        );
+    }
+
+    let compressed = zlib_compress(&original, 6).unwrap();
+    group.bench_with_input(
+        BenchmarkId::from_parameter("zlib_stream_decoder"),
+        &compressed,
+        |b, compressed| {
+            let mut buf = vec![0u8; 65_536];
+            b.iter(|| {
+                let mut decoder = ZlibStreamDecoder::new(black_box(&compressed[..]));
+                let mut total = 0usize;
+                loop {
+                    let n = decoder.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                black_box(total);
+            });
+        },
+    );
+
+    group.finish();
+}
+
 /// Benchmark ZLIB decompression
 fn bench_zlib_decompression(c: &mut Criterion) {
     let mut group = c.benchmark_group("zlib_decompression");
@@ -675,6 +817,8 @@ criterion_group!(
     bench_inflate_stream,
     bench_wrapped_inflate,
     bench_inflate_into,
+    bench_gzip_stream_decoder,
+    bench_inflate_reader,
     bench_zlib_decompression,
     bench_compression_ratio,
     bench_roundtrip,

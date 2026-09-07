@@ -43,21 +43,28 @@ use crate::tags::{
 
 /// The compression a page is written with.
 ///
-/// Only [`Compression::None`] and [`Compression::PackBits`] are wired up in
-/// this build; the remaining variants exist so callers can name them and get a
-/// typed [`crate::UnsupportedError::NotYetAvailable`] error rather than a
-/// silent fallback. Adding a codec means adding one arm to
-/// [`crate::compression::encode`], not touching this file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Every named variant is wired up: encoding with any of them (subject to
+/// the codec's own cargo feature being compiled in --
+/// [`crate::UnsupportedError::FeatureNotCompiled`] otherwise) produces a file
+/// this crate, libtiff and Pillow/`tifffile` all decode. [`Self::Registered`]
+/// selects an out-of-tree codec added through [`crate::CodecRegistry`]
+/// instead of one of this crate's own -- see [`crate::Codec`]'s docs for a
+/// full worked example (a plugin codec, registered for both directions).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
     /// Uncompressed (tag value 1).
+    #[default]
     None,
     /// Apple PackBits (32773).
     PackBits,
     /// LZW (5).
     Lzw,
-    /// Deflate (32946), written with the given zlib level.
+    /// Deflate, written with the given zlib level.
+    ///
+    /// The tag value written is **8** (`AdobeDeflate`), which is what libtiff,
+    /// GDAL and `tifffile` all write; 32946 is the older private registration
+    /// and is read identically.
     Deflate {
         /// 0..=9.
         level: u8,
@@ -90,12 +97,18 @@ pub enum Compression {
         /// Whether the tables go in tag 347 rather than in every chunk.
         shared_tables: bool,
     },
-}
-
-impl Default for Compression {
-    fn default() -> Self {
-        Self::None
-    }
+    /// An out-of-tree codec added through [`crate::CodecRegistry`], named by
+    /// its raw `Compression` (259) tag value.
+    ///
+    /// The registry must be attached with [`Encoder::with_codecs`] *and*
+    /// contain a [`crate::Codec`] whose [`crate::Codec::method`] returns this
+    /// value, or encoding fails with
+    /// [`crate::UnsupportedError::Compression`] -- exactly as an unregistered
+    /// value would. [`Self::level`] always resolves to
+    /// [`crate::compression::CodecLevel::Default`] for this variant: a
+    /// plugin codec that wants tunable effort takes it from its own
+    /// constructor, not from this enum.
+    Registered(u16),
 }
 
 impl Compression {
@@ -106,13 +119,14 @@ impl Compression {
             Self::None => CompressionMethod::None,
             Self::PackBits => CompressionMethod::PackBits,
             Self::Lzw => CompressionMethod::Lzw,
-            Self::Deflate { .. } => CompressionMethod::Deflate,
+            Self::Deflate { .. } => CompressionMethod::AdobeDeflate8,
             Self::Zstd { .. } => CompressionMethod::Zstd,
             Self::Lzma { .. } => CompressionMethod::Lzma,
             Self::CcittRle => CompressionMethod::CcittRle,
             Self::CcittGroup3 { .. } => CompressionMethod::CcittFax3,
             Self::CcittGroup4 => CompressionMethod::CcittFax4,
             Self::Jpeg { .. } => CompressionMethod::Jpeg,
+            Self::Registered(code) => CompressionMethod::from_u16(code),
         }
     }
 
@@ -664,11 +678,19 @@ impl ImageSpec {
             }
         }
         if self.predictor != Predictor::None {
-            crate::predictor::validate(
-                self.predictor,
-                &self.bits_per_sample,
-                self.compression.method(),
-            )?;
+            // Validate per plane, exactly as `ImageWriter::encode_chunk`
+            // applies the predictor: a chunky chunk carries every channel and
+            // so needs one uniform depth across the whole array, while each
+            // planar chunk carries one channel with a stride of 1, so planes
+            // of different widths are fine. The decoder checks the same thing
+            // with `ImageInfo::plane_bits`, so write and read agree.
+            for plane in 0..self.plane_count() {
+                crate::predictor::validate(
+                    self.predictor,
+                    &self.plane_bits(plane),
+                    self.compression.method(),
+                )?;
+            }
         }
         if let Some((h, v)) = self.ycbcr_subsampling {
             if !matches!(h, 1 | 2 | 4) || !matches!(v, 1 | 2 | 4) {
@@ -690,14 +712,29 @@ impl ImageSpec {
     /// A conservative projection of the file size, for
     /// [`VariantChoice::Auto`].
     ///
+    /// Computed in closed form. Every chunk of a plane is coded at the same
+    /// size except, for a strip layout, the last one, so the payload sum needs
+    /// one term per plane rather than one per chunk — a loop over
+    /// [`Self::chunk_count`] would run up to 2^64 times for a large tiled
+    /// specification and never return.
+    ///
     /// # Errors
     /// [`TiffError::IntOverflow`] when the product does not fit.
     pub fn projected_bytes(&self) -> Result<u64> {
         let mut total = 16u64; // header
-        for index in 0..self.chunk_count() {
-            total = total
-                .checked_add(self.chunk_packed_len(index)? as u64 + 1)
-                .ok_or(TiffError::IntOverflow)?;
+        let per_plane = self.chunks_per_plane();
+        if per_plane > 0 {
+            for plane in 0..u64::from(self.plane_count()) {
+                let base = plane.checked_mul(per_plane).ok_or(TiffError::IntOverflow)?;
+                // Chunk 0 of the plane is full size; the last one may be clipped.
+                let full = self.chunk_packed_len(base)? as u64 + 1;
+                let last = self.chunk_packed_len(base + per_plane - 1)? as u64 + 1;
+                let body = full
+                    .checked_mul(per_plane - 1)
+                    .and_then(|v| v.checked_add(last))
+                    .ok_or(TiffError::IntOverflow)?;
+                total = total.checked_add(body).ok_or(TiffError::IntOverflow)?;
+            }
         }
         // IFD plus generous slack for the offset/byte-count arrays.
         let entries = 24u64 + self.extra_tags.len() as u64;
@@ -903,10 +940,14 @@ mod tests {
         assert_eq!(Compression::None.method(), CompressionMethod::None);
         assert_eq!(Compression::PackBits.method(), CompressionMethod::PackBits);
         assert_eq!(Compression::Lzw.method(), CompressionMethod::Lzw);
+        // 8, not 32946: libtiff, GDAL and `tifffile` all write the Adobe
+        // registration, and both values decode identically here.
         assert_eq!(
             Compression::Deflate { level: 6 }.method(),
-            CompressionMethod::Deflate
+            CompressionMethod::AdobeDeflate8
         );
+        assert_eq!(CompressionMethod::AdobeDeflate8.to_u16(), 8);
+        assert_eq!(CompressionMethod::Deflate.to_u16(), 32946);
         assert_eq!(
             Compression::Zstd { level: 3 }.method(),
             CompressionMethod::Zstd
@@ -1087,6 +1128,51 @@ mod tests {
         let large = ImageSpec::new(4096, 4096, ColorType::Rgb(16));
         assert!(small.projected_bytes().expect("small") < large.projected_bytes().expect("large"));
         assert!(large.projected_bytes().expect("large") > 4096 * 4096 * 6);
+    }
+
+    #[test]
+    fn projection_is_closed_form_not_a_loop_over_every_chunk() {
+        // The exact sum for a clipped last strip: three full strips of
+        // 10 x 4 x 1 byte plus one of 10 x 2, each charged one padding byte.
+        let strips = ImageSpec::new(10, 14, ColorType::Gray(8))
+            .with_layout(Layout::Strips { rows_per_strip: 4 });
+        let payload = 3 * (40 + 1) + (20 + 1);
+        // header + 24 built-in entries * 20 bytes + 4 chunks * 16 + slack
+        let overhead = 16 + 24 * 20 + 4 * 16 + 4096;
+        assert_eq!(
+            strips.projected_bytes().expect("strips"),
+            payload + overhead
+        );
+
+        // Planar planes are summed per plane, not per chunk.
+        let planar = ImageSpec::new(10, 14, ColorType::Rgb(8))
+            .with_planar(PlanarConfiguration::Planar)
+            .with_layout(Layout::Strips { rows_per_strip: 4 });
+        assert_eq!(
+            planar.projected_bytes().expect("planar"),
+            3 * payload + 16 + 24 * 20 + 12 * 16 + 4096
+        );
+
+        // A specification whose chunk count is astronomically large must
+        // return promptly instead of looping 2^56 times. (Before this was
+        // closed form, `VariantChoice::Auto` hung here forever.)
+        let huge =
+            ImageSpec::new(u32::MAX, u32::MAX, ColorType::Gray(8)).with_layout(Layout::Tiles {
+                width: 16,
+                length: 16,
+            });
+        assert_eq!(huge.chunk_count(), 268_435_456u64 * 268_435_456);
+        assert!(matches!(
+            huge.projected_bytes(),
+            Err(TiffError::IntOverflow)
+        ));
+
+        // And it must not be reachable as a hang through the encoder either.
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        let mut encoder = Encoder::new(&mut buffer)
+            .expect("encoder")
+            .with_variant(VariantChoice::Auto);
+        assert!(encoder.new_image(&huge).is_err());
     }
 
     #[test]

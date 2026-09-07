@@ -43,7 +43,7 @@
 //!
 //! ## Decoding a stream that arrives in pieces
 //!
-//! [`decompress`] needs the whole compressed stream in one slice and produces
+//! [`decompress()`] needs the whole compressed stream in one slice and produces
 //! the whole output at once. For an HTTP body, a pipe, or anything else that
 //! arrives in chunks, use [`BrotliStream`]: a push decoder that makes progress
 //! from whatever input and output space it is given, with peak memory
@@ -86,7 +86,7 @@
 //! - Bounded incremental decoding ([`BrotliStream`]) with a real sliding
 //!   window, exact per-meta-block output caps and a declared-window ceiling
 //! - Incremental `Write` compressor and `Read`/`AsyncRead` decompressor
-//!   adapters (see [`streaming`] and [`async_brotli`](crate::async_brotli))
+//!   adapters (see [`streaming`] and the `async_brotli` module)
 //!
 //! ## Example
 //!

@@ -244,8 +244,14 @@ impl Limits {
     /// Allocates `count` zeroed elements after checking `count * size_of::<T>()`
     /// against `budget`.
     ///
-    /// This is the only place in the crate where a `Vec` is sized from a number
-    /// that came out of a file.
+    /// A convenience for callers — including out-of-tree [`crate::Codec`]
+    /// implementations — that need one allocation sized by a number from the
+    /// file. The crate's own buffers are guarded by the matching `check_*`
+    /// method instead (`check_intermediate` before the compressed chunk,
+    /// `check_decoding_buffer` before the decoded chunk, `check_image_bytes`
+    /// before the whole-image buffer, `check_value_size` before a tag value);
+    /// the invariant is that *some* guard runs before every file-driven
+    /// allocation, not that they all funnel through this function.
     ///
     /// # Errors
     /// [`LimitError::IntermediateSize`] when the product exceeds `budget`.
@@ -417,6 +423,13 @@ impl Warnings {
     /// Drops every recorded warning.
     pub fn clear(&mut self) {
         self.0.clear();
+    }
+
+    /// Moves every warning out of `other` and appends them here, in order,
+    /// leaving `other` empty. For merging per-worker warning lists back into
+    /// a shared one after a parallel decode.
+    pub fn append(&mut self, other: &mut Warnings) {
+        self.0.append(&mut other.0);
     }
 }
 

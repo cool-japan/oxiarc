@@ -11,9 +11,14 @@
 //! Per-call memory is `window + one block`, constant in the length of the
 //! stream:
 //!
-//! * the sliding window ring ([`crate::window::ZstdWindow`]), sized lazily to
-//!   `min(declared Window_Size, dictionary + bytes actually produced)` and
-//!   refused outright above [`ZstdStream::with_max_window`] (default 8 MiB);
+//! * the sliding window ring (`ZstdWindow`, crate-private), sized lazily to
+//!   `min(declared Window_Size, max(Block_Maximum_Decompressed_Size,
+//!   dictionary + bytes actually produced))` and refused outright above
+//!   [`ZstdStream::with_max_window`] (default 8 MiB). The
+//!   `Block_Maximum_Decompressed_Size` floor (at most 128 KiB) is inherent:
+//!   one whole block has to fit in the ring before the caller drains it, so a
+//!   frame that declares no `Frame_Content_Size` allocates that much even if it
+//!   then produces four bytes;
 //! * one block carry — a block is length-prefixed, so the decoder always knows
 //!   exactly how many bytes it needs before it needs them. The carry holds at
 //!   most one 128 KiB block payload plus, transiently, the not-yet-reclaimed
@@ -105,8 +110,8 @@ const ZSTD_MAGIC_U32: u32 = 0xFD2F_B528;
 /// [`crate::ZstdStreamDecoder`] and the one-shot helpers never had such a
 /// limit, and reference frames produced with `zstd --long` routinely declare
 /// 16-128 MiB, so those paths keep the declaration unrestricted and rely on the
-/// output budget plus lazy window growth (the ring never exceeds the number of
-/// bytes actually produced) for their memory bound.
+/// output budget plus lazy window growth (the ring never exceeds one block plus
+/// the bytes actually produced) for their memory bound.
 pub(crate) const UNRESTRICTED_MAX_WINDOW: usize = usize::MAX;
 
 /// Outcome of one [`ZstdStream::decode`] call.
@@ -215,6 +220,11 @@ pub struct ZstdStream {
     hasher: Option<XxHash64>,
     /// Optional dictionary content, re-seeded at every frame start.
     dict: Option<Vec<u8>>,
+    /// Whether [`Self::dict`] is a formatted (RFC 8878 §5) dictionary, which
+    /// this decoder does not implement. Latched at configuration time and
+    /// reported at the first frame header, so it survives [`ZstdStream::reset`]
+    /// (unlike the sticky fault, which a reset deliberately clears).
+    dict_formatted: bool,
     /// Output budget for the whole stream.
     max_output: Option<u64>,
     /// Largest `Window_Size` a frame may declare.
@@ -261,6 +271,7 @@ impl ZstdStream {
             seq_buf: Vec::new(),
             hasher: None,
             dict: None,
+            dict_formatted: false,
             max_output: None,
             max_window: MAX_WINDOW_SIZE,
             multi_frame: true,
@@ -315,8 +326,18 @@ impl ZstdStream {
     /// The dictionary tail seeds the window at the start of *every* frame, so
     /// a multi-frame stream behaves exactly like
     /// [`crate::decompress_multi_frame_with_dict`].
+    ///
+    /// Only **raw content** dictionaries are implemented (RFC 8878 §5): the
+    /// bytes are used directly as the LZ77 history prefix. A *formatted*
+    /// dictionary — one starting with `Magic_Number` `0xEC30A437`, as produced
+    /// by `zstd --train`, which also carries entropy tables that frames
+    /// reference through `Repeat_Mode` — is refused at the first frame header
+    /// with [`OxiArcError::UnsupportedMethod`]. It is deliberately *not*
+    /// treated as content: a frame built against such a dictionary would then
+    /// decode to silently wrong bytes.
     #[must_use]
     pub fn with_dictionary(mut self, dict: Vec<u8>) -> Self {
+        self.dict_formatted = crate::dict::is_formatted_dictionary(&dict);
         self.dict = if dict.is_empty() { None } else { Some(dict) };
         self
     }
@@ -338,8 +359,14 @@ impl ZstdStream {
 
     /// Current window allocation in bytes.
     ///
-    /// Grows lazily; it is never larger than the number of bytes the stream has
-    /// actually produced (plus the dictionary), whatever the frame declares.
+    /// Grows lazily: whatever the frame declares, the ring is never larger than
+    /// `min(declared Window_Size, max(Block_Maximum_Decompressed_Size,
+    /// dictionary + bytes actually produced))`. The
+    /// `Block_Maximum_Decompressed_Size` term — `min(Window_Size, 128 KiB)` —
+    /// is a floor, not an estimate: one whole block must fit before the caller
+    /// drains it. A frame that declares its `Frame_Content_Size` is therefore
+    /// sized by that (a 12-byte payload gets a 12-byte ring), while one that
+    /// does not starts at a full block.
     pub fn window_size(&self) -> usize {
         self.window.capacity()
     }
@@ -806,11 +833,17 @@ impl ZstdStream {
         let b = self.peek(4);
         let expected = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         self.carry_pos += 4;
-        let computed = self
-            .hasher
-            .as_ref()
-            .map(XxHash64::finish_checksum)
-            .unwrap_or(expected);
+        // `begin_frame` couples the hasher to the header's `Content_Checksum_flag`
+        // and this state is only entered when that flag is set, so a missing
+        // hasher is impossible. Report it rather than passing the frame: a
+        // fallback of "assume it matched" would make any future decoupling an
+        // invisible loss of integrity checking.
+        let Some(computed) = self.hasher.as_ref().map(XxHash64::finish_checksum) else {
+            return Err(OxiArcError::corrupted(
+                self.total_in,
+                "Zstandard frame declares a content checksum but none was computed",
+            ));
+        };
         if expected != computed {
             return Err(OxiArcError::CrcMismatch { expected, computed });
         }
@@ -841,6 +874,26 @@ impl ZstdStream {
 
     /// Configure the window, hasher and budgets for a freshly parsed header.
     fn begin_frame(&mut self, header: FrameHeader) -> Result<()> {
+        if self.dict_formatted {
+            return Err(crate::dict::formatted_dictionary_error());
+        }
+        // A frame that names a `Dictionary_ID` cannot be decoded without that
+        // dictionary: its matches reach into content this decoder does not
+        // have, and its first block may reference the dictionary's entropy
+        // tables. The reference decoder refuses too, and the Phase 8 contract
+        // makes every new entry point strict, so this is an error rather than
+        // a stream of wrong bytes. (`Dictionary_ID` 0 means "no dictionary",
+        // whatever the header's flag width says.)
+        let required_dict = if self.dict.is_none() {
+            header.dict_id.filter(|id| *id != 0)
+        } else {
+            None
+        };
+        if let Some(id) = required_dict {
+            return Err(OxiArcError::invalid_header(format!(
+                "Zstandard frame requires dictionary ID {id:#010x} but no dictionary was supplied"
+            )));
+        }
         if header.declared_window_size > self.max_window as u64 {
             return Err(OxiArcError::MemoryBudgetExceeded {
                 budget: self.max_window,
@@ -893,7 +946,7 @@ impl ZstdStream {
         // content would otherwise force a full-window allocation up front.
         // Start at one block (which `block_max` guarantees is enough for any
         // single block) and let `grow_for` double as real bytes arrive, so the
-        // ring never exceeds what the stream has actually produced.
+        // ring never exceeds one block plus what the stream actually produced.
         let initial = cap_limit.min(MAX_BLOCK_SIZE);
         debug_assert!(initial >= block_max);
 
@@ -1162,8 +1215,8 @@ fn charge(produced: usize, more: usize, limits: &BlockLimits) -> Result<usize> {
 /// Build a stream configured for a bounded one-shot decode.
 ///
 /// The declared-window ceiling is left unrestricted because `max_output`
-/// already bounds the memory: the window ring never grows past the number of
-/// bytes actually produced, which the budget caps.
+/// already bounds the memory: the window ring never grows past one block plus
+/// the number of bytes actually produced, and the budget caps the latter.
 fn bounded_stream(max_output: u64, multi_frame: bool) -> ZstdStream {
     ZstdStream::new()
         .with_max_output(max_output)

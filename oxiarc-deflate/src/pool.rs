@@ -27,9 +27,9 @@
 //!
 //! let pool = DeflatePool::new();
 //! // First call allocates fresh buffers.
-//! let compressed1 = Deflater::new(6).with_pool(&pool).compress_to_vec(b"hello world").unwrap();
+//! let compressed1 = Deflater::new(6).with_pool(&pool).compress_to_vec(b"hello world").expect("deflate");
 //! // Second call reuses the buffers returned from the first.
-//! let compressed2 = Deflater::new(6).with_pool(&pool).compress_to_vec(b"hello world").unwrap();
+//! let compressed2 = Deflater::new(6).with_pool(&pool).compress_to_vec(b"hello world").expect("deflate");
 //! assert_eq!(compressed1, compressed2);
 //! assert!(pool.stats().window_hits >= 1);
 //! ```

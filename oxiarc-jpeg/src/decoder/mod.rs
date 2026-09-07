@@ -1,8 +1,12 @@
 //! The public decoding API.
 
+#[cfg(feature = "arithmetic")]
+mod arith;
 mod engine;
 mod lossless;
 mod output;
+#[cfg(feature = "rayon")]
+mod parallel;
 mod planes;
 mod progressive;
 mod scan;
@@ -131,7 +135,14 @@ pub struct ImageInfo {
     pub has_jfif: bool,
     /// `true` when an `Adobe` `APP14` marker was present.
     pub has_adobe: bool,
-    /// The restart interval in force at the frame header, or 0.
+    /// The most recent `DRI` interval seen so far, or 0 if none.
+    ///
+    /// libjpeg and libtiff emit `DRI` *after* `SOF`, in the scan header, so
+    /// this is usually 0 in the [`ImageInfo`] that [`Decoder::read_info`]
+    /// returns and non-zero in the one [`Decoder::info`] returns after
+    /// [`Decoder::decode`]. Read it after decoding, or read
+    /// [`crate::TableSet::restart_interval`] when the tables arrive
+    /// out of band as TIFF's tag 347 does.
     pub restart_interval: u16,
     /// `(Hmax, Vmax)` over all components — the frame's subsampling grid.
     pub subsampling: (u8, u8),

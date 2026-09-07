@@ -16,12 +16,13 @@
 //! per-chunk builders, so granularity is one-shot per block/stream.
 
 use super::filters::XzFilter;
-use crate::{Lzma2Decoder, Lzma2Encoder, LzmaLevel, dict_size_from_props, props_from_dict_size};
+use super::writer::XzWriter;
+use crate::{Lzma2Decoder, LzmaLevel, dict_size_from_props};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::crc::{Crc32, Crc64};
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
-use std::io::{Read, Write};
+use std::io::Read;
 
 /// XZ magic bytes: 0xFD, '7', 'z', 'X', 'Z', 0x00
 pub const XZ_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
@@ -389,7 +390,19 @@ impl<R: Read> XzReader<R> {
 
             // Read compressed size if present
             let compressed_size = if has_compressed_size {
-                self.read_multibyte_int(header_body, &mut offset)?
+                // xz spec 3.1.4: the field, when present, is the exact size
+                // of the Compressed Data field and must be non-zero. A
+                // declared zero used to fall through to the self-describing
+                // path, so a crafted header could opt out of the
+                // exact-consumption cross-check below.
+                let declared = self.read_multibyte_int(header_body, &mut offset)?;
+                if declared == 0 {
+                    return Err(OxiArcError::corrupted(
+                        0,
+                        "XZ block declares a compressed size of zero",
+                    ));
+                }
+                declared
             } else {
                 0
             };
@@ -692,12 +705,9 @@ impl<R: Read> XzReader<R> {
             ));
         }
 
-        // Read block padding (to 4-byte boundary)
-        let padding = (4 - (compressed_size % 4)) % 4;
-        if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            self.reader.read_exact(&mut pad)?;
-        }
+        // Read block padding (to 4-byte boundary), validating that it is
+        // null as the spec requires.
+        self.read_block_padding(compressed_size)?;
 
         // Read the check field. It is *not* verified here: the xz spec
         // computes it over the block's original uncompressed data, which is
@@ -770,24 +780,61 @@ impl<R: Read> XzReader<R> {
         }
 
         // Decompress LZMA2 (budget-checked chunk by chunk). The payload was
-        // collected chunk by chunk from the same framing the decoder reads,
-        // so it always consumes all of it; there is no declared size to
-        // cross-check here.
-        let (data, _consumed) = self.decode_lzma2_payload(&compressed, dict_size)?;
+        // collected above by *this* function's own copy of the LZMA2 chunk
+        // framing, while the bytes are then parsed again by
+        // `Lzma2Decoder::decode_chunk`. The two must agree exactly, and the
+        // cheapest way to keep that an invariant rather than an assumption
+        // is to assert it: if they ever disagree (the props-byte rule for
+        // control bytes with a reset field >= 2 is the fragile part), the
+        // residue would otherwise be dropped silently -- and on a
+        // `LZMA_CHECK_NONE` stream, which is exactly what libtiff writes,
+        // nothing else in the format would notice.
+        let (data, consumed) = self.decode_lzma2_payload(&compressed, dict_size)?;
+        if consumed != compressed.len() {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ block payload is {} bytes but its LZMA2 chunks ended after {consumed}",
+                    compressed.len()
+                ),
+            ));
+        }
 
         // Read block padding (compressed data is padded to a 4-byte
         // boundary; the block header is always 4-aligned already)
-        let padding = (4 - (compressed.len() % 4)) % 4;
-        if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            self.reader.read_exact(&mut pad)?;
-        }
+        self.read_block_padding(compressed.len())?;
 
         // See `decompress_block_with_size`: the check covers the block's
         // original data, i.e. the bytes after the filter chain is undone.
         let check = self.read_check()?;
 
         Ok((data, check))
+    }
+
+    /// Read and validate the Block Padding that follows the Compressed
+    /// Data field.
+    ///
+    /// xz spec 3.4: the field pads the Compressed Data to a multiple of four
+    /// bytes and **must** contain null bytes; a decoder that skips whatever
+    /// it finds there accepts up to three attacker-chosen bytes that no
+    /// check covers (the block check is computed over the *uncompressed*
+    /// data, and a `LZMA_CHECK_NONE` stream -- what libtiff writes for TIFF
+    /// `Compression = 34925` -- has no check at all). `xz -d` rejects such a
+    /// stream, so accepting it also meant disagreeing with the reference.
+    fn read_block_padding(&mut self, compressed_len: usize) -> Result<()> {
+        let padding = (4 - (compressed_len % 4)) % 4;
+        if padding == 0 {
+            return Ok(());
+        }
+        let mut pad = [0u8; 3];
+        self.reader.read_exact(&mut pad[..padding])?;
+        if pad[..padding].iter().any(|&byte| byte != 0) {
+            return Err(OxiArcError::corrupted(
+                0,
+                "XZ block padding contains non-null bytes",
+            ));
+        }
+        Ok(())
     }
 
     /// Read the block's check field (empty for `CheckType::None`).
@@ -901,10 +948,19 @@ impl<R: Read> XzReader<R> {
             }
         }
 
-        // Read padding (zeros to align to 4 bytes)
+        // Read Index Padding. xz spec 4.4 requires null bytes here, exactly
+        // as Block Padding does; the CRC-32 below covers them, so a
+        // non-null byte is not undetectable, but it must be reported as the
+        // format error it is rather than folded into a CRC mismatch.
         while (index_data.len() + 4) % 4 != 0 {
             let mut byte = [0u8; 1];
             self.reader.read_exact(&mut byte)?;
+            if byte[0] != 0x00 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    "XZ index padding contains non-null bytes",
+                ));
+            }
             index_data.push(byte[0]);
         }
 
@@ -936,6 +992,21 @@ impl<R: Read> XzReader<R> {
         // Verify footer magic
         if footer[10..12] != XZ_FOOTER_MAGIC {
             return Err(OxiArcError::invalid_header("Invalid XZ footer magic"));
+        }
+
+        // Verify the footer's own CRC-32, which covers the Backward Size and
+        // Stream Flags fields that follow it (xz spec 2.1.2.1). Every other
+        // field of the format is checksummed; leaving this one unverified
+        // meant a corrupt footer was reported (if at all) as a confusing
+        // mismatch of one of the fields it protects rather than as the
+        // corruption it is.
+        let expected_footer_crc = u32::from_le_bytes([footer[0], footer[1], footer[2], footer[3]]);
+        let computed_footer_crc = Crc32::compute(&footer[4..10]);
+        if expected_footer_crc != computed_footer_crc {
+            return Err(OxiArcError::crc_mismatch(
+                expected_footer_crc,
+                computed_footer_crc,
+            ));
         }
 
         // Verify stream flags match header
@@ -987,309 +1058,6 @@ impl<R: Read> XzReader<R> {
                 ),
             ));
         }
-
-        Ok(())
-    }
-}
-
-/// XZ writer for creating XZ compressed files.
-pub struct XzWriter {
-    level: LzmaLevel,
-    check_type: CheckType,
-    /// Optional progress sink (wrapper-emitted, one-shot).
-    progress: Option<ProgressHandle>,
-    /// Optional cancellation token checked before compression.
-    cancel: Option<CancellationToken>,
-}
-
-impl XzWriter {
-    /// Create a new XZ writer.
-    pub fn new(level: LzmaLevel) -> Self {
-        Self {
-            level,
-            check_type: CheckType::Crc32,
-            progress: None,
-            cancel: None,
-        }
-    }
-
-    /// Set the check type.
-    #[must_use]
-    pub fn with_check_type(mut self, check_type: CheckType) -> Self {
-        self.check_type = check_type;
-        self
-    }
-
-    /// Attach a progress sink. Notified once after compression completes with
-    /// the uncompressed byte count, followed by `on_finish()`.
-    #[must_use]
-    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
-        self.progress = Some(handle);
-        self
-    }
-
-    /// Attach a cancellation token. Checked before compression begins.
-    #[must_use]
-    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
-        self.cancel = Some(token);
-        self
-    }
-
-    /// Compress data to XZ format.
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if let Some(ref token) = self.cancel {
-            token.check()?;
-        }
-
-        let mut output = Vec::new();
-
-        // Write stream header
-        let stream_flags = StreamFlags::new(self.check_type);
-        self.write_stream_header(&mut output, stream_flags)?;
-
-        // Write block; keep its Unpadded Size (header + compressed data +
-        // check, excluding block padding) for the index record.
-        let unpadded_size = self.write_block(&mut output, data)?;
-
-        // Write index
-        let index_start = output.len();
-        self.write_index(&mut output, unpadded_size, data.len())?;
-        let index_end = output.len();
-
-        // Write stream footer
-        self.write_stream_footer(&mut output, stream_flags, index_end - index_start)?;
-
-        if let Some(ref handle) = self.progress {
-            let total = data.len() as u64;
-            handle.on_progress(total, Some(total));
-            handle.on_finish();
-        }
-
-        Ok(output)
-    }
-
-    /// Write stream header.
-    fn write_stream_header<W: Write>(&self, writer: &mut W, flags: StreamFlags) -> Result<()> {
-        // Magic
-        writer.write_all(&XZ_MAGIC)?;
-
-        // Stream flags
-        let flags_bytes = flags.encode();
-        writer.write_all(&flags_bytes)?;
-
-        // CRC32 of stream flags
-        let crc = Crc32::compute(&flags_bytes);
-        writer.write_all(&crc.to_le_bytes())?;
-
-        Ok(())
-    }
-
-    /// Write a compressed block.
-    ///
-    /// Returns the block's Unpadded Size (block header + compressed data +
-    /// check, excluding block padding) as required by the index record.
-    ///
-    /// The block header declares both optional size fields (flags `0xC0`),
-    /// exactly as the `xz` CLI does. **Uncompressed Size is the size of the
-    /// block's *original* data — before any filter chain, not after it** —
-    /// and Compressed Size is the exact length of the Compressed Data
-    /// field. The reader enforces both (`decompress_stream` /
-    /// `decompress_block_with_size`), so if this writer ever grows a
-    /// non-last filter (Delta, BCJ), it must keep declaring the original
-    /// size here or produce files it cannot read back.
-    fn write_block<W: Write>(&self, writer: &mut W, data: &[u8]) -> Result<usize> {
-        // Compress data with LZMA2
-        let encoder = Lzma2Encoder::new(self.level);
-        let compressed = encoder.encode(data)?;
-
-        // Calculate dictionary size props
-        let dict_size = self.level.dict_size();
-        let dict_props = props_from_dict_size(dict_size);
-
-        // Build compressed size as multibyte int
-        let mut compressed_size_bytes = Vec::new();
-        Self::write_multibyte_int_static(&mut compressed_size_bytes, compressed.len() as u64);
-
-        // Build uncompressed size as multibyte int
-        let mut uncompressed_size_bytes = Vec::new();
-        Self::write_multibyte_int_static(&mut uncompressed_size_bytes, data.len() as u64);
-
-        // Build block header content (not including size byte or CRC)
-        let mut block_header = Vec::new();
-
-        // Flags: 1 filter, has compressed size, has uncompressed size
-        block_header.push(0xC0); // 1 filter, has compressed size (0x40), has uncompressed size (0x80)
-
-        // Compressed size
-        block_header.extend_from_slice(&compressed_size_bytes);
-
-        // Uncompressed size
-        block_header.extend_from_slice(&uncompressed_size_bytes);
-
-        // Filter: LZMA2
-        block_header.push(FILTER_LZMA2 as u8); // Filter ID (single byte for LZMA2)
-        block_header.push(0x01); // Properties size = 1
-        block_header.push(dict_props); // Dictionary size properties
-
-        // Calculate header size byte first
-        // Total header size = 1 (size byte) + content + padding + 4 (CRC)
-        // Must be multiple of 4, so: (size_byte + 1) * 4 = 1 + content + padding + 4
-        // padding = ((size_byte + 1) * 4) - 1 - content - 4 = (size_byte + 1) * 4 - 5 - content
-        // We need the smallest size_byte such that (size_byte + 1) * 4 >= 1 + content + 4
-        // (size_byte + 1) * 4 >= content + 5
-        // size_byte >= (content + 5) / 4 - 1
-        // size_byte = ceil((content + 5) / 4) - 1 = (content + 5 + 3) / 4 - 1 = (content + 4) / 4
-        let header_size_byte = ((block_header.len() + 4) / 4) as u8;
-        let total_header_size = (header_size_byte as usize + 1) * 4;
-        let padding = total_header_size - 1 - block_header.len() - 4;
-
-        // Add padding
-        block_header.resize(block_header.len() + padding, 0x00);
-
-        // CRC32 of block header (size byte + padded content, per the xz
-        // format spec section 3.1: everything except the CRC32 field itself)
-        let mut header_crc_input = Vec::with_capacity(1 + block_header.len());
-        header_crc_input.push(header_size_byte);
-        header_crc_input.extend_from_slice(&block_header);
-        let header_crc = Crc32::compute(&header_crc_input);
-
-        // Write size byte
-        writer.write_all(&[header_size_byte])?;
-
-        // Write block header content
-        writer.write_all(&block_header)?;
-
-        // Write block header CRC
-        writer.write_all(&header_crc.to_le_bytes())?;
-
-        // Write compressed data
-        writer.write_all(&compressed)?;
-
-        // Pad compressed data to a 4-byte boundary (block padding is NOT
-        // part of the Unpadded Size recorded in the index)
-        let padding = (4 - (compressed.len() % 4)) % 4;
-        for _ in 0..padding {
-            writer.write_all(&[0x00])?;
-        }
-
-        // Write check
-        match self.check_type {
-            CheckType::None => {}
-            CheckType::Crc32 => {
-                let crc = Crc32::compute(data);
-                writer.write_all(&crc.to_le_bytes())?;
-            }
-            CheckType::Crc64 => {
-                let crc = Crc64::compute(data);
-                writer.write_all(&crc.to_le_bytes())?;
-            }
-            CheckType::Sha256 => {
-                let digest = super::sha256::Sha256::compute(data);
-                writer.write_all(&digest)?;
-            }
-        }
-
-        // Unpadded Size = block header + compressed data + check
-        Ok(total_header_size + compressed.len() + self.check_type.size())
-    }
-
-    /// Write a multibyte integer (static version).
-    fn write_multibyte_int_static(output: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let byte = (value & 0x7F) as u8;
-            value >>= 7;
-            if value == 0 {
-                output.push(byte);
-                break;
-            } else {
-                output.push(byte | 0x80);
-            }
-        }
-    }
-
-    /// Write index.
-    ///
-    /// `unpadded_size` is the block size WITHOUT the trailing block padding
-    /// (header + compressed data + check), per the xz format spec.
-    fn write_index<W: Write>(
-        &self,
-        writer: &mut W,
-        unpadded_size: usize,
-        uncompressed_size: usize,
-    ) -> Result<()> {
-        let mut index = Vec::new();
-
-        // Index indicator
-        index.push(0x00);
-
-        // Number of records (1)
-        index.push(0x01);
-
-        // Record: unpadded size, uncompressed size
-        self.write_multibyte_int(&mut index, unpadded_size as u64);
-        self.write_multibyte_int(&mut index, uncompressed_size as u64);
-
-        // Pad to 4 bytes
-        while (index.len() + 4) % 4 != 0 {
-            index.push(0x00);
-        }
-
-        // CRC32
-        let crc = Crc32::compute(&index);
-        index.extend_from_slice(&crc.to_le_bytes());
-
-        writer.write_all(&index)?;
-
-        Ok(())
-    }
-
-    /// Write a multibyte integer.
-    fn write_multibyte_int(&self, output: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let byte = (value & 0x7F) as u8;
-            value >>= 7;
-            if value == 0 {
-                output.push(byte);
-                break;
-            } else {
-                output.push(byte | 0x80);
-            }
-        }
-    }
-
-    /// Write stream footer.
-    fn write_stream_footer<W: Write>(
-        &self,
-        writer: &mut W,
-        flags: StreamFlags,
-        index_size: usize,
-    ) -> Result<()> {
-        // Backward size (index size / 4 - 1). `index_size` is a `usize` we
-        // computed ourselves while writing the Index field, but a plain
-        // `as u32` would still silently wrap once it exceeds `u32::MAX`
-        // (an index that large implies an implausibly large archive, but
-        // "implausible" is not "impossible" on a 64-bit target) and emit a
-        // footer whose Backward Size does not describe the Index we just
-        // wrote -- a self-corrupting archive our own reader would then
-        // reject. Mirrors the `try_from` guard `read_footer` applies to the
-        // same field on the decode side.
-        let backward_size = u32::try_from((index_size / 4).saturating_sub(1)).map_err(|_| {
-            OxiArcError::encoding_error(format!(
-                "XZ index size {index_size} does not fit the 32-bit Backward Size field"
-            ))
-        })?;
-
-        // CRC32 of backward size and stream flags
-        let mut footer_data = Vec::new();
-        footer_data.extend_from_slice(&backward_size.to_le_bytes());
-        footer_data.extend_from_slice(&flags.encode());
-        let crc = Crc32::compute(&footer_data);
-
-        // Write footer
-        writer.write_all(&crc.to_le_bytes())?;
-        writer.write_all(&backward_size.to_le_bytes())?;
-        writer.write_all(&flags.encode())?;
-        writer.write_all(&XZ_FOOTER_MAGIC)?;
 
         Ok(())
     }
@@ -1422,7 +1190,7 @@ pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
 
 /// Decompress XZ data from a byte slice (test utility).
 #[cfg(test)]
-fn decompress_slice(data: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn decompress_slice(data: &[u8]) -> Result<Vec<u8>> {
     decompress(&mut std::io::Cursor::new(data))
 }
 
@@ -1431,6 +1199,23 @@ pub fn compress(data: &[u8], level: u8) -> Result<Vec<u8>> {
     let lzma_level = LzmaLevel::new(level);
     let writer = XzWriter::new(lzma_level);
     writer.compress(data)
+}
+
+/// Deterministic pseudo-random bytes for the reader and writer test
+/// modules (incompressible payloads, so a round trip really exercises the
+/// stored-chunk path rather than a run-length shortcut).
+#[cfg(test)]
+pub(super) fn xorshift_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 #[cfg(test)]
@@ -1505,18 +1290,6 @@ mod tests {
     /// Small deterministic xorshift PRNG so tests can generate reproducible,
     /// incompressible-looking data without depending on an external `rand`
     /// crate (SciRS2-Core is for numeric/array workloads, not needed here).
-    fn xorshift_bytes(seed: u64, len: usize) -> Vec<u8> {
-        let mut state = seed | 1;
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            out.extend_from_slice(&state.to_le_bytes());
-        }
-        out.truncate(len);
-        out
-    }
 
     #[test]
     fn test_xz_roundtrip_incompressible_random() {
@@ -1528,58 +1301,6 @@ mod tests {
 
         let decompressed = decompress_slice(&compressed).expect("decompress random data");
         assert_eq!(decompressed, original);
-    }
-
-    #[test]
-    fn test_xz_roundtrip_large_multi_block() {
-        // Hand-assemble a two-block XZ stream (our own `XzWriter::compress`
-        // only ever emits a single block) to exercise the reader's
-        // multi-block loop together with the new index CRC-32 and footer
-        // Backward Size validation against a genuine, format-compliant
-        // multi-record index.
-        let writer = XzWriter::new(LzmaLevel::new(6));
-        let stream_flags = StreamFlags::new(writer.check_type);
-
-        let block_a = xorshift_bytes(0x1234_5678_9ABC_DEF0, 48 * 1024);
-        let block_b: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
-
-        let mut output = Vec::new();
-        writer
-            .write_stream_header(&mut output, stream_flags)
-            .expect("write stream header");
-        let unpadded_a = writer
-            .write_block(&mut output, &block_a)
-            .expect("write block a");
-        let unpadded_b = writer
-            .write_block(&mut output, &block_b)
-            .expect("write block b");
-
-        // Build a genuine 2-record index (Index Indicator + Number of
-        // Records + records + padding + CRC32), matching the on-disk layout
-        // `write_index` produces for a single record.
-        let mut index = vec![0x00u8];
-        index.push(0x02); // number of records
-        writer.write_multibyte_int(&mut index, unpadded_a as u64);
-        writer.write_multibyte_int(&mut index, block_a.len() as u64);
-        writer.write_multibyte_int(&mut index, unpadded_b as u64);
-        writer.write_multibyte_int(&mut index, block_b.len() as u64);
-        while (index.len() + 4) % 4 != 0 {
-            index.push(0x00);
-        }
-        let index_crc = Crc32::compute(&index);
-        index.extend_from_slice(&index_crc.to_le_bytes());
-        output.extend_from_slice(&index);
-
-        writer
-            .write_stream_footer(&mut output, stream_flags, index.len())
-            .expect("write stream footer");
-
-        let mut expected = block_a.clone();
-        expected.extend_from_slice(&block_b);
-
-        let decompressed =
-            decompress_slice(&output).expect("decompress hand-assembled multi-block stream");
-        assert_eq!(decompressed, expected);
     }
 
     #[test]
@@ -1597,63 +1318,5 @@ mod tests {
             matches!(err, OxiArcError::CrcMismatch { .. }),
             "expected CrcMismatch, got {err:?}"
         );
-    }
-
-    #[test]
-    fn test_xz_progress_forwarding() {
-        use oxiarc_core::progress::{ProgressHandle, ProgressSink};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        struct CountingSink {
-            progress_count: AtomicU64,
-            finish_count: AtomicU64,
-            last_processed: AtomicU64,
-        }
-        impl ProgressSink for CountingSink {
-            fn on_progress(&self, processed: u64, _total: Option<u64>) {
-                self.progress_count.fetch_add(1, Ordering::SeqCst);
-                self.last_processed.store(processed, Ordering::SeqCst);
-            }
-            fn on_entry(&self, _name: &str, _index: u64) {}
-            fn on_finish(&self) {
-                self.finish_count.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let sink = Arc::new(CountingSink {
-            progress_count: AtomicU64::new(0),
-            finish_count: AtomicU64::new(0),
-            last_processed: AtomicU64::new(0),
-        });
-        let handle: ProgressHandle = sink.clone();
-
-        // Use a small repeating payload so the underlying LZMA encoder
-        // handles it correctly (see module notes on complex data patterns).
-        let data: Vec<u8> = (0..1_000).map(|_| b'A').collect();
-        let writer = XzWriter::new(LzmaLevel::new(6)).with_progress(handle);
-        let _compressed = writer
-            .compress(&data)
-            .expect("xz compression with progress should succeed");
-
-        assert!(sink.progress_count.load(Ordering::SeqCst) >= 1);
-        assert_eq!(sink.finish_count.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            sink.last_processed.load(Ordering::SeqCst),
-            data.len() as u64
-        );
-    }
-
-    #[test]
-    fn test_xz_cancel_forwarding() {
-        use oxiarc_core::cancel::CancellationToken;
-        use oxiarc_core::error::OxiArcError;
-
-        let token = CancellationToken::new();
-        token.cancel();
-        let writer = XzWriter::new(LzmaLevel::new(6)).with_cancel(token);
-        let data: Vec<u8> = (0..100).map(|_| b'A').collect();
-        let result = writer.compress(&data);
-        assert!(matches!(result, Err(OxiArcError::Cancelled)));
     }
 }

@@ -823,6 +823,51 @@ fn window_allocation_is_lazy() {
     );
 }
 
+/// The lazy bound has a floor, and the documentation must state it.
+///
+/// A frame that declares no `Frame_Content_Size` gives the decoder nothing to
+/// size the ring from except the declared `Window_Size`, which is
+/// attacker-controlled — so the first allocation is
+/// `Block_Maximum_Decompressed_Size` (128 KiB here), not the four bytes the
+/// frame goes on to produce. That floor is inherent: one whole block has to fit
+/// in the ring before the caller drains it. Pinned here because the crate docs
+/// used to promise "never larger than the bytes actually produced", which is a
+/// 32768x understatement for this frame.
+#[test]
+fn window_floor_is_one_block_when_no_content_size_is_declared() {
+    let frame = raw_block_frame(b"tiny");
+    let mut stream = permissive();
+    let got = drive_with(&mut stream, &frame, usize::MAX, 1 << 16);
+    assert_eq!(got.error, None);
+    assert_eq!(got.output, b"tiny");
+    assert_eq!(
+        stream.window_size(),
+        MAX_BLOCK_SIZE,
+        "a frame with no declared content size must allocate exactly one block"
+    );
+
+    // A smaller declared window pulls the floor down with it: the ring is
+    // `min(Window_Size, 128 KiB)`, never more.
+    let mut small = frame.clone();
+    small[5] = 0x00; // Window_Descriptor exponent 0 -> 1 KiB
+    let mut stream = permissive();
+    let got = drive_with(&mut stream, &small, usize::MAX, 1 << 16);
+    assert_eq!(got.error, None);
+    assert_eq!(got.output, b"tiny");
+    assert_eq!(stream.window_size(), 1024);
+
+    // And declaring the content size sizes the ring by it instead.
+    let sized = compress_with_level(b"tiny", 3).expect("compress");
+    let mut stream = permissive();
+    let got = drive_with(&mut stream, &sized, usize::MAX, 1 << 16);
+    assert_eq!(got.error, None);
+    assert!(
+        stream.window_size() <= 16,
+        "a declared content size must size the ring: got {}",
+        stream.window_size()
+    );
+}
+
 /// Build a hand-crafted frame header so the declared `Window_Size` and
 /// `Frame_Content_Size` can be set to values no encoder would produce.
 ///
@@ -1106,4 +1151,200 @@ fn strip_content_size(frame: &[u8]) -> Vec<u8> {
     out.push(0x48); // window descriptor: 8 MiB, big enough for any test payload
     out.extend_from_slice(&frame[header_len..]);
     out
+}
+
+/// A *formatted* dictionary (RFC 8878 §5, `Magic_Number` `0xEC30A437`, what
+/// `zstd --train` writes) carries a `Dictionary_ID`, entropy tables and only
+/// then the content. This decoder implements raw content dictionaries only, so
+/// a formatted one must be **refused by name** — never seeded as if its header
+/// and tables were content, which would silently produce wrong bytes for any
+/// frame built against it.
+#[test]
+fn formatted_dictionary_is_rejected_rather_than_used_as_content() {
+    // Magic 0xEC30A437 little-endian, a Dictionary_ID, then arbitrary bytes.
+    let mut formatted = vec![0x37, 0xA4, 0x30, 0xEC, 0x11, 0x22, 0x33, 0x44];
+    formatted.extend(b"alpha beta gamma delta epsilon zeta eta theta ".repeat(40));
+
+    let payload = b"alpha beta gamma delta".repeat(8);
+    let frame = compress_with_level(&payload, 3).expect("compress");
+
+    for in_chunk in [usize::MAX, 1] {
+        let mut stream = permissive().with_dictionary(formatted.clone());
+        let got = drive_with(&mut stream, &frame, in_chunk, 1 << 16);
+        let message = got.error.expect("formatted dictionary must be refused");
+        assert!(
+            message.contains("formatted Zstandard dictionary"),
+            "unnamed error for a formatted dictionary: {message}"
+        );
+        assert!(got.output.is_empty(), "wrong bytes were handed out");
+        // The refusal survives `reset()`: it is a configuration error, not the
+        // sticky per-stream fault that a reset clears.
+        stream.reset();
+        let again = drive_with(&mut stream, &frame, usize::MAX, 1 << 16);
+        assert!(
+            again
+                .error
+                .is_some_and(|e| e.contains("formatted Zstandard dictionary")),
+            "the refusal did not survive reset()"
+        );
+    }
+
+    // The legacy one-shot dictionary entry points refuse it too: without the
+    // check they would seed the history with the dictionary's header and
+    // entropy tables, which is the silent-corruption case.
+    let one_shot = oxiarc_zstd::decompress_with_dict(&frame, &formatted);
+    assert!(
+        one_shot.is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+        "decompress_with_dict accepted a formatted dictionary"
+    );
+    let multi = oxiarc_zstd::decompress_multi_frame_with_dict(&frame, &formatted);
+    assert!(
+        multi.is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+        "decompress_multi_frame_with_dict accepted a formatted dictionary"
+    );
+
+    // A blob shorter than 8 bytes is a raw content dictionary even when it
+    // starts with the magic, exactly as the reference decoder treats it.
+    let short = vec![0x37, 0xA4, 0x30, 0xEC, 0x11];
+    let mut stream = permissive().with_dictionary(short);
+    let got = drive_with(&mut stream, &frame, usize::MAX, 1 << 16);
+    assert_eq!(got.error, None, "a 5-byte dictionary must be raw content");
+    assert_eq!(got.output, payload);
+}
+
+/// A frame that names a `Dictionary_ID` cannot be decoded without that
+/// dictionary: its matches reach into content the decoder does not have. The
+/// push decoder is strict about it (the Phase 8 contract requires every new
+/// entry point to be), so this is a named error rather than wrong bytes.
+#[test]
+fn frame_requiring_a_dictionary_id_is_refused_without_one() {
+    // Hand-built frame: Single_Segment, Frame_Content_Size = 4 (1 byte),
+    // Dictionary_ID_flag = 1 (1 byte = 0x2A), one last Raw block of "abcd".
+    // Field order is RFC 8878 §3.1.1: descriptor, [window], [dict id], [FCS].
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+    frame.push(0b0010_0001);
+    frame.push(0x2A);
+    frame.push(0x04);
+    // last_block = 1, Block_Type = Raw (0), Block_Size = 4.
+    let block_header = 1u32 | (4u32 << 3);
+    frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    frame.extend_from_slice(b"abcd");
+
+    let mut stream = permissive();
+    let got = drive_with(&mut stream, &frame, usize::MAX, 64);
+    let message = got.error.expect("a dictionary-ID frame must be refused");
+    assert!(
+        message.contains("requires dictionary ID 0x0000002a"),
+        "unnamed error for a missing dictionary: {message}"
+    );
+    assert!(got.output.is_empty());
+
+    // With a (raw content) dictionary supplied, the very same frame decodes:
+    // the check is "a dictionary is required", not "this exact ID".
+    let mut stream = permissive().with_dictionary(b"some raw dictionary content".to_vec());
+    let got = drive_with(&mut stream, &frame, usize::MAX, 64);
+    assert_eq!(got.error, None);
+    assert_eq!(got.output, b"abcd");
+
+    // `Dictionary_ID` 0 means "no dictionary" whatever the flag width says.
+    let mut zero_id = frame.clone();
+    zero_id[5] = 0x00;
+    let mut stream = permissive();
+    let got = drive_with(&mut stream, &zero_id, usize::MAX, 64);
+    assert_eq!(
+        got.error, None,
+        "dictionary ID 0 must not require a dictionary"
+    );
+    assert_eq!(got.output, b"abcd");
+}
+
+/// Build a compressed block carrying `payload`, wrapped in a minimal frame
+/// with no `Frame_Content_Size` and an 8 MiB declared window.
+fn compressed_block_frame(payload: &[u8]) -> Vec<u8> {
+    let mut blocks = Vec::new();
+    blocks.extend_from_slice(&block_header(true, 2, payload.len() as u32));
+    blocks.extend_from_slice(payload);
+    crafted_frame(0x48, None, &blocks)
+}
+
+/// A literals section may not claim to regenerate more than a block can.
+///
+/// `Regenerated_Size` is a 20-bit field, so a three-byte literals header can
+/// claim just under 1 MiB — eight times RFC 8878's
+/// `Block_Maximum_Decompressed_Size`. The claim must be refused **while the
+/// header is parsed**, before anything is sized from it: an RLE literals
+/// section is otherwise materialised with `Vec::resize` straight from the
+/// field, so a four-byte payload would allocate a megabyte before the block's
+/// own output ceiling could reject it.
+///
+/// The allocation half of this claim is pinned in `tests/alloc_budget.rs`;
+/// this test pins the error *shape*, so the bound cannot silently regress into
+/// a post-hoc check that still allocates first.
+#[test]
+fn oversized_literals_regenerated_size_is_refused_by_the_header() {
+    // RLE literals, `Size_Format` 3 (20-bit `Regenerated_Size`) = 983 040
+    // bytes, then the single byte that would be repeated.
+    let literals = [0x0Du8, 0x00, 0xF0, b'X'];
+    let frame = compressed_block_frame(&literals);
+
+    for chunk in [usize::MAX, 1] {
+        let mut stream = permissive();
+        let error = drive_to_error(&mut stream, &frame, chunk);
+        let message = error.to_string();
+        assert!(
+            matches!(error, OxiArcError::CorruptedData { .. }),
+            "expected corrupted data for an oversized literals header, got {error:?}"
+        );
+        assert!(
+            message.contains("literals regenerated size 983040")
+                && message.contains(&MAX_BLOCK_SIZE.to_string()),
+            "the refusal must name the field and the bound: {message}"
+        );
+    }
+
+    // The same field just inside the bound is a well-formed header, so the
+    // check really is a bound and not a blanket rejection of `Size_Format` 3:
+    // it fails later, on the content, not in the header.
+    let mut inside = [0x0Du8, 0x00, 0x08, b'X'];
+    inside[2] = ((MAX_BLOCK_SIZE >> 12) & 0xFF) as u8;
+    let frame = compressed_block_frame(&inside);
+    let mut stream = permissive();
+    let message = drive_to_error(&mut stream, &frame, usize::MAX).to_string();
+    assert!(
+        !message.contains("literals regenerated size"),
+        "a literals section exactly at the block maximum must pass the header check: {message}"
+    );
+}
+
+/// `Number_of_Sequences` may not drive a reservation the bitstream cannot back.
+///
+/// The three-byte form of the field reaches 98 047, i.e. a ~2.3 MB `Vec`
+/// reservation from three attacker-controlled bytes. Every sequence consumes at
+/// least one bit of the sequences bitstream, so the reservation is clamped to
+/// `bitstream_len * 8`; a lying header therefore gets nothing and still fails
+/// cleanly on the exhausted bitstream.
+///
+/// The allocation half is pinned in `tests/alloc_budget.rs`.
+#[test]
+fn lying_sequence_count_is_rejected_without_reserving_for_it() {
+    let mut payload = Vec::new();
+    // Raw literals, `Size_Format` 0, `Regenerated_Size` 0 — an empty section.
+    payload.push(0x00);
+    // `Number_of_Sequences` = 0xFF + (0xFF << 8) + 0x7F00 = 98 047.
+    payload.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    // Symbol_Compression_Modes: predefined tables for all three.
+    payload.push(0x00);
+    // Four bytes of bitstream: enough for the three initial FSE states, far
+    // too little for 98 047 sequences.
+    payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+
+    let frame = compressed_block_frame(&payload);
+    for chunk in [usize::MAX, 1] {
+        let mut stream = permissive();
+        let error = drive_to_error(&mut stream, &frame, chunk);
+        assert!(
+            matches!(error, OxiArcError::CorruptedData { .. }),
+            "expected corrupted data for a lying sequence count, got {error:?}"
+        );
+    }
 }

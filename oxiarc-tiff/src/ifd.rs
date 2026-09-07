@@ -567,6 +567,26 @@ pub trait ValueSource {
     /// # Errors
     /// Any read, bounds or limits failure.
     fn load(&mut self, entry: &Entry) -> Result<Value>;
+
+    /// Reads `len` raw bytes at `offset`, when the source is backed by a file.
+    ///
+    /// Only old-style JPEG (compression 6) needs this: TIFF 6.0 §22's tags
+    /// 519/520/521 hold *file offsets* to the quantisation and Huffman tables
+    /// rather than the tables themselves, so they cannot be resolved from a
+    /// directory entry alone.
+    ///
+    /// The default answers `Ok(None)` — "this source has no file behind it" —
+    /// which is what the in-memory sources used by tests and by the writer
+    /// want. A source that can read returns `Ok(None)` too when the range does
+    /// not fit inside the file, so a bogus offset degrades to "no tables"
+    /// rather than to an error.
+    ///
+    /// # Errors
+    /// Any read or limits failure.
+    fn read_raw(&mut self, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+        let _ = (offset, len);
+        Ok(None)
+    }
 }
 
 /// One parsed Image File Directory.

@@ -1736,3 +1736,126 @@ fn member_boundary_needs_two_bytes_to_decide() {
         assert_eq!(decoder.members_decoded(), 2, "chunk {chunk}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// P0-8: the budget bounds ONE stream, and a multi-member stream is one stream
+// ---------------------------------------------------------------------------
+
+/// `WrappedInflate::with_max_output` must bound the *whole* concatenated
+/// stream, not restart at each member.
+///
+/// This is load-bearing for every downstream consumer that sets a
+/// file-level cap (`oxiarc_http::DecodeLimits::max_output`, PNG, TIFF): the
+/// wrapper reaches a member boundary through
+/// [`oxiarc_deflate::InflateStream::reset_for_next_member`], which
+/// deliberately keeps `total_out` cumulative. If it ever used `reset()`
+/// instead, an N-member gzip would silently get N times the cap — the exact
+/// hole TODO.md P0-8 names.
+#[test]
+fn wrapped_max_output_bounds_every_member_together() {
+    let member = b"0123456789";
+    let mut stream = Vec::new();
+    for _ in 0..4 {
+        stream.extend_from_slice(&gzip_compress(member, 6).expect("gzip"));
+    }
+    let total = member.len() * 4;
+
+    // A cap at the exact total decodes; one byte short does not.
+    for chunk in [1usize, 7, stream.len()] {
+        let mut decoder = WrappedInflate::new(InflateWrapper::Gzip)
+            .multi_member(true)
+            .with_max_output(total as u64);
+        let out = wrapped_decode(&mut decoder, &stream, chunk, 3, total)
+            .unwrap_or_else(|e| panic!("exact cap, chunk {chunk}: {e}"));
+        assert_eq!(out, member.repeat(4), "chunk {chunk}");
+        assert_eq!(decoder.members_decoded(), 4, "chunk {chunk}");
+        assert_eq!(decoder.total_out(), total as u64, "chunk {chunk}");
+
+        // One byte short of the total: must fail, and must never hand back
+        // more than the cap allowed.
+        let mut decoder = WrappedInflate::new(InflateWrapper::Gzip)
+            .multi_member(true)
+            .with_max_output(total as u64 - 1);
+        match wrapped_decode(&mut decoder, &stream, chunk, 3, total) {
+            Err(_) => {}
+            Ok(out) => panic!(
+                "chunk {chunk}: cap of {} let {} bytes through",
+                total - 1,
+                out.len()
+            ),
+        }
+        assert!(
+            decoder.total_out() < total as u64,
+            "chunk {chunk}: produced {} past a cap of {}",
+            decoder.total_out(),
+            total - 1
+        );
+    }
+
+    // A per-member cap (10 bytes) must NOT be enough for four members.
+    let mut decoder = WrappedInflate::new(InflateWrapper::Gzip)
+        .multi_member(true)
+        .with_max_output(member.len() as u64);
+    assert!(
+        wrapped_decode(&mut decoder, &stream, 5, 3, total).is_err(),
+        "a one-member cap must not survive four members"
+    );
+}
+
+/// The ratio guard is likewise a whole-stream property, and it must fire
+/// before the expansion it is guarding against has been handed out.
+#[test]
+fn wrapped_ratio_guard_bounds_a_concatenated_stream() {
+    let member = vec![0u8; 512 * 1024];
+    let mut stream = Vec::new();
+    for _ in 0..3 {
+        stream.extend_from_slice(&gzip_compress(&member, 6).expect("gzip"));
+    }
+
+    let mut decoder = WrappedInflate::new(InflateWrapper::Gzip)
+        .multi_member(true)
+        .with_ratio_guard(50.0, 4096);
+    let err = wrapped_decode(&mut decoder, &stream, 4096, 8192, member.len() * 3)
+        .expect_err("zeros expand far past 50x");
+    let _ = err;
+    // Well short of even one whole member: the guard fired inside the block.
+    assert!(
+        decoder.total_out() < member.len() as u64,
+        "ratio guard let {} bytes through",
+        decoder.total_out()
+    );
+
+    // The same stream without a guard decodes in full, so the test above is
+    // not passing for some unrelated reason.
+    let mut decoder = WrappedInflate::new(InflateWrapper::Gzip).multi_member(true);
+    let out = wrapped_decode(&mut decoder, &stream, 4096, 8192, member.len() * 3)
+        .expect("unguarded decode");
+    assert_eq!(out.len(), member.len() * 3);
+}
+
+/// `total_in` must count exactly the bytes the decoder took, so a caller
+/// that stops at [`TrailingPolicy::Stop`] can find the trailing region.
+#[test]
+fn wrapped_total_in_stops_at_the_end_of_the_last_member() {
+    let member = zlib_compress(b"payload", 6).expect("zlib");
+    let mut input = member.clone();
+    input.extend_from_slice(b"TRAILING GARBAGE");
+
+    for chunk in [1usize, 3, input.len()] {
+        let mut decoder = WrappedInflate::new(InflateWrapper::Zlib)
+            .multi_member(true)
+            .trailing_policy(TrailingPolicy::Stop);
+        let out = wrapped_decode(&mut decoder, &input, chunk, 4, 7)
+            .unwrap_or_else(|e| panic!("chunk {chunk}: {e}"));
+        assert_eq!(out, b"payload", "chunk {chunk}");
+        // At most two bytes of lookahead past the member are examined to
+        // decide the boundary; nothing beyond that may be claimed.
+        assert!(
+            decoder.total_in() >= member.len() as u64
+                && decoder.total_in() <= member.len() as u64 + 2,
+            "chunk {chunk}: total_in {} for a {}-byte member",
+            decoder.total_in(),
+            member.len()
+        );
+    }
+}

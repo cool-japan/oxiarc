@@ -316,6 +316,68 @@ fn e11_sub_byte_packing_with_fill_order_two() {
     }
 }
 
+/// `FillOrder = 2` reverses the bits of every byte of the **compressed**
+/// chunk, at every bit depth.
+///
+/// Verified against libtiff 4.7.1 (`tiffcp -c packbits -f lsb2msb`): the
+/// PackBits control bytes themselves are reversed, so decoding without
+/// reversing first yields the wrong *length*, and an 8-bit uncompressed strip
+/// has every sample byte reversed. `tests/tiff_oracle.rs` pins the interop
+/// half; this test pins the byte layout without needing libtiff on PATH.
+#[test]
+fn e11_fill_order_two_reverses_the_compressed_stream_at_every_depth() {
+    use oxiarc_tiff::compression::packbits;
+    use oxiarc_tiff::sample::reverse_bits_in_place;
+
+    let pixels: Vec<u8> = (0..24u32).map(|i| (i % 253) as u8).collect();
+
+    // Uncompressed 8-bit: the stored strip is the bit-reversed pixel bytes.
+    let spec = ImageSpec::new(6, 4, ColorType::Gray(8))
+        .with_fill_order(FillOrder::Lsb2Msb)
+        .with_layout(Layout::Strips { rows_per_strip: 4 });
+    let mut buffer = Cursor::new(Vec::new());
+    let mut encoder = Encoder::new(&mut buffer).expect("encoder");
+    encoder.write_image(&spec, &pixels).expect("write");
+    encoder.finish().expect("finish");
+    let mut decoder = decode(buffer.into_inner());
+    let stored = decoder.read_strip_raw(0).expect("raw strip");
+    let expected: Vec<u8> = pixels.iter().map(|b| b.reverse_bits()).collect();
+    assert_eq!(
+        stored, expected,
+        "8-bit FillOrder 2 must reverse every byte"
+    );
+
+    // PackBits: the reversal is applied *after* compression, so the control
+    // bytes are reversed too and a naive decode of the stored bytes has the
+    // wrong length.
+    let spec = spec.with_compression(Compression::PackBits);
+    let mut buffer = Cursor::new(Vec::new());
+    let mut encoder = Encoder::new(&mut buffer).expect("encoder");
+    encoder.write_image(&spec, &pixels).expect("write");
+    encoder.finish().expect("finish");
+    let mut decoder = decode(buffer.into_inner());
+    let mut stored = decoder.read_strip_raw(0).expect("raw strip");
+    let mut naive = vec![0u8; pixels.len()];
+    let naive_len = packbits::decode_into(&stored, &mut naive).unwrap_or(0);
+    assert_ne!(
+        naive_len,
+        pixels.len(),
+        "reversing after decompression would have decoded cleanly"
+    );
+    reverse_bits_in_place(&mut stored);
+    let mut back = vec![0u8; pixels.len()];
+    assert_eq!(
+        packbits::decode_into(&stored, &mut back).expect("packbits"),
+        pixels.len()
+    );
+    assert_eq!(back, pixels);
+    // And the decoder itself agrees.
+    assert_eq!(
+        decoder.read_image().expect("decode").as_u8(),
+        Some(&pixels[..])
+    );
+}
+
 #[test]
 fn e11_row_padding_is_per_row_not_per_strip() {
     // 3 pixels of 1 bit each pad to one byte per row; two rows are two bytes.
@@ -441,7 +503,7 @@ fn e16_float_predictor_in_both_byte_orders() {
 // ---------------------------------------------------------------- E17
 
 #[test]
-fn e17_jpeg_in_tiles_reports_not_yet_available() {
+fn e17_jpeg_in_tiles_is_decoded_or_names_its_feature() {
     let pixels = ramp(16 * 16);
     let mut tiff = RawTiff::new();
     let offset = tiff.add_data(&pixels);
@@ -456,13 +518,21 @@ fn e17_jpeg_in_tiles_reports_not_yet_available() {
     tiff.long(323, &[16]);
     tiff.long(324, &[offset as u32]);
     tiff.long(325, &[pixels.len() as u32]);
+    // The strip is a ramp, not a JPEG datastream, so the codec must complain
+    // about the *stream* when it is compiled in, and name the feature when it
+    // is not. Either way it may never claim the method is unimplemented.
     let err = decode(tiff.build())
         .read_image()
-        .expect_err("JPEG is not wired up yet");
-    assert!(matches!(
-        err,
-        TiffError::Unsupported(UnsupportedError::NotYetAvailable { method: 7, .. })
-    ));
+        .expect_err("a ramp is not a JPEG datastream");
+    let compiled = cfg!(feature = "jpeg");
+    match err {
+        TiffError::Format(_) => assert!(compiled, "the codec parsed a ramp while disabled"),
+        TiffError::Unsupported(UnsupportedError::FeatureNotCompiled { feature }) => {
+            assert_eq!(feature, "jpeg");
+            assert!(!compiled, "the feature is on but was reported missing");
+        }
+        other => panic!("JPEG in tiles produced {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------- E18 - E21
@@ -661,7 +731,7 @@ fn e24_multi_page_files_rebuild_the_geometry_per_page() {
         .write_image(
             &ImageSpec::new(3, 1, ColorType::Rgb(16))
                 .with_layout(Layout::Strips { rows_per_strip: 1 }),
-            &vec![0u8; 3 * 3 * 2],
+            &[0u8; 3 * 3 * 2],
         )
         .expect("page 1");
     encoder
@@ -951,16 +1021,25 @@ fn e40_jpeg_tables_on_a_non_jpeg_image_are_ignored_with_a_warning() {
 // ------------------------------------------------- codec dispatch coverage
 
 #[test]
-fn scheduled_codecs_return_the_named_error() {
-    for method in [2u16, 3, 4, 5, 6, 7, 8, 32946, 34925, 50000] {
+fn every_in_crate_codec_reports_a_stream_defect_or_its_feature() {
+    // Four rows of an 8-bit ramp are not a valid stream for any of these
+    // codecs. What must never happen is a "not yet available" answer: every
+    // one of them is implemented, behind a cargo feature.
+    for method in [2u16, 3, 4, 5, 6, 7, 8, 32946, 34925, 50000, 32771] {
         let mut tiff = gray8(4, 4, &ramp(16));
         tiff.short(259, &[method]);
+        if matches!(method, 2 | 3 | 4 | 32771) {
+            // The fax codes are bilevel-only; give them a legal geometry so
+            // the answer is about the stream, not about the depth.
+            tiff.short(258, &[1]);
+        }
         let result = decode(tiff.build()).read_image();
         match result {
-            Err(TiffError::Unsupported(UnsupportedError::NotYetAvailable { method: m, name })) => {
-                assert_eq!(m, method);
-                assert!(!name.is_empty());
+            Err(TiffError::Format(_)) => {}
+            Err(TiffError::Unsupported(UnsupportedError::FeatureNotCompiled { feature })) => {
+                assert!(!feature.is_empty());
             }
+            Err(TiffError::Unsupported(UnsupportedError::OldJpeg(_))) => assert_eq!(method, 6),
             other => panic!("compression {method} produced {other:?}"),
         }
     }
@@ -968,7 +1047,7 @@ fn scheduled_codecs_return_the_named_error() {
 
 #[test]
 fn genuinely_unknown_compressions_report_the_number() {
-    for method in [32766u16, 32771, 34661, 32895, 32947, 50001, 50002] {
+    for method in [32766u16, 34661, 32895, 32947, 50001, 50002] {
         let mut tiff = gray8(4, 4, &ramp(16));
         tiff.short(259, &[method]);
         let err = decode(tiff.build()).read_image().expect_err("unsupported");

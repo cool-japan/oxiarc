@@ -38,8 +38,8 @@
 //! cannot be satisfied from one refill loops; `ErrorKind::Interrupted` from the
 //! inner reader is retried, `WouldBlock` propagates unchanged (the decoder
 //! state stays intact for the retry), and an inner `Ok(0)` switches the decoder
-//! to [`FlushMode::Finish`] so a truncated stream is an error rather than a
-//! short read.
+//! to [`FlushMode::Finish`](oxiarc_core::traits::FlushMode::Finish) so a
+//! truncated stream is an error rather than a short read.
 //!
 //! ## Drop behavior
 //!
@@ -402,11 +402,10 @@ const MAX_STAGING: usize = 4 * 1024 * 1024;
 
 /// A streaming Brotli decompressor that implements `Read`.
 ///
-/// A thin shell over [`BrotliStream`]: at most [`DECODE_STAGING`] (64 KiB) of
-/// compressed data is held at a time and decoded straight into the caller's
-/// buffer, so output is available before the source reaches EOF and peak
-/// memory is bounded by the stream's sliding window rather than by the
-/// decompressed size.
+/// A thin shell over [`BrotliStream`]: at most 64 KiB of compressed data is
+/// held at a time and decoded straight into the caller's buffer, so output is
+/// available before the source reaches EOF and peak memory is bounded by the
+/// stream's sliding window rather than by the decompressed size.
 ///
 /// I/O behaviour:
 ///
@@ -421,7 +420,7 @@ const MAX_STAGING: usize = 4 * 1024 * 1024;
 ///   than an error. This is the behaviour this type has always had and is kept
 ///   deliberately: a zero-byte body is treated as "nothing to decode", not as a
 ///   truncated stream. The strict reading — a zero-byte body is not a valid
-///   Brotli stream — is what [`crate::decompress`] and [`BrotliStream`] apply.
+///   Brotli stream — is what [`crate::decompress()`] and [`BrotliStream`] apply.
 ///
 /// Supports optional progress reporting via [`ProgressHandle`],
 /// cooperative cancellation via [`CancellationToken`], and a memory budget

@@ -233,6 +233,77 @@ fn rejected_bomb_stays_within_its_budget() {
     assert!(stream.window_size() <= 64 * 1024 + oxiarc_zstd::MAX_BLOCK_SIZE + 8);
 }
 
+/// Build a minimal frame carrying one `Compressed` block of `payload`.
+///
+/// No `Frame_Content_Size`, an 8 MiB declared window; the block is the
+/// frame's last.
+fn compressed_block_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x48];
+    let header = 1u32 | (2 << 1) | ((payload.len() as u32) << 3);
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Drive `frame` to its (expected) error, returning nothing.
+fn pump_to_error(frame: &[u8], scratch: &mut [u8]) {
+    let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+    let mut pos = 0usize;
+    loop {
+        match stream.decode(&frame[pos..], scratch, FlushMode::Finish) {
+            Ok(p) => {
+                pos += p.consumed;
+                assert_ne!(
+                    p.status,
+                    ZstdStatus::StreamEnd,
+                    "malformed frame decoded successfully"
+                );
+                assert!(p.consumed > 0 || p.produced > 0, "decoder stalled");
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// A literals header claiming ~1 MiB must not size a buffer from the claim.
+///
+/// `Regenerated_Size` is 20 bits wide, so a four-byte RLE literals section can
+/// name 983 040 bytes — eight times `Block_Maximum_Decompressed_Size`. Without
+/// the header-time bound the decoder calls `Vec::resize` with that number and
+/// only then discovers the block cannot hold it, so a handful of input bytes
+/// buy a megabyte of memory. With the bound the whole decode allocates less
+/// than one block's worth.
+fn oversized_literals_header_allocates_nothing() {
+    let frame = compressed_block_frame(&[0x0D, 0x00, 0xF0, b'X']);
+    let mut scratch = vec![0u8; 64 * 1024];
+    let (_allocs, bytes, ()) = measure(|| pump_to_error(&frame, &mut scratch));
+    assert!(
+        bytes < 256 * 1024,
+        "a literals header claiming 983040 bytes allocated {bytes} bytes; \
+         the regenerated size must be bounded before anything is sized from it"
+    );
+}
+
+/// `Number_of_Sequences` must not drive a reservation the bitstream cannot back.
+///
+/// The three-byte form reaches 98 047, i.e. a ~2.3 MB `Vec<Sequence>`
+/// reservation bought with three bytes. Every sequence consumes at least one
+/// bit, so the reservation is clamped to `bitstream_len * 8`.
+fn lying_sequence_count_allocates_nothing() {
+    let mut payload = vec![0x00u8]; // empty Raw literals section
+    payload.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // Number_of_Sequences = 98047
+    payload.push(0x00); // all three tables predefined
+    payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // 4-byte bitstream
+    let frame = compressed_block_frame(&payload);
+    let mut scratch = vec![0u8; 64 * 1024];
+    let (_allocs, bytes, ()) = measure(|| pump_to_error(&frame, &mut scratch));
+    assert!(
+        bytes < 256 * 1024,
+        "a header claiming 98047 sequences over a 4-byte bitstream allocated {bytes} bytes; \
+         the reservation must be clamped by what the bitstream can encode"
+    );
+}
+
 /// The whole allocation budget, run sequentially in one test so that no other
 /// test's allocations can be charged to an armed measurement.
 #[test]
@@ -240,4 +311,6 @@ fn allocation_budget() {
     steady_state_over_raw_blocks_allocates_nothing();
     allocations_are_per_block_not_per_call();
     rejected_bomb_stays_within_its_budget();
+    oversized_literals_header_allocates_nothing();
+    lying_sequence_count_allocates_nothing();
 }

@@ -8,9 +8,11 @@
 //!    fresh allocation per chunk);
 //! 3. **sizing** — the packed length is computed from the *coded* dimensions
 //!    (tiles are padded, strips are clipped);
-//! 4. **decompress** — straight into the pre-sized packed buffer;
-//! 5. **fill order** — bit reversal when `FillOrder` is 2 and some channel is
-//!    narrower than a byte;
+//! 4. **fill order** — the bits of every byte of the still-compressed chunk are
+//!    reversed when `FillOrder` is 2, exactly where libtiff does it
+//!    (`TIFFFillStrip`), for every bit depth, and skipped for the CCITT codecs
+//!    that consume the tag themselves;
+//! 5. **decompress** — straight into the pre-sized packed buffer;
 //! 6. **predictor** — undone in place, in the *file's* byte order;
 //! 7. **byte order** — swapped to the host's, *after* the predictor;
 //! 8. **unpack** — sub-byte, 12- and 24-bit samples expanded into native slots;
@@ -63,6 +65,23 @@ impl ChunkBuffers {
     #[must_use]
     pub fn compressed(&self) -> &[u8] {
         &self.compressed
+    }
+
+    /// Loads pre-fetched compressed bytes, as an alternative to
+    /// [`fetch_chunk`] for a caller that already has them (a parallel
+    /// driver's serial fetch pass, a byte-range reader).
+    #[cfg(feature = "rayon")]
+    pub(crate) fn load_compressed(&mut self, data: Vec<u8>) {
+        self.compressed = data;
+    }
+
+    /// Takes ownership of the decoded, native-endian buffer, leaving an empty
+    /// one behind. For a caller (the `rayon` driver) that decodes into a
+    /// per-chunk [`ChunkBuffers`] and needs to move the result across a
+    /// thread boundary without a copy.
+    #[cfg(feature = "rayon")]
+    pub(crate) fn take_native(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.native)
     }
 
     /// Total bytes currently held, for diagnostics and allocation tests.
@@ -186,10 +205,47 @@ pub fn decode_chunk<R: Read + Seek>(
     )
 }
 
+/// The packed (post-decompress, pre-unpack) byte length chunk `index`
+/// decodes to.
+///
+/// This is step 3 of the pipeline (see the module docs), factored out of
+/// [`decode_fetched_chunk`] so a caller that needs the size *before*
+/// decoding -- a parallel driver precharging [`OutputBudget`] for a whole
+/// batch, or a byte-range reader sizing its fetch -- computes exactly the
+/// number [`decode_fetched_chunk`] itself will use, rather than a second copy
+/// that can drift from it. A JPEG chunk decodes to full-resolution
+/// interleaved components even when the image is subsampled, because the
+/// JPEG stream owns the sampling factors and upsamples as it renders;
+/// everything else decodes to TIFF subsampling units.
+///
+/// # Errors
+/// The same set as [`ImageInfo::chunk_packed_len`], plus
+/// [`TiffError::IntOverflow`] and [`crate::LimitError`] from the size guard.
+pub fn chunk_output_len(info: &ImageInfo, index: u64, limits: &Limits) -> Result<usize> {
+    let (coded_width, coded_height) = info.chunk_coded_dimensions(index)?;
+    let sample_type = info.sample_type()?;
+    let codec_expands =
+        info.is_subsampled() && crate::compression::expands_subsampling(info.compression);
+    if codec_expands {
+        let slot = sample_type.byte_width();
+        let bytes = (coded_width as u64)
+            .checked_mul(u64::from(coded_height))
+            .and_then(|n| n.checked_mul(3))
+            .and_then(|n| n.checked_mul(slot as u64))
+            .ok_or(TiffError::IntOverflow)?;
+        limits.check_decoding_buffer(bytes)
+    } else {
+        info.chunk_packed_len(index, limits)
+    }
+}
+
 /// Runs steps 3-9 on the bytes already in [`ChunkBuffers::compressed`].
 ///
 /// Split out of [`decode_chunk`] so a caller that fetches chunks itself (a
 /// byte-range reader, a parallel prefetch) can reuse the pipeline.
+///
+/// The compressed buffer is *consumed*: when `FillOrder` is 2 its bytes are
+/// reversed in place, so decoding the same chunk twice needs a fresh fetch.
 ///
 /// # Errors
 /// Every failure the pipeline steps can produce.
@@ -212,12 +268,26 @@ pub fn decode_fetched_chunk(
     let chunk_spp = info.plane_samples_per_pixel();
     let sample_type = info.sample_type()?;
 
-    // 3. sizing
-    let packed_len = info.chunk_packed_len(index, limits)?;
+    // 3. sizing. A JPEG chunk decodes to full-resolution interleaved
+    // components even when the image is subsampled, because the JPEG stream
+    // owns the sampling factors and upsamples as it renders; everything else
+    // decodes to TIFF subsampling units that step 9 expands. The byte count
+    // itself comes from `chunk_output_len`, the single source of truth a
+    // parallel driver also precharges its budget from; `codec_expands` is
+    // re-derived here (cheap, pure) because steps 7-9 below still branch on
+    // it.
+    let subsampled = info.is_subsampled();
+    let codec_expands = subsampled && crate::compression::expands_subsampling(info.compression);
+    let packed_len = chunk_output_len(info, index, limits)?;
     buffers.packed.clear();
     buffers.packed.resize(packed_len, 0);
 
-    // 4. decompress
+    // 4. fill order, on the still-compressed bytes (see `apply_fill_order`)
+    if !crate::compression::handles_fill_order(info.compression) {
+        apply_fill_order(&mut buffers.compressed, info.fill_order);
+    }
+
+    // 5. decompress
     let cx = CodecContext {
         compression: info.compression,
         photometric: info.photometric,
@@ -230,8 +300,17 @@ pub fn decode_fetched_chunk(
         plane,
         t4_options: info.t4_options,
         t6_options: info.t6_options,
+        ycbcr_subsampling: if info.photometric == crate::tags::PhotometricInterpretation::YCbCr {
+            info.ycbcr_subsampling
+        } else {
+            (1, 1)
+        },
         jpeg_tables: info.jpeg_tables.as_deref(),
+        old_jpeg: info.old_jpeg.as_ref(),
         endian: info.endian,
+        leniency,
+        state: Some(&info.codec_state),
+        max_scratch_bytes: limits.intermediate_buffer_size,
     };
     let produced = {
         let compressed = core::mem::take(&mut buffers.compressed);
@@ -255,9 +334,6 @@ pub fn decode_fetched_chunk(
         });
     }
     budget.charge(packed_len as u64)?;
-
-    // 5. fill order
-    apply_fill_order(&mut buffers.packed, info.fill_order, &bits);
 
     // 6. predictor (in the file's byte order)
     if info.predictor != Predictor::None {
@@ -284,23 +360,30 @@ pub fn decode_fetched_chunk(
         .copied()
         .filter(|b| bits.iter().all(|x| x == b));
     let byte_aligned = uniform.map(is_byte_aligned_depth).unwrap_or(false);
-    let subsampled = info.is_subsampled();
     let samples_per_row = coded_width as usize * usize::from(chunk_spp);
     let slot = sample_type.byte_width();
 
-    if byte_aligned && !subsampled {
+    if byte_aligned && (!subsampled || codec_expands) {
         to_native_endian(&mut buffers.packed, info.endian, &bits);
         let native_len = samples_per_row
             .checked_mul(coded_height as usize)
             .and_then(|n| n.checked_mul(slot))
             .ok_or(TiffError::IntOverflow)?;
         limits.check_decoding_buffer(native_len as u64)?;
-        buffers.native.clear();
-        buffers.native.resize(native_len, 0);
-        let copy = native_len.min(buffers.packed.len());
-        if let Some(dst) = buffers.native.get_mut(..copy) {
-            if let Some(src) = buffers.packed.get(..copy) {
-                dst.copy_from_slice(src);
+        if native_len == buffers.packed.len() {
+            // Byte-aligned samples need no unpacking, so the decoded buffer
+            // *is* the native buffer: swapping instead of copying saves one
+            // pass over every chunk of the image (the packed buffer is
+            // re-sized for the next chunk anyway).
+            core::mem::swap(&mut buffers.native, &mut buffers.packed);
+        } else {
+            buffers.native.clear();
+            buffers.native.resize(native_len, 0);
+            let copy = native_len.min(buffers.packed.len());
+            if let Some(dst) = buffers.native.get_mut(..copy) {
+                if let Some(src) = buffers.packed.get(..copy) {
+                    dst.copy_from_slice(src);
+                }
             }
         }
     } else if subsampled {
@@ -332,11 +415,6 @@ pub fn decode_fetched_chunk(
         buffers.native.resize(native_len, 0);
         let row_bytes = packed_row_bytes(&bits, samples_per_row) as usize;
         let native_row = samples_per_row * slot;
-        let format = info
-            .sample_format
-            .first()
-            .copied()
-            .unwrap_or(crate::tags::SampleFormat::Uint);
         for row in 0..coded_height as usize {
             let src_start = row * row_bytes;
             let src = buffers
@@ -347,7 +425,7 @@ pub fn decode_fetched_chunk(
             let Some(dst) = buffers.native.get_mut(dst_start..dst_start + native_row) else {
                 break;
             };
-            unpack_row(src, &bits, samples_per_row, sample_type, dst, format)?;
+            unpack_row(src, &bits, samples_per_row, sample_type, dst)?;
         }
         buffers.scratch.clear();
     }

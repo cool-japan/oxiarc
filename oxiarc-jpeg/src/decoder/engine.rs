@@ -163,7 +163,15 @@ impl Engine {
                 if payload.len() < 2 {
                     return Err(JpegError::malformed("DRI", offset, "segment too short"));
                 }
-                self.tables.restart_interval = Some(u16::from_be_bytes([payload[0], payload[1]]));
+                let interval = u16::from_be_bytes([payload[0], payload[1]]);
+                self.tables.restart_interval = Some(interval);
+                // libjpeg writes `DRI` in the *scan* header, after `SOF`, so
+                // the value is normally unknown when `read_info` returns. Keep
+                // the cached `ImageInfo` in step with the stream as it is read
+                // rather than reporting 0 for every real-world file.
+                if let Some(info) = self.info.as_mut() {
+                    info.restart_interval = interval;
+                }
                 Ok(())
             }
         }
@@ -225,6 +233,7 @@ impl Engine {
             .frame
             .as_ref()
             .ok_or(JpegError::AbbreviatedWithoutFrame)?;
+        #[cfg(not(feature = "arithmetic"))]
         if frame.entropy == EntropyCoding::Arithmetic {
             return Err(JpegError::Unsupported(UnsupportedFeature::ArithmeticCoding));
         }
@@ -324,6 +333,58 @@ impl Engine {
         };
         let tolerate = self.options.tolerate_truncated;
 
+        // Restart intervals make a sequential scan independently decodable
+        // in bands, whichever entropy coder it uses: T.81 E.2.4 resets the
+        // predictions, the bit accumulator and — for arithmetic — every
+        // statistics area at each marker. This runs before the arithmetic
+        // branch below so that `SOF9` gets the same treatment as `SOF0`; the
+        // parallel path declines whenever the shape rules splitting out, and
+        // the serial paths below then run unchanged.
+        #[cfg(feature = "rayon")]
+        if matches!(
+            frame.process,
+            CodingProcess::Baseline | CodingProcess::ExtendedSequential
+        ) {
+            validate_dct_scan(&scan, frame, offset)?;
+            let dac = self.tables.arithmetic;
+            let limits = self.options.limits;
+            let outcome = {
+                let tables = ScanTables {
+                    dc: &self.tables.dc_huffman,
+                    ac: &self.tables.ac_huffman,
+                    quant: &self.tables.quant,
+                };
+                super::parallel::decode_sequential_parallel(
+                    frame,
+                    &scan,
+                    &tables,
+                    &dac,
+                    restart_interval,
+                    entropy,
+                    &mut self.planes,
+                    &limits,
+                    tolerate,
+                )
+            };
+            if let Some(outcome) = outcome {
+                let outcome = outcome?;
+                self.truncated |= outcome.truncated;
+                return Ok(outcome.consumed);
+            }
+        }
+
+        #[cfg(feature = "arithmetic")]
+        if frame.entropy == EntropyCoding::Arithmetic {
+            // The same validation the Huffman paths do, and for the same
+            // reason: `Ss`/`Se` index the spectral band directly.
+            if frame.process != CodingProcess::Lossless {
+                validate_dct_scan(&scan, frame, offset)?;
+            }
+            let outcome = self.decode_arithmetic_scan(&scan, entropy, restart_interval)?;
+            self.truncated |= outcome.truncated;
+            return Ok(outcome.consumed);
+        }
+
         let outcome = match frame.process {
             CodingProcess::Lossless => decode_lossless(
                 frame,
@@ -362,6 +423,59 @@ impl Engine {
         };
         self.truncated |= outcome.truncated;
         Ok(outcome.consumed)
+    }
+
+    /// Run one arithmetic-coded scan (`SOF9`, `SOF10` or `SOF11`).
+    #[cfg(feature = "arithmetic")]
+    fn decode_arithmetic_scan(
+        &mut self,
+        scan: &crate::frame::ScanHeader,
+        entropy: &[u8],
+        restart_interval: u16,
+    ) -> Result<super::scan::ScanOutcome> {
+        let frame = self
+            .frame
+            .as_ref()
+            .ok_or(JpegError::AbbreviatedWithoutFrame)?;
+        let tolerate = self.options.tolerate_truncated;
+        let dac = self.tables.arithmetic;
+        match frame.process {
+            CodingProcess::Lossless => super::arith::decode_lossless_arith(
+                frame,
+                scan,
+                &dac,
+                restart_interval,
+                entropy,
+                &mut self.planes,
+                tolerate,
+            ),
+            CodingProcess::Progressive => super::arith::decode_progressive_arith(
+                frame,
+                scan,
+                &dac,
+                restart_interval,
+                entropy,
+                &mut self.coefficients,
+                tolerate,
+            ),
+            _ => {
+                let tables = ScanTables {
+                    dc: &self.tables.dc_huffman,
+                    ac: &self.tables.ac_huffman,
+                    quant: &self.tables.quant,
+                };
+                super::arith::decode_sequential_arith(
+                    frame,
+                    scan,
+                    &tables,
+                    &dac,
+                    restart_interval,
+                    entropy,
+                    &mut self.planes,
+                    tolerate,
+                )
+            }
+        }
     }
 
     /// Build the output plan for the decoded image.

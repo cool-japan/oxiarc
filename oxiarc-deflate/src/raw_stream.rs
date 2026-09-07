@@ -5,8 +5,10 @@
 //!
 //! Both preserve the LZ77 sliding window across flush boundaries (RFC 4978 §3).
 
+use crate::async_reader::AsyncInflateReader;
 use crate::deflate::Deflater;
-use crate::inflate::Inflater;
+use crate::wrapper::{InflateWrapper, TrailingPolicy, WrappedInflate};
+use oxiarc_core::traits::FlushMode;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -109,37 +111,68 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for RawDeflateWriter<W> {
 /// An [`AsyncRead`] adapter that decompresses a sync-flushed raw-DEFLATE stream
 /// as produced by the RFC 4978 compressor.
 ///
-/// Uses block-level parsing (not byte-pattern scanning) for correct boundary
-/// detection.  Handles partial TCP delivery via snapshot/restore.
+/// Decoding is resumable at the bit level, so a sync-flush unit split across
+/// several TCP segments costs nothing extra: bytes are handed to the caller
+/// as soon as they decode, rather than being withheld until a whole unit has
+/// arrived, and a partial segment is never re-decoded.
+///
+/// The LZ77 window is carried across flush boundaries (RFC 4978 §3), and
+/// end-of-stream on the socket is **not** treated as truncation: an IMAP peer
+/// may fall silent between commands and resume later, so the decoder stays in
+/// [`FlushMode::None`] throughout and simply reports EOF.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::{Deflater, RawInflateReader};
+/// use tokio::io::AsyncReadExt;
+///
+/// # fn main() {
+/// let mut deflater = Deflater::new(6);
+/// let mut wire = Vec::new();
+/// deflater.deflate_sync(b"* OK ready\r\n", &mut wire).expect("deflate_sync");
+///
+/// let runtime = tokio::runtime::Builder::new_current_thread()
+///     .build()
+///     .expect("runtime");
+/// runtime.block_on(async move {
+///     let mut reader = RawInflateReader::new(std::io::Cursor::new(wire));
+///     let mut plain = Vec::new();
+///     reader.read_to_end(&mut plain).await.expect("inflate");
+///     assert_eq!(plain, b"* OK ready\r\n");
+/// });
+/// # }
+/// ```
 pub struct RawInflateReader<R> {
-    inner: R,
-    inflater: Inflater,
-    /// Compressed bytes buffered from `inner`, not yet decompressed.
-    compressed: Vec<u8>,
-    /// Decompressed bytes ready to hand to callers.
-    output_buf: Vec<u8>,
-    /// Read cursor into `output_buf`.
-    output_pos: usize,
-    /// True once `inner` returned EOF.
-    inner_eof: bool,
+    inner: AsyncInflateReader<R>,
 }
 
 impl<R> RawInflateReader<R> {
     /// Wrap `inner` with a decompressor.
     pub fn new(inner: R) -> Self {
         Self {
-            inner,
-            inflater: Inflater::new(),
-            compressed: Vec::new(),
-            output_buf: Vec::new(),
-            output_pos: 0,
-            inner_eof: false,
+            inner: AsyncInflateReader::with_core(
+                inner,
+                WrappedInflate::new(InflateWrapper::Raw)
+                    .multi_member(false)
+                    .trailing_policy(TrailingPolicy::Stop),
+            )
+            // RFC 4978: the peer may send more at any time, so a closed
+            // connection ends the stream without being truncation.
+            .with_eof_flush(FlushMode::None),
         }
     }
 
     /// Unwrap, returning the inner reader.
+    ///
+    /// Compressed bytes already staged inside the decoder are discarded.
     pub fn into_inner(self) -> R {
-        self.inner
+        self.inner.into_inner()
+    }
+
+    /// Decompressed bytes produced so far.
+    pub fn total_out(&self) -> u64 {
+        self.inner.total_out()
     }
 }
 
@@ -149,59 +182,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for RawInflateReader<R> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.as_mut().get_mut();
-
-        loop {
-            // 1. Drain already-decompressed output.
-            if this.output_pos < this.output_buf.len() {
-                let available = &this.output_buf[this.output_pos..];
-                let n = available.len().min(buf.remaining());
-                buf.put_slice(&available[..n]);
-                this.output_pos += n;
-                return Poll::Ready(Ok(()));
-            }
-
-            // 2. Try to decompress a sync unit from the buffer.
-            if !this.compressed.is_empty() {
-                match this.inflater.try_decompress_sync_unit(&this.compressed) {
-                    Ok(Some((decompressed, bytes_consumed))) => {
-                        this.compressed.drain(..bytes_consumed);
-                        this.output_buf = decompressed;
-                        this.output_pos = 0;
-                        // Loop back to drain from output_buf.
-                        continue;
-                    }
-                    Ok(None) => {
-                        // Need more compressed bytes from inner.
-                    }
-                    Err(e) => {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-                    }
-                }
-            }
-
-            // 3. Signal EOF once inner is exhausted and nothing to decompress.
-            if this.inner_eof {
-                return Poll::Ready(Ok(()));
-            }
-
-            // 4. Read more compressed bytes from inner.
-            let mut tmp = [0u8; 8192];
-            let mut rb = ReadBuf::new(&mut tmp);
-            match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {
-                    let n = rb.filled().len();
-                    if n == 0 {
-                        this.inner_eof = true;
-                    } else {
-                        this.compressed.extend_from_slice(&tmp[..n]);
-                    }
-                    // Loop to attempt decompression.
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        Pin::new(&mut self.as_mut().get_mut().inner).poll_read(cx, buf)
     }
 }
 

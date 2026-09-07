@@ -17,6 +17,9 @@ use crate::byteorder::Endian;
 use crate::error::{FormatError, LimitError, Result, TiffError, UnsupportedError};
 use crate::ifd::{Directory, IfdPointer, Rational, Value, ValueSource};
 use crate::limits::{Leniency, Limits, Warning, Warnings};
+use std::sync::Arc;
+
+use crate::compression::{CodecState, OldJpegParams};
 use crate::sample::{SampleType, packed_row_bytes};
 use crate::tags::{
     CompressionMethod, ExtraSamples, FillOrder, Orientation, PhotometricInterpretation,
@@ -24,229 +27,9 @@ use crate::tags::{
     YCbCrPositioning,
 };
 
-/// Whether an image is stored in strips or in tiles.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ChunkType {
-    /// Row-band strips (`StripOffsets` / `StripByteCounts`).
-    Strip,
-    /// Rectangular tiles (`TileOffsets` / `TileByteCounts`).
-    Tile,
-}
+mod types;
 
-impl core::fmt::Display for ChunkType {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Strip => f.write_str("strip"),
-            Self::Tile => f.write_str("tile"),
-        }
-    }
-}
-
-/// Strip or tile layout with the per-chunk offsets and byte counts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChunkGeometry {
-    /// Strips, each `rows_per_strip` rows tall except possibly the last.
-    Strips {
-        /// Rows per strip; `u32::MAX` when `RowsPerStrip` is absent.
-        rows_per_strip: u32,
-        /// File offset of each strip.
-        offsets: Vec<u64>,
-        /// Compressed length of each strip.
-        byte_counts: Vec<u64>,
-    },
-    /// Tiles, always coded at the full declared size and zero padded.
-    Tiles {
-        /// Tile width in pixels.
-        tile_width: u32,
-        /// Tile height in pixels.
-        tile_length: u32,
-        /// File offset of each tile.
-        offsets: Vec<u64>,
-        /// Compressed length of each tile.
-        byte_counts: Vec<u64>,
-    },
-}
-
-impl ChunkGeometry {
-    /// Whether this geometry is strips or tiles.
-    #[must_use]
-    pub const fn chunk_type(&self) -> ChunkType {
-        match self {
-            Self::Strips { .. } => ChunkType::Strip,
-            Self::Tiles { .. } => ChunkType::Tile,
-        }
-    }
-
-    /// The per-chunk file offsets.
-    #[must_use]
-    pub fn offsets(&self) -> &[u64] {
-        match self {
-            Self::Strips { offsets, .. } | Self::Tiles { offsets, .. } => offsets,
-        }
-    }
-
-    /// The per-chunk compressed lengths.
-    #[must_use]
-    pub fn byte_counts(&self) -> &[u64] {
-        match self {
-            Self::Strips { byte_counts, .. } | Self::Tiles { byte_counts, .. } => byte_counts,
-        }
-    }
-}
-
-/// A coarse description of the decoded pixel layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ColorType {
-    /// One greyscale channel of the given bit depth.
-    Gray(u8),
-    /// Greyscale plus alpha.
-    GrayA(u8),
-    /// Palette indices of the given bit depth.
-    Palette(u8),
-    /// Red, green, blue.
-    Rgb(u8),
-    /// Red, green, blue, alpha.
-    Rgba(u8),
-    /// Cyan, magenta, yellow, black.
-    Cmyk(u8),
-    /// Cyan, magenta, yellow, black, alpha.
-    CmykA(u8),
-    /// Luma plus two chroma channels.
-    YCbCr(u8),
-    /// CIE L*a*b* (or one of its ICC/ITU flavours).
-    Lab(u8),
-    /// Anything else: `num_samples` channels of `bit_depth` bits.
-    Multiband {
-        /// Bits per channel.
-        bit_depth: u8,
-        /// Number of channels.
-        num_samples: u16,
-    },
-}
-
-impl ColorType {
-    /// Channels per pixel.
-    #[must_use]
-    pub const fn samples_per_pixel(self) -> u16 {
-        match self {
-            Self::Gray(_) | Self::Palette(_) => 1,
-            Self::GrayA(_) => 2,
-            Self::Rgb(_) | Self::YCbCr(_) | Self::Lab(_) => 3,
-            Self::Rgba(_) | Self::Cmyk(_) => 4,
-            Self::CmykA(_) => 5,
-            Self::Multiband { num_samples, .. } => num_samples,
-        }
-    }
-
-    /// Bits per channel.
-    #[must_use]
-    pub const fn bit_depth(self) -> u8 {
-        match self {
-            Self::Gray(b)
-            | Self::GrayA(b)
-            | Self::Palette(b)
-            | Self::Rgb(b)
-            | Self::Rgba(b)
-            | Self::Cmyk(b)
-            | Self::CmykA(b)
-            | Self::YCbCr(b)
-            | Self::Lab(b) => b,
-            Self::Multiband { bit_depth, .. } => bit_depth,
-        }
-    }
-
-    /// The photometric interpretation a writer should record for this layout.
-    #[must_use]
-    pub const fn photometric(self) -> PhotometricInterpretation {
-        match self {
-            Self::Gray(_) | Self::GrayA(_) | Self::Multiband { .. } => {
-                PhotometricInterpretation::BlackIsZero
-            }
-            Self::Palette(_) => PhotometricInterpretation::Palette,
-            Self::Rgb(_) | Self::Rgba(_) => PhotometricInterpretation::Rgb,
-            Self::Cmyk(_) | Self::CmykA(_) => PhotometricInterpretation::Separated,
-            Self::YCbCr(_) => PhotometricInterpretation::YCbCr,
-            Self::Lab(_) => PhotometricInterpretation::CieLab,
-        }
-    }
-
-    /// The `ExtraSamples` a writer should record for this layout.
-    #[must_use]
-    pub fn extra_samples(self) -> Vec<ExtraSamples> {
-        match self {
-            Self::GrayA(_) | Self::Rgba(_) | Self::CmykA(_) => {
-                vec![ExtraSamples::UnassociatedAlpha]
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
-/// A rectangle in image coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Rect {
-    /// Left edge.
-    pub x: u32,
-    /// Top edge.
-    pub y: u32,
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-}
-
-impl Rect {
-    /// A rectangle from its four coordinates.
-    #[must_use]
-    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// Number of pixels the rectangle covers.
-    #[must_use]
-    pub const fn area(self) -> u64 {
-        self.width as u64 * self.height as u64
-    }
-
-    /// `true` when the rectangle fits inside a `w * h` image.
-    #[must_use]
-    pub const fn fits_in(self, w: u32, h: u32) -> bool {
-        match (
-            self.x.checked_add(self.width),
-            self.y.checked_add(self.height),
-        ) {
-            (Some(right), Some(bottom)) => right <= w && bottom <= h,
-            _ => false,
-        }
-    }
-}
-
-/// The shape of a decoded buffer handed back to the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageLayout {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Native slot type of every sample.
-    pub sample_type: SampleType,
-    /// Channels per pixel.
-    pub samples_per_pixel: u16,
-    /// Bytes between the starts of two consecutive rows.
-    pub row_stride: usize,
-    /// Number of planes; 1 for interleaved output.
-    pub planes: usize,
-    /// Bytes between the starts of two planes; 0 when `planes == 1`.
-    pub plane_stride: usize,
-    /// Total size of the buffer in bytes.
-    pub total_len: usize,
-}
+pub use types::{ChunkGeometry, ChunkType, ColorType, ImageLayout, Rect};
 
 /// Everything the decoder needs to know about one image.
 #[derive(Clone, Debug)]
@@ -298,6 +81,9 @@ pub struct ImageInfo {
     pub t6_options: T6Options,
     /// `JPEGTables` (347).
     pub jpeg_tables: Option<Vec<u8>>,
+    /// The old-style JPEG (compression 6) parameter tags, with every table the
+    /// tags point at already loaded. `None` for every other compression.
+    pub old_jpeg: Option<OldJpegParams>,
     /// `XResolution`, `YResolution` and `ResolutionUnit`.
     pub resolution: (Option<Rational>, Option<Rational>, ResolutionUnit),
     /// `SubIFDs` (330).
@@ -308,6 +94,12 @@ pub struct ImageInfo {
     pub gps_ifd: Option<IfdPointer>,
     /// `InteroperabilityIFD` (40965).
     pub interop_ifd: Option<IfdPointer>,
+    /// Decisions and scratch shared by every chunk of this image.
+    ///
+    /// Cloning an `ImageInfo` shares the state rather than copying it, so a
+    /// parallel decode of the same image reuses one LZW rule and one inflate
+    /// window.
+    pub codec_state: Arc<CodecState>,
 }
 
 /// Reads a scalar tag, falling back to the spec default.
@@ -336,6 +128,111 @@ fn vector_u64<S: ValueSource>(
         Some(entry) => Ok(source.load(entry)?.as_u64_vec()),
         None => Ok(None),
     }
+}
+
+/// Loads the TIFF 6.0 §22 old-style JPEG tags (512-521).
+///
+/// Tags 519/520/521 are arrays of **file offsets**, one per component, not the
+/// tables themselves — the single most awkward thing about compression 6, and
+/// the reason [`ValueSource::read_raw`] exists. An offset that does not resolve
+/// produces a warning and an empty slot rather than an error: the codec decides
+/// whether the flavour it is looking at can live without that table.
+fn read_old_jpeg_params<S: ValueSource>(
+    dir: &Directory,
+    source: &mut S,
+    warnings: &mut Warnings,
+) -> Result<OldJpegParams> {
+    let proc = scalar_u64(dir, Tag::JpegProc, source, Some(1))?.unwrap_or(1) as u16;
+    let restart_interval =
+        scalar_u64(dir, Tag::JpegRestartInterval, source, Some(0))?.unwrap_or(0) as u16;
+    let interchange_offset = scalar_u64(dir, Tag::JpegInterchangeFormat, source, None)?;
+    let interchange_len = scalar_u64(dir, Tag::JpegInterchangeFormatLength, source, None)?;
+    let interchange = match (interchange_offset, interchange_len) {
+        (Some(offset), Some(len)) if offset > 0 && len > 0 => source.read_raw(offset, len)?,
+        _ => None,
+    };
+    let q_tables =
+        load_old_jpeg_tables(dir, Tag::JpegQTables, source, warnings, TableShape::Quant)?;
+    let dc_tables = load_old_jpeg_tables(
+        dir,
+        Tag::JpegDcTables,
+        source,
+        warnings,
+        TableShape::Huffman,
+    )?;
+    let ac_tables = load_old_jpeg_tables(
+        dir,
+        Tag::JpegAcTables,
+        source,
+        warnings,
+        TableShape::Huffman,
+    )?;
+    let shorts = |tag: Tag, source: &mut S| -> Result<Vec<u16>> {
+        Ok(vector_u64(dir, tag, source)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v as u16)
+            .collect())
+    };
+    let lossless_predictors = shorts(Tag::JpegLosslessPredictors, source)?;
+    let point_transform = shorts(Tag::JpegPointTransforms, source)?;
+    Ok(OldJpegParams {
+        proc,
+        interchange,
+        restart_interval,
+        q_tables,
+        dc_tables,
+        ac_tables,
+        lossless_predictors,
+        point_transform,
+    })
+}
+
+/// What an old-style JPEG table offset points at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableShape {
+    /// 64 bytes of 8-bit quantisation values, in zig-zag order.
+    Quant,
+    /// 16 `BITS` counts followed by `sum(BITS)` `HUFFVAL` bytes.
+    Huffman,
+}
+
+/// Resolves one of the three table-offset tags into loaded table bytes.
+fn load_old_jpeg_tables<S: ValueSource>(
+    dir: &Directory,
+    tag: Tag,
+    source: &mut S,
+    warnings: &mut Warnings,
+    shape: TableShape,
+) -> Result<Vec<Vec<u8>>> {
+    let Some(offsets) = vector_u64(dir, tag, source)? else {
+        return Ok(Vec::new());
+    };
+    let mut tables = Vec::with_capacity(offsets.len().min(8));
+    for offset in offsets.into_iter().take(8) {
+        let bytes = match shape {
+            TableShape::Quant => source.read_raw(offset, 64)?,
+            TableShape::Huffman => match source.read_raw(offset, 16)? {
+                Some(bits) => {
+                    let total: u64 = bits.iter().map(|count| u64::from(*count)).sum();
+                    source.read_raw(offset, 16 + total)?
+                }
+                None => None,
+            },
+        };
+        match bytes {
+            Some(bytes) => tables.push(bytes),
+            None => {
+                warnings.push(Warning::SpecViolation {
+                    message: format!(
+                        "old-style JPEG table offset {offset} (tag {tag}) is unusable"
+                    ),
+                });
+                tables.push(Vec::new());
+            }
+        }
+    }
+    Ok(tables)
 }
 
 impl ImageInfo {
@@ -580,6 +477,20 @@ impl ImageInfo {
             None => None,
         };
 
+        let old_jpeg = if compression == CompressionMethod::OldJpeg {
+            Some(read_old_jpeg_params(dir, source, warnings)?)
+        } else {
+            for tag in [Tag::JpegProc, Tag::JpegQTables, Tag::JpegAcTables] {
+                if dir.contains(tag) {
+                    warnings.push(Warning::IgnoredTag {
+                        tag: tag.to_u16(),
+                        reason: "the 512-521 tags are only meaningful with compression 6",
+                    });
+                }
+            }
+            None
+        };
+
         let resolution = {
             let x = match dir.get(Tag::XResolution) {
                 Some(entry) => source
@@ -656,11 +567,13 @@ impl ImageInfo {
             t4_options,
             t6_options,
             jpeg_tables,
+            old_jpeg,
             resolution,
             sub_ifds,
             exif_ifd,
             gps_ifd,
             interop_ifd,
+            codec_state: Arc::new(CodecState::new()),
         };
         info.validate(limits, leniency, warnings)?;
         Ok(info)
@@ -716,18 +629,28 @@ impl ImageInfo {
                 .and_then(|v| v.checked_mul(planes))
                 .ok_or(TiffError::IntOverflow)?;
             limits.check_chunk_count(expected)?;
-            let fallback = Self::uncompressed_chunk_sizes(
-                dir,
-                source,
-                expected,
-                |_| (tile_width, tile_length),
-                samples_per_pixel,
-                bits_per_sample,
-                planar,
-                photometric,
-                subsampling,
-                across.saturating_mul(down).max(1),
-            )?;
+            // Only derive the per-chunk sizes when `TileByteCounts` is really
+            // missing: the derivation is O(chunk count) in both time and
+            // memory, and `max_chunks` alone would let a 200-byte file drive
+            // tens of megabytes of `Vec<u64>` on every uncompressed image.
+            let counts = vector_u64(dir, Tag::TileByteCounts, source)?;
+            let fallback = if counts.is_some() {
+                None
+            } else {
+                Self::uncompressed_chunk_sizes(
+                    dir,
+                    source,
+                    limits,
+                    expected,
+                    |_| (tile_width, tile_length),
+                    samples_per_pixel,
+                    bits_per_sample,
+                    planar,
+                    photometric,
+                    subsampling,
+                    across.saturating_mul(down).max(1),
+                )?
+            };
             let (offsets, byte_counts) = Self::read_chunk_tables(
                 dir,
                 source,
@@ -736,6 +659,7 @@ impl ImageInfo {
                 Tag::TileOffsets,
                 Tag::TileByteCounts,
                 expected,
+                counts,
                 fallback,
                 file_len,
             )?;
@@ -771,21 +695,28 @@ impl ImageInfo {
                 .checked_mul(planes)
                 .ok_or(TiffError::IntOverflow)?;
             limits.check_chunk_count(expected)?;
-            let fallback = Self::uncompressed_chunk_sizes(
-                dir,
-                source,
-                expected,
-                |within| {
-                    let row = (within as u32).saturating_mul(rows_per_strip);
-                    (width, rows_per_strip.min(height.saturating_sub(row)))
-                },
-                samples_per_pixel,
-                bits_per_sample,
-                planar,
-                photometric,
-                subsampling,
-                per_plane.max(1),
-            )?;
+            // See the tiled branch: derived only when the tag is absent.
+            let counts = vector_u64(dir, Tag::StripByteCounts, source)?;
+            let fallback = if counts.is_some() {
+                None
+            } else {
+                Self::uncompressed_chunk_sizes(
+                    dir,
+                    source,
+                    limits,
+                    expected,
+                    |within| {
+                        let row = (within as u32).saturating_mul(rows_per_strip);
+                        (width, rows_per_strip.min(height.saturating_sub(row)))
+                    },
+                    samples_per_pixel,
+                    bits_per_sample,
+                    planar,
+                    photometric,
+                    subsampling,
+                    per_plane.max(1),
+                )?
+            };
             let (offsets, byte_counts) = Self::read_chunk_tables(
                 dir,
                 source,
@@ -794,6 +725,7 @@ impl ImageInfo {
                 Tag::StripOffsets,
                 Tag::StripByteCounts,
                 expected,
+                counts,
                 fallback,
                 file_len,
             )?;
@@ -809,10 +741,15 @@ impl ImageInfo {
     /// `StripByteCounts` / `TileByteCounts` (edge case E1).
     ///
     /// Returns `None` for compressed data, where the sizes cannot be derived.
+    /// Only called when the byte-count tag is really absent: the table is
+    /// `8 * chunk count` bytes derived entirely from numbers in the file, so it
+    /// is charged against [`Limits::intermediate_buffer_size`] as well as
+    /// [`Limits::max_chunks`].
     #[allow(clippy::too_many_arguments)]
     fn uncompressed_chunk_sizes<S: ValueSource, F: Fn(u64) -> (u32, u32)>(
         dir: &Directory,
         source: &mut S,
+        limits: &Limits,
         expected: u64,
         coded_dimensions: F,
         samples_per_pixel: u16,
@@ -835,6 +772,11 @@ impl ImageInfo {
             return Ok(None);
         }
         let count = usize::try_from(expected).map_err(|_| TiffError::IntOverflow)?;
+        limits.check_intermediate(
+            expected
+                .checked_mul(core::mem::size_of::<u64>() as u64)
+                .ok_or(TiffError::IntOverflow)?,
+        )?;
         let mut sizes = Vec::with_capacity(count.min(1 << 20));
         for index in 0..expected {
             let plane = u16::try_from(index / chunks_per_plane.max(1)).unwrap_or(0);
@@ -877,13 +819,14 @@ impl ImageInfo {
         offsets_tag: Tag,
         counts_tag: Tag,
         expected: u64,
+        declared_counts: Option<Vec<u64>>,
         uncompressed_sizes: Option<Vec<u64>>,
         file_len: u64,
     ) -> Result<(Vec<u64>, Vec<u64>)> {
         let offsets = vector_u64(dir, offsets_tag, source)?.ok_or(TiffError::Format(
             FormatError::RequiredTagNotFound(offsets_tag),
         ))?;
-        let counts = match vector_u64(dir, counts_tag, source)? {
+        let counts = match declared_counts {
             Some(counts) => counts,
             None => {
                 match uncompressed_sizes {

@@ -16,8 +16,8 @@
 //! use oxiarc_deflate::gzip::gzip_decompress;
 //!
 //! let data: Vec<u8> = b"Hello, pigz world!".to_vec();
-//! let compressed = compress_gzip_parallel(&data, 6).unwrap();
-//! let decompressed = gzip_decompress(&compressed).unwrap();
+//! let compressed = compress_gzip_parallel(&data, 6).expect("parallel gzip");
+//! let decompressed = gzip_decompress(&compressed).expect("gzip_decompress");
 //! assert_eq!(decompressed, data);
 //! # }
 //! ```
@@ -35,7 +35,7 @@
 //!     .level(6)
 //!     .chunk_size(1024 * 1024)
 //!     .encode(&data)
-//!     .unwrap();
+//!     .expect("parallel gzip");
 //! // Multi-member GZIP; decompress with a multi-member-aware reader.
 //! # }
 //! ```
@@ -199,7 +199,7 @@ pub fn gzip_compress_parallel(input: &[u8], level: u32, chunk_size: usize) -> Re
 ///     .level(6)
 ///     .chunk_size(1024 * 1024)
 ///     .encode(&data)
-///     .unwrap();
+///     .expect("parallel gzip");
 /// assert!(compressed.starts_with(&[0x1f, 0x8b]));
 /// # }
 /// ```

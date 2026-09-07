@@ -25,6 +25,29 @@ pub struct NotAcceptable;
 /// codings it can produce, best first; [`ContentCoding::Identity`] need not
 /// be listed and is always implicitly available unless excluded.
 ///
+/// # `Identity` inside `available`
+///
+/// Listing [`ContentCoding::Identity`] in `available` is permitted but
+/// affects exactly one case, and this asymmetry is deliberate — pinned by
+/// tests, not incidental:
+///
+/// - Under **rule 1** (header absent, so the *client* stated no preference
+///   at all) `available`'s order is the only preference there is, so an
+///   `Identity` in first position wins and yields `Ok(None)` — "the server
+///   would rather send this uncompressed".
+/// - Under **every other** path a client preference exists, and rule 6
+///   applies instead: identity is resolved once, *after* every entry of
+///   `available` has been considered, so it never displaces an equally
+///   weighted real coding no matter where it sits in `available`. In
+///   particular `"*"` — which weights every unlisted coding at `q=1`, but
+///   never reaches identity (rule 4) — picks the first *non*-identity entry
+///   of `available`, not an `Identity` listed ahead of it.
+///
+/// A server that wants "prefer uncompressed" honoured against an explicit
+/// client header should therefore not express it through `available`; it
+/// should act on the returned coding itself (for instance by declining to
+/// compress a body below some size).
+///
 /// # Returns
 /// - `Ok(Some(coding))` — send the body encoded with this coding, and set
 ///   `Content-Encoding: coding.as_str()`.
@@ -37,7 +60,9 @@ pub struct NotAcceptable;
 ///
 /// # Rules implemented (RFC 9110 §12.5.3)
 /// 1. Header **absent** (`None`) → any coding acceptable; `available`'s
-///    first entry is chosen.
+///    first entry is chosen — normalized to `Ok(None)` per the `Returns`
+///    section above if that first entry is itself
+///    [`ContentCoding::Identity`].
 /// 2. Header **present but empty** (`Some("")`, after trimming OWS) →
 ///    `Ok(None)`; the client wants no coding at all. This is the opposite of
 ///    rule 1 — see [`AcceptEncoding`](crate::AcceptEncoding)'s docs.
@@ -78,8 +103,10 @@ pub struct NotAcceptable;
 /// it acceptable at `q=1`. In other words, **the wildcard never reaches
 /// identity** — identity is governed exclusively by its own explicit entry
 /// (if any) or by its own §12.5.3 default. This implementation is pinned
-/// against that reading with the full table in `tests/negotiation.rs`
-/// (report §10.6), which is authoritative over the prose here.
+/// against that reading with the full table below (design report §10.6,
+/// reproduced as this file's own `tests` module — there is no separate
+/// `tests/negotiation.rs` in this crate; see the testing convention noted
+/// in `README.md`), which is authoritative over the prose here.
 ///
 /// # oxihttp deviations
 ///
@@ -95,7 +122,20 @@ pub fn negotiate(
     let Some(raw) = accept_encoding else {
         // Rule 1: header absent => any coding acceptable; use the server's
         // own first preference (or identity, if `available` is empty).
-        return Ok(available.first().cloned());
+        //
+        // Same Identity/`None` normalization as every other return path
+        // below (see the final `match`): `available` is documented as not
+        // *needing* to list `Identity`, not as forbidden from doing so, and
+        // a caller who lists it explicitly (e.g. to rank "send uncompressed"
+        // ahead of one coding but behind another) must still get `Ok(None)`
+        // for it, never a literal `Ok(Some(ContentCoding::Identity))` — this
+        // function's contract is that `Some(_)` always names something to
+        // put in a `Content-Encoding` header, and identity must never appear
+        // there (RFC 9110 §8.4).
+        return Ok(match available.first() {
+            Some(ContentCoding::Identity) | None => None,
+            Some(coding) => Some(coding.clone()),
+        });
     };
     if raw.trim().is_empty() {
         // Rule 2 (empty-value case): the client wants no coding, full stop.
@@ -165,6 +205,18 @@ pub fn negotiate(
         }
     }
 
+    // Formalizes the comment on the `match` above as an actually-checked
+    // invariant: the only way `best` is still unset here is that identity's
+    // own explicit entry carried `q=0` (`consider` never sets `best` for an
+    // unacceptable weight, so the `Some(q)` arm can leave it empty; the
+    // `None` arm above always sets a fallback `best` when it was empty).
+    debug_assert!(
+        best.is_some()
+            || matches!(explicit.get(&ContentCoding::Identity), Some(q) if !q.is_acceptable()),
+        "best is unset only when identity was explicitly refused (q=0); \
+         every other path leaves at least identity's own default acceptance in `best`"
+    );
+
     if best.is_none() {
         // Reachable only when identity carried an explicit `q=0` (the branch
         // above never leaves `best` empty otherwise) and no ordinary coding
@@ -228,8 +280,84 @@ mod tests {
     }
 
     #[test]
+    fn absent_header_with_identity_first_in_available_normalizes_to_none() {
+        // `available` is documented as not *needing* to list `Identity`, not
+        // as forbidden from doing so. Regression: this used to return the
+        // un-normalized `Ok(Some(ContentCoding::Identity))` under rule 1
+        // (the absent-header path bypassed the `Some((Identity, _)) =>
+        // Ok(None)` normalization every other path applies).
+        assert_eq!(
+            negotiate(None, &[ContentCoding::Identity, ContentCoding::Gzip]),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn absent_header_with_identity_not_first_in_available_uses_first() {
+        // An explicit `Identity` entry that is *not* the server's first
+        // preference must not shadow the coding that is.
+        assert_eq!(
+            negotiate(None, &[ContentCoding::Gzip, ContentCoding::Identity]),
+            Ok(Some(ContentCoding::Gzip))
+        );
+    }
+
+    #[test]
+    fn identity_in_available_only_wins_when_the_client_stated_no_preference() {
+        // Pins BOTH halves of the asymmetry documented under "`Identity`
+        // inside `available`" so a later reader cannot "fix" one half and
+        // silently invert the other.
+        let avail = [ContentCoding::Identity, ContentCoding::Gzip];
+        // Rule 1: no client preference at all => `available`'s order rules.
+        assert_eq!(negotiate(None, &avail), Ok(None));
+        // Rule 4/6: the wildcard never reaches identity, and identity is
+        // considered only after every entry of `available`.
+        assert_eq!(negotiate(Some("*"), &avail), Ok(Some(ContentCoding::Gzip)));
+        // An explicit client entry likewise beats an `Identity` that has
+        // none of its own.
+        assert_eq!(
+            negotiate(Some("gzip"), &avail),
+            Ok(Some(ContentCoding::Gzip))
+        );
+        // ... and an `Identity` entry never satisfies a client that refused
+        // identity: the fallback deliberately skips it.
+        assert_eq!(
+            negotiate(Some("identity;q=0"), &avail),
+            Ok(Some(ContentCoding::Gzip))
+        );
+        assert_eq!(
+            negotiate(Some("identity;q=0"), &[ContentCoding::Identity]),
+            Err(NotAcceptable)
+        );
+    }
+
+    #[test]
     fn empty_value_means_no_coding() {
         assert_eq!(negotiate(Some(""), &GZIP_DEFLATE), Ok(None));
+    }
+
+    #[test]
+    fn whitespace_only_value_is_the_empty_value() {
+        // OWS-only is an empty field value, not a header naming nothing.
+        for header in [" ", "\t", " \t "] {
+            assert_eq!(negotiate(Some(header), &GZIP_DEFLATE), Ok(None));
+        }
+    }
+
+    #[test]
+    fn hostile_header_degrades_to_uncompressed_never_to_a_panic_or_a_coding() {
+        // A value over the 64-segment DoS bound cannot be parsed, and
+        // `negotiate` has no error channel for it; the documented, safe
+        // outcome is "send it uncompressed", never a coding the client may
+        // not have asked for.
+        assert_eq!(negotiate(Some(&",".repeat(65)), &GZIP_DEFLATE), Ok(None));
+        assert_eq!(
+            negotiate(Some(&"gzip,".repeat(200)), &GZIP_DEFLATE),
+            Ok(None)
+        );
+        // A list of only empty elements is the empty list, i.e. the
+        // empty-value meaning again.
+        assert_eq!(negotiate(Some(","), &GZIP_DEFLATE), Ok(None));
     }
 
     #[test]
@@ -361,6 +489,31 @@ mod tests {
         assert_eq!(
             negotiate(Some("x-custom;q=1"), &available),
             Ok(Some(ContentCoding::Unknown("x-custom".to_string())))
+        );
+        // Case-insensitive on the wire, because `ContentCoding::parse`
+        // lowercases before it constructs `Unknown`.
+        assert_eq!(
+            negotiate(Some("X-CUSTOM;q=1"), &available),
+            Ok(Some(ContentCoding::Unknown("x-custom".to_string())))
+        );
+    }
+
+    #[test]
+    fn unknown_available_entries_must_be_built_through_parse() {
+        // Pins the normalization contract stated on `ContentCoding::Unknown`:
+        // the token is held already-lowercased and matching is a plain string
+        // comparison, so a hand-written mixed-case `Unknown` never matches a
+        // parsed header and is silently never selected. `parse` is the
+        // supported way to build one.
+        let hand_written = [ContentCoding::Unknown("X-Custom".to_string())];
+        assert_eq!(negotiate(Some("x-custom;q=1"), &hand_written), Ok(None));
+        assert_eq!(negotiate(Some("X-Custom;q=1"), &hand_written), Ok(None));
+
+        let parsed = [ContentCoding::parse("X-Custom")];
+        assert_eq!(
+            negotiate(Some("x-custom;q=1"), &parsed),
+            Ok(Some(ContentCoding::Unknown("x-custom".to_string()))),
+            "`parse` normalizes, so the same coding matches either spelling"
         );
     }
 

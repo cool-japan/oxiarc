@@ -1,6 +1,6 @@
 //! The LZ77 sliding window used by the incremental decoder.
 //!
-//! The one-shot decoder in [`crate::decompress`] resolves backward references
+//! The one-shot decoder in [`crate::decompress()`] resolves backward references
 //! against the output `Vec` itself, which forces the whole decompressed body to
 //! stay resident. A push decoder cannot do that: it hands every byte to the
 //! caller and must still be able to look `window_size` bytes back. This module

@@ -858,3 +858,130 @@ fn oracle_incremental_small_window_large_payload() {
         "[zstd-oracle] wrapped-ring decode: 4 MiB through 1-128 KiB declared windows, byte-identical"
     );
 }
+
+/// A real `zstd --train` (formatted, RFC 8878 §5) dictionary must be refused by
+/// name, never mistaken for raw content.
+///
+/// This is the case a hand-built fixture cannot prove: frames compressed
+/// against a formatted dictionary use `Repeat_Mode` for their sequence tables
+/// and may use `Treeless` literals, both of which resolve against the
+/// dictionary's *entropy tables* — data that a content-only seed does not
+/// carry. Accepting the dictionary as content would therefore hand back wrong
+/// bytes for exactly the frames that need it, which is why the decoder refuses
+/// it instead.
+#[test]
+fn oracle_formatted_dictionary_is_refused_not_misdecoded() {
+    if find_zstd().is_none() {
+        skip_note("oracle_formatted_dictionary_is_refused_not_misdecoded");
+        return;
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "oxiarc_zstd_oracle_traindict_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let samples = dir.join("samples");
+    std::fs::create_dir_all(&samples).expect("create scratch dir");
+
+    // Deterministic sample corpus for `--train` (a xorshift keeps it hermetic).
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let words = [
+        "alice", "bob", "carol", "dave", "users", "orders", "widgets", "invoices",
+    ];
+    for i in 0..400 {
+        let user = words[(next() % words.len() as u64) as usize];
+        let path = words[(next() % words.len() as u64) as usize];
+        let id = next() % 10_000;
+        let record = format!(
+            "{{\"user\":\"{user}\",\"action\":\"GET /api/v1/{path} HTTP/1.1\",\
+             \"host\":\"example.com\",\"id\":{id}}}\n"
+        );
+        let repeats = 1 + (next() % 4) as usize;
+        std::fs::write(samples.join(format!("s{i}.json")), record.repeat(repeats))
+            .expect("write sample");
+    }
+
+    let dict_path = dir.join("formatted.dict");
+    let train = Command::new("zstd")
+        .arg("--train")
+        .arg("-q")
+        .arg("--maxdict=16384")
+        .arg("-o")
+        .arg(&dict_path)
+        .args(
+            (0..400)
+                .map(|i| samples.join(format!("s{i}.json")))
+                .collect::<Vec<_>>(),
+        )
+        .output();
+    let trained = matches!(train, Ok(ref out) if out.status.success()) && dict_path.exists();
+    if !trained {
+        eprintln!(
+            "[zstd-oracle] `zstd --train` unavailable; skipping \
+             'oracle_formatted_dictionary_is_refused_not_misdecoded' (self-skip)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let dict = std::fs::read(&dict_path).expect("read dictionary");
+    assert_eq!(
+        &dict[..4],
+        &[0x37, 0xA4, 0x30, 0xEC],
+        "`zstd --train` did not write a formatted dictionary"
+    );
+    let dict_arg = dict_path.to_string_lossy().to_string();
+
+    let payload = "{\"user\":\"alice\",\"action\":\"GET /api/v1/users HTTP/1.1\",\
+                   \"host\":\"example.com\",\"id\":42}\n"
+        .repeat(40);
+    let payload = payload.into_bytes();
+
+    for level in ["-1", "-3", "-19"] {
+        let frame = run_zstd(&["-q", "-c", level, "-D", &dict_arg], &payload)
+            .expect("reference compress with a formatted dictionary");
+
+        // Every entry point that takes a dictionary must refuse it by name.
+        let one_shot = oxiarc_zstd::decompress_multi_frame_with_dict(&frame, &dict);
+        assert!(
+            one_shot
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+            "decompress_multi_frame_with_dict ({level}) did not refuse a formatted dictionary: \
+             {one_shot:?}"
+        );
+
+        use oxiarc_core::traits::FlushMode;
+        let mut stream = oxiarc_zstd::ZstdStream::new()
+            .with_max_window(usize::MAX)
+            .with_dictionary(dict.clone());
+        let mut out = vec![0u8; 1 << 16];
+        let pushed = stream.decode(&frame, &mut out, FlushMode::Finish);
+        assert!(
+            pushed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+            "ZstdStream ({level}) did not refuse a formatted dictionary: {pushed:?}"
+        );
+
+        // And without any dictionary the frame's `Dictionary_ID` is refused.
+        let mut bare = oxiarc_zstd::ZstdStream::new().with_max_window(usize::MAX);
+        let bare_result = bare.decode(&frame, &mut out, FlushMode::Finish);
+        assert!(
+            bare_result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("requires dictionary ID")),
+            "ZstdStream ({level}) did not refuse a dictionary-ID frame: {bare_result:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

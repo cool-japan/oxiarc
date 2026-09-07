@@ -28,11 +28,14 @@ const STAGING: usize = 64 * 1024;
 /// # What bounds the memory
 ///
 /// Everything except the window is a fixed ~320 KiB. The window is allocated
-/// lazily and never exceeds `min(the frame's declared Window_Size, the bytes
-/// actually produced)`, but this type deliberately places **no ceiling on the
-/// declared window** — that is its historical behaviour, and reference frames
-/// compressed with `zstd --long` declare 16-128 MiB. So on a long stream from
-/// an untrusted source the ring can still grow to whatever the frame declares.
+/// lazily and never exceeds `min(the frame's declared Window_Size,
+/// max(Block_Maximum_Decompressed_Size, the bytes actually produced))` — the
+/// block-maximum floor (at most 128 KiB) is inherent, since one whole block has
+/// to fit before it is drained. This type deliberately places **no ceiling on
+/// the declared window** — that is its historical behaviour, and reference
+/// frames compressed with `zstd --long` declare 16-128 MiB. So on a long stream
+/// from an untrusted source the ring can still grow to whatever the frame
+/// declares.
 /// Two builders make it constant, and untrusted input should use at least one:
 /// [`ZstdStreamDecoder::with_max_output`] bounds the ring by the bytes the
 /// caller agreed to receive, and [`ZstdStreamDecoder::with_max_window`] refuses
@@ -93,6 +96,10 @@ pub struct ZstdStreamDecoder<R: Read> {
     stream_done: bool,
     /// Whether `on_finish` has already been reported.
     reported_finish: bool,
+    /// Compressed bytes read from the inner reader that turned out not to be
+    /// part of the Zstandard stream. Filled once, when the push decoder reports
+    /// `StreamEnd`; empty before that.
+    unused: Vec<u8>,
     /// Optional progress sink.
     progress: Option<ProgressHandle>,
     /// Optional cancellation token.
@@ -114,6 +121,10 @@ impl<R: Read> ZstdStreamDecoder<R> {
     /// used during compression. The dictionary seeds the window at the start of
     /// every frame, so a multi-frame stream produced by
     /// [`crate::ZstdStreamEncoder::with_dictionary`] decodes correctly.
+    ///
+    /// Raw content dictionaries only: see [`ZstdStream::with_dictionary`], which
+    /// refuses a *formatted* (RFC 8878 §5) dictionary by name rather than
+    /// mistaking its header and entropy tables for content.
     pub fn with_dictionary(reader: R, dict: Vec<u8>) -> Self {
         Self::build(
             reader,
@@ -137,6 +148,7 @@ impl<R: Read> ZstdStreamDecoder<R> {
             src_eof: false,
             stream_done: false,
             reported_finish: false,
+            unused: Vec::new(),
             progress: None,
             cancel: None,
         }
@@ -159,8 +171,8 @@ impl<R: Read> ZstdStreamDecoder<R> {
     ///
     /// Unrestricted by default, matching this type's historical behaviour
     /// (reference frames compressed with `zstd --long` declare 16-128 MiB
-    /// windows). The window ring still only ever grows to the number of bytes
-    /// actually produced.
+    /// windows). The window ring still only ever grows to one block plus the
+    /// number of bytes actually produced.
     #[must_use]
     pub fn with_max_window(mut self, bytes: usize) -> Self {
         self.stream = std::mem::take(&mut self.stream).with_max_window(bytes);
@@ -204,10 +216,33 @@ impl<R: Read> ZstdStreamDecoder<R> {
         self.stream_done && self.out_pos >= self.out_len
     }
 
-    /// Compressed bytes read from the inner reader that were not part of the
-    /// Zstandard stream (trailing garbage after a complete frame).
+    /// Compressed bytes read from the inner reader that were **not** part of
+    /// the Zstandard stream — trailing garbage after a complete frame, or the
+    /// bytes that follow the first frame when the stream stops early.
+    ///
+    /// Empty until the stream ends, and empty when it ended exactly on a frame
+    /// boundary. This adapter reads ahead in 64 KiB staging blocks, so the
+    /// answer covers both the bytes the push decoder buffered internally and
+    /// the staging remainder behind them, in stream order. It cannot cover
+    /// bytes that were never read: whatever is still inside the inner reader
+    /// stays there, and [`ZstdStreamDecoder::into_inner`]-style recovery is not
+    /// offered precisely because the boundary is only knowable here.
     pub fn unused_input(&self) -> &[u8] {
-        self.stream.unused_input()
+        &self.unused
+    }
+
+    /// Record the compressed bytes that were read but never used.
+    ///
+    /// Called exactly once, on the transition to `StreamEnd`. The push
+    /// decoder's own residue comes first: `ZstdStream::decode` takes bytes out
+    /// of the staging buffer in order, so anything it held back precedes what
+    /// is still sitting in `in_buf`.
+    fn capture_unused(&mut self) {
+        let mut unused = std::mem::take(&mut self.unused);
+        unused.clear();
+        unused.extend_from_slice(self.stream.unused_input());
+        unused.extend_from_slice(&self.in_buf[self.in_pos..self.in_len]);
+        self.unused = unused;
     }
 
     /// Refill `in_buf` from the inner reader, retrying `Interrupted`.
@@ -268,6 +303,9 @@ impl<R: Read> ZstdStreamDecoder<R> {
 
         match progress.status {
             ZstdStatus::StreamEnd => {
+                if !self.stream_done {
+                    self.capture_unused();
+                }
                 self.stream_done = true;
                 if !self.reported_finish {
                     self.reported_finish = true;
@@ -475,6 +513,91 @@ mod tests {
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("read");
         assert_eq!(out, data);
+    }
+
+    /// Trailing garbage must be reported in full, not just the four bytes the
+    /// push decoder happened to buffer while sniffing the next frame magic.
+    ///
+    /// Regression: `unused_input` used to forward `ZstdStream::unused_input`
+    /// verbatim. `ZstdStream::fill` moves exactly the four magic bytes it needs
+    /// into its carry and counts them as consumed, so every garbage byte beyond
+    /// the fourth stayed in this adapter's 64 KiB staging buffer and was
+    /// silently dropped from the answer.
+    #[test]
+    fn unused_input_reports_every_trailing_byte() {
+        let frame = compress_with_level(b"complete frame payload", 3).expect("compress");
+        let garbage = b"NOT A FRAME, NINE PLUS BYTES OF TRAILING DATA";
+        let mut stream = frame.clone();
+        stream.extend_from_slice(garbage);
+
+        // A source that serves everything in one read: every trailing byte
+        // reached the staging buffer, so every trailing byte must be reported.
+        // The old implementation answered with the four magic bytes alone.
+        let mut decoder = ZstdStreamDecoder::new(&stream[..]);
+        assert!(
+            decoder.unused_input().is_empty(),
+            "nothing is unused before the stream ends"
+        );
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).expect("read_to_end");
+        assert_eq!(out, b"complete frame payload");
+        assert_eq!(
+            decoder.unused_input(),
+            garbage,
+            "the whole trailing remainder must be reported"
+        );
+
+        // A drip-feeding source can only have the bytes it was given: the
+        // answer is then a non-empty prefix of the garbage, never a lie about
+        // bytes still sitting unread in the inner reader.
+        for step in [7usize, 1] {
+            let mut decoder = ZstdStreamDecoder::new(Choppy::new(&stream, step));
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).expect("read_to_end");
+            assert_eq!(out, b"complete frame payload");
+            let unused = decoder.unused_input();
+            assert!(!unused.is_empty(), "step {step}: nothing reported");
+            assert!(
+                garbage.starts_with(unused),
+                "step {step}: {unused:?} is not a prefix of the trailing bytes"
+            );
+        }
+
+        // A stream that ends exactly on a frame boundary has nothing unused.
+        let mut decoder = ZstdStreamDecoder::new(&frame[..]);
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).expect("read_to_end");
+        assert!(decoder.unused_input().is_empty());
+    }
+
+    /// A frame naming a non-zero `Dictionary_ID` cannot be decoded without that
+    /// dictionary, and this adapter is strict about it (see the handoff: the
+    /// derived entry points inherit `ZstdStream`'s strictness deliberately,
+    /// matching the reference decoder's `dictionary_wrong`).
+    #[test]
+    fn dictionary_id_frame_is_refused_without_a_dictionary() {
+        let mut frame = vec![0x28u8, 0xB5, 0x2F, 0xFD];
+        frame.push(0x01); // Dictionary_ID_flag = 1, no FCS, not single-segment
+        frame.push(0x48); // window descriptor
+        frame.push(0x2A); // Dictionary_ID = 42
+        let header = 1u32 | (4u32 << 3); // last block, Raw, 4 bytes
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend_from_slice(b"abcd");
+
+        let mut decoder = ZstdStreamDecoder::new(&frame[..]);
+        let mut out = Vec::new();
+        let err = decoder.read_to_end(&mut out).expect_err("must be refused");
+        assert!(
+            err.to_string().contains("requires dictionary ID"),
+            "unnamed refusal: {err}"
+        );
+
+        // The same frame decodes once a raw-content dictionary is supplied.
+        let mut decoder =
+            ZstdStreamDecoder::with_dictionary(&frame[..], b"raw dictionary content".to_vec());
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).expect("read_to_end");
+        assert_eq!(out, b"abcd");
     }
 
     #[test]

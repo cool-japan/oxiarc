@@ -227,8 +227,60 @@ impl<'a, 'h> BoundedSink<'a, 'h> {
 
     /// Overlapping copy entirely inside `dst`, mirroring
     /// `InflateWindow::copy_within_output`'s chunking rules so both sinks
-    /// reproduce the same LZ77 semantics.
+    /// reproduce the same LZ77 semantics — including its short-distance
+    /// cases, without which a `distance == 1` run of 258 bytes would be 258
+    /// one-byte `copy_within` calls (measured: +16.5 % on `inflate_into`
+    /// over highly compressible input).
     fn copy_within_dst(&mut self, distance: usize, length: usize) {
+        let end = self.pos + length;
+
+        if distance >= length {
+            // Non-overlapping: one memcpy.
+            let src = self.pos - distance;
+            self.dst.copy_within(src..src + length, self.pos);
+            self.pos = end;
+            return;
+        }
+
+        if distance == 1 {
+            // Run of a single byte: one memset.
+            let byte = self.dst.get(self.pos - 1).copied().unwrap_or(0);
+            if let Some(run) = self.dst.get_mut(self.pos..end) {
+                run.fill(byte);
+            }
+            self.pos = end;
+            return;
+        }
+
+        if distance < 16 {
+            // Tile the pattern up to a multiple of `distance` that is at
+            // least 16 bytes, then emit whole tiles: the phase realigns at
+            // every tile boundary because the tile length is a multiple of
+            // the period.
+            let tile_len = distance * (32 / distance);
+            let mut tile = [0u8; 32];
+            let start = self.pos - distance;
+            for (i, slot) in tile.iter_mut().take(tile_len).enumerate() {
+                *slot = self.dst.get(start + i % distance).copied().unwrap_or(0);
+            }
+            let mut written = 0usize;
+            while written < length {
+                let n = (length - written).min(tile_len);
+                if let Some(src) = tile.get(..n) {
+                    if let Some(slot) = self.dst.get_mut(self.pos + written..self.pos + written + n)
+                    {
+                        slot.copy_from_slice(src);
+                    }
+                }
+                written += n;
+            }
+            self.pos = end;
+            return;
+        }
+
+        // Overlapping with a usable period: repeat `distance`-sized memcpys.
+        // Each chunk is bounded by `distance` because only bytes already
+        // materialised may serve as the source.
         let mut copied = 0usize;
         while copied < length {
             let n = (length - copied).min(distance);
@@ -236,7 +288,7 @@ impl<'a, 'h> BoundedSink<'a, 'h> {
             self.dst.copy_within(src..src + n, self.pos + copied);
             copied += n;
         }
-        self.pos += length;
+        self.pos = end;
     }
 }
 
@@ -263,6 +315,7 @@ impl InflateSink for BoundedSink<'_, '_> {
         }
     }
 
+    #[inline(always)]
     fn write_literals(&mut self, bytes: &[u8]) -> Result<()> {
         let end = self
             .pos
@@ -278,6 +331,7 @@ impl InflateSink for BoundedSink<'_, '_> {
         }
     }
 
+    #[inline(always)]
     fn copy_match(&mut self, distance: usize, length: usize) -> Result<()> {
         let history = self.history_len();
         if distance == 0 || distance > history {
@@ -450,5 +504,76 @@ mod tests {
         sink.copy_match(5, 5).expect("copy");
         assert_eq!(sink.written(), 10);
         assert_eq!(window.output(), b"hellohello");
+    }
+
+    /// R10 at the growable sink. `BoundedSink` has its own pair above; the
+    /// same two rejections must hold here, because the fast loop is
+    /// monomorphised over `GrowSink` and never re-checks them itself.
+    #[test]
+    fn grow_sink_rejects_zero_and_out_of_range_distance() {
+        let mut window = InflateWindow::with_capacity(64);
+        let mut sink = GrowSink::new(&mut window);
+        sink.write_literals(b"abc").expect("literals");
+
+        let err = sink.copy_match(0, 3).expect_err("distance zero");
+        assert!(matches!(err, OxiArcError::InvalidDistance { .. }));
+
+        // One past everything ever written: there is no such history byte.
+        let err = sink.copy_match(4, 1).expect_err("distance past history");
+        assert!(matches!(err, OxiArcError::InvalidDistance { .. }));
+    }
+
+    #[test]
+    fn grow_sink_rejects_oversized_copy() {
+        let mut window = InflateWindow::with_capacity(64);
+        let mut sink = GrowSink::new(&mut window);
+        sink.write_literal(b'x').expect("literal");
+        let err = sink
+            .copy_match(1, MAX_COPY_LENGTH + 1)
+            .expect_err("over the copy budget");
+        assert!(matches!(err, OxiArcError::MemoryBudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn bounded_sink_with_history_rejects_zero_distance() {
+        let mut history = History::with_capacity(WINDOW);
+        history.append(b"earlier output");
+        let mut dst = [0u8; 16];
+        let mut sink = BoundedSink::new(&mut dst, Some(&history));
+        sink.write_literals(b"abc").expect("literals");
+        let err = sink.copy_match(0, 3).expect_err("distance zero");
+        assert!(matches!(err, OxiArcError::InvalidDistance { .. }));
+    }
+
+    /// The two sinks must produce identical bytes for the same match, so a
+    /// caller cannot observe which front end decoded a stream.
+    #[test]
+    fn both_sinks_agree_with_the_reference_copy() {
+        let seed: Vec<u8> = (0..48u8)
+            .map(|i| i.wrapping_mul(11).wrapping_add(5))
+            .collect();
+        for distance in 1..=48usize {
+            for length in [1usize, 2, 3, 17, 48, 100, 258] {
+                let expected = reference_copy(&seed, distance, length);
+
+                let mut window = InflateWindow::with_capacity(WINDOW);
+                let mut grow = GrowSink::new(&mut window);
+                grow.write_literals(&seed).expect("seed");
+                grow.copy_match(distance, length).expect("grow copy");
+                let grown = window.output()[seed.len()..].to_vec();
+
+                let mut dst = vec![0u8; seed.len() + length];
+                let mut bounded = BoundedSink::new(&mut dst, None);
+                bounded.write_literals(&seed).expect("seed");
+                bounded.copy_match(distance, length).expect("bounded copy");
+                let bound = dst[seed.len()..].to_vec();
+
+                assert_eq!(grown, expected, "grow distance={distance} length={length}");
+                assert_eq!(
+                    bound, expected,
+                    "bounded distance={distance} length={length}"
+                );
+            }
+        }
     }
 }

@@ -492,7 +492,6 @@ pub fn unpack_row(
     count: usize,
     slot: SampleType,
     dst: &mut [u8],
-    format: SampleFormat,
 ) -> Result<()> {
     let width = slot.byte_width();
     let need = count.checked_mul(width).ok_or(TiffError::IntOverflow)?;
@@ -533,7 +532,7 @@ pub fn unpack_row(
         let Some(out) = dst.get_mut(i * width..i * width + width) else {
             break;
         };
-        store_sample(out, raw, bits as u16, slot, format);
+        store_sample(out, raw, bits as u16, slot);
     }
     Ok(())
 }
@@ -624,7 +623,7 @@ fn write_bits_msb(dst: &mut [u8], pos: u64, bits: u64, value: u64) {
 }
 
 /// Places one raw packed value into a native-endian slot.
-fn store_sample(out: &mut [u8], raw: u64, bits: u16, slot: SampleType, format: SampleFormat) {
+fn store_sample(out: &mut [u8], raw: u64, bits: u16, slot: SampleType) {
     match slot {
         SampleType::U8 => {
             if let Some(b) = out.first_mut() {
@@ -648,8 +647,6 @@ fn store_sample(out: &mut [u8], raw: u64, bits: u16, slot: SampleType, format: S
                 // A 24-bit float is a binary32 with the low eight mantissa
                 // bits truncated; re-attach them as zeros.
                 f32::from_bits((raw as u32) << 8)
-            } else if format == SampleFormat::IeeeFp && bits == 32 {
-                f32::from_bits(raw as u32)
             } else {
                 f32::from_bits(raw as u32)
             };
@@ -735,15 +732,39 @@ fn sign_extend(raw: u64, bits: u16) -> i64 {
     ((raw << shift) as i64) >> shift
 }
 
-/// Applies `FillOrder` to a decoded chunk, in place.
+/// Applies `FillOrder` to a chunk that is still **compressed**, in place.
 ///
-/// Bit reversal is meaningful only when some channel is narrower than a byte;
-/// libtiff ignores the tag otherwise, and so does this crate.
-pub fn apply_fill_order(buf: &mut [u8], fill_order: FillOrder, bits_per_sample: &[u16]) -> bool {
+/// Returns `true` when the buffer was modified.
+///
+/// # Where in the pipeline this belongs
+///
+/// libtiff reverses the bits of every byte of the *raw* strip or tile — before
+/// the codec runs on read (`TIFFFillStrip`) and after it runs on write
+/// (`TIFFFlushData1`) — whenever `FillOrder` is 2, and it does so for **every**
+/// bit depth, not only for sub-byte ones.
+///
+/// This was verified against libtiff 4.7.1: `tiffcp -c packbits -f lsb2msb`
+/// produces a strip whose PackBits control bytes are themselves reversed
+/// (decoding it without reversing first yields the wrong *length*, not merely
+/// the wrong bits), and `tiffcp -c none -f lsb2msb` on an 8-bit image reverses
+/// every sample byte. Reversing after decompression, or skipping the reversal
+/// for byte-aligned depths, therefore produces files no other TIFF reader
+/// agrees with.
+///
+/// The CCITT codecs are the one exception: libtiff sets `TIFF_NOBITREV` for
+/// them and the fax decoder consumes the tag itself, so the caller must skip
+/// this step for them — see [`crate::compression::handles_fill_order`].
+///
+/// ```
+/// use oxiarc_tiff::sample::apply_fill_order;
+/// use oxiarc_tiff::FillOrder;
+///
+/// let mut buf = [0b1010_0000u8];
+/// assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb));
+/// assert_eq!(buf, [0b0000_0101]);
+/// ```
+pub fn apply_fill_order(buf: &mut [u8], fill_order: FillOrder) -> bool {
     if fill_order != FillOrder::Lsb2Msb {
-        return false;
-    }
-    if !bits_per_sample.iter().any(|b| *b < 8) {
         return false;
     }
     reverse_bits_in_place(buf);
@@ -985,7 +1006,7 @@ mod tests {
     fn one_bit_data_unpacks_msb_first() {
         let src = [0b1010_1100u8];
         let mut dst = [0u8; 8];
-        unpack_row(&src, &[1], 8, SampleType::U8, &mut dst, SampleFormat::Uint).expect("unpack");
+        unpack_row(&src, &[1], 8, SampleType::U8, &mut dst).expect("unpack");
         assert_eq!(dst, [1, 0, 1, 0, 1, 1, 0, 0]);
         let mut packed = [0u8; 1];
         pack_row(&dst, &[1], 8, SampleType::U8, &mut packed).expect("pack");
@@ -998,30 +1019,14 @@ mod tests {
         let mut packed = vec![0u8; packed_row_bytes(&[2], 5) as usize];
         pack_row(&values2, &[2], 5, SampleType::U8, &mut packed).expect("pack");
         let mut back = [0u8; 5];
-        unpack_row(
-            &packed,
-            &[2],
-            5,
-            SampleType::U8,
-            &mut back,
-            SampleFormat::Uint,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &[2], 5, SampleType::U8, &mut back).expect("unpack");
         assert_eq!(back, values2);
 
         let values4 = [0xFu8, 0, 7, 8, 1];
         let mut packed = vec![0u8; packed_row_bytes(&[4], 5) as usize];
         pack_row(&values4, &[4], 5, SampleType::U8, &mut packed).expect("pack");
         let mut back = [0u8; 5];
-        unpack_row(
-            &packed,
-            &[4],
-            5,
-            SampleType::U8,
-            &mut back,
-            SampleFormat::Uint,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &[4], 5, SampleType::U8, &mut back).expect("unpack");
         assert_eq!(back, values4);
     }
 
@@ -1036,15 +1041,7 @@ mod tests {
         assert_eq!(packed.len(), 8);
         pack_row(&src, &[12], 5, SampleType::U16, &mut packed).expect("pack");
         let mut back = vec![0u8; 10];
-        unpack_row(
-            &packed,
-            &[12],
-            5,
-            SampleType::U16,
-            &mut back,
-            SampleFormat::Uint,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &[12], 5, SampleType::U16, &mut back).expect("unpack");
         let decoded = Samples::from_native_bytes(SampleType::U16, &back).expect("typed");
         assert_eq!(decoded.as_u16(), Some(&values[..]));
     }
@@ -1060,15 +1057,7 @@ mod tests {
         assert_eq!(packed.len(), 9);
         pack_row(&src, &[24], 3, SampleType::U32, &mut packed).expect("pack");
         let mut back = vec![0u8; 12];
-        unpack_row(
-            &packed,
-            &[24],
-            3,
-            SampleType::U32,
-            &mut back,
-            SampleFormat::Uint,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &[24], 3, SampleType::U32, &mut back).expect("unpack");
         let decoded = Samples::from_native_bytes(SampleType::U32, &back).expect("typed");
         assert_eq!(decoded.as_u32(), Some(&values[..]));
     }
@@ -1083,15 +1072,7 @@ mod tests {
         let mut packed = vec![0u8; packed_row_bytes(&[24], 3) as usize];
         pack_row(&src, &[24], 3, SampleType::F32, &mut packed).expect("pack");
         let mut back = vec![0u8; 12];
-        unpack_row(
-            &packed,
-            &[24],
-            3,
-            SampleType::F32,
-            &mut back,
-            SampleFormat::IeeeFp,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &[24], 3, SampleType::F32, &mut back).expect("unpack");
         let decoded = Samples::from_native_bytes(SampleType::F32, &back).expect("typed");
         assert_eq!(decoded.as_f32(), Some(&original[..]));
     }
@@ -1101,7 +1082,7 @@ mod tests {
         // Two 4-bit two's-complement values: 0b1111 (-1) and 0b0111 (7).
         let src = [0b1111_0111u8];
         let mut dst = vec![0u8; 4];
-        unpack_row(&src, &[4], 2, SampleType::I16, &mut dst, SampleFormat::Int).expect("unpack");
+        unpack_row(&src, &[4], 2, SampleType::I16, &mut dst).expect("unpack");
         let decoded = Samples::from_native_bytes(SampleType::I16, &dst).expect("typed");
         assert_eq!(decoded.as_i16(), Some(&[-1i16, 7][..]));
     }
@@ -1119,15 +1100,7 @@ mod tests {
         assert_eq!(packed.len(), 4);
         pack_row(&src, &bits, 6, SampleType::U16, &mut packed).expect("pack");
         let mut back = vec![0u8; 12];
-        unpack_row(
-            &packed,
-            &bits,
-            6,
-            SampleType::U16,
-            &mut back,
-            SampleFormat::Uint,
-        )
-        .expect("unpack");
+        unpack_row(&packed, &bits, 6, SampleType::U16, &mut back).expect("unpack");
         let decoded = Samples::from_native_bytes(SampleType::U16, &back).expect("typed");
         assert_eq!(decoded.as_u16(), Some(&values[..]));
     }
@@ -1135,40 +1108,38 @@ mod tests {
     #[test]
     fn unpack_refuses_impossible_widths_and_short_destinations() {
         let mut dst = [0u8; 2];
-        assert!(unpack_row(&[0], &[0], 2, SampleType::U8, &mut dst, SampleFormat::Uint).is_err());
-        assert!(unpack_row(&[0], &[65], 2, SampleType::U8, &mut dst, SampleFormat::Uint).is_err());
-        assert!(unpack_row(&[0], &[], 2, SampleType::U8, &mut dst, SampleFormat::Uint).is_err());
+        assert!(unpack_row(&[0], &[0], 2, SampleType::U8, &mut dst).is_err());
+        assert!(unpack_row(&[0], &[65], 2, SampleType::U8, &mut dst).is_err());
+        assert!(unpack_row(&[0], &[], 2, SampleType::U8, &mut dst).is_err());
         let mut tiny = [0u8; 1];
-        assert!(unpack_row(&[0], &[8], 2, SampleType::U8, &mut tiny, SampleFormat::Uint).is_err());
+        assert!(unpack_row(&[0], &[8], 2, SampleType::U8, &mut tiny).is_err());
     }
 
     #[test]
     fn unpack_pads_a_short_source_with_zeros_instead_of_panicking() {
         let mut dst = [0u8; 4];
-        unpack_row(
-            &[0xFF],
-            &[8],
-            4,
-            SampleType::U8,
-            &mut dst,
-            SampleFormat::Uint,
-        )
-        .expect("short source must not fail");
+        unpack_row(&[0xFF], &[8], 4, SampleType::U8, &mut dst).expect("short source must not fail");
         assert_eq!(dst, [0xFF, 0, 0, 0]);
     }
 
     #[test]
-    fn fill_order_only_applies_below_eight_bits() {
+    fn fill_order_applies_at_every_bit_depth() {
+        // libtiff reverses the raw strip for every depth, not just sub-byte
+        // ones; see the doc comment on `apply_fill_order`.
         let mut buf = [0b1000_0001u8];
-        assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb, &[1]));
+        assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb));
         assert_eq!(buf, [0b1000_0001]);
         let mut buf = [0b1010_0000u8];
-        assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb, &[4]));
+        assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb));
         assert_eq!(buf, [0b0000_0101]);
-        let mut buf = [0b1010_0000u8];
-        assert!(!apply_fill_order(&mut buf, FillOrder::Lsb2Msb, &[8]));
-        assert_eq!(buf, [0b1010_0000]);
-        assert!(!apply_fill_order(&mut buf, FillOrder::Msb2Lsb, &[1]));
+        // 8-bit data is reversed too: 0x02 -> 0x40, as `tiffcp -f lsb2msb`
+        // writes it.
+        let mut buf = [0x02u8, 0x0d];
+        assert!(apply_fill_order(&mut buf, FillOrder::Lsb2Msb));
+        assert_eq!(buf, [0x40, 0xb0]);
+        // Msb2Lsb is a no-op.
+        assert!(!apply_fill_order(&mut buf, FillOrder::Msb2Lsb));
+        assert_eq!(buf, [0x40, 0xb0]);
     }
 
     #[test]

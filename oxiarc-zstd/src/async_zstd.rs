@@ -10,7 +10,7 @@
 //! `Window_Size` by default, so the ring can grow to `min(the declared
 //! Window_Size, the bytes actually produced)`. On untrusted input set
 //! `with_max_output` (both types) or `with_max_window`
-//! ([`AsyncZstdDecompressor`]) to make the bound a constant.
+//! ([`crate::async_zstd::AsyncZstdDecompressor`]) to make the bound a constant.
 //!
 //! # Feature flag
 //!
@@ -100,6 +100,9 @@ impl AsyncZstdDecompressor {
     }
 
     /// Decompress with a raw-content dictionary.
+    ///
+    /// See [`ZstdStream::with_dictionary`]: a *formatted* (RFC 8878 §5)
+    /// dictionary is refused by name rather than mistaken for content.
     #[must_use]
     pub fn with_dictionary(mut self, dict: Vec<u8>) -> Self {
         self.dict = if dict.is_empty() { None } else { Some(dict) };
@@ -138,6 +141,8 @@ impl AsyncZstdDecompressor {
                 let n = input.read(&mut in_buf).await?;
                 if n == 0 {
                     src_eof = true;
+                    in_pos = 0;
+                    in_len = 0;
                 } else {
                     in_pos = 0;
                     in_len = n;
@@ -244,6 +249,10 @@ pub struct AsyncZstdReader<R> {
     src_eof: bool,
     /// Whether the push decoder has reported `StreamEnd`.
     stream_done: bool,
+    /// Compressed bytes read from the inner reader that turned out not to be
+    /// part of the Zstandard stream. Filled once, when the push decoder reports
+    /// `StreamEnd`; empty before that.
+    unused: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncZstdReader<R> {
@@ -256,6 +265,9 @@ impl<R: AsyncRead + Unpin> AsyncZstdReader<R> {
     }
 
     /// Wrap `inner`, decoding with a raw-content dictionary.
+    ///
+    /// See [`ZstdStream::with_dictionary`]: a *formatted* (RFC 8878 §5)
+    /// dictionary is refused by name rather than mistaken for content.
     pub fn with_dictionary(inner: R, dict: Vec<u8>) -> Self {
         Self::with_stream(
             inner,
@@ -266,6 +278,12 @@ impl<R: AsyncRead + Unpin> AsyncZstdReader<R> {
     }
 
     /// Wrap `inner` with a caller-configured push decoder.
+    ///
+    /// The decoder is taken exactly as given, **including its declared-window
+    /// ceiling**: a plain [`ZstdStream::new`] defaults to 8 MiB, whereas
+    /// [`AsyncZstdReader::new`] leaves the ceiling unrestricted for
+    /// `zstd --long` compatibility. Pass
+    /// `ZstdStream::new().with_max_window(bytes)` to choose deliberately.
     pub fn with_stream(inner: R, stream: ZstdStream) -> Self {
         Self {
             inner,
@@ -278,6 +296,7 @@ impl<R: AsyncRead + Unpin> AsyncZstdReader<R> {
             out_pos: 0,
             src_eof: false,
             stream_done: false,
+            unused: Vec::new(),
         }
     }
 
@@ -288,14 +307,49 @@ impl<R: AsyncRead + Unpin> AsyncZstdReader<R> {
         self
     }
 
+    /// Refuse frames declaring a `Window_Size` larger than `bytes`.
+    ///
+    /// Unrestricted by default, matching [`crate::ZstdStreamDecoder`] (frames
+    /// made with `zstd --long` declare 16-128 MiB windows). The ring itself
+    /// still only ever grows to one block plus the number of bytes actually
+    /// produced.
+    #[must_use]
+    pub fn with_max_window(mut self, bytes: usize) -> Self {
+        self.stream = std::mem::take(&mut self.stream).with_max_window(bytes);
+        self
+    }
+
     /// Number of decompressed bytes produced so far.
     pub fn total_out(&self) -> u64 {
         self.stream.total_out()
     }
 
+    /// Compressed bytes read from the inner reader that were **not** part of
+    /// the Zstandard stream — trailing garbage after a complete frame, or the
+    /// bytes that follow the first frame when the stream stops early.
+    ///
+    /// The async twin of [`crate::ZstdStreamDecoder::unused_input`], with the
+    /// same guarantees: empty until the stream ends, then the push decoder's
+    /// own residue followed by the staging remainder, in stream order. It
+    /// cannot report bytes that were never polled out of the inner reader.
+    pub fn unused_input(&self) -> &[u8] {
+        &self.unused
+    }
+
     /// Consume the adapter and return the inner reader.
     pub fn into_inner(self) -> R {
         self.inner
+    }
+
+    /// Record the compressed bytes that were read but never used.
+    ///
+    /// Called exactly once, on the transition to `StreamEnd`.
+    fn capture_unused(&mut self) {
+        let mut unused = std::mem::take(&mut self.unused);
+        unused.clear();
+        unused.extend_from_slice(self.stream.unused_input());
+        unused.extend_from_slice(&self.in_buf[self.in_pos..self.in_len]);
+        self.unused = unused;
     }
 }
 
@@ -359,6 +413,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncZstdReader<R> {
             this.out_pos = 0;
             this.out_len = progress.produced;
             if progress.status == ZstdStatus::StreamEnd {
+                if !this.stream_done {
+                    this.capture_unused();
+                }
                 this.stream_done = true;
             } else if progress.consumed == 0 && progress.produced == 0 && this.src_eof {
                 return Poll::Ready(Err(io::Error::new(
@@ -479,6 +536,96 @@ mod tests {
             .await
             .expect_err("truncation must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Trailing garbage must be reported in full, exactly as the sync adapter
+    /// reports it — the push decoder buffers only the four magic bytes it needs
+    /// to sniff the next frame, so the rest lives in this adapter's staging
+    /// buffer and would otherwise be dropped from the answer.
+    /// The decompressor's pump must terminate when the stream ends with input
+    /// still staged, and when the source drip-feeds through a tiny buffer.
+    ///
+    /// `StreamEnd` with `in_pos < in_len` is the shape that would spin if the
+    /// loop ever returned `NeedInput` without consuming while staged bytes
+    /// remained; trailing garbage is the cheapest way to produce it.
+    #[tokio::test]
+    async fn async_decompressor_terminates_with_input_left_staged() {
+        let frame = compress_with_level(&sample(70_000), 3).expect("compress");
+        let mut stream = frame.clone();
+        stream.extend_from_slice(b"TRAILING GARBAGE AFTER A COMPLETE FRAME");
+
+        for buffer_size in [64 * 1024usize, 1024, 1] {
+            let mut decoder = AsyncZstdDecompressor::new();
+            let mut input = std::io::Cursor::new(stream.clone());
+            let mut output = Vec::new();
+            let n = decoder
+                .decompress_async_with_buffer(&mut input, &mut output, buffer_size)
+                .await
+                .expect("decompress");
+            assert_eq!(n, 70_000, "buffer size {buffer_size}");
+            assert_eq!(output, sample(70_000), "buffer size {buffer_size}");
+        }
+
+        // Concatenated frames through the same tiny buffer.
+        let mut joined = frame.clone();
+        joined.extend_from_slice(&frame);
+        let mut decoder = AsyncZstdDecompressor::new();
+        let mut input = std::io::Cursor::new(joined);
+        let mut output = Vec::new();
+        let n = decoder
+            .decompress_async_with_buffer(&mut input, &mut output, 1)
+            .await
+            .expect("decompress");
+        assert_eq!(n, 140_000);
+    }
+
+    #[tokio::test]
+    async fn async_reader_reports_the_unused_tail() {
+        let frame = compress_with_level(b"complete async frame", 3).expect("compress");
+        let garbage = b"NOT A FRAME, NINE PLUS BYTES OF TRAILING DATA";
+        let mut stream = frame.clone();
+        stream.extend_from_slice(garbage);
+
+        let mut reader = AsyncZstdReader::new(std::io::Cursor::new(stream));
+        assert!(reader.unused_input().is_empty());
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+            .await
+            .expect("read_to_end");
+        assert_eq!(out, b"complete async frame");
+        assert_eq!(reader.unused_input(), garbage);
+
+        // Nothing trailing means nothing reported.
+        let mut reader = AsyncZstdReader::new(std::io::Cursor::new(frame));
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+            .await
+            .expect("read_to_end");
+        assert!(reader.unused_input().is_empty());
+    }
+
+    /// `with_max_window` refuses an over-large declaration before allocating,
+    /// on the async reader as well as on the decompressor.
+    #[tokio::test]
+    async fn async_reader_declared_window_ceiling_is_enforced() {
+        let data = sample(300_000);
+        let frame = compress_with_level(&data, 3).expect("compress");
+        let mut reader =
+            AsyncZstdReader::new(std::io::Cursor::new(frame.clone())).with_max_window(4096);
+        let mut out = Vec::new();
+        assert!(
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+                .await
+                .is_err()
+        );
+
+        // Unrestricted by default: the same frame decodes.
+        let mut reader = AsyncZstdReader::new(std::io::Cursor::new(frame));
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+            .await
+            .expect("read_to_end");
+        assert_eq!(out, data);
     }
 
     #[tokio::test]

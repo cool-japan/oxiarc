@@ -11,6 +11,20 @@
 //!
 //! [`merge_jpeg_tables`] exists only for handing a self-contained datastream
 //! to a third-party decoder that cannot take tables out of band.
+//!
+//! # Legacy OJPEG (`Compression = 6`)
+//!
+//! [`reconstruct_ojpeg`] and [`decode_ojpeg`] cover TIFF 6.0's withdrawn JPEG
+//! encoding, whose strips may carry no headers at all. See the [`ojpeg`]
+//! module documentation for the three spellings found in the wild and for
+//! what the TIFF layer has to resolve before calling in.
+
+mod ojpeg;
+
+pub use ojpeg::{
+    OJpegGeometry, OJpegTags, decode_ojpeg, decode_ojpeg_into, decode_ojpeg_into_u16,
+    reconstruct_ojpeg,
+};
 
 use crate::error::{JpegError, Result};
 use crate::marker::{EOI, SOI};

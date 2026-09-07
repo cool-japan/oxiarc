@@ -327,8 +327,15 @@ fn hierarchical_frames_are_a_named_unsupported_error() {
     }
 }
 
+/// The three arithmetic `SOF` codes are recognised as such by the parser.
+///
+/// The fixture here is a *Huffman* stream with its `SOF` marker patched, so
+/// its entropy data is nonsense for an arithmetic decoder: with the
+/// `arithmetic` feature the only guarantee is that decoding it terminates
+/// with either an error or a correctly sized buffer, never a panic. Real
+/// arithmetic decoding is covered by `arith_api.rs` and `arith_oracle.rs`.
 #[test]
-fn arithmetic_frames_parse_but_do_not_decode_yet() {
+fn arithmetic_frames_are_recognised() {
     for code in [0xC9u8, 0xCA, 0xCB] {
         let stream = patch_sof_marker(&sample::RGB_8X8_420, code);
         let mut decoder = Decoder::new(stream.as_slice());
@@ -336,10 +343,19 @@ fn arithmetic_frames_parse_but_do_not_decode_yet() {
             .read_info()
             .unwrap_or_else(|e| panic!("SOF {code:#04X} header should parse: {e}"));
         assert_eq!(info.entropy, EntropyCoding::Arithmetic);
+        let expected = decoder.output_buffer_size().unwrap_or(0);
+
+        #[cfg(not(feature = "arithmetic"))]
         assert!(matches!(
             decoder.decode(),
             Err(JpegError::Unsupported(UnsupportedFeature::ArithmeticCoding))
         ));
+
+        #[cfg(feature = "arithmetic")]
+        if let Ok(pixels) = decoder.decode() {
+            assert_eq!(pixels.len(), expected, "SOF {code:#04X}");
+        }
+        let _ = expected;
     }
 }
 

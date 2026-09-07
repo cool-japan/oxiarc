@@ -772,6 +772,9 @@ pub fn create_streaming_decoder(method: LzhMethod, uncompressed_size: u64) -> St
 /// Size of the chunk appended to the input staging buffer on each `reader.read()`.
 const STREAM_READ_CHUNK: usize = 4096;
 
+/// Size of the reusable decode scratch buffer held by [`LzhStreamDecoder`].
+const STREAM_SCRATCH_LEN: usize = 32768;
+
 /// A streaming LZH decompressor that implements [`std::io::Read`].
 ///
 /// Given any `R: Read` yielding LZH-compressed bytes, this decompresses on the
@@ -814,6 +817,13 @@ pub struct LzhStreamDecoder<R: std::io::Read> {
     output_pos: usize,
     /// Set once the decoder reports `Done` and staging drains.
     finished: bool,
+    /// Reusable scratch buffer the state machine decodes into.
+    ///
+    /// Owned by the struct rather than allocated inside every pump, so a
+    /// `Read` loop over a large stream does not allocate (and free)
+    /// [`STREAM_SCRATCH_LEN`] bytes on every single `read()` call — audit
+    /// finding 5.10.
+    out_scratch: Vec<u8>,
 }
 
 impl<R: std::io::Read> LzhStreamDecoder<R> {
@@ -830,6 +840,7 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
             output_buf: Vec::new(),
             output_pos: 0,
             finished: false,
+            out_scratch: vec![0u8; STREAM_SCRATCH_LEN],
         }
     }
 
@@ -871,25 +882,37 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
     }
 
     /// Drive the state machine once with whatever is in the staging buffer.
-    fn drive_once(&mut self, out_scratch: &mut [u8]) -> std::io::Result<DecompressStatus> {
-        let (consumed, produced, status) = self
-            .decoder
-            .decompress(&self.staging[..self.staging_len], out_scratch)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("lzh decode error: {e}"),
-                )
-            })?;
-
-        self.output_buf.extend_from_slice(&out_scratch[..produced]);
-
-        if consumed > 0 && consumed <= self.staging_len {
-            self.staging.copy_within(consumed..self.staging_len, 0);
-            self.staging_len -= consumed;
+    ///
+    /// The decode scratch buffer is moved out of `self` for the duration of
+    /// the call (the state machine needs `&mut self.decoder` and
+    /// `&self.staging` at the same time) and always moved back, on the error
+    /// path too, so it is allocated exactly once per decoder.
+    fn drive_once(&mut self) -> std::io::Result<DecompressStatus> {
+        let mut scratch = std::mem::take(&mut self.out_scratch);
+        if scratch.len() < STREAM_SCRATCH_LEN {
+            scratch.resize(STREAM_SCRATCH_LEN, 0u8);
         }
 
-        Ok(status)
+        let outcome = match self
+            .decoder
+            .decompress(&self.staging[..self.staging_len], &mut scratch)
+        {
+            Ok((consumed, produced, status)) => {
+                self.output_buf.extend_from_slice(&scratch[..produced]);
+                if consumed > 0 && consumed <= self.staging_len {
+                    self.staging.copy_within(consumed..self.staging_len, 0);
+                    self.staging_len -= consumed;
+                }
+                Ok(status)
+            }
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("lzh decode error: {e}"),
+            )),
+        };
+
+        self.out_scratch = scratch;
+        outcome
     }
 
     /// Pump the state machine until `output_buf` has bytes or the stream ends.
@@ -901,8 +924,6 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
         self.output_buf.clear();
         self.output_pos = 0;
 
-        let mut out_scratch = vec![0u8; 32768];
-
         loop {
             if self.finished {
                 return Ok(!self.output_buf.is_empty());
@@ -912,7 +933,7 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
             if self.staging_len == 0 {
                 if self.reader_eof {
                     // Flush any bits still buffered inside the decoder.
-                    let status = self.drive_once(&mut out_scratch)?;
+                    let status = self.drive_once()?;
                     if matches!(status, DecompressStatus::Done) {
                         self.finished = true;
                     } else if self.output_buf.is_empty() {
@@ -940,7 +961,7 @@ impl<R: std::io::Read> LzhStreamDecoder<R> {
                 }
             }
 
-            let status = self.drive_once(&mut out_scratch)?;
+            let status = self.drive_once()?;
 
             match status {
                 DecompressStatus::Done => {

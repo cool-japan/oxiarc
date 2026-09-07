@@ -125,7 +125,7 @@ impl Deflater {
     ///
     /// let pool = DeflatePool::new();
     /// let mut d = Deflater::new(6).with_pool(&pool);
-    /// let out = d.compress_to_vec(b"hello").unwrap();
+    /// let out = d.compress_to_vec(b"hello").expect("deflate");
     /// // buffers returned to pool when `d` is dropped
     /// drop(d);
     /// assert!(pool.stats().window_hits == 0); // first call always allocates

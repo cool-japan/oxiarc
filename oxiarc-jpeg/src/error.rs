@@ -170,6 +170,20 @@ pub enum JpegError {
         mcu: u64,
     },
 
+    /// An arithmetic-coded scan produced a decision sequence T.81 does not
+    /// define: a magnitude beyond `2^15` or a spectral index past `Se`.
+    ///
+    /// Unlike a Huffman scan, a *truncated* arithmetic scan does not
+    /// necessarily reach this error: T.81 D.2.6 lets the decoder read zeros
+    /// past the last coded byte, so short data usually decodes to noise. Only
+    /// an impossible decision sequence, or a scan that ended before its last
+    /// unit, is reported here.
+    #[error("invalid arithmetic code in scan at MCU {mcu}")]
+    InvalidArithmeticCode {
+        /// Index of the MCU (or sample, for lossless) being decoded.
+        mcu: u64,
+    },
+
     /// A scan referenced a table slot that no segment ever defined.
     #[error("reference to undefined {kind} table {index}")]
     UndefinedTable {
@@ -213,6 +227,16 @@ pub enum JpegError {
     PrecisionMismatch {
         /// The frame's sample precision `P`.
         precision: u8,
+    },
+
+    /// The encoder was asked for something it cannot express in a JPEG
+    /// datastream, or for a combination of options that contradict each other.
+    #[error("invalid encoder setting {parameter}: {reason}")]
+    InvalidEncodeParameter {
+        /// Which setting is at fault, e.g. `"precision"`.
+        parameter: &'static str,
+        /// Why it was rejected.
+        reason: &'static str,
     },
 }
 
@@ -258,7 +282,7 @@ impl From<JpegError> for OxiArcError {
             } => OxiArcError::InvalidHeader {
                 message: format!("malformed JPEG {segment} segment at {offset}: {reason}"),
             },
-            JpegError::InvalidHuffmanCode { mcu } => {
+            JpegError::InvalidHuffmanCode { mcu } | JpegError::InvalidArithmeticCode { mcu } => {
                 OxiArcError::InvalidHuffmanCode { bit_position: mcu }
             }
             JpegError::UndefinedTable { kind, index } => OxiArcError::InvalidHeader {
@@ -285,6 +309,9 @@ impl From<JpegError> for OxiArcError {
             },
             JpegError::PrecisionMismatch { precision } => OxiArcError::InvalidHeader {
                 message: format!("JPEG frame has {precision}-bit samples"),
+            },
+            JpegError::InvalidEncodeParameter { parameter, reason } => OxiArcError::InvalidHeader {
+                message: format!("invalid JPEG encoder setting {parameter}: {reason}"),
             },
         }
     }

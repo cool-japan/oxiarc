@@ -53,6 +53,15 @@ impl Coefficients {
         Ok(Self { planes, strides })
     }
 
+    /// One block of component `index`, or `None` when the coordinates fall
+    /// outside the padded grid (which happens for the trailing blocks of a
+    /// non-interleaved scan and is not an error).
+    #[cfg(feature = "arithmetic")]
+    pub(crate) fn block_mut(&mut self, index: usize, bcol: u32, brow: u32) -> Option<&mut [i32]> {
+        let offset = self.block_offset(index, bcol, brow)?;
+        Some(&mut self.planes[index][offset..offset + 64])
+    }
+
     /// Offset of one block inside component `index`'s buffer.
     fn block_offset(&self, index: usize, bcol: u32, brow: u32) -> Option<usize> {
         let stride = self.strides[index];

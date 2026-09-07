@@ -76,8 +76,14 @@
       memory traffic of maintaining a real 4 MiB ring plus the copy out to the
       caller, where the one-shot decoder uses its output `Vec` as the window and
       touches each byte once. Re-running the same payload at `lgwin = 10` (a
-      cache-resident ring) restores ≈1.0x. Numbers and method in the README's
-      Performance section; harness in `examples/decode_profile.rs`.
+      cache-resident ring) recovers part of the gap — 0.67x -> 0.80x, not all of
+      it. Numbers and method in the README's Performance section; harness in
+      `examples/decode_profile.rs`. Two candidate fixes were measured and
+      rejected in 2026-09 verification: an inline word-at-a-time replacement for
+      the short `copy_from_slice`/`copy_within` runs (0-10% *slower* on every
+      payload shape) and allocating-and-copying instead of `Vec::resize` when
+      the ring grows (no change beyond noise). The remaining cost is the ring's
+      memory traffic itself.
 - [ ] SIMD-accelerated matching
 - [ ] Multi-threaded compression
 - [x] Memory pool for per-encode allocations (`BrotliPool`)
@@ -147,21 +153,27 @@
 
 ## Test Coverage
 
-- Unit tests (lib): 159 — tables/context/dictionary CRC-checked against the
+- Unit tests (lib): 160 — tables/context/dictionary CRC-checked against the
   RFC's own check values; huffman descriptor write/read round-trips;
   decoder primitives (WBITS tree, NBLTYPES VLC, distance ring semantics);
   sliding-window ring checked byte-for-byte against a growing-`Vec` reference
   for every small distance, across the wrap, and through short output slices
 - reference_vectors: 11 (embedded reference-brotli fixtures; always run)
-- stream_conformance: 21 — chunk invariance (1-byte in and out), prime chunk
+- stream_conformance: 26 — chunk invariance (1-byte in and out), prime chunk
   sizes, `MetaBlockShape` differential vs `decompress_reporting_shapes`,
   truncation at every offset, cap exactness and chunk-independence,
   window-ceiling refusal, bit-flip agreement with the one-shot decoder,
+  hand-built metadata meta-blocks, streams larger than the internal carry,
   fault latch, reset isolation
+- stream_adversarial: 10 — declared lengths that never arrive (metadata
+  `MSKIPLEN`, uncompressed `MLEN`), carry saturation under `Finish`, multi-byte
+  corruption differential vs the one-shot decoder, the bulk literal path,
+  degenerate window/output ceilings, idle-after-`StreamEnd`
 - stream_proptest: 4 (random split schedules vs the one-shot oracle, shape
   preservation, arbitrary bytes, arbitrary truncations)
-- stream_adapters: 10 (`Interrupted` retry, `WouldBlock` propagation, output
-  before EOF, truncated source, caps through the adapter)
+- stream_adapters: 11 (`Interrupted` retry, `WouldBlock` propagation, output
+  before EOF, truncated source, caps through the adapter, a >2 MiB compressed
+  stream through the staging buffer)
 - brotli_oracle: 15 (differential sweeps vs the `brotli` CLI, including an
   incremental-decode leg asserting byte- *and* shape-identity, and rejection of
   every prefix of every reference stream; feature-gated, self-skipping)
@@ -169,8 +181,8 @@
   window-bounded peak of the push decoder and the `Read` adapter)
 - corruption_robustness: 4, interop_vectors: 19, high_entropy_roundtrip: 8,
   encoder_bugs: 7, pool: 8, progress_cancel: 10, proptest: 2, async: 16,
-  doctests: 13
-- Total: 316 tests passing (with `--all-features`)
+  doctests: 16
+- Total: 318 tests + 16 doctests passing (with `--all-features`)
 
 ## Code Statistics
 

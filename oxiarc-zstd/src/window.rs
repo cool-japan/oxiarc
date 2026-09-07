@@ -20,7 +20,10 @@
 //! * **Capacity grows lazily.** A frame may declare a 128 MiB window and then
 //!   produce 100 bytes; the ring starts at the frame's maximum block size and
 //!   doubles only when history is about to be evicted, so the allocation is
-//!   bounded by `min(declared window, dictionary + bytes actually produced)`.
+//!   bounded by `min(declared window, max(Block_Maximum_Decompressed_Size,
+//!   dictionary + bytes actually produced))`. The block-maximum floor is
+//!   inherent — a whole block has to fit before the caller drains it — so a
+//!   frame that declares no `Frame_Content_Size` still starts at one block.
 
 use oxiarc_core::error::{OxiArcError, Result};
 
@@ -77,6 +80,29 @@ impl ZstdWindow {
     /// Number of produced bytes not yet drained by the caller.
     pub(crate) fn pending(&self) -> usize {
         self.pending
+    }
+
+    /// Refuse to produce `more` bytes when they would not fit alongside the
+    /// undrained ones.
+    ///
+    /// The decoder's contract is that a whole block fits: [`Self::begin_frame`]
+    /// allocates at least `Block_Maximum_Decompressed_Size` and the caller
+    /// drains the ring empty before the next block is decoded. If that ever
+    /// stopped holding, the ring would overwrite bytes the caller has not seen
+    /// — silent truncation. This turns the broken invariant into a loud error
+    /// instead, in release builds as well as under `debug_assert`.
+    fn reserve_pending(&self, more: usize) -> Result<()> {
+        let total = self.pending.saturating_add(more);
+        if total > self.buf.len() {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "zstd block would write {total} undrained bytes into a {}-byte window",
+                    self.buf.len()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Clear all state but keep the allocation.
@@ -219,8 +245,9 @@ impl ZstdWindow {
             return Ok(());
         }
         self.grow_for(data.len())?;
+        self.reserve_pending(data.len())?;
         self.write_raw(data);
-        self.pending = (self.pending + data.len()).min(self.buf.len());
+        self.pending += data.len();
         Ok(())
     }
 
@@ -230,6 +257,7 @@ impl ZstdWindow {
             return Ok(());
         }
         self.grow_for(len)?;
+        self.reserve_pending(len)?;
         let cap = self.buf.len();
         let mut written = 0usize;
         while written < len {
@@ -239,7 +267,7 @@ impl ZstdWindow {
             written += run;
         }
         self.filled = (self.filled + len).min(cap);
-        self.pending = (self.pending + len).min(cap);
+        self.pending += len;
         Ok(())
     }
 
@@ -258,6 +286,7 @@ impl ZstdWindow {
             return Err(OxiArcError::invalid_distance(offset, reach));
         }
         self.grow_for(len)?;
+        self.reserve_pending(len)?;
         let cap = self.buf.len();
         let mut written = 0usize;
         while written < len {
@@ -273,7 +302,7 @@ impl ZstdWindow {
             self.filled = (self.filled + run).min(cap);
             written += run;
         }
-        self.pending = (self.pending + len).min(cap);
+        self.pending += len;
         Ok(())
     }
 
@@ -400,8 +429,12 @@ mod tests {
         assert!(w.copy_match(9, 1).is_err());
 
         // Same boundary after the ring has wrapped an odd number of bytes.
+        // The wrap is produced the way the decoder produces it — one drained
+        // batch at a time — because undrained output may never exceed the ring.
         let mut w = window(8);
-        w.push(b"0123456789ab").expect("push");
+        w.push(b"01234567").expect("push");
+        let _ = drained(&mut w);
+        w.push(b"89ab").expect("push");
         let _ = drained(&mut w);
         assert_eq!(w.history_len(), 8);
         w.copy_match(8, 3).expect("copy");
@@ -494,6 +527,51 @@ mod tests {
         assert_eq!(drained(&mut w), b"TAIL");
     }
 
+    /// The dictionary re-seeds at **every** frame, including one whose window
+    /// is smaller than the dictionary, and including a frame that follows a
+    /// larger-windowed one in a concatenated stream.
+    ///
+    /// `begin_frame` never shrinks an existing allocation, so the second frame
+    /// runs with a physically larger `buf` than its own `cap_limit`. The reach
+    /// cap is what keeps it honest: history the frame is not entitled to must
+    /// stay unreachable even though the bytes are still in the ring.
+    #[test]
+    fn dictionary_reseeds_every_frame_and_reach_follows_the_frame() {
+        let mut dict = vec![1u8; 4096];
+        dict.extend_from_slice(b"TAIL");
+
+        let mut w = ZstdWindow::new();
+        // Frame 1: a large window, so the whole dictionary is addressable.
+        w.begin_frame(8192, 8192).expect("begin");
+        w.seed_dictionary(&dict).expect("seed");
+        assert_eq!(w.history_len(), 4100);
+        w.copy_match(4, 4).expect("copy");
+        assert_eq!(drained(&mut w), b"TAIL");
+
+        // Frame 2: a 1 KiB window. The allocation is kept (8192 bytes) but the
+        // frame may only reach 1 KiB back, and the dictionary is re-seeded
+        // truncated to that reach.
+        w.begin_frame(1024, 1024).expect("begin");
+        assert_eq!(w.capacity(), 8192, "the allocation is reused, not shrunk");
+        w.seed_dictionary(&dict).expect("seed");
+        assert_eq!(w.pending(), 0, "dictionary bytes are history, not output");
+        w.copy_match(4, 4).expect("copy");
+        assert_eq!(drained(&mut w), b"TAIL");
+        // Exactly at the frame's own window: allowed. One byte more: refused,
+        // even though the byte is physically still in the ring from frame 1.
+        w.copy_match(1024, 1).expect("copy at the frame window");
+        let _ = drained(&mut w);
+        assert!(
+            w.copy_match(1025, 1).is_err(),
+            "a frame must not reach past its own Window_Size"
+        );
+
+        // Frame 3 with no dictionary at all: the previous frames' history is
+        // gone even though the buffer still physically holds it.
+        w.begin_frame(1024, 1024).expect("begin");
+        assert!(w.copy_match(1, 1).is_err());
+    }
+
     #[test]
     fn capacity_grows_lazily_not_to_declared_window() {
         // Declared reach of 64 MiB with a 4-byte initial hint.
@@ -571,21 +649,55 @@ mod tests {
     }
 
     #[test]
-    fn long_overlapping_match_beyond_capacity() {
-        // A match longer than the ring: LZ77 semantics still hold for the
-        // bytes that remain addressable.
-        let mut w = window(256);
+    fn long_overlapping_match_larger_than_the_history() {
+        // A match far longer than the history it reads from, but still inside
+        // the ring: LZ77 semantics hold for every byte.
+        let mut w = window(512);
         w.push(b"xy").expect("push");
         let _ = drained(&mut w);
         w.copy_match(2, 300).expect("copy");
         let out = drained(&mut w);
-        // Logical output is "xy" + 300 alternating bytes = 302 bytes; the ring
-        // keeps the last 256, i.e. logical positions 46..302, and position 46
-        // is even, so the drained suffix starts with 'x'.
-        assert_eq!(out.len(), 256);
-        let expected: Vec<u8> = (0..256)
+        assert_eq!(out.len(), 300);
+        let expected: Vec<u8> = (0..300)
             .map(|i| if i % 2 == 0 { b'x' } else { b'y' })
             .collect();
         assert_eq!(out, expected);
+    }
+
+    /// Producing more than the ring can hold before the caller drains it is an
+    /// **error**, never a silent overwrite of bytes the caller has not seen.
+    ///
+    /// The decoder's own contract keeps this unreachable — `begin_frame`
+    /// allocates at least `Block_Maximum_Decompressed_Size` and every block is
+    /// drained before the next one is decoded — but the ring must not
+    /// quietly clamp if that ever stops holding, because the clamped bytes are
+    /// output the caller never receives.
+    #[test]
+    fn undrained_output_larger_than_the_ring_is_refused() {
+        let mut w = window(64);
+        let err = w.copy_match(1, 1).expect_err("no history yet");
+        assert!(err.to_string().contains("distance"), "{err}");
+
+        let mut w = window(64);
+        w.push(&[b'a'; 64]).expect("push");
+        // 64 undrained bytes already; one more must not evict them.
+        let err = w.push(b"z").expect_err("must refuse");
+        assert!(err.to_string().contains("undrained"), "{err}");
+        assert_eq!(w.pending(), 64);
+
+        let mut w = window(64);
+        w.push(b"ab").expect("push");
+        let _ = drained(&mut w);
+        let err = w.copy_match(2, 300).expect_err("must refuse");
+        assert!(err.to_string().contains("undrained"), "{err}");
+
+        let mut w = window(64);
+        let err = w.push_repeat(b'q', 65).expect_err("must refuse");
+        assert!(err.to_string().contains("undrained"), "{err}");
+
+        // Raw literal batches larger than the ring are refused the same way.
+        let mut w = window(64);
+        let err = w.push(&[b'k'; 65]).expect_err("must refuse");
+        assert!(err.to_string().contains("undrained"), "{err}");
     }
 }

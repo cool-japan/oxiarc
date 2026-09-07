@@ -178,3 +178,39 @@ fn over_declared_uncompressed_size_is_not_allocated() {
         "an over-declared size must never look finished"
     );
 }
+
+/// `Decompressor::decompress_all` must not hand a truncated LZH stream back
+/// as a successful short decode. Before 0.4.2 the driver simply stopped when
+/// its input ran out while the decoder still reported `NeedsInput`, so a
+/// stream cut to a quarter of its length came back as `Ok` with a fraction of
+/// the bytes and no error at all — silent truncation through a public
+/// convenience method.
+#[test]
+fn decompress_all_rejects_a_truncated_stream() {
+    use oxiarc_core::traits::Decompressor;
+
+    let original: Vec<u8> = (0..40_000u32).map(|i| ((i * 7) % 251) as u8).collect();
+    let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+    let compressed = encoder.compress_to_vec(&original).expect("encode failed");
+
+    for cut in [
+        1,
+        compressed.len() / 4,
+        compressed.len() / 2,
+        compressed.len() - 1,
+    ] {
+        let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh5, original.len() as u64);
+        let result = Decompressor::decompress_all(&mut decoder, &compressed[..cut]);
+        assert!(
+            result.is_err(),
+            "cut {cut}: a truncated stream must be an error, got Ok with {:?} bytes",
+            result.map(|v| v.len())
+        );
+    }
+
+    // The complete stream must still decode cleanly through the same path.
+    let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh5, original.len() as u64);
+    let decoded =
+        Decompressor::decompress_all(&mut decoder, &compressed).expect("full stream must decode");
+    assert_eq!(decoded, original);
+}

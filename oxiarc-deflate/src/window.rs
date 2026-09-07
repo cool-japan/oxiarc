@@ -27,9 +27,12 @@ const WINDOW: usize = 32768;
 
 /// Destination for decoded DEFLATE symbols.
 ///
-/// Implemented by [`InflateWindow`] (growable `Vec` output) and
-/// [`SliceSink`] (fixed caller-supplied buffer) so the block decoder — and
-/// in particular its inner symbol loop — exists exactly once.
+/// Implemented by [`InflateWindow`] (growable `Vec` output) so the block
+/// decoder — and in particular its inner symbol loop — exists exactly once.
+/// A second, fixed-slice implementation (`SliceSink`) is retained for the
+/// tests below as an independent reference for the copy semantics; the
+/// production fixed-buffer path is `sink::BoundedSink`, which the resumable
+/// core drives.
 pub(crate) trait DecodeSink {
     /// Append one literal byte.
     fn write_literal(&mut self, byte: u8) -> Result<()>;
@@ -45,12 +48,18 @@ pub(crate) trait DecodeSink {
 /// `dst`. A stream that decodes to more than `dst.len()` bytes, or a
 /// back-reference that reaches behind the start of `dst`, is rejected with
 /// an error — never a panic, never a silent truncation.
+///
+/// Test-only since 0.4.2: `inflate_into` now decodes through
+/// `sink::BoundedSink` on the resumable core, and this type stays as the
+/// independent oracle the window tests compare against.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SliceSink<'a> {
     dst: &'a mut [u8],
     pos: usize,
 }
 
+#[cfg(test)]
 impl<'a> SliceSink<'a> {
     /// Wrap a destination buffer.
     pub(crate) fn new(dst: &'a mut [u8]) -> Self {
@@ -68,6 +77,7 @@ impl<'a> SliceSink<'a> {
     }
 }
 
+#[cfg(test)]
 impl DecodeSink for SliceSink<'_> {
     #[inline(always)]
     fn write_literal(&mut self, byte: u8) -> Result<()> {

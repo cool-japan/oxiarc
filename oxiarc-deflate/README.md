@@ -7,7 +7,11 @@ Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-08-06) — 293 tests passing.
+**Version 0.4.2** (2026-09-07) — 422 tests passing (381 via `cargo nextest run --all-features` + 41 doctests).
+
+**What's new in 0.4.2**: **Resumable inflate, and every decode path re-based on it.** New `InflateStream` (raw DEFLATE) and `WrappedInflate` (gzip/zlib/raw/auto framing) are push decoders: an arbitrary byte split of the same stream yields byte-identical output, because a half-parsed Huffman header, a partially consumed byte and a half-copied match all survive across calls. New `InflateReader<R: Read>` and `AsyncInflateReader<R: AsyncRead>` (feature `async-io`) drive them from any source, with a mandatory 64 KiB output staging buffer, `Interrupted` retry, `WouldBlock` propagated (never turned into a bogus end-of-stream), and truncation reported as an `io::Error` rather than a short read.
+
+`GzipStreamDecoder` and `ZlibStreamDecoder` no longer call `read_to_end`: they serve the first byte without reading the whole stream, and peak memory drops from `O(compressed + decompressed)` to a fixed 64 KiB in + 64 KiB out + 32 KiB history. `ZlibStreamDecoder::with_max_output` is now enforced *during* decoding — inside a single DEFLATE block, so a one-block bomb is stopped at the limit instead of after full expansion — and `decompressed_size()` now means "produced so far". `Decompressor for Inflater` is genuinely incremental with a **sticky fault latch**: a second call after a mid-stream EOF returns the error instead of `Ok((0, n, Done))` with silently truncated output. `RawInflateReader` (RFC 4978) delivers bytes as they decode instead of materialising a whole sync-flush unit, and the async `AsyncDecompressor` path is a bounded pump instead of buffering both the compressed and the decompressed stream. `gzip_decompress` now verifies the `FHCRC` header checksum when present (previously skipped). Decode throughput went **up**: `inflate()` is 12-30 % faster than before on text/random/repetitive/zeros. New `examples/http_body_inflate.rs` shows an HTTP body decoded from a chunked, occasionally-`WouldBlock` source.
 
 **What's new in 0.4.0**: DEFLATE/zlib decoder performance rewrite — no wire-format change, no public API removed. New `inflate_into(src, dst) -> Result<usize>` decompresses a raw DEFLATE stream directly into a caller-supplied buffer with no intermediate `Vec` and no output-size guessing (`BufferTooSmall` if the stream would overflow `dst`, never silently truncated; `InvalidDistance` if a back-reference reaches before the start of `dst` — use `Inflater::with_dictionary` when history before `dst` is needed instead). `zlib::zlib_decompress_into` is the zlib-wrapper equivalent — validates the header, decodes via `inflate_into`, and verifies the trailing Adler-32. New `Inflater::with_output_capacity(size_hint)` pre-sizes the output buffer from a size hint (clamped to the new `MAX_OUTPUT_CAPACITY_HINT` = 64 MiB, since the hint is untrusted); GZIP decoding now seeds this automatically from the trailing ISIZE field. Internally (no API change): `HuffmanTree` now decodes through a two-level root+sub-table (root widened from a 9-bit to a 10-bit table, zlib/libdeflate style); the LZ77 history is now the output buffer itself (`InflateWindow`, via `Vec::extend_from_within`) rather than a separate ring buffer that wrote every decoded byte twice; `Adler32::update` now folds 32-byte groups through a closed-form reduction instead of one add-pair per byte so the compiler can auto-vectorize it. These decoders build on `oxiarc-core`'s new buffered `BitReader`/`BitCache`. New differential test suite `tests/inflate_differential.rs` proves the buffered fast path, the exact-mode path, and `inflate_into`/`zlib_decompress_into` all agree byte-for-byte, including hostile/truncated/corrupted input, plus a new `fuzz_inflate_into` fuzz target.
 
@@ -41,6 +45,9 @@ This crate provides both compression and decompression with no external dependen
 - **Full RFC 1951 compliance** - All block types supported
 - **Compression levels 0-9** - From stored to maximum compression
 - **Streaming API** - Process data in chunks
+- **Resumable push decoding** - `InflateStream`/`WrappedInflate` accept an arbitrary byte split of the compressed stream
+- **Bounded-memory readers** - `InflateReader`/`AsyncInflateReader` decode gzip/zlib/raw from any `Read`/`AsyncRead` in constant memory
+- **Decompression-bomb limits** - `with_max_output` / `with_ratio_guard`, enforced inside a block, not merely between blocks
 - **One-shot API** - Convenient functions for simple cases
 - **Async I/O** - `async_deflate` module with Tokio-based async streaming (enable `async-io` feature)
 - **GZIP support** - `gzip` module for RFC 1952 GZIP format encoding/decoding
@@ -54,8 +61,8 @@ All features are implemented and tested. API is stable.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `default` | yes | DEFLATE compression/decompression, LZ77, Huffman, OptimalParser, LZ77 heuristics, DeflatePool |
-| `async-io` | no | Async streaming I/O via Tokio (enables `async_deflate` module) |
+| `default` | yes | DEFLATE compression/decompression, LZ77, Huffman, OptimalParser, LZ77 heuristics, DeflatePool, the resumable `InflateStream`/`WrappedInflate` core and `InflateReader` |
+| `async-io` | no | Async streaming I/O via Tokio (enables the `async_deflate`, `async_reader` and `raw_stream` modules: `AsyncInflateReader`, `RawDeflateWriter`/`RawInflateReader`) |
 | `parallel` | no | Multi-threaded GZIP compression via `gzip_compress_parallel` and `ParallelGzipEncoder` |
 
 ## Usage
@@ -94,6 +101,72 @@ let compressed = deflate(original, 6)?;  // Level 6 (default)
 let decompressed = inflate(&compressed)?;
 assert_eq!(&decompressed, original);
 ```
+
+## API Overview
+
+| Item | What it is |
+|------|------------|
+| `deflate(data, level)` / `inflate(data)` | One-shot raw DEFLATE (RFC 1951) |
+| `inflate_into(src, dst)` | Decode into a caller-supplied buffer; `BufferTooSmall`, never truncation |
+| `Deflater` / `Inflater` | Encoder / decoder objects (`Compressor` / `Decompressor` traits) |
+| `InflateStream` | Resumable raw-DEFLATE push decoder: `inflate(input, output, flush)` |
+| `WrappedInflate` | The same, plus gzip/zlib/auto framing, multi-member and trailing-byte policy |
+| `InflateReader<R: Read>` | Bounded-memory `Read` adapter over `WrappedInflate` |
+| `AsyncInflateReader<R: AsyncRead>` | The async twin (`async-io`) |
+| `GzipStreamDecoder` / `ZlibStreamDecoder` | Lenient legacy `Read` decoders (now incremental) |
+| `GzipStreamEncoder` / `ZlibStreamEncoder` | `Write` encoders with `sync_flush` / `full_flush` / `partial_flush` |
+| `gzip_compress` / `gzip_decompress` | One-shot GZIP (RFC 1952), multi-member on decode |
+| `zlib_compress` / `zlib_decompress` | One-shot zlib (RFC 1950); exact-slice input |
+| `RawDeflateWriter` / `RawInflateReader` | RFC 4978 IMAP `COMPRESS=DEFLATE` (`async-io`) |
+| `Lz77Encoder`, `HuffmanTree`, `OptimalParser`, `DeflatePool` | Building blocks |
+
+## Streaming Decode
+
+### `InflateReader` — a `Read` over a `Read`
+
+```rust
+use std::io::Read;
+use oxiarc_deflate::{InflateReader, InflateWrapper};
+
+// gzip / zlib / raw / auto-sniff are all the same type.
+let mut reader = InflateReader::new(response_body, InflateWrapper::Gzip)
+    .with_max_output(8 * 1024 * 1024)      // cap a decompression bomb
+    .with_ratio_guard(200.0, 64 * 1024);   // ... and its expansion ratio
+
+let mut plain = Vec::new();
+reader.read_to_end(&mut plain)?;
+println!("{} compressed bytes -> {} bytes", reader.total_in(), reader.total_out());
+```
+
+Peak memory is a fixed 64 KiB of compressed staging + 64 KiB of decoded
+staging + the 32 KiB LZ77 history, whatever the size of the stream. The
+inner reader's `Interrupted` is retried, its `WouldBlock` is propagated
+unchanged, and a source that stops mid-member is an `io::Error` rather than
+a short read. See `examples/http_body_inflate.rs`.
+
+### `InflateStream` / `WrappedInflate` — push decoding
+
+When the bytes arrive as chunks you do not control (a socket, a PNG `IDAT`
+chain, a TIFF strip), drive the core directly and pass the flush mode that
+says whether more input can still arrive:
+
+```rust
+use oxiarc_core::traits::FlushMode;
+use oxiarc_deflate::{InflateStatus, InflateStream};
+
+let mut stream = InflateStream::new();
+let mut out = [0u8; 4096];
+let progress = stream.inflate(chunk, &mut out, FlushMode::None)?;
+// progress.consumed / progress.produced / progress.status
+assert_ne!(progress.status, InflateStatus::StreamEnd);
+```
+
+| Consumer | `flush` |
+|----------|---------|
+| Whole compressed slice in hand (TIFF strip, APNG frame) | `Finish` |
+| Chunked source (HTTP body, PNG `IDAT` chain) | `None` until EOF, then `Finish` |
+| RFC 4978 peer (may send more at any time) | `None` always |
+| `Decompressor::decompress` (whole-remaining-input contract) | `Finish` |
 
 ## Compression Levels
 
@@ -227,6 +300,12 @@ let symbol = tree.decode(&mut bit_reader)?;
 | `parallel` | Multi-threaded GZIP/DEFLATE compression (requires `parallel` feature): `gzip_compress_parallel`, `compress_deflate_parallel`, `ParallelGzipEncoder` |
 | `pool` | `DeflatePool` and `PoolStats` for window/hash buffer reuse |
 | `async_deflate` | Async streaming compression/decompression (requires `async-io` feature) |
+| `stream` | `InflateStream`, `InflateProgress`, `InflateStatus` — the resumable raw-DEFLATE core |
+| `wrapper` | `WrappedInflate`, `InflateWrapper`, `TrailingPolicy`, `GzipHeaderInfo` |
+| `reader` | `InflateReader` — the bounded-memory `Read` adapter |
+| `async_reader` | `AsyncInflateReader` (requires `async-io` feature) |
+| `streaming` | `GzipStreamEncoder`/`Decoder`, `ZlibStreamEncoder`/`Decoder` |
+| `raw_stream` | RFC 4978 `RawDeflateWriter`/`RawInflateReader` (requires `async-io` feature) |
 
 ### GZIP API
 
@@ -359,6 +438,37 @@ Compression ratios on typical data (Calgary Corpus):
 | book1 | 768771 | ~300000 | ~61% |
 | paper1 | 53161 | ~18000 | ~66% |
 | progc | 39611 | ~13000 | ~67% |
+
+## Test Coverage
+
+422 tests (381 via `cargo nextest run -p oxiarc-deflate --all-features` + 41
+doctests), zero clippy warnings with `--all-features --all-targets` and with
+`--no-default-features`.
+
+| Suite | Covers |
+|-------|--------|
+| `tests/inflate_stream.rs` | Split invariance (byte-at-a-time input, 1-byte output, split at every offset, proptest schedules), all 16 gzip header-flag combinations, concatenated zlib with 1-3 byte accumulator residue, truncation at every offset with a bounded call count, `max_output` inside a single 812 KB -> 123 MiB block, CAB-style reset/`set_dictionary` cycles |
+| `tests/inflate_reader.rs` | `Interrupted` retry, `WouldBlock` propagation, truncation as `io::Error`, the zlib 1-5 byte trailing-fragment rule (with a negative control), raw padding-bit vs trailing-byte framing, 1/3/7/64 KiB read patterns, the legacy-vs-strict split, `Decompressor` sticky-fault two-call regression |
+| `tests/inflate_differential.rs` | Seven decode paths compared byte-for-byte over the whole corpus at four levels: `inflate`, exact-mode `BitReader`, `inflate_into`, `InflateStream` at three granularities, `inflate_to_vec`, `WrappedInflate`, `InflateReader` |
+| `tests/wrapper_regressions.rs` | The DEFLATE-01..05 wrapper defects, with CPython-produced gzip/zlib fixtures |
+| `tests/compliance.rs`, `tests/edge_cases.rs`, `tests/proptest_roundtrip.rs` | RFC 1951 block types, spec-inflater cross-checks, round-trip properties |
+| `tests/zlib_oracle.rs` (`zlib-oracle` feature) | Live differential tests against CPython `zlib`/`gzip` and the system `gzip` CLI, in both directions and through both `Read` adapters. Self-skips when the tools are absent |
+
+## Performance Notes
+
+Interleaved A/B, best-of-40 rounds, 200 KB payloads at level 6 (negative =
+faster than the previous implementation):
+
+| Corpus | `inflate()` | `inflate_into()` |
+|--------|-------------|------------------|
+| text | -12 % | +8 % |
+| random | -30 % | -0.4 % |
+| repetitive | -12 % | -38 % |
+| zeros | -27 % | ~0 % |
+
+`GzipStreamDecoder` at a 64 KiB caller buffer is within +-3 % of the
+one-shot `gzip_decompress`, while using bounded memory instead of holding
+both the compressed and the decompressed stream.
 
 ## References
 

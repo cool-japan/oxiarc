@@ -77,6 +77,35 @@ impl Read for Blocking<'_> {
     }
 }
 
+/// A [`Trickle`] that publishes how many bytes have actually left it, so a
+/// test can prove a refusal happened *before* the source was drained rather
+/// than after every byte had already been pulled across the wire.
+struct Counted<'a> {
+    inner: Trickle<'a>,
+    delivered: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl<'a> Counted<'a> {
+    fn new(data: &'a [u8], step: usize) -> (Self, std::rc::Rc<std::cell::Cell<usize>>) {
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(0));
+        (
+            Counted {
+                inner: Trickle::new(data, step),
+                delivered: std::rc::Rc::clone(&delivered),
+            },
+            delivered,
+        )
+    }
+}
+
+impl Read for Counted<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.delivered.set(self.delivered.get() + n);
+        Ok(n)
+    }
+}
+
 /// A reader that stops early, simulating a connection cut mid-body.
 struct Truncating<'a> {
     data: &'a [u8],
@@ -204,7 +233,7 @@ fn a_truncated_source_is_an_error() {
 fn max_output_is_enforced_without_draining_the_source() {
     let data = vec![0u8; 32 * 1024 * 1024];
     let compressed = compress(&data, 5).expect("compress");
-    let source = Trickle::new(&compressed, 512);
+    let (source, delivered) = Counted::new(&compressed, 512);
     let mut decompressor = BrotliDecompressor::new(source).with_max_output(1 << 20);
     let mut out = Vec::new();
     let err = decompressor
@@ -218,6 +247,14 @@ fn max_output_is_enforced_without_draining_the_source() {
         out.len() <= 1 << 20,
         "produced {} bytes past the 1 MiB budget",
         out.len()
+    );
+    // The point of a pre-decode cap: the refusal lands while most of the body
+    // is still on the wire. A decoder that read everything first would show
+    // `delivered == compressed.len()` here.
+    assert!(
+        delivered.get() < compressed.len(),
+        "the whole {}-byte body was pulled from the source before the refusal",
+        compressed.len()
     );
 }
 
@@ -290,4 +327,54 @@ fn one_byte_reads_work() {
         }
     }
     assert_eq!(out, data);
+}
+
+/// A compressed stream far larger than the decoder's internal carry, pulled
+/// through the adapter's 64 KiB staging buffer with tiny caller reads.
+///
+/// This is the adapter's own refill/compaction loop under load: hundreds of
+/// staging refills, each one compacting whatever the decoder did not take. A
+/// short `consumed` that the adapter forgot to carry forward, or a compaction
+/// that dropped a byte, shows up here as wrong bytes rather than as an error,
+/// which is why the comparison is against the full plaintext.
+#[test]
+fn a_stream_larger_than_the_carry_streams_through_the_read_adapter() {
+    // Hex-dump text: ~5.9 MB plain, ~2.9 MB compressed, i.e. past the 2 MiB
+    // carry cap and hundreds of staging refills.
+    let mut state = 0x2468_ACE0_1357_9BDFu64;
+    let mut noise = Vec::with_capacity(2 << 20);
+    for _ in 0..(2 << 20) {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        noise.push((state >> 33) as u8);
+    }
+    let mut data = Vec::new();
+    for (i, chunk) in noise.chunks(16).enumerate() {
+        data.extend_from_slice(format!("line {i}: ").as_bytes());
+        for byte in chunk {
+            data.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        data.push(b'\n');
+    }
+    let compressed = compress(&data, 5).expect("compress");
+    assert!(
+        compressed.len() > 2 * 1024 * 1024,
+        "fixture must exceed the carry cap: {} bytes",
+        compressed.len()
+    );
+
+    // The source dribbles 1 KiB at a time and the caller reads 100 bytes at a
+    // time, so neither side ever lines up with the staging buffer.
+    let mut decompressor = BrotliDecompressor::new(Trickle::new(&compressed, 1024));
+    let mut out = Vec::with_capacity(data.len());
+    let mut buf = [0u8; 100];
+    loop {
+        match decompressor.read(&mut buf).expect("read") {
+            0 => break,
+            n => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    assert_eq!(out.len(), data.len(), "body length differs");
+    assert!(out == data, "body bytes differ");
 }

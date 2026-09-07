@@ -22,10 +22,10 @@
 //!
 //! // Compress data
 //! let original = b"Hello, World! Hello, World!";
-//! let compressed = deflate(original, 6).unwrap();
+//! let compressed = deflate(original, 6).expect("deflate");
 //!
 //! // Decompress data
-//! let decompressed = inflate(&compressed).unwrap();
+//! let decompressed = inflate(&compressed).expect("inflate");
 //! assert_eq!(&decompressed, original);
 //! ```
 //!
@@ -62,6 +62,7 @@ pub(crate) mod inflate_core;
 pub mod lz77;
 pub mod optimal;
 pub mod pool;
+pub mod reader;
 pub(crate) mod sink;
 pub mod stream;
 pub mod streaming;
@@ -74,10 +75,16 @@ pub mod zlib;
 pub mod async_deflate;
 
 #[cfg(feature = "async-io")]
+pub mod async_reader;
+
+#[cfg(feature = "async-io")]
 pub mod raw_stream;
 
 #[cfg(feature = "parallel")]
 pub mod parallel;
+
+#[cfg(feature = "async-io")]
+pub use async_reader::AsyncInflateReader;
 
 #[cfg(feature = "async-io")]
 pub use raw_stream::{RawDeflateWriter, RawInflateReader};
@@ -96,6 +103,7 @@ pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};
 pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
 pub use optimal::OptimalParser;
 pub use pool::{DeflatePool, PoolStats};
+pub use reader::InflateReader;
 pub use stream::{InflateProgress, InflateStatus, InflateStream};
 pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
 pub use wrapper::{GzipHeaderInfo, InflateWrapper, TrailingPolicy, WrappedInflate};

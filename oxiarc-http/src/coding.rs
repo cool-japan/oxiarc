@@ -40,7 +40,9 @@ pub enum ContentCoding {
     /// `deflate` (RFC 9110 §8.4.1.2) — an RFC 1950 zlib wrapper around an
     /// RFC 1951 DEFLATE stream. RFC 9110 itself sanctions accepting a raw
     /// (unwrapped) DEFLATE stream too, since some servers send that under
-    /// this name; that sniffing logic lives in the decoder wave.
+    /// this name. [`Decoder`](crate::Decoder) sniffs for a zlib header and
+    /// falls back to raw DEFLATE (and accepts a gzip stream mislabelled
+    /// `deflate`, which browsers do too).
     Deflate,
     /// `gzip` / `x-gzip` (RFC 9110 §8.4.1.3) — RFC 1952.
     Gzip,
@@ -64,6 +66,14 @@ pub enum ContentCoding {
     Dcz,
     /// Any other token, preserved verbatim (lowercased) for round-tripping
     /// and for matching a server's own custom/experimental coding.
+    ///
+    /// **Build it with [`parse`](Self::parse), not by hand.** Content
+    /// codings are case-insensitive (RFC 9110 §8.4.1), and this crate
+    /// normalizes that by holding the token already lowercased; equality —
+    /// and therefore [`negotiate`]'s matching of an `available` entry
+    /// against a client's token — is a plain string comparison. A
+    /// hand-written `Unknown("X-Custom".to_string())` will never match the
+    /// `Unknown("x-custom")` a parsed header yields.
     ///
     /// [`is_decodable`](Self::is_decodable) and
     /// [`is_encodable`](Self::is_encodable) are always `false`. Ranked most
@@ -150,6 +160,21 @@ impl ContentCoding {
     /// [`Dcb`](Self::Dcb) are `false` unconditionally (see their doc
     /// comments) even when their Cargo features are enabled. [`Identity`]
     /// is always `true`.
+    ///
+    /// # What this predicate is for
+    ///
+    /// It answers "will this build's [`Decoder`](crate::Decoder) handle
+    /// this coding?" — the question a client building an `Accept-Encoding`
+    /// header must answer at request time, and the one
+    /// [`AcceptEncoding`](crate::AcceptEncoding) uses it for.
+    /// [`Decoder::new`](crate::Decoder::new) refuses exactly the codings
+    /// this reports `false` for, with
+    /// [`HttpCodingError::UnsupportedCoding`](crate::HttpCodingError::UnsupportedCoding).
+    ///
+    /// One caveat: [`Dcz`](Self::Dcz) is decodable only *with* a caller-
+    /// supplied dictionary, so it reports `true` whenever the `zstd`
+    /// feature is on, while `Decoder::new` still directs you to
+    /// [`Decoder::with_dictionary`](crate::Decoder::with_dictionary).
     ///
     /// [`Identity`]: Self::Identity
     pub const fn is_decodable(&self) -> bool {

@@ -175,7 +175,7 @@ proptest! {
         let mut spec = ImageSpec::new(width, height, colour)
             .with_sample_format(format)
             .with_predictor(predictor)
-            .with_layout(Layout::Strips { rows_per_strip: height.min(4).max(1) });
+            .with_layout(Layout::Strips { rows_per_strip: height.clamp(1, 4) });
         if planar {
             spec = spec.with_planar(PlanarConfiguration::Planar);
         }
@@ -241,5 +241,145 @@ proptest! {
             let _ = decoder.read_image();
             let _ = decoder.all_tags();
         }
+    }
+}
+
+/// The lossless codecs, chosen by index so the strategy stays a plain `usize`.
+fn lossless_codec(index: usize, level: u8) -> Option<Compression> {
+    Some(match index {
+        0 => Compression::None,
+        1 => Compression::PackBits,
+        2 => Compression::Lzw,
+        3 => Compression::Deflate { level: level % 10 },
+        4 if cfg!(feature = "zstd") => Compression::Zstd {
+            level: i32::from(level % 19) + 1,
+        },
+        5 if cfg!(feature = "lzma") => Compression::Lzma { preset: level % 10 },
+        _ => return None,
+    })
+}
+
+/// The fax codecs, which are defined for bilevel data only.
+fn fax_codec(index: usize) -> Compression {
+    match index {
+        0 => Compression::CcittRle,
+        1 => Compression::CcittGroup3 {
+            two_dimensional: false,
+            byte_align_eol: false,
+        },
+        2 => Compression::CcittGroup3 {
+            two_dimensional: true,
+            byte_align_eol: false,
+        },
+        3 => Compression::CcittGroup3 {
+            two_dimensional: true,
+            byte_align_eol: true,
+        },
+        _ => Compression::CcittGroup4,
+    }
+}
+
+proptest! {
+    // The codec properties are cheap and the search space is wide — the
+    // single-bit-row bug in the fax decoder needed a page whose last row was
+    // one `V0` code, which 96 cases did not reach — so these run more of them.
+    #![proptest_config(ProptestConfig {
+        cases: 384,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// Every lossless codec must be bit-exact over arbitrary geometry, depth,
+    /// byte order, layout and predictor.
+    #[test]
+    fn every_lossless_codec_round_trips_bit_exactly(
+        width in 1u32..=48,
+        height in 1u32..=48,
+        spp in 1usize..=4,
+        depth_index in 0usize..DEPTHS.len(),
+        codec_index in 0usize..6,
+        level in any::<u8>(),
+        rows_per_strip in 1u32..=48,
+        tiled in any::<bool>(),
+        predictor in any::<bool>(),
+        big_endian in any::<bool>(),
+        seed in any::<u64>(),
+    ) {
+        let Some(compression) = lossless_codec(codec_index, level) else {
+            return Ok(());
+        };
+        let bits = DEPTHS[depth_index];
+        let colour = ColorType::Multiband {
+            bit_depth: bits as u8,
+            num_samples: spp as u16,
+        };
+        let data = make_data((width * height) as usize * spp, bits, SampleFormat::Uint, seed);
+        let mut spec = ImageSpec::new(width, height, colour)
+            .with_compression(compression)
+            .with_layout(if tiled {
+                Layout::Tiles { width: 16, length: 16 }
+            } else {
+                Layout::Strips { rows_per_strip }
+            });
+        if predictor && bits % 8 == 0 {
+            spec = spec.with_predictor(oxiarc_tiff::Predictor::Horizontal);
+        }
+        prop_assume!(spec.validate().is_ok());
+
+        let mut buffer = Cursor::new(Vec::new());
+        let mut encoder = Encoder::new(&mut buffer)
+            .expect("encoder")
+            .with_endian(if big_endian { Endian::Big } else { Endian::Little });
+        encoder.write_image(&spec, &data).expect("write");
+        encoder.finish().expect("finish");
+
+        let mut decoder = Decoder::new(Cursor::new(buffer.into_inner())).expect("decoder");
+        prop_assert_eq!(decoder.dimensions().expect("dims"), (width, height));
+        let samples = decoder.read_image().expect("read");
+        prop_assert_eq!(samples.to_native_bytes(), data);
+    }
+
+    /// The fax codecs must be bit-exact for bilevel data of any width, which
+    /// is where the row padding and the changing-element engine meet.
+    #[test]
+    fn every_fax_codec_round_trips_bit_exactly(
+        width in 1u32..=200,
+        height in 1u32..=32,
+        codec_index in 0usize..5,
+        rows_per_strip in 1u32..=32,
+        photometric_is_black_zero in any::<bool>(),
+        lsb_first in any::<bool>(),
+        seed in any::<u64>(),
+    ) {
+        let compression = fax_codec(codec_index);
+        let mut state = seed | 1;
+        let data: Vec<u8> = (0..(width * height) as usize)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // Runs, not noise: fax codes exist for scanned documents.
+                u8::from((state >> 33) % 7 == 0)
+            })
+            .collect();
+        let mut spec = ImageSpec::new(width, height, ColorType::Gray(1))
+            .with_compression(compression)
+            .with_layout(Layout::Strips { rows_per_strip });
+        if photometric_is_black_zero {
+            spec = spec.with_photometric(oxiarc_tiff::PhotometricInterpretation::BlackIsZero);
+        } else {
+            spec = spec.with_photometric(oxiarc_tiff::PhotometricInterpretation::WhiteIsZero);
+        }
+        if lsb_first {
+            spec = spec.with_fill_order(FillOrder::Lsb2Msb);
+        }
+        prop_assume!(spec.validate().is_ok());
+
+        let mut buffer = Cursor::new(Vec::new());
+        let mut encoder = Encoder::new(&mut buffer).expect("encoder");
+        encoder.write_image(&spec, &data).expect("write");
+        encoder.finish().expect("finish");
+
+        let mut decoder = Decoder::new(Cursor::new(buffer.into_inner())).expect("decoder");
+        let samples = decoder.read_image().expect("read");
+        prop_assert_eq!(samples.to_native_bytes(), data);
     }
 }

@@ -50,6 +50,14 @@ pub enum HttpCodingError {
     /// The underlying `oxiarc-*` codec crate reported an error while
     /// encoding or decoding this coding's data (bad checksum, bad framing,
     /// an invalid parameter, or any other codec-level failure).
+    ///
+    /// Despite the name, this is not exclusively about *corrupt input*: a
+    /// codec that rejects an out-of-range encode parameter reports it here
+    /// too, because the distinction lives in the sibling crate's own error
+    /// type, which this variant deliberately boxes rather than mirrors. The
+    /// concrete case in this crate today is
+    /// [`EncodeOptions::brotli_quality`](crate::EncodeOptions::brotli_quality)
+    /// above 11 — see that field's docs for why it is not clamped.
     #[error("{coding} codec error: {source}")]
     Corrupt {
         /// The coding whose codec reported the error.
@@ -140,6 +148,19 @@ pub enum LimitKind {
         /// Codings counted so far (more than the limit).
         count: usize,
     },
+    /// A stream declared a sliding window larger than the decoder's
+    /// ceiling, and was refused **before** that window was allocated.
+    ///
+    /// Unlike every other variant here this is not driven by
+    /// [`DecodeLimits`](crate::DecodeLimits) — the ceiling is each codec's
+    /// own, chosen to match what an HTTP decoder is required to support
+    /// (8 MiB for `zstd`, 16 MiB for `br`, the largest an RFC 7932 `WBITS`
+    /// field can name). A `zstd --long` body is the realistic way to see
+    /// it: those declare 16-128 MiB.
+    Window {
+        /// The window size the stream declared, in bytes.
+        declared: u64,
+    },
 }
 
 impl fmt::Display for LimitKind {
@@ -154,6 +175,7 @@ impl fmt::Display for LimitKind {
                 )
             }
             Self::Codings { count } => write!(f, "chained coding count ({count})"),
+            Self::Window { declared } => write!(f, "declared window ({declared} bytes)"),
         }
     }
 }
@@ -191,6 +213,19 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("shrink-o-matic"));
         assert!(!msg.contains("rebuild"));
+    }
+
+    #[test]
+    fn window_limit_displays_the_declared_size() {
+        let err = HttpCodingError::LimitExceeded {
+            limit: (8 * 1024 * 1024) as f64,
+            kind: LimitKind::Window {
+                declared: 128 * 1024 * 1024,
+            },
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("declared window"));
+        assert!(msg.contains("134217728"));
     }
 
     #[test]

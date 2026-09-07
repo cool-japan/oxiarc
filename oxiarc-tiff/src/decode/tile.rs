@@ -75,6 +75,43 @@ pub fn tile_rows_for_rect(tile_length: u32, height: u32, rect: Rect) -> (u32, u3
     (top / tile_length, ((bottom - 1) / tile_length) + 1)
 }
 
+/// The chunk indices, in decode order, of every tile across every plane that
+/// intersects `rect`.
+///
+/// Factored out of [`decode_into`] so a parallel driver (the `rayon`
+/// feature) enumerates *exactly* the chunks the serial path would, in the
+/// same order -- there is only one place this list is computed.
+#[must_use]
+pub fn chunk_indices_for_rect(info: &ImageInfo, rect: Rect) -> Vec<u64> {
+    let ChunkGeometry::Tiles {
+        tile_width,
+        tile_length,
+        ..
+    } = &info.chunks
+    else {
+        return Vec::new();
+    };
+    let across = tiles_across(info.width, *tile_width);
+    let (col0, col1) = tile_cols_for_rect(*tile_width, info.width, rect);
+    let (row0, row1) = tile_rows_for_rect(*tile_length, info.height, rect);
+    let per_plane = info.chunks_per_plane();
+    let planes = u64::from(info.plane_count());
+    let available = info.chunks.offsets().len() as u64;
+
+    let mut indices = Vec::new();
+    for plane in 0..planes {
+        for row in row0..row1 {
+            for col in col0..col1 {
+                let index = plane * per_plane + tile_index(col, row, across);
+                if index < available {
+                    indices.push(index);
+                }
+            }
+        }
+    }
+    indices
+}
+
 /// Decodes every tile that intersects `rect` into `dst`.
 ///
 /// # Errors
@@ -92,41 +129,18 @@ pub fn decode_into<R: Read + Seek>(
     warnings: &mut Warnings,
     buffers: &mut ChunkBuffers,
 ) -> Result<()> {
-    let ChunkGeometry::Tiles {
-        tile_width,
-        tile_length,
-        ..
-    } = &info.chunks
-    else {
-        return Ok(());
-    };
-    let across = tiles_across(info.width, *tile_width);
-    let (col0, col1) = tile_cols_for_rect(*tile_width, info.width, rect);
-    let (row0, row1) = tile_rows_for_rect(*tile_length, info.height, rect);
-    let per_plane = info.chunks_per_plane();
-    let planes = u64::from(info.plane_count());
-    let available = info.chunks.offsets().len() as u64;
-
-    for plane in 0..planes {
-        for row in row0..row1 {
-            for col in col0..col1 {
-                let index = plane * per_plane + tile_index(col, row, across);
-                if index >= available {
-                    continue;
-                }
-                let shape = decode_chunk(
-                    reader, info, index, limits, leniency, budget, registry, warnings, buffers,
-                )?;
-                place_chunk_in_rect(
-                    buffers.native(),
-                    &shape,
-                    dst,
-                    rect,
-                    info.samples_per_pixel,
-                    info.planar,
-                )?;
-            }
-        }
+    for index in chunk_indices_for_rect(info, rect) {
+        let shape = decode_chunk(
+            reader, info, index, limits, leniency, budget, registry, warnings, buffers,
+        )?;
+        place_chunk_in_rect(
+            buffers.native(),
+            &shape,
+            dst,
+            rect,
+            info.samples_per_pixel,
+            info.planar,
+        )?;
     }
     Ok(())
 }

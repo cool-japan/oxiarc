@@ -57,9 +57,11 @@ assert_eq!(decompressed, original);
 
 ### Frame Format (High-Level)
 
-`Lz4Compressor`/`Lz4Decompressor` implement the bounded-memory streaming
-`Compressor`/`Decompressor` traits (true block-at-a-time streaming — see the
-"Progress and Cancellation" section below for per-block hooks). Their
+`Lz4Compressor`/`Lz4Decompressor` implement `oxiarc-core`'s `Compressor`/
+`Decompressor` traits with true block-at-a-time streaming (see "Memory budget
+builder" above: the `with_memory_budget` cap this pair shares is input-side
+only, not a bound on decompressed output — see the "Progress and
+Cancellation" section below for per-block hooks). Their
 `compress_all`/`decompress_all` convenience methods run a whole buffer
 through that same state machine in one call:
 

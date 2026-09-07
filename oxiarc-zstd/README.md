@@ -7,13 +7,13 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 286 tests passing (274 unit/integration + 12 doctests)**
+**Version: 0.4.2 (2026-09-07) | 309 tests passing (297 unit/integration + 12 doctests)**
 
 ## Overview
 
 Zstandard is a modern compression algorithm developed by Facebook (Meta), offering excellent compression ratios with fast decompression speeds. It's designed to replace older algorithms like DEFLATE and BZip2 in many applications. Version 0.3.6 hardened the frame decoder against malformed/hostile headers (bounded, `try_reserve`-based output allocation instead of trusting the untrusted `Frame_Content_Size` field outright) and made the FSE/Huffman entropy layer bit-exact with RFC 8878: the backward bitstream is read/written with the reference `BIT_*` semantics, so real `zstd`-produced frames decode byte-identically and every oxiarc-produced frame is accepted by the reference `zstd` CLI (verified continuously by the `zstd-oracle` differential test suite).
 
-**New in 0.4.2: bounded, truly incremental decoding.** [`ZstdStream`] is a resumable push decoder — feed it any number of compressed bytes, take back any number of decompressed bytes, one at a time if you like. It keeps a real sliding-window ring (never "the output `Vec` is the window"), enforces an output budget *before* decoding wherever the format declares a size, refuses frames that declare an oversized window before allocating one, and grows the window lazily to the bytes actually produced. `ZstdStreamDecoder<R>` and the new async adapters are thin shells over it, so neither reads the whole compressed input nor materialises the whole output.
+**New in 0.4.2: bounded, truly incremental decoding.** [`ZstdStream`] is a resumable push decoder — feed it any number of compressed bytes, take back any number of decompressed bytes, one at a time if you like. It keeps a real sliding-window ring (never "the output `Vec` is the window"), enforces an output budget *before* decoding wherever the format declares a size, refuses frames that declare an oversized window before allocating one, and grows the window lazily to `min(declared Window_Size, max(Block_Maximum_Decompressed_Size, bytes actually produced))` — the block-maximum floor (at most 128 KiB) is inherent, since one whole block has to fit before it is drained. `ZstdStreamDecoder<R>` and the new async adapters are thin shells over it, so neither reads the whole compressed input nor materialises the whole output.
 
 
 ## Features
@@ -24,7 +24,7 @@ Zstandard is a modern compression algorithm developed by Facebook (Meta), offeri
 - **Huffman literals on the encode path** - literal sections are Huffman-compressed when that wins (self-verified with Raw/RLE fallback)
 - **Custom block-optimal FSE sequence tables** - `FSE_Compressed_Mode` is emitted when it beats RLE and the predefined tables on total bit cost (reference-faithful `FSE_normalizeCount` / `FSE_writeNCount` ports)
 - **Parallel compression** - Multi-threaded block compression with Rayon (`parallel` feature)
-- **Dictionary support** - Raw-content dictionaries, interoperable with `zstd -D` in both directions
+- **Dictionary support** - Raw-content dictionaries, interoperable with `zstd -D` in both directions. Formatted dictionaries (RFC 8878 §5, `Magic_Number` `0xEC30A437`, what `zstd --train` writes) are **rejected with a named error** rather than mistaken for content, and a frame that names a `Dictionary_ID` is refused by `ZstdStream` when no dictionary is supplied — see [Dictionary Compression](#dictionary-compression)
 - **Checksum support** - XXH64 checksums for data integrity
 - **Bounded incremental decoding** - `ZstdStream` push decoder (`decode(input, output, flush)`, `finish()`, `reset()`), resumable at every input-dry point, with a real sliding-window ring, a sticky fault latch, `with_max_output` / `with_max_window` / `with_multi_frame` / `with_dictionary`, and `decompress_into` / `decompress_with_limit` / `decompress_multi_frame_with_limit` as bomb-safe one-shot helpers
 - **Streaming API** - `ZstdStreamEncoder<W>` (`Write`) and `ZstdStreamDecoder<R>` (`Read`, truly incremental: it serves the first byte without reading the whole input)
@@ -193,6 +193,29 @@ assert_eq!(decompressed, payload);
 See `examples/dictionary_compress.rs` for a complete, runnable version
 (`cargo run -p oxiarc-zstd --example dictionary_compress`).
 
+**Raw content dictionaries only.** RFC 8878 §5 defines two dictionary shapes:
+a *raw content* dictionary, whose bytes are used directly as the LZ77 history
+prefix, and a *formatted* dictionary, which starts with `Magic_Number`
+`0xEC30A437` and additionally carries a `Dictionary_ID`, one Huffman literals
+table, three FSE tables and three initial repeat offsets. This crate implements
+the raw content shape — `train_dictionary` produces one, and `zstd -D` accepts
+and produces frames against one in both directions.
+
+A formatted dictionary (what `zstd --train` writes) is **refused by name**
+(`Unsupported compression method: formatted Zstandard dictionary …`) by
+`ZstdStream::with_dictionary`, `ZstdStreamDecoder::with_dictionary`, the async
+adapters, `decompress_with_dict` and `decompress_multi_frame_with_dict`. It is
+deliberately not treated as content: frames built against such a dictionary
+reference its *entropy tables* through `Repeat_Mode`, so seeding the window
+with the dictionary's header and tables would hand back silently wrong bytes
+for exactly the frames that need it. Convert with
+`zstd --train ... --dictID=0` plus a raw extraction, or train with
+[`train_dictionary`], which emits raw content.
+
+Correspondingly, `ZstdStream` (and everything built on it) refuses a frame
+whose header names a non-zero `Dictionary_ID` when no dictionary is configured,
+instead of decoding it to wrong bytes; the reference decoder refuses too.
+
 ## Progress Reporting and Cancellation
 
 `ZstdEncoder`, `ZstdStreamEncoder`, and `ZstdStreamDecoder` all expose builder methods for observability and cooperative cancellation:
@@ -285,7 +308,16 @@ per-byte modulo loop.
 Steady-state allocations after warm-up are **zero** over `Raw`/`RLE` blocks, and
 for compressed blocks the allocation count is a function of the frame (a few
 entropy tables per block) and provably independent of how the caller chunks the
-input — pinned by `tests/alloc_budget.rs` with a counting global allocator.
+input — pinned by `tests/alloc_budget.rs` with a counting global allocator,
+which also pins that no attacker-controlled length field (a literals section's
+20-bit `Regenerated_Size`, a sequences section's `Number_of_Sequences`) can size
+a buffer beyond what one block can hold.
+
+`tests/mutation_differential.rs` closes the gap between "agrees with the
+one-shot decoder on valid frames" and "does not panic on invalid ones": it
+mutates real frames byte by byte and requires that **whenever the one-shot
+decoder still succeeds, the incremental decoder produces exactly the same
+bytes**, under chunk schedules down to one byte in and one byte out.
 
 Reproduce the full matrix, including the starved 1-byte-in / 1-byte-out
 schedules, with `cargo bench -p oxiarc-zstd --bench stream_bench` (criterion's

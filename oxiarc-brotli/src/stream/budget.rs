@@ -7,7 +7,7 @@
 //! a meta-block is decoded is an *exact* projection with no false positives
 //! and no part of a bomb's expansion ever produced.
 //!
-//! This mirrors [`crate::decompress`]'s one-shot budget so the two decoders
+//! This mirrors [`crate::decompress()`]'s one-shot budget so the two decoders
 //! reject the same streams with the same error variants.
 
 use crate::decompress::MAX_OUTPUT_SIZE;

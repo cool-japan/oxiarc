@@ -684,3 +684,214 @@ fn pillow_cross_check_within_one_lsb() {
     let _ = std::fs::remove_file(&jpeg_path);
     let _ = std::fs::remove_file(&raw_path);
 }
+
+/// Restart markers inside a *progressive* scan. `DRI` resets the DC
+/// predictors, the bit alignment and the EOB run at once, and a progressive
+/// frame exercises all three across ten scans rather than one.
+#[test]
+fn progressive_restart_intervals_are_byte_identical() {
+    if !oracle_ready() {
+        eprintln!("skipping: cjpeg/djpeg unavailable");
+        return;
+    }
+    let mut compared = 0;
+    for (name, source) in sources() {
+        for restart in ["1", "2"] {
+            for sampling in ["1x1", "2x2"] {
+                let Some(jpeg) = cjpeg(
+                    &[
+                        "-quality",
+                        "80",
+                        "-progressive",
+                        "-restart",
+                        restart,
+                        "-sample",
+                        sampling,
+                    ],
+                    &source,
+                ) else {
+                    continue;
+                };
+                let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+                let ours = decode_u8(&jpeg, Upsampling::Fancy);
+                assert_identical(
+                    &format!("{name} progressive restart {restart} {sampling}"),
+                    &ours,
+                    &reference,
+                );
+                compared += 1;
+            }
+        }
+    }
+    require_comparisons(compared, "progressive restart intervals");
+}
+
+/// Expansion factors that are neither 1 nor 2 fall through libjpeg's fancy
+/// kernels to `int_upsample`, its plain replicator. Both upsampling modes are
+/// checked because `-nosmooth` selects a different libjpeg path for the 2x
+/// cases and must not for these.
+#[test]
+fn odd_sampling_factors_are_byte_identical() {
+    if !oracle_ready() {
+        eprintln!("skipping: cjpeg/djpeg unavailable");
+        return;
+    }
+    let mut compared = 0;
+    for (name, source) in sources() {
+        for sampling in ["3x1", "1x3", "3x2", "2x3"] {
+            let Some(jpeg) = cjpeg(&["-quality", "80", "-sample", sampling], &source) else {
+                continue;
+            };
+            let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+            let ours = decode_u8(&jpeg, Upsampling::Fancy);
+            assert_identical(&format!("{name} sample {sampling}"), &ours, &reference);
+            let reference_box = djpeg(&["-dct", "int", "-nosmooth", "-pnm"], &jpeg).expect("djpeg");
+            let ours_box = decode_u8(&jpeg, Upsampling::Box);
+            assert_identical(
+                &format!("{name} sample {sampling} box"),
+                &ours_box,
+                &reference_box,
+            );
+            compared += 2;
+        }
+    }
+    require_comparisons(compared, "odd sampling factors");
+}
+
+/// `-sample H1xV1,H2xV2,H3xV3` gives Cb and Cr *different* sampling, so one
+/// image drives two different upsamplers at once — the case a per-frame
+/// "which kernel do we use" decision gets wrong.
+#[test]
+fn asymmetric_per_component_sampling_is_byte_identical() {
+    if !oracle_ready() {
+        eprintln!("skipping: cjpeg/djpeg unavailable");
+        return;
+    }
+    let mut compared = 0;
+    for (name, source) in sources() {
+        for sampling in [
+            "2x2,1x1,2x1",
+            "2x2,2x1,1x1",
+            "2x2,1x2,1x1",
+            "2x2,1x1,1x2",
+            "2x2,2x2,1x1",
+            "4x1,2x1,1x1",
+        ] {
+            let Some(jpeg) = cjpeg(&["-quality", "82", "-sample", sampling], &source) else {
+                continue;
+            };
+            let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+            let ours = decode_u8(&jpeg, Upsampling::Fancy);
+            assert_identical(&format!("{name} asymmetric {sampling}"), &ours, &reference);
+            let reference_box = djpeg(&["-dct", "int", "-nosmooth", "-pnm"], &jpeg).expect("djpeg");
+            let ours_box = decode_u8(&jpeg, Upsampling::Box);
+            assert_identical(
+                &format!("{name} asymmetric {sampling} box"),
+                &ours_box,
+                &reference_box,
+            );
+            compared += 2;
+        }
+        let gray = synthetic(source.width, source.height, 1, 255);
+        for extra in [
+            &["-progressive"][..],
+            &["-progressive", "-restart", "1"][..],
+        ] {
+            let mut args = vec!["-quality", "82"];
+            args.extend_from_slice(extra);
+            let Some(jpeg) = cjpeg(&args, &gray) else {
+                continue;
+            };
+            let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+            let ours = decode_u8(&jpeg, Upsampling::Fancy);
+            assert_identical(
+                &format!("{name} progressive grayscale {extra:?}"),
+                &ours,
+                &reference,
+            );
+            compared += 1;
+        }
+    }
+    require_comparisons(compared, "asymmetric sampling");
+}
+
+/// 12-bit *colour*: the fancy upsamplers and the fixed-point YCbCr conversion
+/// both key off `MAXJSAMPLE`/`CENTERJSAMPLE`, and every other 12-bit test in
+/// this file is grayscale, which exercises neither.
+#[test]
+fn twelve_bit_colour_is_byte_identical() {
+    if !oracle_ready() {
+        eprintln!("skipping: cjpeg/djpeg unavailable");
+        return;
+    }
+    let mut compared = 0;
+    for (name, (width, height)) in [("small", (37usize, 29usize)), ("mcu_edge", (131, 97))] {
+        let source = synthetic(width, height, 3, 4095);
+        for sampling in ["1x1", "2x1", "2x2"] {
+            let Some(jpeg) = cjpeg(
+                &["-precision", "12", "-quality", "85", "-sample", sampling],
+                &source,
+            ) else {
+                continue;
+            };
+            let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+            assert_eq!(reference.maxval, 4095, "djpeg should emit a 12-bit PPM");
+            let ours = decode_wide(&jpeg);
+            assert_identical(
+                &format!("{name} 12-bit colour {sampling}"),
+                &ours,
+                &reference,
+            );
+            compared += 1;
+        }
+    }
+    if compared == 0 {
+        eprintln!("skipping 12-bit colour: cjpeg -precision unsupported");
+    }
+}
+
+/// 12-bit combined with the options that change the entropy layer rather than
+/// the sample range: restart markers, an odd sampling factor, and encoder-side
+/// optimized Huffman tables.
+#[test]
+fn twelve_bit_with_restarts_and_odd_sampling_is_byte_identical() {
+    if !oracle_ready() {
+        eprintln!("skipping: cjpeg/djpeg unavailable");
+        return;
+    }
+    let source = synthetic(59, 41, 3, 4095);
+    let mut compared = 0;
+    for args in [
+        &[
+            "-precision",
+            "12",
+            "-quality",
+            "80",
+            "-restart",
+            "1",
+            "-sample",
+            "2x2",
+        ][..],
+        &["-precision", "12", "-quality", "80", "-sample", "3x1"][..],
+        &[
+            "-precision",
+            "12",
+            "-quality",
+            "80",
+            "-optimize",
+            "-sample",
+            "2x1",
+        ][..],
+    ] {
+        let Some(jpeg) = cjpeg(args, &source) else {
+            continue;
+        };
+        let reference = djpeg(&["-dct", "int", "-pnm"], &jpeg).expect("djpeg");
+        let ours = decode_wide(&jpeg);
+        assert_identical(&format!("12-bit {args:?}"), &ours, &reference);
+        compared += 1;
+    }
+    if compared == 0 {
+        eprintln!("skipping 12-bit variants: cjpeg -precision unsupported");
+    }
+}

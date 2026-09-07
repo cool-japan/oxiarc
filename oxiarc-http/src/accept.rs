@@ -20,6 +20,20 @@ use crate::header::QValue;
 /// accident: `None` means "send no header at all" (do not set the header),
 /// and only [`to_header_value_or_empty`](Self::to_header_value_or_empty)
 /// (or an explicit empty builder) ever produces the empty string.
+///
+/// # "Can decode" means this build, not necessarily your decode path
+///
+/// Every method here filters on [`ContentCoding::is_decodable`], which
+/// reports what `oxiarc-http` compiled with these Cargo features will
+/// decode; [`Decoder`](crate::Decoder) accepts exactly that set, so a
+/// header built here and a decoder built by [`Decoder::from_header`] agree
+/// by construction. Advertising a coding is a promise about whatever
+/// actually decodes the response body — if that is not this crate's
+/// `Decoder`, the promise is about *that* decoder and only you can vouch
+/// for it. The filtering keeps a coding whose Cargo feature is off out of
+/// the header, which is the mistake worth preventing.
+///
+/// [`Decoder::from_header`]: crate::Decoder::from_header
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcceptEncoding {
     /// `(coding, weight)`; `coding: None` is the `*` wildcard.
@@ -76,7 +90,10 @@ impl AcceptEncoding {
     /// A coding whose feature is off — or, like [`ContentCoding::Compress`],
     /// not yet implemented at all — is **silently skipped**: advertising a
     /// coding you cannot decode is the one mistake that turns a working
-    /// client into one that receives an undecodable body.
+    /// client into one that receives an undecodable body. See the
+    /// type-level docs for exactly which "cannot decode" this is: the
+    /// feature-gated capability of the finished crate, not of this
+    /// decoder-less version.
     // `add` is a builder method, not an arithmetic operator — there is no
     // sensible `std::ops::Add` for `AcceptEncoding`, so the name collision
     // clippy flags here is spurious.
@@ -205,6 +222,58 @@ mod tests {
     #[test]
     fn default_is_all_supported() {
         assert_eq!(AcceptEncoding::default(), AcceptEncoding::all_supported());
+    }
+
+    #[test]
+    fn all_supported_renders_exactly_what_the_docs_claim() {
+        // Pins `all_supported`'s rustdoc, which names two concrete header
+        // values. Written so it asserts something on every feature combo:
+        // the rendered list is exactly the decodable subset of the declared
+        // best-first order, and never contains a coding this build cannot
+        // decode.
+        let expected: Vec<&str> = [
+            ContentCoding::Zstd,
+            ContentCoding::Brotli,
+            ContentCoding::Gzip,
+            ContentCoding::Deflate,
+        ]
+        .iter()
+        .filter(|c| c.is_decodable())
+        .map(|c| c.as_str())
+        .collect();
+        let rendered = AcceptEncoding::all_supported().to_header_value();
+        if expected.is_empty() {
+            assert_eq!(rendered, None, "no decodable coding => send no header");
+        } else {
+            assert_eq!(rendered, Some(expected.join(", ")));
+        }
+        // The two combinations the rustdoc spells out verbatim.
+        #[cfg(all(
+            feature = "gzip",
+            feature = "deflate",
+            not(feature = "brotli"),
+            not(feature = "zstd")
+        ))]
+        assert_eq!(rendered, Some("gzip, deflate".to_string()));
+        #[cfg(all(
+            feature = "gzip",
+            feature = "deflate",
+            feature = "brotli",
+            feature = "zstd"
+        ))]
+        assert_eq!(rendered, Some("zstd, br, gzip, deflate".to_string()));
+        // Never advertises a coding with no dictionary story (Dcz), a
+        // permanently-unsupported one (Compress/Dcb), or identity.
+        for banned in ["dcz", "dcb", "compress", "identity", "*"] {
+            assert!(
+                !rendered
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(", ")
+                    .any(|t| t == banned),
+                "all_supported must not advertise {banned:?}"
+            );
+        }
     }
 
     #[test]

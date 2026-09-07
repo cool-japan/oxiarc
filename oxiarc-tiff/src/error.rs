@@ -215,6 +215,20 @@ pub enum FormatError {
     /// A subsampled YCbCr image has an illegal subsampling factor.
     #[error("illegal YCbCrSubSampling ({0}, {1})")]
     IllegalSubsampling(u16, u16),
+    /// A JPEG frame's sampling factors disagree with `YCbCrSubSampling` (530).
+    ///
+    /// TTN2 makes the frame header authoritative, so this is only reported
+    /// under [`crate::Leniency::Strict`].
+    #[error(
+        "JPEG frame is subsampled {}x{} but YCbCrSubSampling says {}x{}",
+        coded.0, coded.1, declared.0, declared.1
+    )]
+    JpegSubsamplingMismatch {
+        /// What tag 530 said (or its 2x2 default).
+        declared: (u16, u16),
+        /// What the `SOF` sampling factors say.
+        coded: (u16, u16),
+    },
 }
 
 /// The file is well formed but this build cannot decode or encode it.

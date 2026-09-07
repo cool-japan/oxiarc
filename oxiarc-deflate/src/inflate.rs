@@ -7,13 +7,15 @@
 //! - Type 2: Dynamic Huffman codes
 
 use crate::huffman::HuffmanTree;
+use crate::sink::{BoundedSink, InflateSink};
+use crate::stream::{InflateStatus, InflateStream};
 use crate::tables::{
     CODE_LENGTH_ORDER, DISTANCE_EXTRA_BITS, LENGTH_EXTRA_BITS, decode_distance, decode_length,
     fixed_distance_tree, fixed_litlen_tree,
 };
-use crate::window::{DecodeSink, InflateWindow, SliceSink};
+use crate::window::{DecodeSink, InflateWindow};
 use oxiarc_core::error::{OxiArcError, Result};
-use oxiarc_core::traits::{DecompressStatus, Decompressor};
+use oxiarc_core::traits::{DecompressStatus, Decompressor, FlushMode};
 use oxiarc_core::{BitCache, BitReader};
 use std::io::Read;
 
@@ -46,13 +48,15 @@ pub struct Inflater {
     expected_dict_checksum: Option<u32>,
     /// Set when `inflate_stored` processes a zero-length stored block (sync flush).
     last_empty_stored: bool,
-    /// Decoded bytes awaiting delivery via the streaming [`Decompressor`]
-    /// trait (`decompress`). Retained so a caller-supplied output buffer
-    /// smaller than the decoded payload drains across calls instead of
-    /// silently truncating.
-    trait_pending: Vec<u8>,
-    /// Cursor into `trait_pending`: bytes before it have been delivered.
-    trait_pending_pos: usize,
+    /// Resumable core backing the [`Decompressor`] trait implementation.
+    ///
+    /// Allocated on first use so an `Inflater` driven only through
+    /// [`Inflater::inflate_reader`] (the ZIP/CAB path) pays nothing for it.
+    trait_stream: Option<Box<InflateStream>>,
+    /// The preset dictionary, retained so the lazily-created trait core can
+    /// be seeded with it. Only the trailing [`MAX_DICTIONARY_SIZE`] bytes
+    /// are kept, and the allocation is reused across calls.
+    dictionary: Option<Vec<u8>>,
 }
 
 impl Inflater {
@@ -77,8 +81,8 @@ impl Inflater {
             finished: false,
             expected_dict_checksum: None,
             last_empty_stored: false,
-            trait_pending: Vec::new(),
-            trait_pending_pos: 0,
+            trait_stream: None,
+            dictionary: None,
         }
     }
 
@@ -114,8 +118,18 @@ impl Inflater {
     /// The Adler-32 checksum of the dictionary.
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> u32 {
         self.output.preload_dictionary(dictionary);
-        self.expected_dict_checksum = Some(Self::adler32(dictionary));
-        self.expected_dict_checksum.unwrap_or(1)
+        let tail = dictionary
+            .get(dictionary.len().saturating_sub(MAX_DICTIONARY_SIZE)..)
+            .unwrap_or(dictionary);
+        let kept = self.dictionary.get_or_insert_with(Vec::new);
+        kept.clear();
+        kept.extend_from_slice(tail);
+        if let Some(stream) = self.trait_stream.as_mut() {
+            stream.set_dictionary(tail);
+        }
+        let checksum = Self::adler32(dictionary);
+        self.expected_dict_checksum = Some(checksum);
+        checksum
     }
 
     /// Get the expected dictionary checksum.
@@ -160,14 +174,20 @@ impl Inflater {
     }
 
     /// Reset the decompressor.
+    ///
+    /// Everything is cleared: the decoded output and its history, the
+    /// dictionary, the block state and — since 0.4.2 — the streaming core
+    /// backing [`Decompressor::decompress`], including its latched error.
+    /// A reset `Inflater` therefore decodes a fresh, independent stream,
+    /// which is what a multi-block CAB/MSZIP folder relies on.
     pub fn reset(&mut self) {
         self.output.clear();
         self.final_block = false;
         self.finished = false;
         self.expected_dict_checksum = None;
         self.last_empty_stored = false;
-        self.trait_pending = Vec::new();
-        self.trait_pending_pos = 0;
+        self.dictionary = None;
+        self.trait_stream = None;
     }
 
     /// Reset the decompressor but keep the dictionary.
@@ -178,8 +198,12 @@ impl Inflater {
         self.finished = false;
         self.expected_dict_checksum = checksum;
         self.last_empty_stored = false;
-        self.trait_pending = Vec::new();
-        self.trait_pending_pos = 0;
+        if let Some(stream) = self.trait_stream.as_mut() {
+            stream.reset();
+            if let Some(dictionary) = self.dictionary.as_deref() {
+                stream.set_dictionary(dictionary);
+            }
+        }
     }
 
     /// Decompress data from a reader.
@@ -320,32 +344,19 @@ impl Inflater {
         }
     }
 
-    /// Copy as many undelivered decoded bytes as fit into `output`.
-    ///
-    /// Returns the number of bytes copied and the resulting status:
-    /// [`DecompressStatus::NeedsOutput`] while bytes remain, or
-    /// [`DecompressStatus::Done`] once the decoded stream is fully drained
-    /// (`finished` is only set at that point).
-    fn drain_trait_pending(&mut self, output: &mut [u8]) -> (usize, DecompressStatus) {
-        let remaining = self.trait_pending.len() - self.trait_pending_pos;
-        let to_copy = remaining.min(output.len());
-        output[..to_copy].copy_from_slice(
-            &self.trait_pending[self.trait_pending_pos..self.trait_pending_pos + to_copy],
-        );
-        self.trait_pending_pos += to_copy;
+    /// The retained preset dictionary, for the crate's own async adapter.
+    #[cfg(feature = "async-io")]
+    pub(crate) fn trait_dictionary(&self) -> Option<&[u8]> {
+        self.dictionary.as_deref()
+    }
 
-        if self.trait_pending_pos < self.trait_pending.len() {
-            // Not fully delivered yet — `inflate` may already have marked the
-            // stream finished; hold the flag back until the caller has
-            // received every decoded byte.
-            self.finished = false;
-            (to_copy, DecompressStatus::NeedsOutput)
-        } else {
-            self.trait_pending = Vec::new();
-            self.trait_pending_pos = 0;
-            self.finished = true;
-            (to_copy, DecompressStatus::Done)
-        }
+    /// Mark the stream complete after an out-of-band decode.
+    ///
+    /// Used by the async adapter, which drives its own [`InflateStream`]
+    /// but must leave `is_finished()` reporting the truth afterwards.
+    #[cfg(feature = "async-io")]
+    pub(crate) fn mark_finished(&mut self) {
+        self.finished = true;
     }
 
     /// Decompress one complete sync-flushed chunk (convenience wrapper).
@@ -368,44 +379,96 @@ impl Default for Inflater {
 }
 
 impl Decompressor for Inflater {
-    /// Streaming decompression: the entire DEFLATE stream in `input` is
-    /// parsed on the first call, and the decoded bytes are delivered
-    /// through `output` across as many calls as needed.
+    /// Incrementally decompress a raw DEFLATE stream.
+    ///
+    /// Since 0.4.2 this is a genuine push decoder: state survives across
+    /// calls, so a caller-supplied `output` smaller than the payload is
+    /// drained over as many calls as it takes.
+    ///
+    /// # Contract
+    ///
+    /// `input` is the **whole remaining** compressed stream, per
+    /// [`Decompressor`]'s trait-level contract: the call runs with
+    /// [`FlushMode::Finish`], so a slice that ends mid-symbol is
+    /// [`OxiArcError::UnexpectedEof`], never a short `Ok`. Callers that
+    /// feed genuine chunks — bytes still in flight — must use
+    /// [`InflateStream`] or [`WrappedInflate`](crate::WrappedInflate)
+    /// directly, where the flush mode is an explicit parameter.
+    ///
+    /// Between calls `input` **must** be advanced by the reported
+    /// `consumed` count. This changed in 0.4.2: the pre-0.4.2
+    /// implementation decoded the whole slice on the first call and merely
+    /// drained afterwards, so re-passing an unadvanced slice happened to be
+    /// harmless. It no longer is — bytes already reported consumed would be
+    /// decoded a second time and the caller would collect duplicated
+    /// output. `decompress_all` and the async wrapper in this crate advance
+    /// correctly; a caller writing its own loop must too:
+    ///
+    /// ```
+    /// use oxiarc_core::traits::{DecompressStatus, Decompressor};
+    /// use oxiarc_deflate::{deflate, Inflater};
+    ///
+    /// let compressed = deflate(&b"advance by consumed".repeat(200), 6).expect("deflate");
+    /// let mut inflater = Inflater::new();
+    /// let mut out = Vec::new();
+    /// let mut scratch = [0u8; 64];
+    /// let mut fed = 0usize;
+    /// loop {
+    ///     let (consumed, produced, status) = inflater
+    ///         .decompress(&compressed[fed..], &mut scratch)
+    ///         .expect("decompress");
+    ///     fed += consumed; // <- mandatory
+    ///     out.extend_from_slice(&scratch[..produced]);
+    ///     if status == DecompressStatus::Done {
+    ///         break;
+    ///     }
+    /// }
+    /// assert_eq!(out, b"advance by consumed".repeat(200));
+    /// ```
     ///
     /// Returns [`DecompressStatus::NeedsOutput`] while decoded bytes remain
-    /// undelivered and [`DecompressStatus::Done`] only once every byte has
-    /// been copied out — a caller-supplied buffer smaller than the payload
-    /// is never silently truncated.
+    /// undelivered and [`DecompressStatus::Done`] only once the stream has
+    /// ended — a payload larger than `output` is never silently truncated.
+    ///
+    /// # Errors
+    ///
+    /// Errors are **sticky**: once a stream has failed, every later call
+    /// returns the same error until [`Inflater::reset`] is called. In
+    /// particular a stream truncated mid-block cannot be turned into a
+    /// short success by calling again.
     fn decompress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
-        // Drain bytes decoded by a previous call first.
-        if self.trait_pending_pos < self.trait_pending.len() {
-            let (produced, status) = self.drain_trait_pending(output);
-            return Ok((0, produced, status));
-        }
-
         if self.finished {
             return Ok((0, 0, DecompressStatus::Done));
         }
-
-        // Track consumption through the BitReader rather than the cursor: in
-        // buffered mode the cursor is advanced past the end of the DEFLATE
-        // stream by the prefetch, so `cursor.position()` would over-report.
-        // `bits_read()` counts only bits the decoder actually consumed.
-        let cursor = std::io::Cursor::new(input);
-        let mut bit_reader = BitReader::buffered(cursor);
-        let (result, consumed_u64) = self.inflate_consumed(&mut bit_reader)?;
-        let consumed = usize::try_from(consumed_u64)
-            .unwrap_or(input.len())
-            .min(input.len());
-
-        self.trait_pending = result;
-        self.trait_pending_pos = 0;
-        let (produced, status) = self.drain_trait_pending(output);
-        Ok((consumed, produced, status))
+        if self.trait_stream.is_none() {
+            let mut fresh = InflateStream::new();
+            if let Some(dictionary) = self.dictionary.as_deref() {
+                fresh.set_dictionary(dictionary);
+            }
+            self.trait_stream = Some(Box::new(fresh));
+        }
+        let Some(stream) = self.trait_stream.as_mut() else {
+            return Err(OxiArcError::corrupted(
+                0,
+                "inflater streaming core unavailable",
+            ));
+        };
+        let progress = stream.inflate(input, output, FlushMode::Finish)?;
+        let status = match progress.status {
+            InflateStatus::StreamEnd => {
+                self.finished = true;
+                DecompressStatus::Done
+            }
+            InflateStatus::NeedOutput => DecompressStatus::NeedsOutput,
+            // Unreachable under `Finish`: running dry is raised as
+            // `UnexpectedEof` rather than a request for more input.
+            _ => DecompressStatus::NeedsInput,
+        };
+        Ok((progress.consumed, progress.produced, status))
     }
 
     fn reset(&mut self) {
@@ -417,11 +480,30 @@ impl Decompressor for Inflater {
     }
 }
 
-/// Decompress DEFLATE data.
+/// Decompress a raw DEFLATE stream held entirely in memory.
+///
+/// `data` must contain the whole stream; bytes after the final block are
+/// ignored. Decoding runs on the resumable core with a growable sink, so
+/// the compressed input is read in place — no copy into an internal reader
+/// buffer, and no per-block table allocations.
+///
+/// # Errors
+///
+/// [`OxiArcError::UnexpectedEof`] if the stream ends before its final
+/// block, plus the usual header/Huffman/back-reference errors for corrupt
+/// input.
+///
+/// # Example
+///
+/// ```
+/// use oxiarc_deflate::{deflate, inflate};
+///
+/// let compressed = deflate(b"round trip", 6).expect("deflate");
+/// assert_eq!(inflate(&compressed).expect("inflate"), b"round trip");
+/// ```
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>> {
-    let mut inflater = Inflater::new();
-    let mut cursor = std::io::Cursor::new(data);
-    inflater.inflate_reader(&mut cursor)
+    let mut stream = InflateStream::new();
+    stream.inflate_to_vec(data)
 }
 
 #[cfg(test)]
@@ -1021,10 +1103,19 @@ fn decode_detached<R: Read>(
 
 /// Decompress a raw DEFLATE stream straight into a caller-supplied buffer.
 ///
-/// No output `Vec` is allocated and no capacity is guessed: literals and
-/// matches are written directly into `dst`. This is the lowest-overhead
-/// entry point when the decompressed size is known in advance (a GeoTIFF
-/// tile, a PNG scanline block, a fixed-size record).
+/// No output `Vec` is allocated, no capacity is guessed and nothing is
+/// re-grown or copied: literals and matches are written straight into `dst`,
+/// and `dst` itself is the history window, so there is no per-call window
+/// update either. That makes it the entry point to reach for when the
+/// decompressed size is known in advance (a GeoTIFF tile, a PNG scanline
+/// block, a fixed-size record).
+///
+/// The saving is in the allocation, not in the symbol loop: this runs the
+/// same decoder as [`inflate`], with a bounds check per write in place of
+/// [`Vec`] growth. Measured interleaved on 100 KiB corpora it is a few per
+/// cent quicker than [`inflate`] on compressible input and indistinguishable
+/// on incompressible input — so choose between them by whether the size is
+/// known, not by expecting a different class of speed.
 ///
 /// # Returns
 ///
@@ -1050,19 +1141,26 @@ fn decode_detached<R: Read>(
 /// use oxiarc_deflate::{deflate, inflate_into};
 ///
 /// let original = b"Hello, World! Hello, World!";
-/// let compressed = deflate(original, 6).unwrap();
+/// let compressed = deflate(original, 6).expect("deflate");
 ///
 /// let mut out = vec![0u8; original.len()];
-/// let n = inflate_into(&compressed, &mut out).unwrap();
+/// let n = inflate_into(&compressed, &mut out).expect("inflate_into");
 /// assert_eq!(&out[..n], original);
 /// ```
 pub fn inflate_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
-    let cursor = std::io::Cursor::new(src);
-    let mut reader = BitReader::buffered(cursor);
-    let mut sink = SliceSink::new(dst);
-    let mut state = BlockState::default();
-    while !state.final_block {
-        inflate_block_into(&mut reader, &mut sink, &mut state)?;
+    let capacity = dst.len();
+    let mut stream = InflateStream::new();
+    let mut sink = BoundedSink::new(dst, None);
+    let (_consumed, status) = stream.inflate_sink(src, &mut sink, FlushMode::Finish)?;
+    match status {
+        InflateStatus::StreamEnd => Ok(sink.written()),
+        // The sink filled before the stream ended: report what it would
+        // have taken rather than truncating.
+        InflateStatus::NeedOutput => Err(OxiArcError::buffer_too_small(
+            sink.written().saturating_add(1),
+            capacity,
+        )),
+        // Unreachable under `Finish`, which raises a short stream itself.
+        _ => Err(OxiArcError::unexpected_eof(1)),
     }
-    Ok(sink.written())
 }

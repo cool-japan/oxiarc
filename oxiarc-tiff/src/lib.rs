@@ -17,10 +17,22 @@
 //! * **Transforms** — predictors 1/2/3 (horizontal differencing with whole-sample
 //!   carry propagation in the *file's* byte order, and the floating-point
 //!   byte-plane transpose) and the photometric conversions.
-//! * **Codecs** — uncompressed and PackBits ship today; every other registered
-//!   compression value has a named enum variant and returns a typed
-//!   [`UnsupportedError::NotYetAvailable`] error from the dispatch rather than
-//!   falling through a wildcard.
+//! * **Codecs** — uncompressed (1), PackBits (32773), LZW (5), Deflate (8 and
+//!   32946), CCITT RLE (2), Group 3 (3), Group 4 (4) and word-aligned RLE
+//!   (32771) by default, plus ZSTD (50000), LZMA (34925) and JPEG (7, with
+//!   best-effort old-style JPEG 6) behind cargo features. Every one of them
+//!   encodes as well as decodes. A registered value this crate implements but
+//!   whose feature is off reports [`UnsupportedError::FeatureNotCompiled`],
+//!   and one it does not implement reports [`UnsupportedError::Compression`];
+//!   nothing falls through a wildcard, and out-of-tree codecs plug in through
+//!   [`Codec`] and a [`CodecRegistry`] (an out-of-tree codec can also be
+//!   selected for **encoding**, via [`writer::Compression::Registered`]).
+//! * **Optional features** — `compat` (a `tiff`-0.11.3-shaped facade, see
+//!   "Migrating from `tiff`" below), `rayon` (parallel strip/tile decode and
+//!   encode, byte-identical to the serial path) and `mmap`
+//!   (`Decoder::from_path`, a memory-mapped reader). All three are named as
+//!   plain text here, not doc links: each is only compiled when its feature
+//!   is on, and this paragraph is not.
 //!
 //! # Reading
 //!
@@ -55,8 +67,62 @@
 //! * A `YCbCr` image with no `YCbCrSubSampling` tag is read back as 2x2
 //!   subsampled, because that is the TIFF 6.0 default. The encoder therefore
 //!   always writes tag 530 for a YCbCr page.
+//! * [`FillOrder`] 2 reverses the bits of every byte of the **compressed**
+//!   chunk, at *every* bit depth — not only for sub-byte samples, and not
+//!   after decompression. That is where libtiff does it (`TIFFFillStrip` on
+//!   read, `TIFFFlushData1` on write), verified against libtiff 4.7.1 at 1, 8,
+//!   16, 32 and 64 bits in strips and tiles: a `tiffcp -c packbits -f lsb2msb`
+//!   strip has its PackBits control bytes reversed too, so decoding it without
+//!   reversing first yields the wrong *length*. The CCITT codecs are the
+//!   exception and consume the tag themselves
+//!   ([`compression::handles_fill_order`]). [`Decoder::read_chunk_raw`]
+//!   deliberately does not apply the reversal.
+//! * The CCITT codes are **photometric-agnostic**: measured against libtiff
+//!   4.7.1, `tiffcp -c g3` and `-c g4` write byte-identical strips for a
+//!   `MinIsWhite` and a `MinIsBlack` page holding the same bits, so a coded
+//!   *white* run is a run of zero bits whatever tag 262 says. Group 3/4
+//!   uncompressed mode is reported by name rather than decoded, exactly as
+//!   libtiff reports it.
+//! * A JPEG page's `SOF` sampling factors win over `YCbCrSubSampling` (TTN2);
+//!   a disagreement is an error only under [`Leniency::Strict`]. TIFF JPEG
+//!   carries no `JFIF` and no `Adobe` marker, so colour stays in
+//!   `PhotometricInterpretation` and a `Separated` page is never inverted.
+//! * [`Compression::Deflate`] writes tag value 8 (the Adobe registration that
+//!   libtiff, GDAL and `tifffile` write); 32946 is read identically.
 //! * `Orientation`, `ImageDescription` (ImageJ, OME) and the GeoTIFF *keys* are
 //!   exposed and passed through, never interpreted.
+//!
+//! # Migrating from `tiff` / `image`
+//!
+//! Enable the `compat` feature for a mechanical, mostly-mechanical migration
+//! off the `tiff` crate (0.11.3-shaped) or, transitively, `image`'s `tiff`
+//! codec (the sibling [`oxiarc-image`](https://docs.rs/oxiarc-image) crate is
+//! the facade for `image` itself; `compat` is the layer under it for TIFF
+//! specifically):
+//!
+//! ```text
+//! - use tiff::decoder::{Decoder, DecodingResult};
+//! - use tiff::{ColorType, TiffError};
+//! - use tiff::tags::Tag;
+//! + use oxiarc_tiff::compat::decoder::{Decoder, DecodingResult};
+//! + use oxiarc_tiff::compat::{ColorType, TiffError};
+//! + use oxiarc_tiff::compat::tags::Tag;
+//! ```
+//!
+//! Three shapes are frozen there because downstream code (`image` 0.25.10's
+//! own `codecs/tiff.rs` included) matches them exhaustively with no wildcard
+//! arm: `compat::decoder::DecodingResult` (exactly the eleven upstream
+//! variants; `F16` carries real `half::f16` values, unlike this crate's own
+//! [`Samples::F16`], which stays raw `u16` bits so the native API needs no
+//! `half` dependency), `compat::ColorType` (all ten upstream variants) and
+//! `compat::TiffError` (exactly six variants). `tests/compat_api.rs`
+//! reproduces `image` 0.25.10's exact call sequence against this module, so
+//! a shape break fails a compile or a test in this crate, never downstream.
+//! See the `compat` module's own docs (`cargo doc --features compat`) for
+//! the full contract, including the deliberate, documented deviations from
+//! upstream (never a silent behaviour change). This paragraph names it as
+//! plain text, not a doc link, because it is only compiled when the
+//! `compat` feature is on, and this paragraph is not.
 //!
 //! # Guarding untrusted input
 //!
@@ -91,6 +157,8 @@
 
 pub mod byteorder;
 pub mod colour;
+#[cfg(feature = "compat")]
+pub mod compat;
 pub mod compression;
 pub mod decode;
 pub mod error;
@@ -98,19 +166,25 @@ pub mod header;
 pub mod ifd;
 pub mod image;
 pub mod limits;
+#[cfg(feature = "mmap")]
+pub mod mmap;
 pub mod predictor;
+#[cfg(feature = "rayon")]
+pub mod rayon_support;
 pub mod reader;
 pub mod sample;
 pub mod tags;
 pub mod writer;
 
 pub use byteorder::{Endian, EndianReader, EndianWriter};
-pub use compression::{Codec, CodecContext, CodecRegistry};
+pub use compression::{Codec, CodecContext, CodecRegistry, CodecState, OldJpegParams};
 pub use error::{FormatError, LimitError, Result, TiffError, UnsupportedError, UsageError};
 pub use header::{Header, Variant};
 pub use ifd::{Directory, Entry, IfdPointer, Rational, SRational, Value, ValueSource};
 pub use image::{ChunkGeometry, ChunkType, ColorType, ImageInfo, ImageLayout, Rect};
 pub use limits::{Leniency, Limits, OutputBudget, Warning, Warnings};
+#[cfg(feature = "mmap")]
+pub use mmap::MmapDecoder;
 pub use predictor::{apply_predictor_forward, apply_predictor_reverse};
 pub use reader::{Decoder, GeoTags, SubIfdNode};
 pub use sample::{SampleType, Samples, f16_bits_to_f32, f32_to_f16_bits};

@@ -1,12 +1,12 @@
-# oxiarc-http [Partial: headers/negotiation/encode done, decoder pending]
+# oxiarc-http
 
 HTTP content-coding (RFC 9110 `Content-Encoding` / `Accept-Encoding`: gzip, deflate, br, zstd, dcz) for OxiArc — Pure Rust, no `flate2`, no `http` crate dependency.
 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-http.svg)](https://crates.io/crates/oxiarc-http)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-Partial-yellow)
+![Status](https://img.shields.io/badge/status-Complete-brightgreen)
 
-**Version: 0.4.2 (unreleased) | 90 tests passing (nextest, all features) + 6 doctests**
+**Version: 0.4.2 (unreleased) | 249 tests passing (nextest, all features) + 17 doctests**
 
 ## Overview
 
@@ -19,16 +19,10 @@ exposure, and encodes response bodies through the existing `oxiarc-deflate`
 dependency on the `http` crate, so it drops into `ureq`, `reqwest`,
 `oxihttp`, or any hand-rolled client or server unmodified.
 
-**What's in this version:** the headers/negotiation/encode layer —
-[`ContentCoding`], header parsing, [`QValue`], the [`AcceptEncoding`]
-builder, [`negotiate`], [`DecodeLimits`], the crate's error type, and
-server-side [`encode_body`] / [`Encoder`]. **Not yet in this version:** a
-response-body `Decoder` (the client-side decode path). That lands in a
-later wave, gated on resumable push decoders landing in
-`oxiarc-deflate`/`oxiarc-brotli`/`oxiarc-zstd`; see `TODO.md`. The module
-boundary is deliberately drawn so that wave only adds new files plus a
-handful of `pub use` lines in `lib.rs` — nothing documented below changes
-shape to make room for it.
+Both directions are complete: the client decodes response bodies
+incrementally and bounded (`Decoder`, `DecodedBody`, `AsyncDecodedBody`,
+`decode_body`), and the server negotiates and encodes them (`negotiate`,
+`encode_body`, `Encoder`, `negotiate_and_encode`).
 
 ## Features
 
@@ -59,16 +53,50 @@ shape to make room for it.
 - **`encode_body` / `Encoder<W: Write>`** — one-shot and streaming
   server-side response encoding for gzip, deflate, brotli, zstd, and (with
   a shared dictionary) `dcz` (RFC 9842 Compression Dictionary Transport).
+  `EncodeOptions` is built with `new()` + `with_level`/`with_brotli_quality`/
+  `with_zstd_level`/`with_dictionary`. `Encoder`'s per-coding framing is
+  documented rather than assumed uniform: a `flush()` stays inside one
+  member for gzip/deflate/brotli, but **closes a Zstandard frame** for
+  `zstd`/`dcz` — as does streaming past 128 KiB with no flush at all — so a
+  streamed zstd body needs a multi-frame decoder
+  (`oxiarc_zstd::decompress_multi_frame`), never the single-frame one,
+  which stops after the first frame without erroring.
 - **`DecodeLimits`** — `max_output` (the load-bearing bomb control, default
   64 MiB), `max_ratio` (defense-in-depth, documented with the measurements
   behind the default), `max_codings`.
 - **Bomb-safe by construction** — every limit is documented with the exact
   measured legitimate-vs-hostile ratios that justify its default, not a
   guessed number.
+- **`Decoder` / `decode_body` / `DecodedBody` / `AsyncDecodedBody`** — the
+  client-side decode path, driven through the resumable push decoders in
+  `oxiarc-deflate` / `oxiarc-brotli` / `oxiarc-zstd`, never a `read_to_end`.
+  A slice-primary, allocation-free `decode()`; `feed_into` for a push body
+  loop (`reqwest::Response::chunk`, a `hyper` frame loop); `Read` + `BufRead`
+  and `tokio::io::AsyncRead` adapters. `gzip` is multi-member (RFC 1952 §2.2),
+  `deflate` accepts all three spellings servers actually send (zlib, raw, and
+  a whole gzip stream mislabelled `deflate`), `zstd` is multi-frame, and
+  `dcz` decodes against a caller-supplied dictionary
+  (`Decoder::with_dictionary`).
+- **Truly incremental, measured** — streaming a 16 MiB gzip body peaks at
+  **~210 KiB** of live allocation; `feed_into` allocates **nothing** per call
+  after warm-up; the decoded bytes are identical however the wire data is
+  split (byte-at-a-time, arbitrary proptest split points, 64 KiB chunks).
+  Throughput is **0.96–0.98x** of `oxiarc_deflate::gzip_decompress` — i.e.
+  making the decode incremental and bounded costs 2–4%.
+- **Bomb-safe inside a block, not between blocks** — one fixed-Huffman
+  DEFLATE block of 812 KB expands to 123 MiB, so `max_output` is enforced by
+  truncating the output slice handed to the codec, which makes
+  `oxiarc-deflate`'s own bounded sink enforce the HTTP budget on every
+  literal and match copy. The test suite regenerates that exact stream from a
+  committed Rust generator and asserts a 1 MiB cap stops it at 1 MiB.
+- **`finish()` is mandatory and enforced** — it verifies gzip's CRC-32 and
+  `ISIZE`, zlib's Adler-32, zstd's XXH64 and every codec's truncation check.
+  `DecodedBody` calls it at EOF, so a truncated response is an `io::Error`
+  from the final read, never a silently short body.
 - **Cargo feature matrix** — `default = ["gzip", "deflate"]`; `brotli`,
   `zstd`, `compress` (plumbing only — see `ContentCoding::Compress`),
-  `async-io` (plumbing for the future decoder) all opt-in. Every
-  combination, including `--no-default-features`, builds and is
+  `async-io` (`AsyncDecodedBody`) and `http-oracle` (differential tests) all
+  opt-in. Every combination, including `--no-default-features`, builds and is
   clippy-clean.
 
 ## Quick Start
@@ -95,6 +123,34 @@ if let Some(coding) = chosen {
 }
 ```
 
+Decoding a response body, bounded and with checksums verified:
+
+```rust
+use oxiarc_http::{DecodeLimits, DecodedBody};
+
+// `wire` is the raw response body, `encoding` its Content-Encoding header
+// value ("identity" when the header is absent).
+let mut body = DecodedBody::new(wire_reader, encoding, &DecodeLimits::default())?;
+let text = body.read_to_string()?;   // a truncated body is an Err, never short
+```
+
+Or, for a push-shaped transport (`reqwest`, `hyper`):
+
+```rust
+use oxiarc_http::{DecodeLimits, Decoder};
+
+let mut decoder = Decoder::from_header(encoding, &DecodeLimits::default())?;
+let mut out = Vec::new();
+while let Some(chunk) = next_chunk() {
+    decoder.feed_into(&chunk, &mut out)?;   // errors *before* a bomb lands
+}
+decoder.finish_into(&mut out)?;             // REQUIRED: verifies checksums
+```
+
+Runnable integration recipes live in `examples/`:
+`ureq3_manual_gzip`, `reqwest_bytes_stream`, `oxihttp_client`, plus
+`fuzz_seeds` (the seed-corpus generator for the seven fuzz targets).
+
 See the crate-level rustdoc (`cargo doc -p oxiarc-http --all-features --open`)
 for the full API, the `Transfer-Encoding`-out-of-scope statement, and the
 `HEAD`/204/304/`Range` empty-body notes.
@@ -106,13 +162,39 @@ cargo nextest run -p oxiarc-http --all-features
 cargo test --doc -p oxiarc-http --all-features
 cargo clippy -p oxiarc-http --all-features --all-targets -- -D warnings
 cargo build -p oxiarc-http --no-default-features
+cargo bench -p oxiarc-http --all-features
+
+# Differential tests against CPython's zlib/gzip and the brotli/zstd CLIs.
+# Each self-skips (does not fail) when its tool is absent.
+cargo nextest run -p oxiarc-http --features http-oracle,gzip,deflate,brotli,zstd
 ```
 
-Every test lives as a unit test co-located with the code it exercises
-(`#[cfg(test)] mod tests` in each `src/*.rs` file) and exclusively calls
-`pub` items — verified by inspection, not merely assumed — so it doubles as
-an integration test of the public API without a separate `tests/`
-directory duplicating the same coverage.
+The headers/negotiation/encode layer keeps its tests co-located
+(`#[cfg(test)] mod tests` in each `src/*.rs`); the decode layer adds an
+integration suite in `tests/`, because what it has to prove is external
+behaviour:
+
+| File | Proves |
+|---|---|
+| `roundtrip.rs` | every coding x payload agrees across all four entry points |
+| `chunking.rs` | chunk invariance, incl. proptest over arbitrary split points |
+| `framing.rs` | gzip members/flags/FHCRC, the `deflate` sniff, trailing policy, chains |
+| `limits.rs` | the 812 KB -> 123 MiB single-block bomb, ratio, boundaries, windows |
+| `dictionary.rs` | `dcz` against a supplied dictionary; `dcb` refused |
+| `async_body.rs` | a `Poll::Pending` source is never an empty body |
+| `allocations.rs` | peak-memory and zero-allocation gates (counting allocator) |
+| `fuzz_seeds.rs` | the invariants the seven fuzz targets assert |
+| `http_oracle.rs` | reference-encoder differential (feature `http-oracle`) |
+
+A co-located test is **not** a substitute for external linkage, though, and
+this crate has already been bitten by the difference: code inside the crate
+may build a `#[non_exhaustive]` struct with struct-expression syntax, and a
+downstream crate may not. The **doctests** are the guard for that class,
+because rustdoc compiles each one as its own external crate. They are not a
+blanket second copy of the unit tests — the rule is narrower: anything whose
+correctness depends on being *constructible or callable from outside* must
+carry a doctest as well as a unit test. Every `EncodeOptions` builder does,
+for exactly that reason.
 
 Part of the [OxiArc](https://github.com/cool-japan/oxiarc) Pure Rust
 archive/compression ecosystem.

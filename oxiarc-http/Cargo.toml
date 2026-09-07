@@ -18,8 +18,8 @@ all-features = true
 
 [features]
 default = ["gzip", "deflate"]
-# RFC 1952 gzip / x-gzip. Encode side lands in this crate now; the decode side
-# (`oxiarc_http::decode`) is a separate, later wave — see `lib.rs`.
+# RFC 1952 gzip / x-gzip. Both sides: `encode_body`/`Encoder`, and the
+# `Decoder`/`DecodedBody` gzip stage (multi-member, RFC 1952 §2.2).
 gzip = ["dep:oxiarc-deflate"]
 # RFC 1950 zlib-wrapped deflate (and the RFC 9110 §8.4.1.2 raw-deflate sniff,
 # decode side only). Shares `oxiarc-deflate` with `gzip`; the two features are
@@ -37,9 +37,15 @@ zstd = ["dep:oxiarc-zstd"]
 # Cargo feature (rather than a `compile_error!`) so the crate's feature matrix —
 # `--no-default-features`, each feature alone — stays green.
 compress = ["dep:oxiarc-lzw"]
-# Async plumbing for the future decoder wave (`AsyncDecodedBody`). Declared now
-# so that wave only has to add new files plus a `lib.rs` re-export line.
+# `AsyncDecodedBody`, the `tokio::io::AsyncRead` twin of `DecodedBody`.
 async-io = ["dep:tokio", "oxiarc-core/async-io"]
+# Differential oracle tests (tests/http_oracle.rs) that decode streams built
+# by CPython's `zlib`/`gzip` modules and by the reference `brotli` / `zstd`
+# CLIs, rather than by oxiarc's own encoders. Self-skips (does not fail) at
+# runtime when a tool is absent, matching the established `zlib-oracle` /
+# `brotli-oracle` / `zstd-oracle` pattern. Never enabled by default; not
+# needed for normal library use.
+http-oracle = []
 
 [dependencies]
 oxiarc-core = { workspace = true }
@@ -52,6 +58,17 @@ tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+# The tests, examples and benches build fixtures with the matching oxiarc
+# encoders, so they need these unconditionally — the library's own use of
+# them stays feature-gated and optional above.
+oxiarc-deflate = { workspace = true }
+oxiarc-brotli = { workspace = true }
+oxiarc-zstd = { workspace = true }
+
+[[bench]]
+name = "decode_bench"
+harness = false
 
 [lints]
 workspace = true

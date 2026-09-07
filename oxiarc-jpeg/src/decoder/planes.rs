@@ -101,6 +101,32 @@ impl Planes {
         &self.data[start..end]
     }
 
+    /// Copy a band of decoded rows in from a smaller, band-shaped set of
+    /// planes.
+    ///
+    /// `first_row` is the destination row of each component's band, which for
+    /// a band of whole MCU rows is `mcu_row * v * 8`. Rows past the
+    /// destination's padded extent are dropped: the last band of a frame
+    /// whose height is not a whole number of MCUs decodes padding rows that
+    /// the full-frame planes do not carry.
+    #[cfg(feature = "rayon")]
+    pub(crate) fn copy_band_from(&mut self, band: &Planes, first_rows: &[usize]) {
+        for (index, &first_row) in first_rows.iter().enumerate() {
+            if index >= self.strides.len() || index >= band.strides.len() {
+                break;
+            }
+            let stride = self.strides[index].min(band.strides[index]);
+            let available = self.padded_heights[index].saturating_sub(first_row);
+            let rows = band.padded_heights[index].min(available);
+            for row in 0..rows {
+                let source = band.offsets[index] + row * band.strides[index];
+                let target = self.offsets[index] + (first_row + row) * self.strides[index];
+                self.data[target..target + stride]
+                    .copy_from_slice(&band.data[source..source + stride]);
+            }
+        }
+    }
+
     /// Padded row count of component `index`.
     pub(crate) fn padded_height(&self, index: usize) -> usize {
         self.padded_heights[index]

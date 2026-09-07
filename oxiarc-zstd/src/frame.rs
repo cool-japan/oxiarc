@@ -286,8 +286,36 @@ impl ZstdDecoder {
         }
     }
 
+    /// Refuse a formatted (RFC 8878 §5) dictionary before decoding anything.
+    ///
+    /// Only raw content dictionaries are implemented. A formatted dictionary
+    /// must not be seeded as if it were content: its `Magic_Number`,
+    /// `Dictionary_ID` and entropy tables are not part of the history, so a
+    /// frame built against it would decode to silently wrong bytes.
+    fn check_dictionary(&self) -> Result<()> {
+        if self
+            .dictionary
+            .as_deref()
+            .is_some_and(crate::dict::is_formatted_dictionary)
+        {
+            return Err(crate::dict::formatted_dictionary_error());
+        }
+        Ok(())
+    }
+
     /// Decode a complete Zstandard frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::UnsupportedMethod`] when the configured
+    /// dictionary is a *formatted* one (RFC 8878 §5 `Magic_Number`
+    /// `0xEC30A437`, as written by `zstd --train`). Only raw content
+    /// dictionaries are implemented, and a formatted dictionary must not be
+    /// mistaken for content: its header and entropy tables would seed the
+    /// history with bytes that are not part of it, silently producing wrong
+    /// output. Otherwise the usual corrupted-data errors.
     pub fn decode_frame(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        self.check_dictionary()?;
         let header = parse_frame_header(data)?;
         self.window_size = header.window_size;
 
@@ -625,6 +653,7 @@ fn decompress_frame_with_decoder(
     data: &[u8],
     decoder: &mut ZstdDecoder,
 ) -> Result<(Vec<u8>, usize)> {
+    decoder.check_dictionary()?;
     let header = parse_frame_header(data)?;
     decoder.window_size = header.window_size;
 
