@@ -37,5 +37,9 @@ weezl.workspace = true
 name = "lzw_bench"
 harness = false
 
+[[bench]]
+name = "lzw_into_bench"
+harness = false
+
 [lints]
 workspace = true

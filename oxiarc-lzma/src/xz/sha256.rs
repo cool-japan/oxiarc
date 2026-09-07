@@ -382,7 +382,7 @@ mod tests {
             // Use a highly compressible repeated-byte payload, consistent with
             // what the existing XZ roundtrip tests exercise successfully.
             let payload: Vec<u8> = (0..500).map(|_| b'A').collect();
-            let compressed = XzWriter::new(oxiarc_lzma::LzmaLevel::new(1))
+            let compressed = XzWriter::new(crate::LzmaLevel::new(1))
                 .with_check_type(CheckType::Sha256)
                 .compress(&payload)
                 .expect("XzWriter::compress with SHA-256 check");
@@ -395,7 +395,7 @@ mod tests {
         #[test]
         fn sha256_corrupt_check_detected() {
             let payload: Vec<u8> = (0..500).map(|_| b'A').collect();
-            let mut compressed = XzWriter::new(oxiarc_lzma::LzmaLevel::new(1))
+            let mut compressed = XzWriter::new(crate::LzmaLevel::new(1))
                 .with_check_type(CheckType::Sha256)
                 .compress(&payload)
                 .expect("compress for corruption test");

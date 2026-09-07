@@ -6,7 +6,11 @@
 //! * the exact-mode path used when a `BitReader` may not read ahead
 //!   (`BitReader::new`), which routes every symbol through
 //!   `HuffmanTree::decode` and its bit-at-a-time fallback,
-//! * the decompress-into-a-slice path (`inflate_into` / `zlib_decompress_into`).
+//! * the decompress-into-a-slice path (`inflate_into` / `zlib_decompress_into`),
+//! * the resumable push path (`InflateStream` / `WrappedInflate`), driven at
+//!   several feed granularities — it shares the symbol loop with the first
+//!   path but reaches it through a different state machine, so the two are
+//!   compared entry by entry rather than assumed equivalent.
 //!
 //! Everything here is exercised against inputs covering all three block types
 //! (stored / fixed Huffman / dynamic Huffman), maximum-distance
@@ -19,8 +23,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use oxiarc_core::BitReader;
+use oxiarc_core::traits::FlushMode;
 use oxiarc_deflate::{
-    Inflater, deflate, inflate, inflate_into, zlib_compress, zlib_decompress, zlib_decompress_into,
+    InflateStatus, InflateStream, InflateWrapper, Inflater, TrailingPolicy, WrappedInflate,
+    deflate, inflate, inflate_into, zlib_compress, zlib_decompress, zlib_decompress_into,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +117,32 @@ fn inflate_exact_mode(compressed: &[u8]) -> oxiarc_core::error::Result<Vec<u8>> 
     inflater.inflate(&mut reader)
 }
 
+/// Decode through the resumable push API with a fixed feed schedule.
+fn inflate_push(
+    compressed: &[u8],
+    in_chunk: usize,
+    out_size: usize,
+) -> oxiarc_core::error::Result<Vec<u8>> {
+    let mut stream = InflateStream::new();
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; out_size];
+    let mut fed = 0usize;
+    loop {
+        let end = (fed + in_chunk).min(compressed.len());
+        let flush = if end >= compressed.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream.inflate(&compressed[fed..end], &mut scratch, flush)?;
+        fed += progress.consumed;
+        out.extend_from_slice(&scratch[..progress.produced]);
+        if progress.status == InflateStatus::StreamEnd {
+            return Ok(out);
+        }
+    }
+}
+
 #[test]
 fn all_decode_paths_agree() {
     for (name, data) in corpus() {
@@ -131,6 +163,28 @@ fn all_decode_paths_agree() {
                 "{name} level {level}: inflate_into len"
             );
             assert_eq!(buf, data, "{name} level {level}: inflate_into bytes");
+
+            // The fifth path: the resumable push decoder, at three feed
+            // granularities so the fast loop, the careful per-symbol path
+            // and the output-bound path are all exercised on every entry.
+            for (in_chunk, out_size) in [(1usize, 64usize), (7, 4096), (4096, 65_536)] {
+                let via_push = inflate_push(&compressed, in_chunk, out_size)
+                    .unwrap_or_else(|e| panic!("{name} level {level} {in_chunk}/{out_size}: {e}"));
+                assert_eq!(
+                    via_push, via_vec,
+                    "{name} level {level}: push path at {in_chunk}/{out_size}"
+                );
+            }
+
+            // And the growable push front end, which shares the window with
+            // the one-shot decoder.
+            let via_grow = InflateStream::new()
+                .inflate_to_vec(&compressed)
+                .expect("inflate_to_vec");
+            assert_eq!(
+                via_grow, via_vec,
+                "{name} level {level}: growable push path"
+            );
         }
     }
 }
@@ -146,6 +200,29 @@ fn zlib_wrapper_paths_agree() {
             let n = zlib_decompress_into(&compressed, &mut buf).expect("zlib into");
             assert_eq!(n, data.len(), "{name} level {level}");
             assert_eq!(buf, data, "{name} level {level}");
+
+            // The push wrapper must agree with the slice functions, both
+            // when told the framing and when sniffing it.
+            for framing in [InflateWrapper::Zlib, InflateWrapper::Auto] {
+                let mut decoder =
+                    WrappedInflate::new(framing).trailing_policy(TrailingPolicy::Reject);
+                let mut out = Vec::new();
+                let mut scratch = vec![0u8; 251];
+                let mut fed = 0usize;
+                loop {
+                    let progress = decoder
+                        .inflate(&compressed[fed..], &mut scratch, FlushMode::Finish)
+                        .unwrap_or_else(|e| panic!("{name} level {level} {framing:?}: {e}"));
+                    fed += progress.consumed;
+                    out.extend_from_slice(&scratch[..progress.produced]);
+                    if progress.status == InflateStatus::StreamEnd {
+                        break;
+                    }
+                }
+                assert_eq!(out, data, "{name} level {level}: push {framing:?}");
+                assert_eq!(decoder.members_decoded(), 1);
+                assert_eq!(decoder.total_in(), compressed.len() as u64);
+            }
         }
     }
 }

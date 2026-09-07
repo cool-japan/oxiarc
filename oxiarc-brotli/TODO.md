@@ -1,4 +1,4 @@
-# oxiarc-brotli - Development Status (v0.4.2, 2026-08-06)
+# oxiarc-brotli - Development Status (v0.4.2, 2026-09-07)
 
 ## Completed Features (COMPLETE)
 
@@ -28,9 +28,37 @@
 - [x] Block type switching
 
 ### Streaming API
-- [x] BrotliCompressor<W: Write> - streaming compressor
-- [x] BrotliDecompressor<R: Read> - streaming decompressor
+- [x] BrotliCompressor<W: Write> - incremental compressor
+- [x] BrotliDecompressor<R: Read> - incremental decompressor (built on BrotliStream)
 - [x] finish() for flushing final output
+
+### Bounded incremental decoding (BrotliStream, 0.4.2)
+- [x] `decode(&mut self, input, output, flush) -> BrotliProgress { consumed, produced,
+      status: NeedInput | NeedOutput | StreamEnd }` push decoder; `finish()`, `reset()`
+- [x] Meta-block preludes parsed atomically with bit-cursor rollback and retry,
+      bounded by a 1 MiB header cap; the shared `MetaBlockHeader::read` parser is the
+      one the one-shot decoder uses, so both read header bits at identical positions
+- [x] Command loop resumable at every literal, every byte of a backward reference and
+      every byte of a transformed static-dictionary word; up to 256 literal /
+      insert-and-copy / distance prefix trees, both context maps, block-switch state
+      and the distance ring all survive a `NeedInput` return
+- [x] Real sliding-window ring (power-of-two, lazily allocated, grown on demand to the
+      declared `1 << WBITS`) with bulk `copy_within` matches and periodic tiling for
+      short distances; literals decoded straight into the ring's linear region
+- [x] Uncompressed meta-blocks streamed without materialising
+- [x] `with_max_output(u64)` — exact pre-decode MLEN check per meta-block
+- [x] `with_max_window(usize)` — default 16 MiB, refused before allocation
+      (`BrotliError::WindowTooLarge`)
+- [x] `with_shape_recording(bool)` — `MetaBlockShape` differential vs
+      `decompress_reporting_shapes`
+- [x] Sticky fault latch, cleared only by `reset()`
+- [x] Input consumed exactly once; the bounded carry is compacted in place, never drained
+- [x] `BrotliAsyncDecompressor` re-based on `BrotliStream` (bounded staging buffer)
+- [x] Tests: byte-at-a-time in and out, prime chunk sizes, proptest split schedules,
+      truncation at every offset, cap exactness and chunk-independence, window-ceiling
+      refusal, all quality levels 0-11, RFC 7932 reference vectors, brotli-oracle
+      incremental leg (byte- and shape-identical vs the reference CLI), bit-flip
+      agreement with the one-shot decoder, counting-allocator memory bounds
 
 ### Public API
 - [x] compress(data, quality) -> BrotliResult<Vec<u8>>
@@ -41,6 +69,15 @@
 ## Future Enhancements
 
 ### Performance
+- [ ] Close the remaining decode gap on literal-dense payloads. `BrotliStream`
+      is 5-6x faster than the one-shot decoder on repetitive content (bulk
+      match copies and periodic tiling beat the one-shot's byte-at-a-time
+      append) but ~0.67x on hex-dump-like text. The cost is localised: it is the
+      memory traffic of maintaining a real 4 MiB ring plus the copy out to the
+      caller, where the one-shot decoder uses its output `Vec` as the window and
+      touches each byte once. Re-running the same payload at `lgwin = 10` (a
+      cache-resident ring) restores ≈1.0x. Numbers and method in the README's
+      Performance section; harness in `examples/decode_profile.rs`.
 - [ ] SIMD-accelerated matching
 - [ ] Multi-threaded compression
 - [x] Memory pool for per-encode allocations (`BrotliPool`)
@@ -73,7 +110,10 @@
   - **Tests:** counting-sink fixture on encode + decode round-trip; cancellation fixture that cancels mid-decode and asserts `OxiArcError::Cancelled`.
   - **Risk:** Progress at iteration boundary only (not per byte) to avoid overhead. Mitigated by virtual-call-amortization (one call per chunk).
 - [x] Async I/O support
-  - **Goal:** `async-io` Cargo feature implementing `oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor}` on `BrotliCompressor`/`BrotliDecompressor`. Mirrors `async_deflate.rs`: read-all → sync-process → write-all. NOT bounded-memory streaming; docs state this explicitly.
+  - **Goal:** `async-io` Cargo feature implementing `oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor}` on `BrotliCompressor`/`BrotliDecompressor`.
+  - **2026-09-07:** the decompressor is now bounded — it drives `BrotliStream`
+    with a small compressed staging buffer and writes each decoded chunk as it
+    is produced. The compressor still reads its input fully before compressing.
   - **Design:** NEW `oxiarc-brotli/src/async_brotli.rs` gated by `#[cfg(feature = "async-io")]`. Feature: `async-io = ["oxiarc-core/async-io", "dep:tokio"]`. Body: `AsyncReadExt::read_to_end` → `compress_with_params` / `decompress` → `write_all` → `flush`.
   - **Files:** NEW `oxiarc-brotli/src/async_brotli.rs`; MODIFY `Cargo.toml`, `lib.rs`
   - **Tests:** async_roundtrip (qualities 1/5/11), async_decode_serial_output, async_encode_serial_decode, async_empty
@@ -107,36 +147,59 @@
 
 ## Test Coverage
 
-- Unit tests (lib): 119 — tables/context/dictionary CRC-checked against the
+- Unit tests (lib): 159 — tables/context/dictionary CRC-checked against the
   RFC's own check values; huffman descriptor write/read round-trips;
-  decoder primitives (WBITS tree, NBLTYPES VLC, distance ring semantics)
+  decoder primitives (WBITS tree, NBLTYPES VLC, distance ring semantics);
+  sliding-window ring checked byte-for-byte against a growing-`Vec` reference
+  for every small distance, across the wrap, and through short output slices
 - reference_vectors: 11 (embedded reference-brotli fixtures; always run)
-- brotli_oracle: 3 (full differential sweep vs the `brotli` CLI; feature-gated)
-- corruption_robustness: 4 (truncation/bit-flip/garbage/CPU-DoS regression)
-- interop_vectors: 19, high_entropy_roundtrip: 8, encoder_bugs: 7,
-  pool: 8, progress_cancel: 10, proptest: 2, async: 11, doctests: 11
-- Total: 213 tests passing (with `--all-features`)
+- stream_conformance: 21 — chunk invariance (1-byte in and out), prime chunk
+  sizes, `MetaBlockShape` differential vs `decompress_reporting_shapes`,
+  truncation at every offset, cap exactness and chunk-independence,
+  window-ceiling refusal, bit-flip agreement with the one-shot decoder,
+  fault latch, reset isolation
+- stream_proptest: 4 (random split schedules vs the one-shot oracle, shape
+  preservation, arbitrary bytes, arbitrary truncations)
+- stream_adapters: 10 (`Interrupted` retry, `WouldBlock` propagation, output
+  before EOF, truncated source, caps through the adapter)
+- brotli_oracle: 15 (differential sweeps vs the `brotli` CLI, including an
+  incremental-decode leg asserting byte- *and* shape-identity, and rejection of
+  every prefix of every reference stream; feature-gated, self-skipping)
+- memory_limit: 7 (counting global allocator; bomb rejection and the
+  window-bounded peak of the push decoder and the `Read` adapter)
+- corruption_robustness: 4, interop_vectors: 19, high_entropy_roundtrip: 8,
+  encoder_bugs: 7, pool: 8, progress_cancel: 10, proptest: 2, async: 16,
+  doctests: 13
+- Total: 316 tests passing (with `--all-features`)
 
 ## Code Statistics
 
 | File | Lines |
 |------|-------|
-| huffman.rs | ~1,310 |
-| decompress.rs | ~890 |
-| compress.rs | ~650 |
-| streaming.rs | ~510 |
-| lz77.rs | ~470 |
-| pool.rs | ~470 |
-| dictionary.rs | ~460 (+ 122,784-byte `dict_data.bin`) |
+| huffman.rs | ~1,335 |
+| decompress.rs | ~1,140 |
+| compress.rs | ~1,145 |
+| block_split.rs | ~1,105 |
+| streaming.rs | ~990 |
+| stream/mod.rs | ~940 |
+| stream/command.rs | ~530 |
+| bit_reader.rs | ~560 |
+| lz77.rs | ~475 |
+| pool.rs | ~475 |
+| dictionary.rs | ~470 (+ 122,784-byte `dict_data.bin`) |
+| stream/window.rs | ~450 |
 | parallel.rs | ~360 |
-| bit_reader.rs | ~340 |
-| context.rs | ~290 |
-| async_brotli.rs | ~270 |
-| tables.rs | ~290 |
-| bit_writer.rs | ~230 |
-| lib.rs | ~270 |
-| error.rs | ~90 |
-| **Total** | **~6,900** |
+| async_brotli.rs | ~360 |
+| tables.rs | ~315 |
+| context.rs | ~270 |
+| lib.rs | ~290 |
+| bit_writer.rs | ~235 |
+| stream/meta.rs | ~170 |
+| error.rs | ~130 |
+| stream/budget.rs | ~95 |
+| **Total** | **~11,100** |
+
+Every file is under the 2,000-line house limit.
 
 ## Known Limitations
 
@@ -146,9 +209,16 @@
    Within a few percent of reference q6 on typical text, but notably behind
    at q10-11 and on structured binary data. (The *decoder* handles all of
    these features.)
-2. Streaming types buffer the whole input/output in memory (documented in
-   the `streaming` module); not bounded-memory streaming.
-3. No shared/custom dictionary support yet
+2. ~~Streaming types buffer the whole input/output in memory; not
+   bounded-memory streaming.~~ — **Fixed 2026-09-07** for the decode side:
+   `BrotliStream` is a real push decoder and `BrotliDecompressor<R>` /
+   `BrotliAsyncDecompressor` are thin adapters over it, bounded by the declared
+   sliding window (asserted with a counting allocator in
+   `tests/memory_limit.rs`). `BrotliAsyncCompressor` still reads its input fully
+   before compressing; `BrotliCompressor<W>` was already incremental.
+3. No shared/custom dictionary support yet (RFC 8478-style shared brotli
+   dictionaries; needed before `oxiarc-http` can support the `dcb`
+   content-coding)
 4. ~~Quality-1 encoder produces incorrect output for repeated-pattern data~~ — **Fixed 2026-05-17** (copy_length tail guard in `build_insert_copy_commands`)
 5. ~~Multi-block encoder is broken: inputs > 256 KiB at quality 4 (> 1 MiB at quality 5+) produce invalid bitstreams~~ — **Fixed 2026-05-17** (same root cause as #4)
 6. ~~High-entropy / incompressible data fails to decode at some quality levels ("invalid Huffman code: no matching code found" / truncated insert lengths)~~ — **Fixed 2026-06-06** (package-merge length-limited Huffman codes + unified insert-length code table covering inserts up to ~4 MiB)

@@ -58,12 +58,16 @@ pub mod deflate;
 pub mod gzip;
 pub mod huffman;
 pub mod inflate;
+pub(crate) mod inflate_core;
 pub mod lz77;
 pub mod optimal;
 pub mod pool;
+pub(crate) mod sink;
+pub mod stream;
 pub mod streaming;
 pub mod tables;
 mod window;
+pub mod wrapper;
 pub mod zlib;
 
 #[cfg(feature = "async-io")]
@@ -92,7 +96,9 @@ pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};
 pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
 pub use optimal::OptimalParser;
 pub use pool::{DeflatePool, PoolStats};
+pub use stream::{InflateProgress, InflateStatus, InflateStream};
 pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
+pub use wrapper::{GzipHeaderInfo, InflateWrapper, TrailingPolicy, WrappedInflate};
 pub use zlib::{
     Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
     zlib_decompress, zlib_decompress_into, zlib_decompress_with_dict, zlib_requires_dictionary,

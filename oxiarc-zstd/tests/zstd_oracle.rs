@@ -600,3 +600,261 @@ fn oracle_encode_fse_compressed_sequence_tables() {
     );
     eprintln!("[zstd-oracle] FSE_Compressed_Mode sequence tables accepted by reference zstd");
 }
+
+// ---------------------------------------------------------------------------
+// Incremental decode leg
+// ---------------------------------------------------------------------------
+
+/// Drive `ZstdStream` over `frame`, feeding `in_chunk` bytes per call and
+/// taking at most `out_chunk` bytes back, and return the decoded output.
+fn incremental_decode(frame: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, String> {
+    use oxiarc_core::traits::FlushMode;
+    use oxiarc_zstd::{ZstdStatus, ZstdStream};
+
+    // Reference frames made with `--long` declare 16-128 MiB windows, so the
+    // oracle raises the declared-window ceiling; the ring still only grows to
+    // the number of bytes actually produced.
+    let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; out_chunk.max(1)];
+    let mut pos = 0usize;
+    let mut calls = 0usize;
+
+    loop {
+        calls += 1;
+        if calls > 40_000_000 {
+            return Err("decoder did not terminate".to_string());
+        }
+        let end = pos.saturating_add(in_chunk).min(frame.len());
+        let flush = if end == frame.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream
+            .decode(&frame[pos..end], &mut scratch, flush)
+            .map_err(|e| e.to_string())?;
+        pos += progress.consumed;
+        out.extend_from_slice(&scratch[..progress.produced]);
+        if progress.status == ZstdStatus::StreamEnd {
+            stream.finish().map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
+    }
+}
+
+/// Decode direction, incremental: every reference frame across the full
+/// level/flag matrix must decode byte-identically through the *push* decoder,
+/// at several chunk schedules including one byte in / one byte out.
+#[test]
+fn oracle_incremental_decode_reference_frames() {
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_decode_reference_frames");
+        return;
+    }
+
+    let flag_sets: &[&[&str]] = &[
+        &["-1"],
+        &["-3"],
+        &["-9"],
+        &["-19"],
+        &["--ultra", "-22"],
+        &["--long=24", "-6"],
+        &["--no-check", "-3"],
+        &["--no-content-size", "-3"],
+    ];
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    for (name, data) in test_inputs() {
+        for flags in flag_sets {
+            let frame = zstd_compress(&data, flags)
+                .unwrap_or_else(|e| panic!("reference compress {name} {flags:?}: {e}"));
+
+            // Big payloads only get the coarse schedules so the suite stays
+            // fast; small ones get the pathological ones too.
+            let mut schedules: Vec<(usize, usize)> =
+                vec![(usize::MAX, 1 << 16), (1, 1 << 16), (4096, 37), (13, 7)];
+            if data.len() <= 4096 {
+                schedules.push((1, 1));
+                schedules.push((3, 5));
+            }
+
+            for (ic, oc) in schedules {
+                total += 1;
+                match incremental_decode(&frame, ic, oc) {
+                    Ok(out) if out == data => passed += 1,
+                    Ok(out) => panic!(
+                        "[{name} {flags:?} {ic}/{oc}] incremental decode produced {} bytes, expected {}",
+                        out.len(),
+                        data.len()
+                    ),
+                    Err(e) => panic!("[{name} {flags:?} {ic}/{oc}] incremental decode failed: {e}"),
+                }
+            }
+        }
+    }
+    assert_eq!(passed, total);
+    eprintln!(
+        "[zstd-oracle] incremental decode: {passed}/{total} reference frame/chunk-schedule pairs byte-identical"
+    );
+}
+
+/// The bounded one-shot helpers agree with the reference CLI, and their caps
+/// are honoured on reference frames.
+#[test]
+fn oracle_bounded_helpers_on_reference_frames() {
+    if find_zstd().is_none() {
+        skip_note("oracle_bounded_helpers_on_reference_frames");
+        return;
+    }
+
+    let mut checked = 0usize;
+    for (name, data) in test_inputs() {
+        for flags in [
+            &["-3"][..],
+            &["--long=24", "-6"][..],
+            &["--no-check", "-3"][..],
+        ] {
+            let frame = zstd_compress(&data, flags)
+                .unwrap_or_else(|e| panic!("reference compress {name} {flags:?}: {e}"));
+
+            let out = oxiarc_zstd::decompress_with_limit(&frame, data.len())
+                .unwrap_or_else(|e| panic!("[{name} {flags:?}] decompress_with_limit: {e}"));
+            assert_eq!(out, data, "[{name} {flags:?}] decompress_with_limit");
+
+            let mut dst = vec![0u8; data.len()];
+            let n = oxiarc_zstd::decompress_into(&frame, &mut dst)
+                .unwrap_or_else(|e| panic!("[{name} {flags:?}] decompress_into: {e}"));
+            assert_eq!(n, data.len(), "[{name} {flags:?}] decompress_into length");
+            assert_eq!(dst, data, "[{name} {flags:?}] decompress_into content");
+
+            if !data.is_empty() {
+                assert!(
+                    oxiarc_zstd::decompress_with_limit(&frame, data.len() - 1).is_err(),
+                    "[{name} {flags:?}] a tight cap must be enforced"
+                );
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("[zstd-oracle] bounded helpers: {checked} reference frames within cap");
+}
+
+/// A truncated reference frame must be an error through the push decoder — a
+/// short `Ok` would be silent data loss.
+#[test]
+fn oracle_incremental_truncation_is_an_error() {
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_truncation_is_an_error");
+        return;
+    }
+
+    let data = b"truncate me at every quarter ".repeat(400);
+    let frame = zstd_compress(&data, &["-6"]).expect("reference compress");
+    for cut in [1usize, frame.len() / 4, frame.len() / 2, frame.len() - 1] {
+        let result = incremental_decode(&frame[..cut], usize::MAX, 1 << 16);
+        assert!(
+            result.is_err(),
+            "truncation at {cut}/{} decoded successfully",
+            frame.len()
+        );
+    }
+}
+
+/// The single most important differential for a windowed decoder: reference
+/// frames whose payload is **far larger than their declared `Window_Size`**.
+///
+/// Everything else in this file compresses at most 600 KB, and `zstd`'s default
+/// window at level 3+ is 2 MiB, so no other test ever makes the ring wrap. Here
+/// the payload is 4 MiB against declared windows of 128 KiB and 1 KiB, so the
+/// ring wraps 32x and 4096x respectively and every back-reference lands at or
+/// near the window boundary — exactly the arithmetic that the old
+/// "whole output is the window" decoder never had to get right.
+#[test]
+fn oracle_incremental_small_window_large_payload() {
+    use oxiarc_core::traits::FlushMode;
+    use oxiarc_zstd::{ZstdStatus, ZstdStream};
+
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_small_window_large_payload");
+        return;
+    }
+
+    // Compressible enough that the encoder emits long matches, and long enough
+    // to wrap even a 1 KiB window thousands of times.
+    let mut raw = Vec::with_capacity(4 << 20);
+    let mut i = 0u32;
+    while raw.len() < (4 << 20) {
+        raw.extend_from_slice(
+            format!("record {i:08} name=widget-{} qty={}\n", i % 97, i % 13).as_bytes(),
+        );
+        i += 1;
+    }
+    raw.truncate(4 << 20);
+
+    let flag_sets: &[&[&str]] = &[
+        &["--zstd=wlog=17", "-6"],  // 128 KiB window, 32x wrap
+        &["--zstd=wlog=10", "-3"],  // 1 KiB window, 4096x wrap
+        &["--long=17", "-9"],       // long mode with a small window
+        &["--zstd=wlog=11", "-19"], // deep search, 2 KiB window
+    ];
+
+    for flags in flag_sets {
+        let frame = zstd_compress(&raw, flags)
+            .unwrap_or_else(|e| panic!("reference compress {flags:?}: {e}"));
+
+        // The declared window really is small, or the test proves nothing.
+        assert_eq!(frame[4] & 0x20, 0, "{flags:?}: expected a windowed frame");
+        let wd = frame[5];
+        let base = 1u64 << (10 + u32::from(wd >> 3));
+        let declared = base + (base >> 3) * u64::from(wd & 7);
+        assert!(
+            declared <= 256 * 1024,
+            "{flags:?}: declared window {declared} is not smaller than the payload"
+        );
+
+        for chunk in [usize::MAX, 4096, 1] {
+            let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+            let mut out = Vec::with_capacity(raw.len());
+            let mut scratch = vec![0u8; 64 * 1024];
+            let mut pos = 0usize;
+            loop {
+                let end = pos.saturating_add(chunk).min(frame.len());
+                let flush = if end == frame.len() {
+                    FlushMode::Finish
+                } else {
+                    FlushMode::None
+                };
+                let progress = stream
+                    .decode(&frame[pos..end], &mut scratch, flush)
+                    .unwrap_or_else(|e| panic!("[{flags:?} chunk {chunk}] decode failed: {e}"));
+                pos += progress.consumed;
+                out.extend_from_slice(&scratch[..progress.produced]);
+                if progress.status == ZstdStatus::StreamEnd {
+                    break;
+                }
+            }
+            assert!(
+                out == raw,
+                "[{flags:?} chunk {chunk}] wrapped-ring decode differs from the input"
+            );
+            // The whole 4 MiB was produced through a ring no larger than the
+            // frame's declared window.
+            assert!(
+                stream.window_size() as u64 <= declared.max(1),
+                "[{flags:?}] window grew to {} for a declared {declared}",
+                stream.window_size()
+            );
+        }
+
+        // And through the bounded one-shot helper.
+        let got = oxiarc_zstd::decompress_with_limit(&frame, raw.len())
+            .unwrap_or_else(|e| panic!("[{flags:?}] decompress_with_limit: {e}"));
+        assert!(got == raw, "[{flags:?}] decompress_with_limit differs");
+    }
+
+    eprintln!(
+        "[zstd-oracle] wrapped-ring decode: 4 MiB through 1-128 KiB declared windows, byte-identical"
+    );
+}

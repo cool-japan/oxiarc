@@ -1,5 +1,31 @@
 
-# oxiarc-lzma - Development Status (v0.4.2, 2026-08-06)
+# oxiarc-lzma - Development Status (v0.4.2, 2026-09-07)
+
+## XZ container (`oxiarc_lzma::xz`) — COMPLETE (new in 0.4.2)
+
+- [x] Stream header/footer, block headers, multi-block streams, index
+      (records + CRC-32) and footer Backward-Size cross-check
+- [x] Multi-stream files (`cat a.xz b.xz`) and Stream Padding, decoded and
+      concatenated like `xz -d`; trailing garbage is an error, not a silent
+      short read
+- [x] Block Uncompressed Size vs. decoded length, index record count vs.
+      block count, and reserved block-header flag bits — the only
+      cross-checks available on the `LZMA_CHECK_NONE` streams libtiff writes
+- [x] Check types: None, CRC-32, CRC-64/ECMA-182, SHA-256 (FIPS 180-4,
+      dependency-free), verified **after** the filter chain per the spec
+- [x] Block filter chains (1-4 filters, LZMA2 last, duplicates rejected):
+      Delta (0x03) and BCJ x86 / PowerPC / IA-64 / ARM / ARM-Thumb / SPARC /
+      ARM64, each byte-for-byte validated against liblzma (CPython `lzma`)
+      and the `xz` CLI in both directions
+- [x] BCJ RISC-V (0x0B) and unknown filter IDs: named `UnsupportedMethod`
+      error, never silently mis-decoded
+- [x] `xz::decompress_into(src, &mut dst)` / `xz::decompress_with_limit(data,
+      max)` / `XzReader::with_max_output(u64)` — output cap enforced during
+      decoding, chunk by chunk
+- [x] `oxiarc-archive` re-exports the module unchanged (same public paths)
+- [x] libtiff `tiffcp -c lzma` (TIFF `Compression = 34925`) multi-strip
+      differential suite and an `xz` CLI check-type sweep, behind `xz-oracle`
+
 
 ## Completed Features (COMPLETE)
 

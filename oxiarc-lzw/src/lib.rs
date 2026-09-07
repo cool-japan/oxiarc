@@ -39,6 +39,25 @@
 //! assert_eq!(decompressed, original);
 //! ```
 //!
+//! ## Zero-allocation TIFF strip decoding
+//!
+//! [`decompress_tiff_into`] decodes a TIFF LZW strip straight into a
+//! caller-supplied buffer using the classical prefix/suffix code table, so
+//! no allocation happens per decoded code (and none at all beyond the code
+//! table itself):
+//!
+//! ```rust
+//! use oxiarc_lzw::{compress_tiff, decompress_tiff_into};
+//!
+//! let strip = b"row0row0row1row1row2row2";
+//! let compressed = compress_tiff(strip).unwrap();
+//!
+//! let mut out = vec![0u8; strip.len()];
+//! let written = decompress_tiff_into(&compressed, &mut out).unwrap();
+//! assert_eq!(written, strip.len());
+//! assert_eq!(&out[..written], strip);
+//! ```
+//!
 //! ## Critical Bug Fix
 //!
 //! This implementation fixes a critical bug in the weezl crate where LZW
@@ -158,6 +177,141 @@ pub fn compress(data: &[u8], config: LzwConfig) -> Result<Vec<u8>> {
 /// ```
 pub fn decompress_tiff(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     decompress(data, expected_size, LzwConfig::TIFF)
+}
+
+/// Decompress LZW data directly into a caller-supplied buffer.
+///
+/// This is the allocation-free decode entry point: codes are expanded
+/// through the prefix/suffix code table straight into `dst`, so decoding a
+/// TIFF strip costs no per-code allocation and no intermediate `Vec`.
+///
+/// # Parameters
+///
+/// - `src`: LZW-compressed input (MSB-first, as used by TIFF)
+/// - `dst`: output buffer; decoding stops once it is full
+/// - `config`: LZW configuration (see [`LzwConfig::TIFF`] and
+///   [`LzwConfig::TIFF_OLD_STYLE`])
+///
+/// # Returns
+///
+/// The number of bytes written to `dst`. A value smaller than `dst.len()`
+/// means the stream ended (EOI) before the buffer was filled.
+///
+/// # Errors
+///
+/// - [`LzwError::UnexpectedEof`] if the input runs out before `dst` is full
+///   and before an EOI code is read (a truncated strip is never reported as
+///   success),
+/// - [`LzwError::InvalidCode`] for a code outside the current table,
+/// - [`LzwError::InvalidBitWidth`] if `config` is out of range.
+///
+/// Any input left over once `dst` is full is ignored, matching libtiff's
+/// `LZWDecode`.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_lzw::{compress, decompress_into, LzwConfig};
+///
+/// let original = b"Hello, World! Hello, World!";
+/// let compressed = compress(original, LzwConfig::TIFF).unwrap();
+///
+/// let mut out = vec![0u8; original.len()];
+/// let written = decompress_into(&compressed, &mut out, LzwConfig::TIFF).unwrap();
+/// assert_eq!(&out[..written], original);
+/// ```
+pub fn decompress_into(src: &[u8], dst: &mut [u8], config: LzwConfig) -> Result<usize> {
+    let mut decoder = LzwDecoder::new(config)?;
+    decoder.decode_into(src, dst)
+}
+
+/// Decompress a TIFF LZW strip/tile directly into a caller-supplied buffer.
+///
+/// Equivalent to `decompress_into(src, dst, LzwConfig::TIFF)`: MSB-first
+/// 9-12 bit codes, TIFF early code change, ClearCode/EOI handling per TIFF
+/// 6.0 §13 and libtiff.
+///
+/// # Returns
+///
+/// The number of bytes written to `dst`.
+///
+/// # Errors
+///
+/// See [`decompress_into`].
+///
+/// # Old-style writers (no early code-width change)
+///
+/// Some encoders follow TIFF 6.0's own pseudo-code and grow the code width
+/// one code later than libtiff does; [`LzwConfig::TIFF_OLD_STYLE`] decodes
+/// those. Fall back to it **only when the standard rule returns an error**,
+/// and decode the retry into a scratch buffer so a failed retry cannot
+/// clobber a good result:
+///
+/// ```rust
+/// use oxiarc_lzw::{compress, decompress_into, decompress_tiff_into, LzwConfig};
+///
+/// # fn decode_strip(strip: &[u8], out: &mut [u8]) -> oxiarc_lzw::Result<usize> {
+/// let written = match decompress_tiff_into(strip, out) {
+///     Ok(n) => n,
+///     Err(standard_err) => {
+///         let mut scratch = vec![0u8; out.len()];
+///         match decompress_into(strip, &mut scratch, LzwConfig::TIFF_OLD_STYLE) {
+///             Ok(n) => {
+///                 out.copy_from_slice(&scratch);
+///                 n
+///             }
+///             // Neither rule explains the strip: report the first failure.
+///             Err(_) => return Err(standard_err),
+///         }
+///     }
+/// };
+/// # Ok(written)
+/// # }
+/// let original = b"old-style TIFF LZW strip; long enough that the code \
+///                  width has to grow, which is the only place the two \
+///                  rules disagree at all. AAAAAAAAAABBBBBBBBBBCCCCCCCCCC";
+/// let original = original.repeat(20);
+/// let strip = compress(&original, LzwConfig::TIFF_OLD_STYLE).unwrap();
+/// let mut out = vec![0u8; original.len()];
+/// let written = decode_strip(&strip, &mut out).unwrap();
+/// assert_eq!(&out[..written], &original[..]);
+/// ```
+///
+/// Two rules that this recipe deliberately does **not** apply, because both
+/// corrupt real images:
+///
+/// * A short return (`n < dst.len()`) is a **short strip**, not a reason to
+///   retry: a strip whose data ends before the geometry says it should is
+///   ordinary (libtiff warns and keeps the partial row), while an old-style
+///   retry on such a strip fails and destroys the bytes already decoded.
+/// * Caching the winning configuration per image is worth it (the retry
+///   then costs one strip), but the *first* strip must still be decoded by
+///   this recipe rather than by sniffing the stream: unlike libtiff's
+///   LSB-first `LZWDecodeCompat` case, an early-change decoder cannot tell
+///   an old-style stream from a standard one by looking at its first bytes.
+///
+/// One case no return-value heuristic can catch: an old-style stream can
+/// occasionally fill `dst` completely under the standard rule with wrong
+/// bytes (measured at roughly 2 % of random old-style strips in
+/// `tests/old_style_fallback.rs`). A caller that *knows* a file is old-style should
+/// select [`LzwConfig::TIFF_OLD_STYLE`] outright instead of relying on the
+/// fallback.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_lzw::{compress_tiff, decompress_tiff_into};
+///
+/// let original = b"TOBEORNOTTOBEORTOBEORNOT";
+/// let compressed = compress_tiff(original).unwrap();
+///
+/// let mut out = vec![0u8; original.len()];
+/// let written = decompress_tiff_into(&compressed, &mut out).unwrap();
+/// assert_eq!(written, original.len());
+/// assert_eq!(&out[..], original);
+/// ```
+pub fn decompress_tiff_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    decompress_into(src, dst, LzwConfig::TIFF)
 }
 
 /// Compress data with TIFF LZW (convenience function).

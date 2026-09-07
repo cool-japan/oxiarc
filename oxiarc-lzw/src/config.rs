@@ -36,6 +36,30 @@ impl LzwConfig {
         early_change: true,
     };
 
+    /// Old-style TIFF LZW configuration: the standard (late) code-width
+    /// change instead of TIFF's early change.
+    ///
+    /// Identical to [`LzwConfig::TIFF`] — same MSB-first packing, same
+    /// ClearCode/EOI handling — except that the code width grows when
+    /// `next_code` reaches `2^current_bits + 1` rather than one code
+    /// earlier. That is what a writer following TIFF 6.0's own pseudo-code
+    /// literally produces, instead of the early change libtiff, Pillow and
+    /// GDAL all implement, and it is the reason such strips decode to
+    /// garbage (or to `InvalidCode`) under [`LzwConfig::TIFF`].
+    ///
+    /// This is **not** the same variant as libtiff's `LZWDecodeCompat`
+    /// path: that one handles streams whose codes are packed LSB-first,
+    /// which this crate's MSB-first bit reader does not decode at all.
+    ///
+    /// See [`crate::decompress_tiff_into`] for how to fall back to this
+    /// configuration safely, and for the case no fallback rule can catch.
+    pub const TIFF_OLD_STYLE: Self = Self {
+        min_bits: 9,
+        max_bits: 12,
+        use_clear_code: true,
+        early_change: false,
+    };
+
     /// Standard GIF LZW configuration.
     ///
     /// - LSB-first bit order (would need different bitstream)
@@ -146,6 +170,16 @@ mod tests {
     #[test]
     fn test_default_config_is_tiff() {
         assert_eq!(LzwConfig::default(), LzwConfig::TIFF);
+    }
+
+    #[test]
+    fn test_tiff_old_style_config() {
+        let config = LzwConfig::TIFF_OLD_STYLE;
+        assert_eq!(config.min_bits, 9);
+        assert_eq!(config.max_bits, 12);
+        assert!(config.use_clear_code);
+        assert!(!config.early_change, "old-style TIFF has no early change");
+        assert!(config.validate().is_ok());
     }
 
     #[test]

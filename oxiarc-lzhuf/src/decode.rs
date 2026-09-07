@@ -11,6 +11,11 @@ use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::traits::{DecompressStatus, Decompressor};
 use std::io::Read;
 
+/// Initial capacity cap when reading a *stored* (`-lh0-`) entry, so a crafted
+/// header declaring a huge uncompressed size cannot force one giant allocation
+/// before a single byte has been read.
+const STORED_READ_CHUNK: usize = 64 * 1024;
+
 /// History ring buffer, mirroring `lhasa`'s `LHANewDecoder` ring.
 ///
 /// The buffer holds `1 << history_bits` bytes, pre-filled with ASCII space
@@ -90,6 +95,10 @@ pub struct LzhDecoder {
     dictionary: Vec<u8>,
     /// Last decode result (for [`output`](Self::output)).
     output_buf: Vec<u8>,
+    /// How much of `output_buf` has already been handed to a
+    /// [`Decompressor::decompress`] caller. Only that trait impl uses it;
+    /// [`output`](Self::output) and [`decode`](Self::decode) are unaffected.
+    output_pos: usize,
     /// Whether decoding is finished.
     finished: bool,
 }
@@ -102,6 +111,7 @@ impl LzhDecoder {
             uncompressed_size,
             dictionary: Vec::new(),
             output_buf: Vec::new(),
+            output_pos: 0,
             finished: false,
         }
     }
@@ -128,6 +138,7 @@ impl LzhDecoder {
     /// Reset the decoder.
     pub fn reset(&mut self) {
         self.output_buf.clear();
+        self.output_pos = 0;
         self.finished = false;
     }
 
@@ -183,8 +194,22 @@ impl LzhDecoder {
 
     /// Decode stored (lh0 / lhd) data.
     fn decode_stored<R: Read>(&mut self, reader: &mut R) -> Result<Vec<u8>> {
-        let mut output = vec![0u8; self.uncompressed_size as usize];
-        reader.read_exact(&mut output)?;
+        // `uncompressed_size` comes from an untrusted LZH header, so it is
+        // never allocated up front: a 30-byte archive may declare terabytes.
+        // Read what the source actually has, growing geometrically but never
+        // past the declared size, and treat a short read as the truncation it
+        // is (the same outcome `read_exact` produced, without the allocation).
+        let declared = self.uncompressed_size;
+        let initial = declared.min(STORED_READ_CHUNK as u64) as usize;
+        let mut output = Vec::with_capacity(initial);
+        reader.take(declared).read_to_end(&mut output)?;
+        if (output.len() as u64) != declared {
+            // `expected` is the number of bytes still missing.
+            let missing = declared - output.len() as u64;
+            return Err(OxiArcError::unexpected_eof(
+                usize::try_from(missing).unwrap_or(usize::MAX),
+            ));
+        }
         self.output_buf = output.clone();
         self.finished = true;
         Ok(output)
@@ -316,6 +341,26 @@ impl LzhDecoder {
         &self.output_buf
     }
 
+    /// Copy the not-yet-delivered part of `output_buf` into `output` for the
+    /// [`Decompressor`] impl, advancing the delivery cursor.
+    fn drain_decoded(&mut self, output: &mut [u8]) -> usize {
+        let available = &self.output_buf[self.output_pos.min(self.output_buf.len())..];
+        let to_copy = available.len().min(output.len());
+        output[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.output_pos += to_copy;
+        to_copy
+    }
+
+    /// Status for the [`Decompressor`] impl: undelivered staged output
+    /// outranks "the stream is decoded".
+    fn drain_status(&self) -> DecompressStatus {
+        if self.output_pos < self.output_buf.len() {
+            DecompressStatus::NeedsOutput
+        } else {
+            DecompressStatus::Done
+        }
+    }
+
     /// Check if decoding is finished.
     pub fn is_done(&self) -> bool {
         self.finished
@@ -323,23 +368,36 @@ impl LzhDecoder {
 }
 
 impl Decompressor for LzhDecoder {
+    /// Decode the whole compressed stream (this decoder is one-shot
+    /// internally) and hand it back to the caller **one output buffer at a
+    /// time**.
+    ///
+    /// The decoded bytes are staged in `output_buf` and drained across calls:
+    /// while any remain undelivered the status is
+    /// [`NeedsOutput`](DecompressStatus::NeedsOutput), and only the call that
+    /// delivers the last byte reports [`Done`](DecompressStatus::Done).
+    /// Reporting `Done` on the first call — as this did before 0.4.2 — meant
+    /// every caller that stops at `Done` silently received a truncated result:
+    /// [`decompress_all`](Decompressor::decompress_all) uses a 32 KiB buffer,
+    /// so any entry larger than that came back cut to 32 KiB with no error.
     fn decompress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
         if self.finished {
-            return Ok((0, 0, DecompressStatus::Done));
+            let written = self.drain_decoded(output);
+            return Ok((0, written, self.drain_status()));
         }
 
         let mut cursor = std::io::Cursor::new(input);
-        let result = self.decode(&mut cursor)?;
+        self.decode(&mut cursor)?;
 
         let consumed = cursor.position() as usize;
-        let to_copy = result.len().min(output.len());
-        output[..to_copy].copy_from_slice(&result[..to_copy]);
+        self.output_pos = 0;
+        let written = self.drain_decoded(output);
 
-        Ok((consumed, to_copy, DecompressStatus::Done))
+        Ok((consumed, written, self.drain_status()))
     }
 
     fn reset(&mut self) {

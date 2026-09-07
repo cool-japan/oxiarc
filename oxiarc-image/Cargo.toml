@@ -1,0 +1,31 @@
+[package]
+name = "oxiarc-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Thin image-crate-shaped facade over oxiarc-png, oxiarc-jpeg and oxiarc-tiff: format sniffing, open/load/save, typed pixel buffers"
+readme = "README.md"
+keywords = ["image", "png", "jpeg", "tiff", "facade"]
+categories = ["multimedia::images", "multimedia::encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[dependencies]
+oxiarc-png = { workspace = true }
+oxiarc-jpeg = { workspace = true }
+oxiarc-tiff = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

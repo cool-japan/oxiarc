@@ -34,7 +34,7 @@ use crate::tables::{BLOCK_COUNT_CODES, COPY_LENGTH_CODES, INSERT_LENGTH_CODES, d
 
 /// Maximum allowed output size (256 MB limit for safety against
 /// decompression bombs; a documented guard, not an RFC limit).
-const MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
 
 /// The output-size cap enforced while a stream is being decoded.
 ///
@@ -220,11 +220,7 @@ fn decompress_instrumented(
 
     // Ring buffer of the last four distances (Section 4): the last distance
     // is 4, then 11, 15, 16. Persists across meta-blocks.
-    let mut state = DecoderState {
-        dist_ring: [16, 15, 11, 4],
-        dist_ring_idx: 0,
-        window_size,
-    };
+    let mut state = DecoderState::new(window_size);
 
     loop {
         if let Some(token) = cancel {
@@ -313,7 +309,7 @@ fn decompress_instrumented(
 }
 
 /// Read the stream header WBITS field (RFC 7932 Section 9.1).
-fn read_window_bits(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
+pub(crate) fn read_window_bits(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
     if !reader.read_bit()? {
         return Ok(16);
     }
@@ -379,7 +375,10 @@ pub(crate) fn read_block_type_count(reader: &mut BitReader<'_>) -> BrotliResult<
 }
 
 /// Read a block count using the 26-symbol block-count code (Section 6).
-fn read_block_count(reader: &mut BitReader<'_>, tree: &HuffmanTree) -> BrotliResult<u32> {
+pub(crate) fn read_block_count(
+    reader: &mut BitReader<'_>,
+    tree: &HuffmanTree,
+) -> BrotliResult<u32> {
     let sym = tree.decode_symbol(reader)?;
     let (base, extra_bits) = *BLOCK_COUNT_CODES
         .get(sym as usize)
@@ -388,15 +387,15 @@ fn read_block_count(reader: &mut BitReader<'_>, tree: &HuffmanTree) -> BrotliRes
 }
 
 /// Per-category block-switching state (Section 6).
-struct BlockCategory {
+pub(crate) struct BlockCategory {
     /// Number of block types (NBLTYPESx).
-    num_types: u32,
+    pub(crate) num_types: u32,
     /// Current block type.
-    btype: usize,
+    pub(crate) btype: usize,
     /// Block type of the block that preceded the current one.
-    prev_btype: usize,
+    pub(crate) prev_btype: usize,
     /// Remaining element count for the current block.
-    blen: u32,
+    pub(crate) blen: u32,
     /// Prefix code over the block type alphabet (present when >= 2 types).
     btype_tree: Option<HuffmanTree>,
     /// Prefix code over the block count alphabet (present when >= 2 types).
@@ -406,7 +405,7 @@ struct BlockCategory {
 impl BlockCategory {
     /// Read the NBLTYPES header field and, when >= 2, the block type and
     /// block count prefix codes plus the first block count (Section 9.2).
-    fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
+    pub(crate) fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
         let num_types = read_block_type_count(reader)?;
         if num_types >= 2 {
             let btype_tree = read_prefix_code(reader, num_types + 2)?;
@@ -434,7 +433,7 @@ impl BlockCategory {
 
     /// Consume one element of this category, performing a block switch
     /// first when the current block is exhausted (Section 6).
-    fn tick(&mut self, reader: &mut BitReader<'_>) -> BrotliResult<()> {
+    pub(crate) fn tick(&mut self, reader: &mut BitReader<'_>) -> BrotliResult<()> {
         if self.num_types < 2 {
             return Ok(());
         }
@@ -466,14 +465,27 @@ impl BlockCategory {
 }
 
 /// Distance ring buffer and window state shared across meta-blocks.
-struct DecoderState {
-    dist_ring: [usize; 4],
-    dist_ring_idx: usize,
-    window_size: usize,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoderState {
+    /// The last four distances, most recent at `dist_ring_idx - 1`.
+    pub(crate) dist_ring: [usize; 4],
+    /// Write cursor into `dist_ring` (masked with 3).
+    pub(crate) dist_ring_idx: usize,
+    /// `(1 << WBITS) - 16`, the largest in-window backward reference.
+    pub(crate) window_size: usize,
 }
 
 impl DecoderState {
-    fn last_distance(&self) -> usize {
+    /// The initial ring state of RFC 7932 Section 4: last = 4, then 11, 15, 16.
+    pub(crate) const fn new(window_size: usize) -> Self {
+        DecoderState {
+            dist_ring: [16, 15, 11, 4],
+            dist_ring_idx: 0,
+            window_size,
+        }
+    }
+
+    pub(crate) fn last_distance(&self) -> usize {
         self.dist_ring[(self.dist_ring_idx.wrapping_sub(1)) & 3]
     }
 
@@ -481,14 +493,14 @@ impl DecoderState {
         self.dist_ring[(self.dist_ring_idx.wrapping_sub(n)) & 3]
     }
 
-    fn push_distance(&mut self, distance: usize) {
+    pub(crate) fn push_distance(&mut self, distance: usize) {
         self.dist_ring[self.dist_ring_idx & 3] = distance;
         self.dist_ring_idx = self.dist_ring_idx.wrapping_add(1);
     }
 }
 
 /// Read a literal or distance context map (RFC 7932 Section 7.3).
-fn read_context_map(
+pub(crate) fn read_context_map(
     reader: &mut BitReader<'_>,
     num_trees: u32,
     size: usize,
@@ -543,6 +555,135 @@ fn inverse_move_to_front(data: &mut [u8]) {
     }
 }
 
+/// Everything a compressed meta-block's header declares (RFC 7932 Section
+/// 9.2), parsed as one unit.
+///
+/// Both decoders share this parser: the one-shot [`decompress`] path and the
+/// incremental [`crate::stream::BrotliStream`], whose header tier re-parses
+/// from a rolled-back bit cursor until the whole header has arrived. Sharing
+/// it is what makes the two decoders read the header at bit-identical
+/// positions.
+pub(crate) struct MetaBlockHeader {
+    /// Literal block-switch state.
+    pub(crate) cat_l: BlockCategory,
+    /// Insert-and-copy block-switch state.
+    pub(crate) cat_i: BlockCategory,
+    /// Distance block-switch state.
+    pub(crate) cat_d: BlockCategory,
+    /// Context mode per literal block type.
+    pub(crate) context_modes: Vec<ContextMode>,
+    /// Literal context map.
+    pub(crate) cmapl: ContextMap,
+    /// Distance context map.
+    pub(crate) cmapd: ContextMap,
+    /// `NTREESL` literal prefix codes.
+    pub(crate) literal_trees: Vec<HuffmanTree>,
+    /// `NBLTYPESI` insert-and-copy prefix codes.
+    pub(crate) ic_trees: Vec<HuffmanTree>,
+    /// `NTREESD` distance prefix codes.
+    pub(crate) distance_trees: Vec<HuffmanTree>,
+    /// `NDIRECT`, already shifted left by `NPOSTFIX`.
+    pub(crate) ndirect: u32,
+    /// `NPOSTFIX`.
+    pub(crate) npostfix: u32,
+    /// `(1 << NPOSTFIX) - 1`.
+    pub(crate) postfix_mask: u32,
+    /// The block-splitting shape, for [`decompress_reporting_shapes`].
+    pub(crate) shape: MetaBlockShape,
+}
+
+impl MetaBlockHeader {
+    /// Parse a compressed meta-block header from `reader`.
+    pub(crate) fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
+        // Block type headers, in the fixed order L, I, D.
+        let cat_l = BlockCategory::read(reader)?;
+        let cat_i = BlockCategory::read(reader)?;
+        let cat_d = BlockCategory::read(reader)?;
+
+        // Distance parameters.
+        let npostfix = reader.read_bits(2)?;
+        let ndirect = reader.read_bits(4)? << npostfix;
+        let postfix_mask = (1u32 << npostfix) - 1;
+        let distance_alphabet_size = 16 + ndirect + (48 << npostfix);
+
+        // Context modes, one per literal block type.
+        let mut context_modes = Vec::with_capacity(cat_l.num_types as usize);
+        for _ in 0..cat_l.num_types {
+            let mode_bits = reader.read_bits(2)? as u8;
+            let mode = ContextMode::from_bits(mode_bits).ok_or_else(|| {
+                BrotliError::InvalidContextMap(format!("invalid context mode {mode_bits}"))
+            })?;
+            context_modes.push(mode);
+        }
+
+        // Literal and distance context maps (always preceded by NTREES fields).
+        let ntreesl = read_block_type_count(reader)?;
+        let cmapl_size = cat_l.num_types as usize * NUM_LITERAL_CONTEXTS;
+        let cmapl = if ntreesl >= 2 {
+            let map = read_context_map(reader, ntreesl, cmapl_size)?;
+            ContextMap {
+                map,
+                num_contexts: NUM_LITERAL_CONTEXTS,
+                num_trees: ntreesl as usize,
+            }
+        } else {
+            ContextMap::trivial(cat_l.num_types as usize, NUM_LITERAL_CONTEXTS)
+        };
+
+        let ntreesd = read_block_type_count(reader)?;
+        let cmapd_size = cat_d.num_types as usize * NUM_DISTANCE_CONTEXTS;
+        let cmapd = if ntreesd >= 2 {
+            let map = read_context_map(reader, ntreesd, cmapd_size)?;
+            ContextMap {
+                map,
+                num_contexts: NUM_DISTANCE_CONTEXTS,
+                num_trees: ntreesd as usize,
+            }
+        } else {
+            ContextMap::trivial(cat_d.num_types as usize, NUM_DISTANCE_CONTEXTS)
+        };
+
+        // Prefix code arrays: NTREESL literal codes, NBLTYPESI insert-and-copy
+        // codes, NTREESD distance codes.
+        let mut literal_trees = Vec::with_capacity(ntreesl as usize);
+        for _ in 0..ntreesl {
+            literal_trees.push(read_prefix_code(reader, 256)?);
+        }
+        let mut ic_trees = Vec::with_capacity(cat_i.num_types as usize);
+        for _ in 0..cat_i.num_types {
+            ic_trees.push(read_prefix_code(reader, 704)?);
+        }
+        let mut distance_trees = Vec::with_capacity(ntreesd as usize);
+        for _ in 0..ntreesd {
+            distance_trees.push(read_prefix_code(reader, distance_alphabet_size)?);
+        }
+
+        let shape = MetaBlockShape {
+            literal_types: cat_l.num_types,
+            insert_and_copy_types: cat_i.num_types,
+            distance_types: cat_d.num_types,
+            literal_trees: ntreesl,
+            distance_trees: ntreesd,
+        };
+
+        Ok(MetaBlockHeader {
+            cat_l,
+            cat_i,
+            cat_d,
+            context_modes,
+            cmapl,
+            cmapd,
+            literal_trees,
+            ic_trees,
+            distance_trees,
+            ndirect,
+            npostfix,
+            postfix_mask,
+            shape,
+        })
+    }
+}
+
 /// Decode one compressed meta-block (RFC 7932 Sections 9.2/9.3), reporting the
 /// block-splitting shape its header declared.
 fn decode_compressed_meta_block(
@@ -554,68 +695,21 @@ fn decode_compressed_meta_block(
     let block_start = output.len();
     let target_len = block_start + mlen;
 
-    // Block type headers, in the fixed order L, I, D.
-    let mut cat_l = BlockCategory::read(reader)?;
-    let mut cat_i = BlockCategory::read(reader)?;
-    let mut cat_d = BlockCategory::read(reader)?;
-
-    // Distance parameters.
-    let npostfix = reader.read_bits(2)?;
-    let ndirect = reader.read_bits(4)? << npostfix;
-    let postfix_mask = (1u32 << npostfix) - 1;
-    let distance_alphabet_size = 16 + ndirect + (48 << npostfix);
-
-    // Context modes, one per literal block type.
-    let mut context_modes = Vec::with_capacity(cat_l.num_types as usize);
-    for _ in 0..cat_l.num_types {
-        let mode_bits = reader.read_bits(2)? as u8;
-        let mode = ContextMode::from_bits(mode_bits).ok_or_else(|| {
-            BrotliError::InvalidContextMap(format!("invalid context mode {mode_bits}"))
-        })?;
-        context_modes.push(mode);
-    }
-
-    // Literal and distance context maps (always preceded by NTREES fields).
-    let ntreesl = read_block_type_count(reader)?;
-    let cmapl_size = cat_l.num_types as usize * NUM_LITERAL_CONTEXTS;
-    let cmapl = if ntreesl >= 2 {
-        let map = read_context_map(reader, ntreesl, cmapl_size)?;
-        ContextMap {
-            map,
-            num_contexts: NUM_LITERAL_CONTEXTS,
-            num_trees: ntreesl as usize,
-        }
-    } else {
-        ContextMap::trivial(cat_l.num_types as usize, NUM_LITERAL_CONTEXTS)
-    };
-
-    let ntreesd = read_block_type_count(reader)?;
-    let cmapd_size = cat_d.num_types as usize * NUM_DISTANCE_CONTEXTS;
-    let cmapd = if ntreesd >= 2 {
-        let map = read_context_map(reader, ntreesd, cmapd_size)?;
-        ContextMap {
-            map,
-            num_contexts: NUM_DISTANCE_CONTEXTS,
-            num_trees: ntreesd as usize,
-        }
-    } else {
-        ContextMap::trivial(cat_d.num_types as usize, NUM_DISTANCE_CONTEXTS)
-    };
-
-    // Prefix code arrays: NTREESL literal codes, NBLTYPESI insert-and-copy
-    // codes, NTREESD distance codes.
-    let mut literal_trees = Vec::with_capacity(ntreesl as usize);
-    for _ in 0..ntreesl {
-        literal_trees.push(read_prefix_code(reader, 256)?);
-    }
-    let mut ic_trees = Vec::with_capacity(cat_i.num_types as usize);
-    for _ in 0..cat_i.num_types {
-        ic_trees.push(read_prefix_code(reader, 704)?);
-    }
-    let mut distance_trees = Vec::with_capacity(ntreesd as usize);
-    for _ in 0..ntreesd {
-        distance_trees.push(read_prefix_code(reader, distance_alphabet_size)?);
-    }
+    let MetaBlockHeader {
+        mut cat_l,
+        mut cat_i,
+        mut cat_d,
+        context_modes,
+        cmapl,
+        cmapd,
+        literal_trees,
+        ic_trees,
+        distance_trees,
+        ndirect,
+        npostfix,
+        postfix_mask,
+        shape,
+    } = MetaBlockHeader::read(reader)?;
 
     // ── Command loop ─────────────────────────────────────────────────────
     while output.len() < target_len {
@@ -729,20 +823,14 @@ fn decode_compressed_meta_block(
         }
     }
 
-    Ok(MetaBlockShape {
-        literal_types: cat_l.num_types,
-        insert_and_copy_types: cat_i.num_types,
-        distance_types: cat_d.num_types,
-        literal_trees: ntreesl,
-        distance_trees: ntreesd,
-    })
+    Ok(shape)
 }
 
 /// Convert a distance symbol into a distance (RFC 7932 Section 4).
 ///
 /// Returns `(distance, is_code_zero)`; `is_code_zero` distances are not
 /// pushed onto the ring buffer.
-fn decode_distance(
+pub(crate) fn decode_distance(
     reader: &mut BitReader<'_>,
     dsym: u32,
     state: &DecoderState,

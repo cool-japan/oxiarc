@@ -16,7 +16,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use oxiarc_brotli::{BrotliParams, compress_with_params, decompress};
+use oxiarc_brotli::{
+    BrotliParams, BrotliStatus, BrotliStream, MetaBlockShape, compress_with_params, decompress,
+    decompress_reporting_shapes,
+};
+use oxiarc_core::traits::FlushMode;
 
 /// Locate the `brotli` binary via `which`. Returns `None` if not found.
 fn find_brotli() -> Option<PathBuf> {
@@ -886,4 +890,179 @@ fn test_oracle_corpus_accepted_by_reference_at_splitting_qualities() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     eprintln!("[brotli-oracle] full corpus accepted by reference brotli at q10/q11");
+}
+
+// ─── Incremental decode leg ─────────────────────────────────────────────────
+
+/// Drive [`BrotliStream`] over `data` with fixed input/output chunk sizes.
+///
+/// Returns the decoded bytes together with the meta-block shapes the
+/// incremental decoder observed.
+fn incremental_decode(
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<(Vec<u8>, Vec<MetaBlockShape>), String> {
+    let mut stream = BrotliStream::new().with_shape_recording(true);
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    let mut pos = 0usize;
+    let mut calls = 0u64;
+    let budget = (data.len() as u64 + 1) * 64 + 4_000_000;
+    loop {
+        calls += 1;
+        if calls > budget {
+            return Err("decoder did not terminate".to_string());
+        }
+        let end = (pos + in_chunk.max(1)).min(data.len());
+        let flush = if end == data.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream
+            .decode(&data[pos..end], &mut buf, flush)
+            .map_err(|e| e.to_string())?;
+        pos += progress.consumed;
+        decoded.extend_from_slice(&buf[..progress.produced]);
+        if progress.status == BrotliStatus::StreamEnd && pos == data.len() {
+            break;
+        }
+        if progress.consumed == 0 && progress.produced == 0 && end == data.len() {
+            return Err("decoder stalled with all input offered".to_string());
+        }
+    }
+    stream.finish().map_err(|e| e.to_string())?;
+    let shapes = stream.recorded_shapes().to_vec();
+    Ok((decoded, shapes))
+}
+
+/// Incremental decode direction: every reference stream must decode
+/// byte-identically through [`BrotliStream`], under several chunkings, and
+/// must observe the same meta-block shapes as the one-shot decoder.
+///
+/// This is the strongest interop check in the crate: the reference encoder's
+/// streams carry block splits, real context maps, static-dictionary references
+/// with transforms and uncompressed meta-blocks — the exact features that make
+/// resumable parsing hard, and that this crate's own encoder does not emit.
+#[test]
+fn test_oracle_reference_encode_incremental_decode() {
+    let Some(brotli) = find_brotli() else {
+        eprintln!("[brotli-oracle] `brotli` not on PATH; skipping (not a failure)");
+        return;
+    };
+    let dir = scratch_dir("incdec");
+
+    let mut total = 0usize;
+    let mut shape_checked = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (name, data) in corpus() {
+        let big = data.len() > 200_000;
+        let qualities: &[u32] = if big { &[5, 11] } else { &[0, 1, 5, 9, 11] };
+        for &q in qualities {
+            let windows: &[u32] = if big || q != 11 {
+                &[22]
+            } else {
+                &[10, 16, 22, 24]
+            };
+            for &w in windows {
+                let compressed = reference_compress(&brotli, &dir, &data, q, w);
+                let (expected, expected_shapes) = match decompress_reporting_shapes(&compressed) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        failures.push(format!("one-shot ERROR {name} q{q} w{w}: {e}"));
+                        continue;
+                    }
+                };
+                if expected != data {
+                    failures.push(format!("one-shot MISMATCH {name} q{q} w{w}"));
+                    continue;
+                }
+                // Big inputs use a coarse chunking to keep the test fast; the
+                // small ones get the punishing one-byte-in/one-byte-out grid.
+                let schedules: &[(usize, usize)] = if big {
+                    &[(4096, 65536), (7, 13)]
+                } else {
+                    &[(1, 1), (3, 7), (127, 251), (usize::MAX / 2, 65536)]
+                };
+                for &(in_chunk, out_chunk) in schedules {
+                    total += 1;
+                    match incremental_decode(&compressed, in_chunk, out_chunk) {
+                        Ok((got, shapes)) => {
+                            if got != data {
+                                failures.push(format!(
+                                    "SILENT MISMATCH {name} q{q} w{w} in={in_chunk} out={out_chunk}: \
+                                     {} != {} bytes",
+                                    got.len(),
+                                    data.len()
+                                ));
+                            } else if shapes != expected_shapes {
+                                failures.push(format!(
+                                    "SHAPE MISMATCH {name} q{q} w{w} in={in_chunk} out={out_chunk}: \
+                                     {} shapes vs {} from the one-shot decoder",
+                                    shapes.len(),
+                                    expected_shapes.len()
+                                ));
+                            } else {
+                                shape_checked += 1;
+                            }
+                        }
+                        Err(e) => failures.push(format!(
+                            "ERROR {name} q{q} w{w} in={in_chunk} out={out_chunk}: {e}"
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "incremental decode: {}/{total} failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!(
+        "[brotli-oracle] incremental decode: {total}/{total} reference streams byte-identical, \
+         {shape_checked} with matching meta-block shapes"
+    );
+}
+
+/// Every prefix of a reference stream must be rejected by the incremental
+/// decoder — no panic, no hang, no short body reported as success.
+#[test]
+fn test_oracle_reference_truncations_rejected_incrementally() {
+    let Some(brotli) = find_brotli() else {
+        eprintln!("[brotli-oracle] `brotli` not on PATH; skipping (not a failure)");
+        return;
+    };
+    let dir = scratch_dir("inctrunc");
+
+    let mut failures: Vec<String> = Vec::new();
+    for (name, data) in corpus() {
+        if data.len() > 20_000 {
+            continue;
+        }
+        for &q in &[1u32, 5, 11] {
+            let compressed = reference_compress(&brotli, &dir, &data, q, 22);
+            for cut in 0..compressed.len() {
+                if incremental_decode(&compressed[..cut], 1, 1).is_ok() {
+                    failures.push(format!(
+                        "{name} q{q}: a {cut}/{}-byte prefix decoded successfully",
+                        compressed.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "{} truncations accepted:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!("[brotli-oracle] every reference-stream prefix rejected by the incremental decoder");
 }

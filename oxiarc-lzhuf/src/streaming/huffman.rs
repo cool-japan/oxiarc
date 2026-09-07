@@ -103,6 +103,29 @@ impl StreamingBitReader {
         self.input_pos
     }
 
+    /// Drop the first `trim` bytes from the slice this reader's cursor
+    /// tracks, without touching any buffered bits.
+    ///
+    /// The caller must have already removed the same prefix from the slice
+    /// it passes to the read methods (e.g. via `Vec::drain(..trim)`) — this
+    /// only rebases the cursor to match. `trim` must not exceed
+    /// [`bytes_consumed`](Self::bytes_consumed): bytes at or past the cursor
+    /// have not been read yet, so dropping them would corrupt decoding.
+    ///
+    /// This exists so a caller retaining an ever-growing buffer (the
+    /// streaming LZH decoder's `carry`) can periodically compact the
+    /// fully-consumed prefix instead of retaining the whole compressed
+    /// stream for the life of the decode. The only caller in this crate
+    /// derives `trim` from `bytes_consumed()` itself, so the invariant below
+    /// is structurally guaranteed rather than merely hoped for.
+    pub(crate) fn rebase(&mut self, trim: usize) {
+        debug_assert!(
+            trim <= self.input_pos,
+            "rebase() would drop bytes not yet read"
+        );
+        self.input_pos = self.input_pos.saturating_sub(trim);
+    }
+
     /// Number of sub-byte bits currently buffered.
     pub fn bits_available(&self) -> u8 {
         self.bits_in_buffer

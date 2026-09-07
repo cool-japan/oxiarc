@@ -14,7 +14,8 @@
 
 use oxiarc_core::traits::{CompressStatus, Compressor, Decompressor, FlushMode};
 use oxiarc_deflate::{
-    Deflater, Inflater, ZlibStreamDecoder, compress_gzip_parallel, gzip_decompress,
+    Deflater, InflateStatus, InflateWrapper, Inflater, WrappedInflate, ZlibStreamDecoder,
+    compress_gzip_parallel, gzip_decompress,
 };
 use std::io::Read;
 use std::process::Command;
@@ -401,4 +402,172 @@ sys.stdout.buffer.write(gzip.decompress(open(sys.argv[1], 'rb').read()))
             checked.join(", ")
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resumable push decoder against CPython's zlib/gzip
+// ---------------------------------------------------------------------------
+
+/// Drive the push decoder over `input`, one byte of compressed data per
+/// call into a small output buffer — the worst-case schedule for a
+/// resumable state machine.
+fn push_decode_wrapped(
+    wrapper: InflateWrapper,
+    input: &[u8],
+    multi_member: bool,
+) -> oxiarc_core::error::Result<Vec<u8>> {
+    let mut decoder = WrappedInflate::new(wrapper).multi_member(multi_member);
+    let mut out = Vec::new();
+    let mut scratch = [0u8; 13];
+    let mut fed = 0usize;
+    loop {
+        let end = (fed + 1).min(input.len());
+        let flush = if end >= input.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = decoder.inflate(&input[fed..end], &mut scratch, flush)?;
+        fed += progress.consumed;
+        out.extend_from_slice(&scratch[..progress.produced]);
+        if progress.status == InflateStatus::StreamEnd {
+            return Ok(out);
+        }
+    }
+}
+
+/// D4: the same payload compressed by CPython with `wbits` = -15 (raw), 15
+/// (zlib) and 31 (gzip) must decode through the matching wrapper **and**
+/// through `Auto`, fed one byte at a time.
+#[test]
+fn oracle_python_wbits_matrix_through_the_push_decoder() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping wbits matrix (self-skip)");
+        return;
+    }
+
+    let script = r#"
+import sys, zlib
+data = open(sys.argv[1], 'rb').read()
+wbits = int(sys.argv[3])
+c = zlib.compressobj(6, zlib.DEFLATED, wbits)
+out = c.compress(data) + c.flush()
+open(sys.argv[2], 'wb').write(out)
+"#;
+
+    for (name, payload) in oracle_payloads() {
+        for (wbits, wrapper) in [
+            (-15i32, InflateWrapper::Raw),
+            (15, InflateWrapper::Zlib),
+            (31, InflateWrapper::Gzip),
+        ] {
+            let src = temp_path(&format!("wbits_src_{name}"));
+            let dst = temp_path(&format!("wbits_dst_{name}"));
+            std::fs::write(&src, &payload).expect("write payload");
+            run_python(
+                script,
+                &[&src, &dst, std::path::Path::new(&wbits.to_string())],
+            );
+            let compressed = std::fs::read(&dst).expect("read compressed");
+            let _ = std::fs::remove_file(&src);
+            let _ = std::fs::remove_file(&dst);
+
+            let named = push_decode_wrapped(wrapper, &compressed, false)
+                .unwrap_or_else(|e| panic!("{name} wbits {wbits} named: {e}"));
+            assert_eq!(named, payload, "{name} wbits {wbits}: named wrapper");
+
+            let sniffed = push_decode_wrapped(InflateWrapper::Auto, &compressed, false)
+                .unwrap_or_else(|e| panic!("{name} wbits {wbits} auto: {e}"));
+            assert_eq!(sniffed, payload, "{name} wbits {wbits}: Auto");
+        }
+    }
+    eprintln!("[zlib-oracle] CPython wbits -15/15/31 decoded byte-at-a-time through the push API");
+}
+
+/// D3: CPython's `Z_SYNC_FLUSH` output — a stream of sync-flushed units,
+/// exactly what RFC 4978 peers emit — decoded one byte at a time.
+#[test]
+fn oracle_python_sync_flush_stream_through_the_push_decoder() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping sync-flush stream (self-skip)");
+        return;
+    }
+
+    let script = r#"
+import sys, zlib
+data = open(sys.argv[1], 'rb').read()
+c = zlib.compressobj(6, zlib.DEFLATED, -15)
+out = b''
+step = max(1, len(data) // 5)
+for i in range(0, len(data), step) if data else []:
+    out += c.compress(data[i:i+step]) + c.flush(zlib.Z_SYNC_FLUSH)
+out += c.flush()
+open(sys.argv[2], 'wb').write(out)
+"#;
+
+    for (name, payload) in oracle_payloads() {
+        let src = temp_path(&format!("sync_src_{name}"));
+        let dst = temp_path(&format!("sync_dst_{name}"));
+        std::fs::write(&src, &payload).expect("write payload");
+        run_python(script, &[&src, &dst]);
+        let compressed = std::fs::read(&dst).expect("read compressed");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+
+        let decoded = push_decode_wrapped(InflateWrapper::Raw, &compressed, false)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(decoded, payload, "{name}: sync-flushed stream");
+    }
+    eprintln!(
+        "[zlib-oracle] CPython Z_SYNC_FLUSH streams decoded byte-at-a-time through the push API"
+    );
+}
+
+/// D5: CPython's `decompressobj().decompress(data, max_length=n)` is the
+/// direct analogue of a bounded-output push call. Feeding both the same
+/// stream with the same output budget must produce the same bytes.
+#[test]
+fn oracle_python_bounded_output_matches() {
+    if !python3_available() {
+        eprintln!("[zlib-oracle] python3 not found; skipping bounded-output check (self-skip)");
+        return;
+    }
+
+    let script = r#"
+import sys, zlib
+data = open(sys.argv[1], 'rb').read()
+n = int(sys.argv[3])
+d = zlib.decompressobj()
+out = d.decompress(data, n)
+open(sys.argv[2], 'wb').write(out)
+"#;
+
+    for (name, payload) in oracle_payloads() {
+        let compressed = oxiarc_deflate::zlib_compress(&payload, 6).expect("zlib_compress");
+        for budget in [1usize, 97, 4096, 65_536] {
+            let src = temp_path(&format!("bounded_src_{name}_{budget}"));
+            let dst = temp_path(&format!("bounded_dst_{name}_{budget}"));
+            std::fs::write(&src, &compressed).expect("write compressed");
+            run_python(
+                script,
+                &[&src, &dst, std::path::Path::new(&budget.to_string())],
+            );
+            let expected = std::fs::read(&dst).expect("read reference output");
+            let _ = std::fs::remove_file(&src);
+            let _ = std::fs::remove_file(&dst);
+
+            // One push call with an output buffer of exactly `budget`.
+            let mut decoder = WrappedInflate::new(InflateWrapper::Zlib);
+            let mut scratch = vec![0u8; budget];
+            let progress = decoder
+                .inflate(&compressed, &mut scratch, FlushMode::None)
+                .unwrap_or_else(|e| panic!("{name} budget {budget}: {e}"));
+            assert_eq!(
+                &scratch[..progress.produced],
+                &expected[..],
+                "{name} budget {budget}: bounded output diverged from CPython"
+            );
+        }
+    }
+    eprintln!("[zlib-oracle] bounded-output push calls match CPython decompressobj(max_length=n)");
 }

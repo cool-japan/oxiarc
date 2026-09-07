@@ -41,6 +41,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Default buffer size for async operations (32KB).
 const DEFAULT_BUFFER_SIZE: usize = 32 * 1024;
 
+/// How many already-consumed compressed bytes
+/// [`AsyncDecompressorWrapper`]'s decode loop lets accumulate before dropping
+/// them from its input staging buffer.
+///
+/// Compaction is thresholded rather than unconditional so a stream delivered
+/// in small reads does not pay an O(n) `Vec::drain` per iteration; the cost is
+/// amortised O(1) per byte, and peak memory becomes O(unconsumed input +
+/// threshold) instead of O(whole compressed stream).
+const INPUT_COMPACT_THRESHOLD: usize = 64 * 1024;
+
 /// A trait for async compression operations.
 ///
 /// This trait provides an asynchronous interface for compressing data from
@@ -334,6 +344,44 @@ impl<C: Compressor + Send> AsyncCompressor for AsyncCompressorWrapper<C> {
 /// This wrapper adapts any type implementing the [`Decompressor`] trait to work
 /// with async I/O using Tokio's async read/write traits.
 ///
+/// # Limitation: does not work with a whole-remaining-input decoder
+///
+/// [`Decompressor::decompress`] is documented as a whole-remaining-input
+/// contract: every call must receive the *entire* compressed stream still
+/// available, and an implementation is entitled to treat a slice that ends
+/// mid-symbol as truncated input rather than requesting more. This wrapper
+/// cannot honor that contract for such a decoder — internally it feeds a
+/// **growing prefix**, one `buffer_size` read at a time
+/// ([`decompress_async_with_buffer`](AsyncDecompressor::decompress_async_with_buffer)),
+/// so the very first call on any stream larger than `buffer_size` already
+/// hands the inner decompressor an incomplete prefix.
+///
+/// Concretely, `AsyncDecompressorWrapper<oxiarc_deflate::Inflater>` does not
+/// work this way: `Inflater::decompress` builds a fresh bit reader over
+/// whatever slice it is handed and runs it to completion, so a multi-buffer
+/// input either errors out or — before that was fixed — silently reported
+/// the stream `Done` with truncated output. Use `oxiarc_deflate`'s
+/// `AsyncInflateReader` instead: it drives the crate's resumable push
+/// decoder with an explicit flush mode and genuinely accepts a growing
+/// prefix, one buffer at a time.
+///
+/// This wrapper remains correct for decompressors that are *already*
+/// incremental across arbitrary prefixes — ones that retain their own
+/// buffer internally and therefore do not require the whole stream up
+/// front, such as this workspace's LZ4 frame streaming types or
+/// `StreamingLzhDecoder`.
+///
+/// # Memory and liveness
+///
+/// The decode loop stages compressed bytes in an internal buffer and drops
+/// each consumed prefix once it exceeds an internal threshold, so peak memory
+/// is proportional to the *unconsumed* input rather than to the whole
+/// compressed stream. It also refuses to spin: if the inner decompressor
+/// neither consumes nor produces anything on two consecutive iterations while
+/// no further input can be read, the call fails with a corrupted-data error
+/// instead of looping forever — the same safety net
+/// [`Decompressor::decompress_all`] applies on the blocking side.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -444,15 +492,18 @@ impl<D: Decompressor + Send> AsyncDecompressor for AsyncDecompressorWrapper<D> {
             let mut input_data = Vec::new();
             let mut input_pos = 0;
             let mut eof_reached = false;
+            let mut stalled_once = false;
 
             loop {
                 // Read more input if we need it and haven't reached EOF
+                let mut read_progress = false;
                 if input_pos >= input_data.len() && !eof_reached {
                     let bytes_read = input.read(&mut self.input_buffer).await?;
                     if bytes_read == 0 {
                         eof_reached = true;
                     } else {
                         input_data.extend_from_slice(&self.input_buffer[..bytes_read]);
+                        read_progress = true;
                     }
                 }
 
@@ -471,6 +522,39 @@ impl<D: Decompressor + Send> AsyncDecompressor for AsyncDecompressorWrapper<D> {
                 if produced > 0 {
                     output.write_all(&self.output_buffer[..produced]).await?;
                     total_written += produced;
+                }
+
+                // Drop the consumed prefix once it is worth the memmove, so a
+                // long stream does not retain every compressed byte it has
+                // already decoded (memory stays O(unconsumed), not
+                // O(compressed length)).
+                if input_pos >= INPUT_COMPACT_THRESHOLD {
+                    input_data.drain(..input_pos);
+                    input_pos = 0;
+                }
+
+                // Guard against an implementation that neither consumes,
+                // produces, nor finishes: without this the loop below spins
+                // forever (it only reads more input once the decompressor has
+                // consumed what it already holds, so an inner decoder that
+                // keeps answering `NeedsInput` with `consumed == 0` is never
+                // handed anything new). Reading more bytes from `input`
+                // counts as progress, so a decoder that legitimately buffers
+                // several reads before emitting anything is unaffected; two
+                // consecutive fully-idle iterations are not recoverable.
+                let made_progress = consumed > 0
+                    || produced > 0
+                    || read_progress
+                    || status == DecompressStatus::Done;
+                if made_progress {
+                    stalled_once = false;
+                } else if stalled_once {
+                    return Err(OxiArcError::corrupted(
+                        total_written as u64,
+                        "async decompress: decoder made no progress on two consecutive calls",
+                    ));
+                } else {
+                    stalled_once = true;
                 }
 
                 match status {
@@ -1250,6 +1334,142 @@ mod tests {
         assert!(result.is_ok());
         // Should have at least header and footer
         assert!(compressed.len() >= 2);
+    }
+
+    /// A decompressor that never makes progress: it always reports
+    /// `NeedsInput` without consuming or producing anything.
+    struct NeverProgressesDecompressor {
+        status: DecompressStatus,
+    }
+
+    impl Decompressor for NeverProgressesDecompressor {
+        fn decompress(
+            &mut self,
+            _input: &[u8],
+            _output: &mut [u8],
+        ) -> Result<(usize, usize, DecompressStatus)> {
+            Ok((0, 0, self.status))
+        }
+
+        fn reset(&mut self) {}
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+    }
+
+    /// The async decode loop only reads more input once the decompressor has
+    /// consumed what it already holds, so a decoder that keeps answering
+    /// `NeedsInput` with `consumed == 0` would never be handed anything new
+    /// and the loop would spin forever. It must error instead.
+    ///
+    /// Like the blocking `decompress_all` guard this mirrors, a regression
+    /// here hangs this test rather than failing it — a run that never
+    /// finishes on this test *is* the signal.
+    #[tokio::test]
+    async fn test_async_decompress_detects_stalled_decoder_needs_input() {
+        let mut wrapper = AsyncDecompressorWrapper::new(NeverProgressesDecompressor {
+            status: DecompressStatus::NeedsInput,
+        });
+        // Larger than the buffer size used below, so the first read leaves
+        // unconsumed bytes staged and no further read is attempted.
+        let mut input = Cursor::new(vec![0x42u8; 40 * 1024]);
+        let mut output = Vec::new();
+
+        let result = wrapper
+            .decompress_async_with_buffer(&mut input, &mut output, 8 * 1024)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a decoder that never progresses must be reported, not looped on forever"
+        );
+    }
+
+    /// Same guard, reached through the `NeedsOutput` arm and after the inner
+    /// reader has already hit EOF.
+    #[tokio::test]
+    async fn test_async_decompress_detects_stalled_decoder_needs_output() {
+        let mut wrapper = AsyncDecompressorWrapper::new(NeverProgressesDecompressor {
+            status: DecompressStatus::NeedsOutput,
+        });
+        let mut input = Cursor::new(vec![0x42u8; 16]);
+        let mut output = Vec::new();
+
+        let result = wrapper
+            .decompress_async_with_buffer(&mut input, &mut output, 8 * 1024)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a decoder stuck on NeedsOutput must be reported, not looped on forever"
+        );
+    }
+
+    /// An identity decompressor that copies at most `chunk` bytes per call and
+    /// finishes once it has produced `expected` bytes — deliberately slow
+    /// enough that the wrapper's staging buffer crosses its compaction
+    /// threshold many times over the stream.
+    struct ChunkedIdentityDecompressor {
+        produced: usize,
+        expected: usize,
+        chunk: usize,
+    }
+
+    impl Decompressor for ChunkedIdentityDecompressor {
+        fn decompress(
+            &mut self,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> Result<(usize, usize, DecompressStatus)> {
+            if self.produced >= self.expected {
+                return Ok((0, 0, DecompressStatus::Done));
+            }
+            let n = input.len().min(output.len()).min(self.chunk);
+            if n == 0 {
+                return Ok((0, 0, DecompressStatus::NeedsInput));
+            }
+            output[..n].copy_from_slice(&input[..n]);
+            self.produced += n;
+            let status = if self.produced >= self.expected {
+                DecompressStatus::Done
+            } else {
+                DecompressStatus::NeedsInput
+            };
+            Ok((n, n, status))
+        }
+
+        fn reset(&mut self) {
+            self.produced = 0;
+        }
+
+        fn is_finished(&self) -> bool {
+            self.produced >= self.expected
+        }
+    }
+
+    /// Regression for the staging-buffer compaction: a stream several times
+    /// the compaction threshold, consumed in small pieces, must still come
+    /// back byte-for-byte. An off-by-one in the `drain`/`input_pos` reset
+    /// would corrupt or drop bytes here.
+    #[tokio::test]
+    async fn test_async_decompress_compacted_input_is_byte_exact() {
+        let payload: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut wrapper = AsyncDecompressorWrapper::new(ChunkedIdentityDecompressor {
+            produced: 0,
+            expected: payload.len(),
+            chunk: 1000,
+        });
+        let mut input = Cursor::new(payload.clone());
+        let mut output = Vec::new();
+
+        let written = wrapper
+            .decompress_async_with_buffer(&mut input, &mut output, 8 * 1024)
+            .await
+            .expect("chunked identity decode must succeed");
+
+        assert_eq!(written, payload.len(), "reported length mismatch");
+        assert_eq!(output, payload, "compaction corrupted the decoded stream");
     }
 
     #[tokio::test]

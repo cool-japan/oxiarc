@@ -131,7 +131,96 @@ impl HuffmanTree {
         Self::from_code_lengths_inner(code_lengths, true)
     }
 
+    /// Rebuild this tree in place from a fresh set of code lengths.
+    ///
+    /// Behaviourally identical to [`HuffmanTree::from_code_lengths`], but the
+    /// existing decode-table and symbol allocations are reused instead of a
+    /// new pair being allocated for every block. A DEFLATE stream made of
+    /// many small dynamic blocks builds three trees per block, so reusing the
+    /// buffers removes three allocations per block from the decode path.
+    ///
+    /// On error the tree is left in the degenerate "no codes" state, so a
+    /// caller that ignores the error still decodes nothing rather than
+    /// decoding through a half-written table.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`HuffmanTree::from_code_lengths`]: an empty slice,
+    /// a code longer than 15 bits, or an over-subscribed code.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_deflate::HuffmanTree;
+    ///
+    /// let mut tree = HuffmanTree::from_code_lengths(&[1, 1]).expect("build");
+    /// tree.rebuild_from_code_lengths(&[2, 2, 2, 2])
+    ///     .expect("rebuild");
+    /// assert_eq!(tree.max_code_length(), 2);
+    /// ```
+    pub fn rebuild_from_code_lengths(&mut self, code_lengths: &[u8]) -> Result<()> {
+        self.build_into(code_lengths, false)
+    }
+
+    /// Rebuild this tree in place, additionally requiring the code to be
+    /// complete — the in-place form of
+    /// [`HuffmanTree::from_code_length_code`].
+    ///
+    /// # Errors
+    ///
+    /// As [`HuffmanTree::from_code_length_code`], plus the conditions listed
+    /// for [`HuffmanTree::rebuild_from_code_lengths`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_deflate::HuffmanTree;
+    ///
+    /// let mut tree = HuffmanTree::from_code_lengths(&[1, 1]).expect("build");
+    /// // A complete 4-symbol code: Kraft sum is exactly 1.
+    /// tree.rebuild_from_code_length_code(&[2, 2, 2, 2])
+    ///     .expect("rebuild");
+    /// // An incomplete one is rejected.
+    /// assert!(tree.rebuild_from_code_length_code(&[2, 2, 2]).is_err());
+    /// ```
+    pub fn rebuild_from_code_length_code(&mut self, code_lengths: &[u8]) -> Result<()> {
+        self.build_into(code_lengths, true)
+    }
+
+    /// A tree that decodes nothing: every lookup yields a zero-length
+    /// entry, which callers must reject. Used as the starting point for
+    /// [`HuffmanTree::build_into`] and as the initial value of a decoder's
+    /// reusable tree slots.
+    pub(crate) fn degenerate() -> Self {
+        Self {
+            table: vec![0u32; 1],
+            root_bits: 0,
+            root_mask: 0,
+            max_code_length: 0,
+            symbols: Vec::new(),
+            base_codes: [0; MAX_CODE_LENGTH + 1],
+            symbol_offsets: [0; MAX_CODE_LENGTH + 1],
+        }
+    }
+
     fn from_code_lengths_inner(code_lengths: &[u8], require_complete: bool) -> Result<Self> {
+        let mut tree = Self::degenerate();
+        tree.build_into(code_lengths, require_complete)?;
+        Ok(tree)
+    }
+
+    /// The shared table builder, writing into `self`'s existing allocations.
+    fn build_into(&mut self, code_lengths: &[u8], require_complete: bool) -> Result<()> {
+        // Any early return below must leave a tree that decodes nothing.
+        self.max_code_length = 0;
+        self.root_bits = 0;
+        self.root_mask = 0;
+        self.symbols.clear();
+        self.table.clear();
+        self.table.push(0);
+        self.base_codes = [0; MAX_CODE_LENGTH + 1];
+        self.symbol_offsets = [0; MAX_CODE_LENGTH + 1];
+
         if code_lengths.is_empty() {
             return Err(OxiArcError::invalid_header("Empty code lengths"));
         }
@@ -155,17 +244,9 @@ impl HuffmanTree {
 
         // Check for valid code (at least one symbol)
         if max_length == 0 {
-            // Special case: no symbols (all zeros)
-            // Create a dummy tree that always returns error
-            return Ok(Self {
-                table: vec![0u32; 1],
-                root_bits: 0,
-                root_mask: 0,
-                max_code_length: 0,
-                symbols: Vec::new(),
-                base_codes: [0; MAX_CODE_LENGTH + 1],
-                symbol_offsets: [0; MAX_CODE_LENGTH + 1],
-            });
+            // Special case: no symbols (all zeros). `self` is already in the
+            // degenerate state set up above, which decodes nothing.
+            return Ok(());
         }
 
         // Compute first code for each length (RFC 1951 algorithm)
@@ -197,8 +278,10 @@ impl HuffmanTree {
             }
         }
 
-        // Build symbol table
-        let mut symbols = vec![0u16; total_codes as usize];
+        // Build symbol table, reusing the existing allocation.
+        self.symbols.resize(total_codes as usize, 0u16);
+        self.symbols.fill(0u16);
+        let symbols = &mut self.symbols;
         let mut symbol_offsets = [0u16; MAX_CODE_LENGTH + 1];
         let mut base_codes = [0u32; MAX_CODE_LENGTH + 1];
 
@@ -232,7 +315,11 @@ impl HuffmanTree {
         let root_bits = Self::ROOT_BITS.min(max_length);
         let root_size = 1usize << root_bits;
         let root_mask = (root_size - 1) as u32;
-        let mut table = vec![0u32; root_size];
+        // Reuse the existing table allocation: `clear` then `resize` gives a
+        // zeroed root table without asking the allocator for a new one.
+        self.table.clear();
+        self.table.resize(root_size, 0u32);
+        let table = &mut self.table;
 
         // Pass 1: size the sub-tables. For every code longer than
         // `root_bits`, the first `root_bits` bits (in stream order, i.e. the
@@ -251,10 +338,13 @@ impl HuffmanTree {
             assign[len_us] += 1;
             if len > root_bits {
                 let slot = (reversed as u32 & root_mask) as usize;
-                if let Some(cur) = sub_max_len.get_mut(slot)
-                    && *cur < len
-                {
-                    *cur = len;
+                // Deliberately nested rather than an `if let ... && ...`
+                // chain: let-chains need Rust 1.88 and this workspace's MSRV
+                // is 1.85.
+                if let Some(cur) = sub_max_len.get_mut(slot) {
+                    if *cur < len {
+                        *cur = len;
+                    }
                 }
             }
         }
@@ -322,15 +412,12 @@ impl HuffmanTree {
             }
         }
 
-        Ok(Self {
-            table,
-            root_bits,
-            root_mask,
-            max_code_length: max_length,
-            symbols,
-            base_codes,
-            symbol_offsets,
-        })
+        self.root_bits = root_bits;
+        self.root_mask = root_mask;
+        self.max_code_length = max_length;
+        self.base_codes = base_codes;
+        self.symbol_offsets = symbol_offsets;
+        Ok(())
     }
 
     /// Reverse bits in a code.

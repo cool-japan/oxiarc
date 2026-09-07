@@ -314,11 +314,27 @@ enum DecoderState {
 /// state machine.  Each `read()` call attempts to decode the next available
 /// chunk(s) and copies decompressed data into the caller-supplied buffer.
 ///
+/// # Truncated streams
+///
+/// If the inner reader reaches EOF before the LZMA2 end-of-stream marker,
+/// [`Read::read`] delivers whatever was already decoded and then fails with
+/// [`io::ErrorKind::UnexpectedEof`]. It never reports a truncated stream as a
+/// clean `Ok(0)` (which a caller could not distinguish from a complete
+/// stream), and it never spins waiting for input that cannot arrive — both of
+/// which the pre-0.4.2 implementation did, depending on where the cut fell.
+/// `WouldBlock` from a non-blocking inner reader is propagated unchanged and
+/// is *not* treated as EOF, so a caller that retries can resume decoding
+/// exactly where it left off.
+///
 /// # Memory budget
 ///
 /// Use [`with_memory_budget`][Self::with_memory_budget] to limit how many
-/// compressed bytes may be buffered before being processed.  Exceeding the
-/// budget returns an error.  Defaults to 64 MiB.
+/// **compressed (input)** bytes may be buffered before being processed.
+/// Exceeding the budget returns an error. Defaults to 64 MiB. This bounds
+/// `input_buf` only — decompressed output is delivered straight into the
+/// caller's buffer and is not itself capped by this budget; a caller
+/// decoding untrusted input who also needs an output-size limit must track
+/// bytes read from this type's `Read` impl itself.
 pub struct Lzma2StreamDecoder<R: Read> {
     /// Inner compressed reader.
     reader: R,
@@ -379,13 +395,46 @@ impl<R: Read> Lzma2StreamDecoder<R> {
 
     /// Return `true` when the LZMA2 end-of-stream marker has been seen and all
     /// decompressed data has been delivered to the caller.
+    ///
+    /// Any `Ok(0)` this decoder returns **from a non-empty buffer** satisfies
+    /// this predicate: a stream that ends before its end-of-stream marker is
+    /// reported as [`io::ErrorKind::UnexpectedEof`], never as a clean EOF.
+    /// (`read` with a zero-length buffer trivially returns `Ok(0)` at any
+    /// time, as the [`Read`] contract requires, and says nothing about
+    /// completion.)
     pub fn is_finished(&self) -> bool {
         matches!(self.state, DecoderState::Done) && self.output_pos >= self.output_buf.len()
+    }
+
+    /// Short, allocation-free name of the current parse state, for error
+    /// messages (`DecoderState`'s `Debug` would print whole payload buffers).
+    fn state_name(&self) -> &'static str {
+        match self.state {
+            DecoderState::NeedChunkHeader => "awaiting chunk control byte",
+            DecoderState::NeedLzmaHeader { .. } => "awaiting LZMA chunk header",
+            DecoderState::NeedCompressedData { .. } => "awaiting LZMA chunk payload",
+            DecoderState::NeedUncompressedSize { .. } => "awaiting uncompressed chunk size",
+            DecoderState::NeedUncompressedData { .. } => "awaiting uncompressed chunk payload",
+            DecoderState::Done => "finished",
+        }
     }
 
     // ── internal helpers ──────────────────────────────────────────────────
 
     /// Refill `input_buf` from the inner reader.
+    ///
+    /// `io::ErrorKind::WouldBlock` (and every other `Err`) is propagated to
+    /// the caller unchanged — it must never be swallowed here. This used to
+    /// return `Ok(())` on `WouldBlock` with `input_buf` untouched, which
+    /// looked harmless but broke `Read::read` at its one call site (below):
+    /// with an empty `input_buf` that turned a real "not ready yet" into a
+    /// **false EOF** (`Ok(0)`, silently truncating the stream); with a
+    /// non-empty-but-incomplete `input_buf` it **spun forever**
+    /// (`step() == false` → `refill_input()` → `step()`, repeatedly, burning
+    /// CPU), because a non-blocking reader with no data ready keeps returning
+    /// the same `WouldBlock` on every immediate retry. Propagating the error
+    /// instead lets the caller do what `WouldBlock` means: stop, and try
+    /// again once the source is actually ready.
     fn refill_input(&mut self) -> io::Result<()> {
         if self.reader_eof {
             return Ok(());
@@ -406,7 +455,6 @@ impl<R: Read> Lzma2StreamDecoder<R> {
                     ));
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
         Ok(())
@@ -718,13 +766,34 @@ impl<R: Read> Read for Lzma2StreamDecoder<R> {
                 }
                 false => {
                     // Need more input.
+                    let buffered_before = self.input_buf.len();
                     self.refill_input()?;
-                    if self.input_buf.is_empty() {
-                        // No more data from the inner reader.
+                    if self.reader_eof && self.input_buf.len() == buffered_before {
+                        // The inner reader is exhausted and the state machine
+                        // cannot advance with what is buffered: the stream
+                        // ended before the LZMA2 end-of-stream marker. Hand
+                        // back anything already decoded first, then report the
+                        // truncation on the following call.
+                        //
+                        // Returning `Ok(0)` here instead would be a *false
+                        // EOF* — indistinguishable from a cleanly finished
+                        // stream, i.e. silent truncation — and simply looping
+                        // would spin forever whenever the stranded bytes are a
+                        // partial chunk header (`step()` keeps returning
+                        // `false` while `input_buf` stays non-empty, so the
+                        // old `input_buf.is_empty()` test never fired).
                         if self.output_pos < self.output_buf.len() {
                             return Ok(self.drain_output(buf));
                         }
-                        return Ok(0);
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "LZMA2 stream ended before the end-of-stream marker \
+                                 (state {}, {} stranded input byte(s))",
+                                self.state_name(),
+                                buffered_before
+                            ),
+                        ));
                     }
                     // More input arrived; re-enter the state machine.
                 }
@@ -893,18 +962,30 @@ mod tests {
     // ── test 5 ────────────────────────────────────────────────────────────────
 
     /// Feed all-but-one-byte of the stream; then feed full stream.
+    ///
+    /// The truncated half also pins the truncation contract: cutting the
+    /// final end-of-stream marker off must be reported as
+    /// [`io::ErrorKind::UnexpectedEof`], not as a clean `Ok(0)` after the
+    /// already-decoded bytes (which is what this test accepted before 0.4.2,
+    /// and which is indistinguishable from a complete stream at the call
+    /// site).
     #[test]
     fn test_stream_decoder_chunk_boundary() {
         let data = make_compressible_data(32 * 1024);
         let compressed = encode_lzma2_chunked(&data, LzmaLevel::FAST).expect("encode failed");
 
-        // Feed all-but-last byte — expect either partial or empty decode.
+        // Feed all-but-last byte — the end-of-stream marker is missing.
         let partial_reader = Cursor::new(&compressed[..compressed.len() - 1]);
         let mut partial_decoder = Lzma2StreamDecoder::new(partial_reader, TEST_DICT_SIZE);
         let mut partial_out = Vec::new();
-        partial_decoder
+        let err = partial_decoder
             .read_to_end(&mut partial_out)
-            .expect("partial read failed");
+            .expect_err("a stream cut before the end-of-stream marker must not decode cleanly");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            !partial_decoder.is_finished(),
+            "a truncated stream must never report is_finished()"
+        );
 
         // Partial stream should decode no more bytes than the original.
         assert!(
@@ -999,7 +1080,266 @@ mod tests {
         assert_eq!(decompressed, data, "multi-chunk roundtrip data mismatch");
     }
 
+    // ── test 9 ────────────────────────────────────────────────────────────────
+
+    /// Regression for the `WouldBlock`-swallowing defect: a reader that
+    /// reports `WouldBlock` before ever delivering a byte (`input_buf` is
+    /// still empty). Before the fix, `refill_input` swallowed the error and
+    /// `read` then saw an empty `input_buf` and returned `Ok(0)` — a false
+    /// EOF that silently truncates the stream to nothing. It must now
+    /// propagate the error unchanged.
+    #[test]
+    fn test_stream_decoder_would_block_empty_buffer_propagates() {
+        let mut decoder = Lzma2StreamDecoder::new(AlwaysWouldBlockReader, TEST_DICT_SIZE);
+        let mut buf = [0u8; 64];
+
+        let err = decoder.read(&mut buf).expect_err(
+            "WouldBlock on the very first read (empty input_buf) must propagate, not become Ok(0)",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    // ── test 10 ───────────────────────────────────────────────────────────────
+
+    /// Regression for the other half of the same defect: a reader that
+    /// delivers a short, LZMA2-header-incomplete prefix once and then
+    /// reports `WouldBlock` on every call after that (`input_buf` is
+    /// non-empty but insufficient). Before the fix, `refill_input` swallowed
+    /// each `WouldBlock` and `read`'s outer loop kept re-entering
+    /// `step() == false -> refill_input() -> step()` forever, since no new
+    /// bytes ever arrived — a genuine hang. This call must return promptly
+    /// with the propagated error instead of spinning.
+    ///
+    /// **If this fix ever regresses, this test does not fail — it hangs**
+    /// (the single `decoder.read(&mut buf)` call below never returns), since
+    /// there is no internal timeout to convert an infinite loop into a
+    /// clean assertion failure. A run that never completes on this test is
+    /// therefore itself the regression signal, not a flake to retry past.
+    #[test]
+    fn test_stream_decoder_would_block_mid_stream_does_not_spin() {
+        let data = make_compressible_data(64 * 1024);
+        let compressed = encode_lzma2_chunked(&data, LzmaLevel::FAST).expect("encode failed");
+        assert!(
+            compressed.len() > 4,
+            "need a real multi-byte stream so a 2-byte prefix is genuinely incomplete"
+        );
+
+        let reader = DeliverOnceThenWouldBlockForever {
+            prefix: &compressed[..2],
+            delivered: false,
+        };
+        let mut decoder = Lzma2StreamDecoder::new(reader, TEST_DICT_SIZE);
+        let mut buf = [0u8; 64];
+
+        let err = decoder.read(&mut buf).expect_err(
+            "WouldBlock with a non-empty, incomplete input_buf must propagate, not spin forever",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    // ── test 11 ───────────────────────────────────────────────────────────────
+
+    /// `WouldBlock` must be a genuinely retryable condition, not merely a
+    /// terminal error: a caller that retries after seeing it must still
+    /// decode the full stream correctly, with no bytes lost, duplicated, or
+    /// corrupted across the interruptions.
+    #[test]
+    fn test_stream_decoder_recovers_after_would_block() {
+        let data = make_compressible_data(200 * 1024);
+        let compressed = encode_lzma2_chunked(&data, LzmaLevel::FAST).expect("encode failed");
+
+        let reader = BlockOnceThenChunkReader {
+            data: &compressed,
+            pos: 0,
+            chunk_size: 97,
+            blocked_this_round: false,
+        };
+        let mut decoder = Lzma2StreamDecoder::new(reader, TEST_DICT_SIZE);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+
+        // A well-behaved caller retries on `WouldBlock`. Bound the retry
+        // count generously so a future regression back to "spins forever"
+        // fails this test instead of hanging the suite.
+        let max_iterations = compressed.len() * 8 + 10_000;
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= max_iterations,
+                "decoder did not finish within a generous retry budget \u{2014} looks like a spin"
+            );
+            match decoder.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(
+            out, data,
+            "WouldBlock retries must not lose, duplicate, or corrupt any bytes"
+        );
+    }
+
+    // ── test 12 ───────────────────────────────────────────────────────────────
+
+    /// Truncation at *every* byte offset of a real multi-chunk stream must
+    /// terminate within a bounded number of `read()` calls and must report
+    /// [`io::ErrorKind::UnexpectedEof`] — never a clean `Ok(0)` (silent
+    /// truncation) and never an unbounded retry loop.
+    ///
+    /// The loop below is call-count-bounded on purpose: before this was
+    /// fixed, a cut landing inside an LZMA2 chunk header (control byte read,
+    /// 4-or-5-byte size header incomplete) made `read` spin forever —
+    /// `step()` kept returning `false` while `input_buf` stayed non-empty, so
+    /// the "no more data from the inner reader" test never fired. A hang is
+    /// the hardest kind of regression to diagnose from CI, so this test
+    /// converts it into a clean assertion failure.
+    #[test]
+    fn test_stream_decoder_truncation_at_every_offset() {
+        // (a) A single-chunk stream: cuts land in the chunk header, the
+        //     payload, and just before the end-of-stream marker.
+        let data = make_compressible_data(96 * 1024);
+        let one_shot = encode_lzma2_chunked(&data, LzmaLevel::FAST).expect("encode failed");
+        assert!(
+            one_shot.len() > 8,
+            "fixture must be long enough for interesting cut points"
+        );
+        sweep_truncations(&one_shot, data.len(), 1);
+
+        // (b) A multi-chunk stream from the streaming encoder: every 4 KiB of
+        //     input starts a new chunk, so the sweep hits many *interior*
+        //     chunk headers, which is where the pre-0.4.2 spin lived.
+        let multi = stream_encode(&data, 16 * 1024, 4 * 1024);
+        let chunk_headers = multi.iter().filter(|&&b| (b & 0x80) != 0).count();
+        assert!(
+            chunk_headers >= 4,
+            "multi-chunk fixture must contain several chunk headers, saw {chunk_headers}"
+        );
+        sweep_truncations(&multi, data.len(), 1);
+
+        // (c) Poorly-compressible data, so chunk payloads are long and the
+        //     decoder is mid-LZMA-symbol at most cut points. Stepped to keep
+        //     the sweep quick while still covering every chunk header region.
+        let varied = make_varied_data(24 * 1024);
+        let varied_stream = stream_encode(&varied, 8 * 1024, 4 * 1024);
+        sweep_truncations(&varied_stream, varied.len(), 3);
+    }
+
+    // ── test 13 ───────────────────────────────────────────────────────────────
+
+    /// A complete stream must still decode byte-exactly when the caller hands
+    /// over a **one-byte** output buffer, i.e. the smallest possible sink, and
+    /// must then report a clean `Ok(0)` with `is_finished()` true.
+    #[test]
+    fn test_stream_decoder_one_byte_output_buffer() {
+        let data = make_compressible_data(48 * 1024);
+        let compressed = encode_lzma2_chunked(&data, LzmaLevel::FAST).expect("encode failed");
+
+        let mut decoder = Lzma2StreamDecoder::new(Cursor::new(&compressed), TEST_DICT_SIZE);
+        let mut out = Vec::with_capacity(data.len());
+        let mut buf = [0u8; 1];
+        let max_calls = data.len() + 1024;
+        let mut calls = 0usize;
+        loop {
+            calls += 1;
+            assert!(calls <= max_calls, "one-byte reads did not terminate");
+            match decoder.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("one-byte read failed: {e}"),
+            }
+        }
+
+        assert_eq!(out, data, "one-byte-buffer decode mismatch");
+        assert!(
+            decoder.is_finished(),
+            "a fully decoded stream must report is_finished()"
+        );
+    }
+
+    // ── test 14 ───────────────────────────────────────────────────────────────
+
+    /// An empty inner reader is a truncated LZMA2 stream (a valid one carries
+    /// at least the end-of-stream marker), so it must error rather than look
+    /// like a successfully decoded empty payload.
+    #[test]
+    fn test_stream_decoder_empty_input_is_truncation() {
+        let mut decoder = Lzma2StreamDecoder::new(Cursor::new(Vec::new()), TEST_DICT_SIZE);
+        let mut buf = [0u8; 32];
+        let err = decoder
+            .read(&mut buf)
+            .expect_err("an empty stream must not decode as a clean, complete stream");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Generate poorly-compressible bytes (SplitMix64) so LZMA2 chunk
+    /// payloads stay long instead of collapsing to a few bytes.
+    fn make_varied_data(size: usize) -> Vec<u8> {
+        let mut seed: u64 = 0x0123_4567_89ab_cdef;
+        let mut out = Vec::with_capacity(size + 8);
+        while out.len() < size {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out.truncate(size);
+        out
+    }
+
+    /// Decode every truncated prefix `compressed[..cut]` (for `cut` stepping
+    /// by `step`) and assert each one terminates within a bounded number of
+    /// `read()` calls with [`io::ErrorKind::UnexpectedEof`].
+    fn sweep_truncations(compressed: &[u8], original_len: usize, step: usize) {
+        for cut in (0..compressed.len()).step_by(step) {
+            let mut decoder =
+                Lzma2StreamDecoder::new(Cursor::new(&compressed[..cut]), TEST_DICT_SIZE);
+            let mut produced = 0usize;
+            let mut buf = vec![0u8; 8192];
+            let max_calls = compressed.len() * 4 + original_len / 8192 + 64;
+            let mut calls = 0usize;
+            let outcome = loop {
+                calls += 1;
+                assert!(
+                    calls <= max_calls,
+                    "cut at {cut}: read() did not terminate within {max_calls} calls \
+                     — the decoder is spinning on a truncated stream"
+                );
+                match decoder.read(&mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => produced += n,
+                    Err(e) => break Err(e),
+                }
+            };
+
+            let err = outcome.err().unwrap_or_else(|| {
+                panic!(
+                    "cut at {cut}: a truncated stream reported clean EOF after {produced} \
+                     bytes — silent truncation"
+                )
+            });
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "cut at {cut}: unexpected error kind"
+            );
+            assert!(
+                !decoder.is_finished(),
+                "cut at {cut}: a truncated stream must not report is_finished()"
+            );
+            assert!(
+                produced <= original_len,
+                "cut at {cut}: produced more bytes than the original"
+            );
+        }
+    }
 
     /// A `Read` wrapper that returns at most `chunk_size` bytes per `read()`.
     struct SmallChunkReader<'a> {
@@ -1020,6 +1360,64 @@ mod tests {
 
     impl Read for SmallChunkReader<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.data.len() - self.pos;
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let n = remaining.min(buf.len()).min(self.chunk_size);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// A `Read` that reports `io::ErrorKind::WouldBlock` on every call and
+    /// never delivers a byte.
+    struct AlwaysWouldBlockReader;
+
+    impl Read for AlwaysWouldBlockReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// A `Read` that delivers `prefix` on its first call, then reports
+    /// `io::ErrorKind::WouldBlock` on every call after that.
+    struct DeliverOnceThenWouldBlockForever<'a> {
+        prefix: &'a [u8],
+        delivered: bool,
+    }
+
+    impl Read for DeliverOnceThenWouldBlockForever<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.delivered {
+                self.delivered = true;
+                let n = self.prefix.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.prefix[..n]);
+                return Ok(n);
+            }
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// A `Read` that reports `WouldBlock` on every other call, and delivers
+    /// up to `chunk_size` real bytes on the calls in between — a
+    /// deterministic stand-in for a non-blocking transport whose readiness
+    /// flaps between "would block" and "has data".
+    struct BlockOnceThenChunkReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        chunk_size: usize,
+        blocked_this_round: bool,
+    }
+
+    impl Read for BlockOnceThenChunkReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.blocked_this_round {
+                self.blocked_this_round = true;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.blocked_this_round = false;
             let remaining = self.data.len() - self.pos;
             if remaining == 0 {
                 return Ok(0);

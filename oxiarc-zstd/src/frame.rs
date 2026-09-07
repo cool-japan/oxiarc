@@ -17,8 +17,14 @@ const FHD_CONTENT_SIZE_FLAG_MASK: u8 = 0xC0;
 /// Zstandard frame header.
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
-    /// Window size for decompression buffer.
+    /// Window size for decompression buffer, clamped to [`MAX_WINDOW_SIZE`].
     pub window_size: usize,
+    /// Window size exactly as declared by the frame, with no clamping.
+    ///
+    /// The incremental decoder compares this against its configured
+    /// `max_window` *before* allocating anything, so a frame declaring a
+    /// multi-gigabyte window is refused rather than clamped.
+    pub declared_window_size: u64,
     /// Uncompressed content size (if known).
     pub content_size: Option<u64>,
     /// Dictionary ID (if present).
@@ -81,6 +87,9 @@ pub fn parse_frame_header(data: &[u8]) -> Result<FrameHeader> {
 
     let mut pos = 5;
 
+    // Unclamped Window_Size exactly as declared by the frame.
+    let mut declared_window: u64 = 0;
+
     // Window descriptor (absent if single segment)
     let window_size = if single_segment {
         0 // Will be determined from content size
@@ -98,6 +107,7 @@ pub fn parse_frame_header(data: &[u8]) -> Result<FrameHeader> {
         let mantissa = (wd & 0x07) as u32;
         let base = 1u64 << (10 + exponent);
         let window = base + (base >> 3) * mantissa as u64;
+        declared_window = window;
         window.min(MAX_WINDOW_SIZE as u64) as usize
     };
 
@@ -184,22 +194,59 @@ pub fn parse_frame_header(data: &[u8]) -> Result<FrameHeader> {
         None
     };
 
-    // Adjust window size for single segment
+    // Adjust window size for single segment: the whole content is the window.
     let window_size = if single_segment {
-        content_size
-            .unwrap_or(MAX_WINDOW_SIZE as u64)
-            .min(MAX_WINDOW_SIZE as u64) as usize
+        declared_window = content_size.unwrap_or(MAX_WINDOW_SIZE as u64);
+        declared_window.min(MAX_WINDOW_SIZE as u64) as usize
     } else {
         window_size
     };
 
     Ok(FrameHeader {
         window_size,
+        declared_window_size: declared_window,
         content_size,
         dict_id,
         has_checksum,
         header_size: pos,
     })
+}
+
+/// Total size of a frame header (magic included) given its first bytes.
+///
+/// Returns `None` when fewer than 5 bytes are available — the frame header
+/// descriptor at offset 4 is what tells the decoder how many more bytes the
+/// header occupies. The result is at most 18 (4 magic + 1 descriptor +
+/// 1 window descriptor + 4 dictionary ID + 8 content size), so an incremental
+/// decoder can buffer the header without an unbounded read-ahead.
+pub(crate) fn frame_header_len(data: &[u8]) -> Option<usize> {
+    if data.len() < 5 {
+        return None;
+    }
+    let descriptor = data[4];
+    let single_segment = (descriptor & FHD_SINGLE_SEGMENT) != 0;
+    let dict_id_flag = descriptor & FHD_DICT_ID_FLAG_MASK;
+    let content_size_flag = (descriptor & FHD_CONTENT_SIZE_FLAG_MASK) >> 6;
+
+    let mut len = 5;
+    if !single_segment {
+        len += 1;
+    }
+    len += match dict_id_flag {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    if single_segment || content_size_flag != 0 {
+        len += match content_size_flag {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+    }
+    Some(len)
 }
 
 /// Zstandard decoder.
@@ -437,8 +484,17 @@ impl ZstdDecoder {
     }
 
     /// Reset decoder state for a new frame.
+    ///
+    /// Clears the output buffer, the repeat offsets **and the entropy tables**:
+    /// the literals Huffman table (used by `Treeless` literal sections) and the
+    /// three sequence FSE tables (used by `CompressionMode::Repeat`). Those
+    /// tables are per-frame state; leaving them in place made a reused decoder
+    /// silently accept a `Treeless`/`Repeat` block at the start of a *new*
+    /// frame — decoding it with the previous frame's table instead of
+    /// rejecting it as corrupt.
     pub fn reset(&mut self) {
         self.output.clear();
+        self.literals_decoder.reset();
         self.sequences_decoder.reset();
     }
 }

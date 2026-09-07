@@ -8,9 +8,16 @@
 //! - Performance across various data patterns
 //! - Throughput measurements (MB/s)
 //! - Compression ratios for different scenarios
+//! - The resumable push decoder (`InflateStream` / `WrappedInflate`) at
+//!   several feed granularities, next to the one-shot `inflate()` it shares
+//!   a core with
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use oxiarc_deflate::{deflate, inflate, lz77::Lz77Encoder, zlib_compress, zlib_decompress};
+use oxiarc_core::traits::FlushMode;
+use oxiarc_deflate::{
+    InflateStatus, InflateStream, InflateWrapper, WrappedInflate, deflate, gzip_compress, inflate,
+    inflate_into, lz77::Lz77Encoder, zlib_compress, zlib_decompress,
+};
 use std::hint::black_box;
 
 /// Type alias for pattern generator functions
@@ -345,6 +352,157 @@ fn bench_decompression_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark the resumable push decoder at several feed granularities.
+///
+/// `whole_input` is the gate that matters: it drives the same `InflateStream`
+/// core the one-shot `inflate()` uses, over the same corpus, so the two
+/// numbers are directly comparable and a regression in the push path shows
+/// up as a gap against `decompression_speed/*`.
+fn bench_inflate_stream(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_stream");
+
+    let size = data_sizes::MEDIUM;
+    let original = test_data::text_like(size);
+    let compressed = deflate(&original, 6).unwrap();
+
+    group.throughput(Throughput::Bytes(size as u64));
+
+    // Whole input, growable output: the direct counterpart of `inflate()`.
+    group.bench_with_input(
+        BenchmarkId::from_parameter("whole_input"),
+        &compressed,
+        |b, compressed| {
+            b.iter(|| {
+                let mut stream = InflateStream::new();
+                let out = stream.inflate_to_vec(black_box(compressed)).unwrap();
+                black_box(out);
+            });
+        },
+    );
+
+    // Bounded output at three feed granularities, which is how the HTTP,
+    // PNG and TIFF layers actually drive the decoder.
+    for (label, chunk, buffer) in [
+        ("chunk_65536", 65_536usize, 65_536usize),
+        ("chunk_4096", 4_096, 65_536),
+        ("chunk_1", 1, 65_536),
+    ] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(label),
+            &compressed,
+            |b, compressed| {
+                b.iter(|| {
+                    let mut stream = InflateStream::new();
+                    let mut scratch = vec![0u8; buffer];
+                    let mut out = Vec::with_capacity(size);
+                    let mut fed = 0usize;
+                    loop {
+                        let end = (fed + chunk).min(compressed.len());
+                        let flush = if end >= compressed.len() {
+                            FlushMode::Finish
+                        } else {
+                            FlushMode::None
+                        };
+                        let p = stream
+                            .inflate(&compressed[fed..end], &mut scratch, flush)
+                            .unwrap();
+                        fed += p.consumed;
+                        out.extend_from_slice(&scratch[..p.produced]);
+                        if p.status == InflateStatus::StreamEnd {
+                            break;
+                        }
+                    }
+                    black_box(out);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark gzip/zlib framing through the push decoder, so the wrapper's
+/// per-member bookkeeping is measured separately from the DEFLATE core.
+fn bench_wrapped_inflate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wrapped_inflate");
+
+    let size = data_sizes::MEDIUM;
+    let original = test_data::text_like(size);
+    group.throughput(Throughput::Bytes(size as u64));
+
+    for (label, framing, bytes) in [
+        (
+            "gzip",
+            InflateWrapper::Gzip,
+            gzip_compress(&original, 6).unwrap(),
+        ),
+        (
+            "zlib",
+            InflateWrapper::Zlib,
+            zlib_compress(&original, 6).unwrap(),
+        ),
+        (
+            "auto_zlib",
+            InflateWrapper::Auto,
+            zlib_compress(&original, 6).unwrap(),
+        ),
+    ] {
+        group.bench_with_input(BenchmarkId::from_parameter(label), &bytes, |b, bytes| {
+            b.iter(|| {
+                let mut decoder = WrappedInflate::new(framing);
+                let mut scratch = vec![0u8; 65_536];
+                let mut out = Vec::with_capacity(size);
+                let mut fed = 0usize;
+                loop {
+                    let p = decoder
+                        .inflate(&bytes[fed..], &mut scratch, FlushMode::Finish)
+                        .unwrap();
+                    fed += p.consumed;
+                    out.extend_from_slice(&scratch[..p.produced]);
+                    if p.status == InflateStatus::StreamEnd {
+                        break;
+                    }
+                }
+                black_box(out);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark `inflate_into`, the fixed-destination decode path, which had no
+/// coverage before.
+fn bench_inflate_into(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_into");
+
+    let patterns: [(&str, PatternGenerator); 3] = [
+        ("text", test_data::text_like as PatternGenerator),
+        ("repetitive", test_data::repetitive as PatternGenerator),
+        ("random", test_data::random as PatternGenerator),
+    ];
+    let size = data_sizes::MEDIUM;
+
+    for (pattern_name, generator) in patterns {
+        let original = generator(size);
+        let compressed = deflate(&original, 6).unwrap();
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(pattern_name),
+            &compressed,
+            |b, compressed| {
+                let mut dst = vec![0u8; size];
+                b.iter(|| {
+                    let written = inflate_into(black_box(compressed), &mut dst).unwrap();
+                    black_box(written);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Benchmark ZLIB decompression
 fn bench_zlib_decompression(c: &mut Criterion) {
     let mut group = c.benchmark_group("zlib_decompression");
@@ -514,6 +672,9 @@ criterion_group!(
     bench_compression_sizes,
     bench_decompression_speed,
     bench_decompression_sizes,
+    bench_inflate_stream,
+    bench_wrapped_inflate,
+    bench_inflate_into,
     bench_zlib_decompression,
     bench_compression_ratio,
     bench_roundtrip,

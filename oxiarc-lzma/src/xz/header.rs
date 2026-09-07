@@ -3,6 +3,11 @@
 //! Based on XZ file format specification:
 //! <https://tukaani.org/xz/xz-file-format.txt>
 //!
+//! This code used to live in `oxiarc-archive/src/xz/`; it moved here so
+//! that image codecs (TIFF `Compression = 34925` stores a complete `.xz`
+//! stream per strip) can depend on `oxiarc-lzma` alone. `oxiarc-archive`
+//! re-exports it unchanged.
+//!
 //! ## Progress / cancellation
 //!
 //! [`XzReader`] and [`XzWriter`] expose `.with_progress()` / `.with_cancel()`
@@ -10,13 +15,12 @@
 //! the underlying `oxiarc-lzma` LZMA2 encoder/decoder do not currently expose
 //! per-chunk builders, so granularity is one-shot per block/stream.
 
+use super::filters::XzFilter;
+use crate::{Lzma2Decoder, Lzma2Encoder, LzmaLevel, dict_size_from_props, props_from_dict_size};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::crc::{Crc32, Crc64};
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
-use oxiarc_lzma::{
-    Lzma2Decoder, Lzma2Encoder, LzmaLevel, dict_size_from_props, props_from_dict_size,
-};
 use std::io::{Read, Write};
 
 /// XZ magic bytes: 0xFD, '7', 'z', 'X', 'Z', 0x00
@@ -145,6 +149,13 @@ pub struct XzReader<R: Read> {
     /// [`Self::skip_index`] and cross-checked against the stream footer's
     /// Backward Size field in [`Self::read_footer`].
     index_size: usize,
+    /// Optional cap on the total uncompressed size of the stream, enforced
+    /// *during* decoding (after every LZMA2 chunk), so a decompression bomb
+    /// is rejected before its output is materialised.
+    max_output: Option<u64>,
+    /// Uncompressed bytes produced by blocks completed so far. Used both
+    /// for the running budget check and for progress reporting.
+    produced: u64,
 }
 
 impl<R: Read> XzReader<R> {
@@ -182,6 +193,8 @@ impl<R: Read> XzReader<R> {
             cancel: None,
             bytes_processed: 0,
             index_size: 0,
+            max_output: None,
+            produced: 0,
         })
     }
 
@@ -201,9 +214,110 @@ impl<R: Read> XzReader<R> {
         self
     }
 
-    /// Decompress the XZ stream.
+    /// Cap the total uncompressed size of the stream.
+    ///
+    /// The cap is checked after every LZMA2 chunk, not after the stream has
+    /// been expanded, so a stream that would exceed it fails with
+    /// [`OxiArcError::MemoryBudgetExceeded`] while its output is still
+    /// bounded by roughly one chunk (at most 2 MiB) above the limit.
+    #[must_use]
+    pub fn with_max_output(mut self, max_output: u64) -> Self {
+        self.max_output = Some(max_output);
+        self
+    }
+
+    /// Decompress the whole `.xz` file.
+    ///
+    /// A `.xz` *file* is one or more Streams, optionally separated and
+    /// terminated by Stream Padding (xz spec §2.2), which is how
+    /// `cat a.xz b.xz` and every parallel xz compressor produce their
+    /// output. Every stream is decoded and the results are concatenated,
+    /// matching `xz -d`; a file that ends in anything other than clean EOF
+    /// or well-formed padding is an error rather than a silent short read.
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
         let mut output = Vec::new();
+
+        // The first stream's header was consumed by `new()`.
+        self.decompress_stream(&mut output)?;
+        while self.next_stream_header()? {
+            self.decompress_stream(&mut output)?;
+        }
+
+        if let Some(ref handle) = self.progress {
+            handle.on_finish();
+        }
+
+        Ok(output)
+    }
+
+    /// Read the next Stream Header after a stream footer, skipping any
+    /// Stream Padding.
+    ///
+    /// Returns `Ok(false)` at a clean end of file (no further stream), and
+    /// `Ok(true)` after a valid header whose flags replace the current
+    /// ones. Trailing bytes that are neither 4-byte-aligned null padding
+    /// nor a valid header are an error, exactly as `xz -d` treats them.
+    fn next_stream_header(&mut self) -> Result<bool> {
+        let mut quad = [0u8; 4];
+        loop {
+            match read_up_to(&mut self.reader, &mut quad)? {
+                0 => return Ok(false),
+                4 => {}
+                partial => {
+                    return Err(OxiArcError::corrupted(
+                        0,
+                        format!(
+                            "XZ file ends with {partial} trailing byte(s); Stream Padding must \
+                             be a multiple of 4 null bytes"
+                        ),
+                    ));
+                }
+            }
+            if quad != [0u8; 4] {
+                break;
+            }
+            // Four more bytes of Stream Padding; keep looking.
+        }
+
+        let mut header = [0u8; 12];
+        header[..4].copy_from_slice(&quad);
+        let tail = read_up_to(&mut self.reader, &mut header[4..])?;
+        if tail != 8 {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ file has {} trailing byte(s) after the last stream, which are \
+                     neither Stream Padding nor a Stream Header",
+                    4 + tail
+                ),
+            ));
+        }
+
+        if header[..6] != XZ_MAGIC {
+            return Err(OxiArcError::InvalidMagic {
+                expected: XZ_MAGIC.to_vec(),
+                found: header[..6].to_vec(),
+            });
+        }
+        let stream_flags = StreamFlags::decode([header[6], header[7]])?;
+        let expected_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        let computed_crc = Crc32::compute(&header[6..8]);
+        if expected_crc != computed_crc {
+            return Err(OxiArcError::CrcMismatch {
+                expected: expected_crc,
+                computed: computed_crc,
+            });
+        }
+
+        self.stream_flags = stream_flags;
+        self.index_size = 0;
+        Ok(true)
+    }
+
+    /// Decompress one stream whose Stream Header has already been consumed,
+    /// appending its blocks' output to `output`.
+    fn decompress_stream(&mut self, output: &mut Vec<u8>) -> Result<()> {
+        let mut blocks = 0u64;
 
         loop {
             // Cooperative cancellation check before each block.
@@ -257,6 +371,16 @@ impl<R: Read> XzReader<R> {
 
             // Parse block header flags
             let flags = header_body[0];
+            // xz spec §3.1.2: bits 2-5 are reserved and must be zero. A
+            // future revision may use them to add fields ahead of the
+            // filter list, so accepting them would mean mis-parsing the
+            // rest of the header instead of reporting an unreadable file.
+            if flags & 0x3C != 0 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    format!("XZ block header sets reserved flag bits (0x{flags:02X})"),
+                ));
+            }
             let num_filters = (flags & 0x03) + 1;
             let has_compressed_size = (flags & 0x40) != 0;
             let has_uncompressed_size = (flags & 0x80) != 0;
@@ -271,15 +395,24 @@ impl<R: Read> XzReader<R> {
             };
 
             // Read uncompressed size if present
-            let _uncompressed_size = if has_uncompressed_size {
+            let declared_uncompressed_size = if has_uncompressed_size {
                 self.read_multibyte_int(header_body, &mut offset)?
             } else {
                 0
             };
 
-            // Read filters
+            // Read the filter chain. The xz spec lists filters in the order
+            // an encoder applied them, so the last one is the compression
+            // filter (LZMA2 here) and the preceding "non-last" filters must
+            // be undone in reverse order after decompression. Filters other
+            // than LZMA2 used to be parsed and then silently dropped, which
+            // produced wrong output rather than an error for every stream
+            // that used one (libtiff writes `Delta(1) + LZMA2` for TIFF
+            // Compression 34925).
             let mut dict_size = 1 << 20; // Default 1MB
-            for _ in 0..num_filters {
+            let mut saw_lzma2 = false;
+            let mut non_last_filters: Vec<XzFilter> = Vec::new();
+            for index in 0..num_filters {
                 let filter_id = self.read_multibyte_int(header_body, &mut offset)?;
                 let props_size = self.read_multibyte_int(header_body, &mut offset)?;
 
@@ -297,9 +430,18 @@ impl<R: Read> XzReader<R> {
                             "XZ filter properties exceed the block header bounds",
                         )
                     })?;
+                let props = &header_body[offset..offset + props_len];
+                let is_last = index + 1 == num_filters;
 
                 if filter_id == FILTER_LZMA2 {
-                    // xz spec §5.3.1: LZMA2 has exactly one property byte.
+                    // xz spec §5.3.1: LZMA2 is a "last" filter and has
+                    // exactly one property byte.
+                    if !is_last {
+                        return Err(OxiArcError::corrupted(
+                            0,
+                            "XZ LZMA2 filter must be the last filter in the chain",
+                        ));
+                    }
                     if props_len != 1 {
                         return Err(OxiArcError::corrupted(
                             0,
@@ -308,51 +450,95 @@ impl<R: Read> XzReader<R> {
                     }
                     let dict_props = header_body[offset];
                     dict_size = dict_size_from_props(dict_props);
-                    if dict_size > oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP {
+                    if dict_size > crate::decoder::DICT_SIZE_ALLOC_CAP {
                         return Err(OxiArcError::corrupted(
                             0,
                             format!(
                                 "XZ block declares LZMA2 dictionary size {dict_size} bytes, \
                                  exceeding the maximum allowed allocation of {} bytes",
-                                oxiarc_lzma::decoder::DICT_SIZE_ALLOC_CAP
+                                crate::decoder::DICT_SIZE_ALLOC_CAP
                             ),
                         ));
                     }
+                    saw_lzma2 = true;
+                } else {
+                    if is_last {
+                        return Err(OxiArcError::corrupted(
+                            0,
+                            format!("XZ block ends with non-compression filter 0x{filter_id:02X}"),
+                        ));
+                    }
+                    let filter = XzFilter::parse(filter_id, props)?;
+                    if non_last_filters.contains(&filter) {
+                        return Err(OxiArcError::corrupted(
+                            0,
+                            format!("XZ block repeats filter 0x{filter_id:02X}"),
+                        ));
+                    }
+                    non_last_filters.push(filter);
                 }
                 offset += props_len;
+            }
+
+            if !saw_lzma2 {
+                return Err(OxiArcError::UnsupportedMethod {
+                    method: "XZ block without an LZMA2 compression filter".to_string(),
+                });
             }
 
             // Remaining header-body bytes are padding (header is padded to
             // a multiple of 4); the CRC32 validated above already covers
             // them.
 
-            // Decompress block data
-            let block_data = if has_compressed_size && compressed_size > 0 {
+            // Decompress block data, then undo the non-last filters in
+            // reverse order (the encoder applied them left to right before
+            // handing the result to LZMA2).
+            let (mut block_data, block_check) = if has_compressed_size && compressed_size > 0 {
                 self.decompress_block_with_size(dict_size, compressed_size as usize)?
             } else {
                 self.decompress_block(dict_size)?
             };
+            for filter in non_last_filters.iter().rev() {
+                filter.decode(&mut block_data);
+            }
+            // The check covers the original (unfiltered) block data, so it
+            // is verified only now.
+            self.verify_check(&block_data, &block_check)?;
+
+            // xz spec §3.3: when the optional Uncompressed Size field is
+            // present it must equal the size of the block's original data.
+            // libtiff writes `LZMA_CHECK_NONE` strips, so on that path this
+            // is the *only* integrity cross-check the format offers; without
+            // it a corrupt block that still decodes is accepted silently.
+            if has_uncompressed_size && declared_uncompressed_size != block_data.len() as u64 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    format!(
+                        "XZ block declares an uncompressed size of \
+                         {declared_uncompressed_size} bytes but decoded to {}",
+                        block_data.len()
+                    ),
+                ));
+            }
 
             // Update cumulative progress after each block.
+            self.produced = self.produced.saturating_add(block_data.len() as u64);
             self.bytes_processed = self.bytes_processed.saturating_add(block_data.len() as u64);
             if let Some(ref handle) = self.progress {
                 handle.on_progress(self.bytes_processed, None);
             }
 
             output.extend_from_slice(&block_data);
+            blocks = blocks.saturating_add(1);
         }
 
-        // Parse the index, validating its trailing CRC-32.
-        self.skip_index()?;
+        // Parse the index, validating its record count and trailing CRC-32.
+        self.skip_index(blocks)?;
 
         // Read stream footer
         self.read_footer()?;
 
-        if let Some(ref handle) = self.progress {
-            handle.on_finish();
-        }
-
-        Ok(output)
+        Ok(())
     }
 
     /// Read a multibyte integer (variable-length encoding).
@@ -458,11 +644,15 @@ impl<R: Read> XzReader<R> {
     }
 
     /// Decompress a block with known compressed size.
+    ///
+    /// Returns the LZMA2 output (still carrying any non-last filters) and
+    /// the block's check bytes; the caller undoes the filters and then
+    /// verifies the check.
     fn decompress_block_with_size(
         &mut self,
         dict_size: u32,
         compressed_size: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         // The declared size comes straight from the (attacker-controlled)
         // block header. Cap it to the same limit `decompress_block`
         // enforces, and allocate via `try_reserve_exact` so an allocation
@@ -486,10 +676,21 @@ impl<R: Read> XzReader<R> {
         compressed.resize(compressed_size, 0);
         self.reader.read_exact(&mut compressed)?;
 
-        // Decompress LZMA2
-        let mut decoder = Lzma2Decoder::new(dict_size);
-        let mut cursor = std::io::Cursor::new(&compressed);
-        let data = decoder.decode(&mut cursor)?;
+        // Decompress LZMA2 (budget-checked chunk by chunk)
+        let (data, consumed) = self.decode_lzma2_payload(&compressed, dict_size)?;
+        // xz spec §3.3: the Compressed Size field is the exact size of the
+        // Compressed Data field, so the filter chain must consume all of it.
+        // Ignoring a shorter consumption would silently accept trailing
+        // bytes inside the block -- and on a `LZMA_CHECK_NONE` stream
+        // nothing else would notice.
+        if consumed != compressed_size {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ block declares a compressed size of {compressed_size} bytes but its                      LZMA2 payload ended after {consumed}"
+                ),
+            ));
+        }
 
         // Read block padding (to 4-byte boundary)
         let padding = (4 - (compressed_size % 4)) % 4;
@@ -498,15 +699,13 @@ impl<R: Read> XzReader<R> {
             self.reader.read_exact(&mut pad)?;
         }
 
-        // Read and verify check (based on stream flags)
-        let check_size = self.stream_flags.check_type.size();
-        if check_size > 0 {
-            let mut check = vec![0u8; check_size];
-            self.reader.read_exact(&mut check)?;
-            self.verify_check(&data, &check)?;
-        }
+        // Read the check field. It is *not* verified here: the xz spec
+        // computes it over the block's original uncompressed data, which is
+        // what comes out after the non-last filters have been undone, so
+        // the caller verifies it once the filter chain has run.
+        let check = self.read_check()?;
 
-        Ok(data)
+        Ok((data, check))
     }
 
     /// Decompress a block whose header does not declare the compressed size
@@ -515,7 +714,10 @@ impl<R: Read> XzReader<R> {
     /// LZMA2 chunk framing is self-describing: each chunk header carries the
     /// exact payload length, so the block payload can be collected chunk by
     /// chunk until the end-of-stream control byte (0x00).
-    fn decompress_block(&mut self, dict_size: u32) -> Result<Vec<u8>> {
+    ///
+    /// Returns the LZMA2 output and the block's check bytes, as
+    /// [`Self::decompress_block_with_size`] does.
+    fn decompress_block(&mut self, dict_size: u32) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut compressed = Vec::new();
         loop {
             let mut ctrl = [0u8; 1];
@@ -567,10 +769,11 @@ impl<R: Read> XzReader<R> {
             }
         }
 
-        // Decompress LZMA2
-        let mut decoder = Lzma2Decoder::new(dict_size);
-        let mut cursor = std::io::Cursor::new(&compressed);
-        let data = decoder.decode(&mut cursor)?;
+        // Decompress LZMA2 (budget-checked chunk by chunk). The payload was
+        // collected chunk by chunk from the same framing the decoder reads,
+        // so it always consumes all of it; there is no declared size to
+        // cross-check here.
+        let (data, _consumed) = self.decode_lzma2_payload(&compressed, dict_size)?;
 
         // Read block padding (compressed data is padded to a 4-byte
         // boundary; the block header is always 4-aligned already)
@@ -580,19 +783,61 @@ impl<R: Read> XzReader<R> {
             self.reader.read_exact(&mut pad)?;
         }
 
-        // Read and verify check (based on stream flags)
-        let check_size = self.stream_flags.check_type.size();
-        if check_size > 0 {
-            let mut check = vec![0u8; check_size];
-            self.reader.read_exact(&mut check)?;
-            self.verify_check(&data, &check)?;
-        }
+        // See `decompress_block_with_size`: the check covers the block's
+        // original data, i.e. the bytes after the filter chain is undone.
+        let check = self.read_check()?;
 
-        Ok(data)
+        Ok((data, check))
     }
 
-    /// Parse the index and validate its trailing CRC-32.
-    fn skip_index(&mut self) -> Result<()> {
+    /// Read the block's check field (empty for `CheckType::None`).
+    fn read_check(&mut self) -> Result<Vec<u8>> {
+        let check_size = self.stream_flags.check_type.size();
+        if check_size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut check = vec![0u8; check_size];
+        self.reader.read_exact(&mut check)?;
+        Ok(check)
+    }
+
+    /// Decode one block's LZMA2 payload, enforcing [`Self::max_output`]
+    /// after every chunk.
+    ///
+    /// `Lzma2Decoder::decode` would expand the whole payload before any cap
+    /// could be applied; decoding chunk by chunk keeps peak memory bounded
+    /// by the budget (plus one chunk) even for a hostile stream.
+    fn decode_lzma2_payload(&self, compressed: &[u8], dict_size: u32) -> Result<(Vec<u8>, usize)> {
+        let mut decoder = Lzma2Decoder::new(dict_size);
+        let mut cursor = std::io::Cursor::new(compressed);
+        let mut data = Vec::new();
+        loop {
+            let more = decoder.decode_chunk(&mut cursor, &mut data)?;
+            if let Some(max) = self.max_output {
+                let total = self.produced.saturating_add(data.len() as u64);
+                if total > max {
+                    return Err(OxiArcError::memory_budget_exceeded(
+                        usize::try_from(max).unwrap_or(usize::MAX),
+                        usize::try_from(total).unwrap_or(usize::MAX),
+                    ));
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+        let consumed = usize::try_from(cursor.position()).unwrap_or(compressed.len());
+        Ok((data, consumed))
+    }
+
+    /// Parse the index, validate its record count against the number of
+    /// blocks actually decoded, and validate its trailing CRC-32.
+    ///
+    /// The record count is checked *before* the record loop runs: it is an
+    /// attacker-controlled multibyte integer (up to 2^63), and comparing it
+    /// with `blocks` first turns a crafted count into an immediate error
+    /// instead of a byte-at-a-time read loop.
+    fn skip_index(&mut self, blocks: u64) -> Result<()> {
         // The index indicator (0x00) was already read when we detected end of blocks
         // Now we need to read the number of records and skip the index
 
@@ -616,6 +861,22 @@ impl<R: Read> XzReader<R> {
             if byte[0] & 0x80 == 0 {
                 break;
             }
+            if shift > 63 {
+                return Err(OxiArcError::corrupted(
+                    0,
+                    "XZ index record count overflows a 64-bit integer",
+                ));
+            }
+        }
+
+        if num_records != blocks {
+            return Err(OxiArcError::corrupted(
+                0,
+                format!(
+                    "XZ index declares {num_records} record(s) but the stream contains \
+                     {blocks} block(s)"
+                ),
+            ));
         }
 
         // Read each record (unpadded size + uncompressed size, both multibyte)
@@ -827,6 +1088,15 @@ impl XzWriter {
     ///
     /// Returns the block's Unpadded Size (block header + compressed data +
     /// check, excluding block padding) as required by the index record.
+    ///
+    /// The block header declares both optional size fields (flags `0xC0`),
+    /// exactly as the `xz` CLI does. **Uncompressed Size is the size of the
+    /// block's *original* data — before any filter chain, not after it** —
+    /// and Compressed Size is the exact length of the Compressed Data
+    /// field. The reader enforces both (`decompress_stream` /
+    /// `decompress_block_with_size`), so if this writer ever grows a
+    /// non-last filter (Delta, BCJ), it must keep declaring the original
+    /// size here or produce files it cannot read back.
     fn write_block<W: Write>(&self, writer: &mut W, data: &[u8]) -> Result<usize> {
         // Compress data with LZMA2
         let encoder = Lzma2Encoder::new(self.level);
@@ -1025,10 +1295,129 @@ impl XzWriter {
     }
 }
 
+/// Fill `buf` from `reader`, returning how many bytes were read before the
+/// end of input.
+///
+/// `Read::read` may return fewer bytes than asked for without being at EOF,
+/// so a single call cannot distinguish "no more data" from "not yet"; this
+/// loops until the buffer is full or a read returns zero. `Interrupted` is
+/// retried, as `read_exact` does.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
+}
+
 /// Decompress XZ data from a reader.
 pub fn decompress<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let mut xz_reader = XzReader::new(reader)?;
     xz_reader.decompress()
+}
+
+/// Decompress a complete `.xz` stream directly into a caller-supplied
+/// buffer.
+///
+/// This is the entry point for TIFF `Compression = 34925`, where every
+/// strip/tile is a complete `.xz` stream whose uncompressed size the caller
+/// already knows from the image geometry. The output cap is enforced
+/// *during* decoding (after every LZMA2 chunk), so a strip that claims to
+/// expand far beyond `dst` fails immediately instead of allocating first.
+///
+/// Note that the LZMA2 layer needs a contiguous window over the block it is
+/// decoding, so one block-sized buffer is still used internally; what this
+/// function guarantees is that the caller allocates nothing, that the
+/// decoded size never has to be guessed, and that a stream larger than
+/// `dst` is an error rather than a truncation.
+///
+/// # Returns
+///
+/// The number of bytes written to `dst`, which may be fewer than
+/// `dst.len()` when the stream is shorter than the buffer.
+///
+/// # Errors
+///
+/// - [`OxiArcError::BufferTooSmall`] if the stream expands past `dst`. The
+///   overflow is detected *during* decoding, so `needed` is a lower bound
+///   (the bytes produced when the limit was crossed), not the stream's full
+///   uncompressed size — which is exactly why nothing has to be expanded to
+///   find out.
+/// - the usual framing/CRC errors for a corrupt stream.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_lzma::xz;
+///
+/// let original = b"one TIFF strip, one .xz stream";
+/// let stream = xz::compress(original, 6)?;
+///
+/// let mut strip = vec![0u8; original.len()];
+/// let written = xz::decompress_into(&stream, &mut strip)?;
+/// assert_eq!(written, original.len());
+/// assert_eq!(&strip[..written], original);
+/// # Ok::<(), oxiarc_core::error::OxiArcError>(())
+/// ```
+pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    let mut reader = XzReader::new(std::io::Cursor::new(src))?.with_max_output(dst.len() as u64);
+    // The cap is `dst.len()`, so an oversized stream trips the running
+    // budget check inside the decoder rather than this function's own
+    // post-hoc comparison. Report it the way this entry point documents it
+    // (and the way `oxiarc_deflate::inflate_into` reports the same
+    // condition) instead of leaking a budget the caller never configured;
+    // `requested` is the running total that crossed the limit, i.e. a lower
+    // bound on what `dst` would have needed.
+    let data = reader.decompress().map_err(|err| match err {
+        OxiArcError::MemoryBudgetExceeded { requested, .. } => OxiArcError::BufferTooSmall {
+            needed: requested,
+            available: dst.len(),
+        },
+        other => other,
+    })?;
+    if data.len() > dst.len() {
+        return Err(OxiArcError::BufferTooSmall {
+            needed: data.len(),
+            available: dst.len(),
+        });
+    }
+    dst[..data.len()].copy_from_slice(&data);
+    Ok(data.len())
+}
+
+/// Decompress a complete `.xz` stream with an explicit output cap.
+///
+/// Like [`decompress`] but bounded: the cap is enforced after every LZMA2
+/// chunk, so an `.xz` decompression bomb is rejected while its output is
+/// still bounded by roughly the limit plus one chunk.
+///
+/// # Errors
+///
+/// [`OxiArcError::MemoryBudgetExceeded`] when the stream expands past
+/// `max_output`, plus the usual framing/CRC errors.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_lzma::xz;
+///
+/// let stream = xz::compress(&vec![0u8; 1 << 20], 6)?;
+///
+/// // Within budget:
+/// assert_eq!(xz::decompress_with_limit(&stream, 1 << 20)?.len(), 1 << 20);
+///
+/// // Over budget: rejected, not expanded.
+/// assert!(xz::decompress_with_limit(&stream, 4096).is_err());
+/// # Ok::<(), oxiarc_core::error::OxiArcError>(())
+/// ```
+pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
+    let mut reader = XzReader::new(std::io::Cursor::new(data))?.with_max_output(max_output as u64);
+    reader.decompress()
 }
 
 /// Decompress XZ data from a byte slice (test utility).

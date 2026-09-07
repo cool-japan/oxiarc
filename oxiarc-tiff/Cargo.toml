@@ -1,0 +1,41 @@
+[package]
+name = "oxiarc-tiff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Pure Rust TIFF 6.0 / BigTIFF / GeoTIFF-tag-preserving reader and writer for OxiArc (LZW, Deflate, PackBits, CCITT, JPEG, ZSTD, LZMA)"
+readme = "README.md"
+keywords = ["tiff", "bigtiff", "geotiff", "image", "decoder"]
+categories = ["multimedia::images", "multimedia::encoding", "encoding"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+# Differential oracle tests (tests/tiff_oracle.rs) that shell out to libtiff's
+# `tiffcp`/`tiffinfo` and to `python3` with Pillow / tifffile. They validate
+# both directions: reference-written TIFFs must decode byte-identically here,
+# and oxiarc-written TIFFs must be accepted by the reference tools. Every test
+# self-skips (prints a note, does not fail) when the tool is absent, exactly
+# like `oxiarc-snappy`'s `snappy-oracle`. Never needed for library use.
+tiff-oracle = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "tiff_bench"
+harness = false
+
+[lints]
+workspace = true

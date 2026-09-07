@@ -25,6 +25,23 @@
 //! `carry`) and retried once more input has arrived. This replaces the previous
 //! fine-grained sub-phase state machine (whose spin-loops caused hangs) with a
 //! single, always-terminating loop.
+//!
+//! ## Memory: `carry` is compacted, not retained forever
+//!
+//! `carry` does **not** grow for the life of the decode. Once the bit reader
+//! has fully consumed (or rolled back past) at least
+//! `CARRY_COMPACT_THRESHOLD` (64 KiB) of it, [`StreamingLzhDecoder`]'s
+//! internal `compact_carry` drops that prefix and rebases the bit reader's
+//! cursor to match — every call to
+//! [`decompress`](StreamingLzhDecoder::decompress), not only `reset()`.
+//! Compaction runs once, at the end of each call, so `carry`'s steady state
+//! (between calls) is bounded by the threshold rather than by the whole
+//! compressed stream; a caller that feeds reasonably-sized chunks — one
+//! byte at a time, in the strictest test in this module's suite — never
+//! sees `carry` grow past a small multiple of the threshold. A caller that
+//! hands the *entire* compressed stream to a single call gets no benefit
+//! from compaction until that one call returns, since a call's newly
+//! appended bytes cannot be trimmed before they are read.
 
 use crate::methods::LzhMethod;
 use oxiarc_core::error::{OxiArcError, Result};
@@ -124,6 +141,11 @@ pub enum DecoderPhase {
     Error,
 }
 
+/// `carry` compaction threshold (64 KiB): once the bit reader has consumed
+/// at least this many bytes of `carry`, [`StreamingLzhDecoder::compact_carry`]
+/// drops that prefix instead of retaining it for the life of the decode.
+const CARRY_COMPACT_THRESHOLD: usize = 64 * 1024;
+
 /// A back-reference copy that overflowed the caller's output buffer and must be
 /// continued on the next [`StreamingLzhDecoder::decompress`] call.
 #[derive(Debug, Clone, Copy)]
@@ -151,7 +173,12 @@ pub struct StreamingLzhDecoder {
     history: StreamHistory,
     /// Resumable MSB-first bit reader over `carry`.
     bit_reader: StreamingBitReader,
-    /// Accumulated compressed bytes fed so far (retained for resumable reads).
+    /// Compressed bytes not yet consumed by the bit reader, plus a
+    /// [`CARRY_COMPACT_THRESHOLD`]-sized trailing margin of already-consumed
+    /// bytes retained until the next [`compact_carry`](Self::compact_carry)
+    /// call. Bounded by that threshold plus the largest in-flight block
+    /// header/symbol plus one caller-supplied chunk — **not** by the whole
+    /// compressed stream (see `compact_carry`).
     carry: Vec<u8>,
     /// Expected uncompressed size.
     uncompressed_size: u64,
@@ -341,12 +368,55 @@ impl StreamingLzhDecoder {
                     offset: pending.offset,
                     remaining: left,
                 });
+                self.compact_carry();
                 return Ok((consumed, output_pos, DecompressStatus::NeedsOutput));
             }
         }
 
         let status = self.run_loop(output, &mut output_pos)?;
+        self.compact_carry();
         Ok((consumed, output_pos, status))
+    }
+
+    /// Drop the fully-consumed prefix of `carry`, once it has grown past
+    /// [`CARRY_COMPACT_THRESHOLD`].
+    ///
+    /// `run_loop`/`try_read_block_header` decode transactionally: each
+    /// attempt saves the bit reader's state, and on running out of input
+    /// mid-header/mid-command, rewinds it before returning — so by the time
+    /// any call to `decompress` returns control to the caller, the bit
+    /// reader's cursor never points back into a discarded checkpoint from a
+    /// *previous* call. That makes `bit_reader.bytes_consumed()` at this
+    /// point safe to treat as "never needed again": every byte before it,
+    /// across every call so far, has either been fully decoded or rewound
+    /// past, never both.
+    ///
+    /// Thresholded (rather than compacting on every call) so a steady stream
+    /// of tiny chunks does not pay an O(n) `Vec::drain` on every single
+    /// `decompress` call.
+    ///
+    /// # Bound this gives `carry`
+    ///
+    /// Compaction runs once, at the *end* of each `decompress` call, so
+    /// `carry` can transiently hold as much as **the largest single input
+    /// slice any one call is ever given**, plus a little slack (the
+    /// threshold, plus whatever partially-decoded block header/command is
+    /// still in flight and therefore not yet compactable) — steady state
+    /// after that call returns is back down to roughly the threshold. That
+    /// is a **per-call, chunk-size-bounded** guarantee, not a fixed constant
+    /// independent of how the caller chunks its input: a caller that always
+    /// hands over reasonably-sized chunks (as every caller in this crate's
+    /// own test suite does, down to one byte at a time) gets memory bounded
+    /// by the threshold, not by the whole compressed stream; a caller that
+    /// hands the entire compressed stream to a single `decompress` call gets
+    /// no benefit from compaction *during* that one call, only after it
+    /// returns.
+    fn compact_carry(&mut self) {
+        let trim = self.bit_reader.bytes_consumed();
+        if trim >= CARRY_COMPACT_THRESHOLD {
+            self.carry.drain(..trim);
+            self.bit_reader.rebase(trim);
+        }
     }
 
     /// The single, always-terminating decode loop.
@@ -1447,6 +1517,119 @@ mod tests {
             "last processed ({}) should equal input size ({})",
             sink.last_processed(),
             input_size
+        );
+    }
+
+    /// Regression for the unbounded-`carry`-growth defect: `carry` must be
+    /// periodically compacted, not retained for the life of the decode.
+    ///
+    /// Feeds the compressed stream **one byte at a time** — the strictest
+    /// possible chunking, since it exercises every single possible split
+    /// point, including a block header or command split landing exactly at
+    /// the moment the consumed prefix first crosses the compaction
+    /// threshold (the one ordering — a checkpoint rollback racing a
+    /// compaction — that could silently corrupt decoding if `compact_carry`
+    /// ever ran before a rollback restored the pre-header bit-reader
+    /// position; see `compact_carry`'s doc comment for why it does not).
+    #[test]
+    fn test_streaming_decoder_carry_is_bounded_not_whole_stream() {
+        use crate::encode::LzhEncoder;
+
+        // High-entropy pseudo-random (SplitMix64), not merely repetitive: a
+        // real LZH archiver compresses highly repetitive test fixtures down
+        // to almost nothing, which would never accumulate enough `carry` to
+        // exercise compaction at all. A weaker generator has the same
+        // problem in disguise: an earlier version of this test emitted only
+        // the top byte of a linear congruential step per index, which
+        // varies slowly enough between neighbouring indices that LZSS still
+        // found abundant matches (400 KiB compressed to under 22 KiB).
+        // SplitMix64 decorrelates every output byte, so LZSS finds
+        // essentially no matches and the compressed size stays close to the
+        // original — the scenario a decompression-bomb defense actually
+        // needs to hold up against.
+        fn make_incompressible(size: usize) -> Vec<u8> {
+            let mut seed: u64 = 0x1234_5678_9abc_def0;
+            let mut out = Vec::with_capacity(size + 8);
+            while out.len() < size {
+                seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = seed;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                out.extend_from_slice(&z.to_le_bytes());
+            }
+            out.truncate(size);
+            out
+        }
+
+        let original = make_incompressible(400 * 1024);
+        let mut encoder = LzhEncoder::new(LzhMethod::Lh5);
+        let compressed = encoder
+            .compress_to_vec(&original)
+            .expect("compression failed");
+        assert!(
+            compressed.len() > 2 * CARRY_COMPACT_THRESHOLD,
+            "fixture must compress to more than 2x the {}-byte compaction \
+             threshold to actually exercise repeated compaction; got {} bytes \
+             (increase `original`'s size if this fails)",
+            CARRY_COMPACT_THRESHOLD,
+            compressed.len()
+        );
+
+        let mut decoder = StreamingLzhDecoder::new(LzhMethod::Lh5, original.len() as u64);
+        let mut output = Vec::with_capacity(original.len());
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut compactions_observed = 0usize;
+        let mut previous_carry_len = 0usize;
+        // Generous ceiling: the compaction threshold plus headroom far
+        // larger than any single LZH block header (16-bit count + temp-tree
+        // + up to NC c-tree codes + a handful of p-tree codes is at most a
+        // few KiB) could ever add before a compaction gets a chance to run.
+        // Still far below the full stream size, so a regression back to
+        // "retain everything" fails this assertion long before the loop
+        // finishes.
+        let carry_ceiling = CARRY_COMPACT_THRESHOLD * 3;
+
+        for byte in &compressed {
+            let mut remaining: &[u8] = std::slice::from_ref(byte);
+            loop {
+                let (consumed, produced, status) = decoder
+                    .decompress(remaining, &mut scratch)
+                    .expect("decompress failed");
+                output.extend_from_slice(&scratch[..produced]);
+                remaining = &remaining[consumed..];
+
+                assert!(
+                    decoder.carry.len() <= carry_ceiling,
+                    "carry grew to {} bytes (ceiling {}, threshold {}) \u{2014} \
+                     compaction is not bounding memory",
+                    decoder.carry.len(),
+                    carry_ceiling,
+                    CARRY_COMPACT_THRESHOLD
+                );
+                if decoder.carry.len() < previous_carry_len {
+                    compactions_observed += 1;
+                }
+                previous_carry_len = decoder.carry.len();
+
+                match status {
+                    DecompressStatus::NeedsOutput => continue,
+                    _ => break,
+                }
+            }
+        }
+
+        assert_eq!(
+            output, original,
+            "byte-at-a-time decode with periodic carry compaction must still be byte-exact"
+        );
+        assert!(
+            compactions_observed >= 2,
+            "expected at least 2 compaction events over a {}-byte compressed \
+             stream with a {}-byte threshold, observed {}",
+            compressed.len(),
+            CARRY_COMPACT_THRESHOLD,
+            compactions_observed
         );
     }
 }

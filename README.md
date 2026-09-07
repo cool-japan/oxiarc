@@ -47,7 +47,8 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Modern CLI** - Progress bars, verbose output, JSON support, shell completions
 - **Streaming API** - Memory-efficient processing with stdin/stdout support
 - **Async I/O** - Async ZIP and async deflate support (async-io feature flag)
-- **Streaming API** - GzipStream/ZlibStream/LzwStream encoders/decoders with flush modes
+- **Streaming API** - GzipStream/ZlibStream encoders/decoders with flush modes
+- **LZW Streaming** - `LzwStreamEncoder` writes incrementally with flush modes; `LzwStreamDecoder` currently buffers the whole input before decoding (own length-prefixed framing, not a bare TIFF/GIF bitstream) - not yet true streaming
 - **Dry-Run Mode** - Preview operations without writing files
 - **EntryBuilder** - Fluent API for building archive entries
 - **Pattern Filtering** - Include/exclude patterns with glob syntax

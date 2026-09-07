@@ -28,8 +28,15 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
   incomplete prefix codes, and length overruns are rejected; the decoder
   never returns `Ok` with wrong bytes.
 - **Quality levels 0–11** — Quality 0 stores; higher levels increase LZ77 search effort
-- **Streaming API** — `BrotliCompressor<W: Write>` and `BrotliDecompressor<R: Read>`
-  adapters (fully buffered in memory; see the `streaming` module docs)
+- **Bounded incremental decoding** — `BrotliStream` is a push decoder: feed it
+  whatever compressed bytes and output space you have and it makes as much
+  progress as both allow. Peak memory is the stream's declared sliding window,
+  not the body size; the output cap is exact (checked per meta-block, before
+  the meta-block is decoded) and an over-large declared window is refused
+  before it is allocated.
+- **Streaming API** — `BrotliCompressor<W: Write>` (incremental) and
+  `BrotliDecompressor<R: Read>` / `BrotliAsyncDecompressor` (incremental,
+  built on `BrotliStream`)
 - **One-shot API** — Convenient `compress` / `decompress` functions
 - **Configurable window** — `lgwin` 10–24; window size is `(1 << lgwin) - 16` bytes (RFC 9.1)
 
@@ -90,10 +97,59 @@ use std::io::Read;
 use oxiarc_brotli::BrotliDecompressor;
 
 let compressed: Vec<u8> = /* ... */;
-let mut decompressor = BrotliDecompressor::new(&compressed[..]);
+// Decodes as the source delivers: 64 KiB of compressed data is staged at a
+// time and decoded straight into `output`, so nothing waits for EOF.
+let mut decompressor = BrotliDecompressor::new(&compressed[..])
+    .with_max_output(64 << 20)   // refuse a bomb before it expands
+    .with_max_window(4 << 20);   // refuse an over-large declared window
 let mut output = Vec::new();
 decompressor.read_to_end(&mut output)?;
 ```
+
+### Incremental decoding (`BrotliStream`)
+
+For an HTTP body, a pipe, or anything else that arrives in pieces — and for
+callers that own their own output buffer:
+
+```rust
+use oxiarc_brotli::{BrotliStatus, BrotliStream};
+use oxiarc_core::traits::FlushMode;
+
+let compressed: Vec<u8> = /* ... */;
+let mut stream = BrotliStream::new()
+    .with_max_output(64 << 20)
+    .with_max_window(4 << 20);
+
+let mut decoded = Vec::new();
+let mut out = [0u8; 8192];
+let mut fed = 0;
+loop {
+    let end = (fed + 1400).min(compressed.len());          // one TCP segment
+    let flush = if end == compressed.len() { FlushMode::Finish } else { FlushMode::None };
+    let progress = stream.decode(&compressed[fed..end], &mut out, flush)?;
+    fed += progress.consumed;
+    decoded.extend_from_slice(&out[..progress.produced]);
+    if progress.status == BrotliStatus::StreamEnd { break; }
+}
+stream.finish()?;   // a truncated body fails here, never silently succeeds
+```
+
+`decode` reports which side to grow: `NeedInput` wants more compressed bytes,
+`NeedOutput` wants more room. Chunking is not observable — one byte at a time
+into a one-byte slice yields exactly the bytes one call with everything would.
+
+#### Memory and the window
+
+`BrotliStream` keeps a real LZ77 ring, allocated lazily and grown on demand up
+to the stream's declared `1 << WBITS`. `with_max_window` (default 16 MiB, which
+admits every RFC 7932 window) refuses a larger declaration *while reading the
+stream header*, before anything is allocated — `Content-Encoding: br` in
+practice uses `lgwin <= 22` (4 MiB).
+
+`with_max_output` bounds the total decoded size. Because every meta-block
+declares its exact `MLEN`, the check is an exact projection made *before* the
+offending meta-block is decoded: a bomb is refused with none of its expansion
+produced, and without the rest of the body being read.
 
 ## API Overview
 
@@ -109,8 +165,19 @@ decompressor.read_to_end(&mut output)?;
 | `BrotliCompressor<W>` | struct | Streaming compressor implementing `Write` |
 | `BrotliCompressor::new(writer, params)` | method | Create a new streaming compressor |
 | `BrotliCompressor::finish()` | method | Flush and finalise the compressed stream |
-| `BrotliDecompressor<R>` | struct | Streaming decompressor implementing `Read` |
+| `BrotliDecompressor<R>` | struct | Incremental decompressor implementing `Read`, built on `BrotliStream` |
 | `BrotliDecompressor::new(reader)` | method | Create a new streaming decompressor |
+| `BrotliDecompressor::with_max_output(n)` | method | Cap total output; enforced before the offending meta-block decodes |
+| `BrotliDecompressor::with_max_window(n)` | method | Refuse a declared window larger than `n`, before allocating |
+| `BrotliStream` | struct | Bounded push decoder: `decode`/`finish`/`reset` |
+| `BrotliStream::decode(input, output, flush)` | method | Make progress from the given input and output space |
+| `BrotliStream::finish()` | method | Assert the stream really ended (truncation is an error here) |
+| `BrotliStream::reset()` | method | Return to the initial state and clear the fault latch |
+| `BrotliStream::with_max_output(n)` | method | Exact per-meta-block output cap |
+| `BrotliStream::with_max_window(n)` | method | Declared-window ceiling, checked before allocation |
+| `BrotliProgress` | struct | `{ consumed, produced, status }` returned by `decode` |
+| `BrotliStatus` | enum | `NeedInput` / `NeedOutput` / `StreamEnd` |
+| `DEFAULT_MAX_WINDOW` | const | 16 MiB — the default `with_max_window` ceiling |
 | `BrotliError` | enum | Error type for all Brotli operations |
 | `BrotliResult<T>` | type alias | `Result<T, BrotliError>` |
 
@@ -119,10 +186,12 @@ decompressor.read_to_end(&mut output)?;
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `parallel` | no | Rayon-based parallel compression for throughput-sensitive workloads |
-| `async-io` | no | `BrotliAsyncCompressor`/`BrotliAsyncDecompressor` (`oxiarc_core::async_io` traits) for `tokio`-based async I/O; reads the input fully before compressing/decompressing synchronously (not bounded-memory streaming) |
+| `async-io` | no | `BrotliAsyncCompressor`/`BrotliAsyncDecompressor` (`oxiarc_core::async_io` traits) for `tokio`-based async I/O. The **decompressor is bounded**: it drives `BrotliStream` with a small compressed staging buffer and writes each decoded chunk as it is produced. The compressor still reads its input fully before compressing. |
 | `brotli-oracle` | no | Differential oracle tests against the reference `brotli` CLI in both directions (tests self-skip when the binary is absent) |
 
-All other functionality — one-shot API, streaming API, Huffman coding, LZ77 engine, static dictionary — is enabled by default with no feature flags required.
+All other functionality — one-shot API, `BrotliStream`, the `Read`/`Write`
+adapters, Huffman coding, LZ77 engine and the static dictionary — is enabled by
+default with no feature flags required.
 
 ```toml
 [dependencies]
@@ -149,6 +218,93 @@ output is larger than the reference encoder's at the same quality — close
 (within a few percent) on typical text at q5–9, further behind at q10–11 and
 on structured binary data. The decoder, in contrast, handles everything the
 reference encoder produces.
+
+## Performance
+
+Decode throughput, best of 12 runs per configuration, Apple Silicon, release
+build (`cargo run --release --example decode_profile`). "one-shot" is
+`decompress` over the complete slice. Two streaming columns are reported
+because they do different amounts of *output-side* work: `decompress` allocates
+and grows a `Vec` for the whole body, so the **Vec sink** column is the
+apples-to-apples comparison, while the **64 KiB buffer** column is the API's own
+shape — a caller that owns a fixed buffer and consumes each chunk, which is what
+an HTTP body reader does.
+
+| Payload (lgwin 22, q5) | one-shot | Vec sink | 64 KiB buffer |
+|---|---|---|---|
+| 1.08 MB repetitive text | 616 µs | 112 µs (**5.5×**) | 94 µs (**6.6×**) |
+| 1.05 MB single repeated byte | 565 µs | 137 µs (**4.1×**) | 107 µs (**5.3×**) |
+| 2.94 MB hex-dump text (literal-dense) | 16.1 ms | 25.4 ms (0.63×) | 25.4 ms (0.63×) |
+| 1.05 MB incompressible (stored meta-blocks) | 14.4 µs | 125 µs (0.12×) | 97 µs (0.15×) |
+
+Two things are worth reading off that table.
+
+**Where the push decoder wins**, it wins by a lot: it resolves matches with
+bulk `copy_within` runs and tiles short-distance (periodic) matches, whereas
+the one-shot decoder appends backward references one byte at a time. Repetitive
+content — which is most real web content — is 5–6× faster.
+
+**Where it loses, it loses to the same trade that makes it bounded.** The
+one-shot decoder uses its output `Vec` *as* the sliding window, so it touches
+each byte once and keeps the whole body resident. `BrotliStream` maintains a
+real ring and hands the caller a copy, so it touches each byte twice and pays
+the memory traffic of the declared window. Re-running the same two payloads at
+`lgwin = 10` — a 1 KiB, cache-resident ring — isolates that cost exactly:
+
+| Payload (64 KiB buffer) | lgwin 22 (4 MiB ring) | lgwin 10 (1 KiB ring) |
+|---|---|---|
+| hex-dump text (literal-dense) | 0.63× | 0.80× |
+| incompressible (stored meta-blocks) | 0.15× | **0.36×** |
+
+Shrinking the ring recovers a large part of the gap in both rows, which
+localises the cost to the window's memory traffic rather than to the decode
+loop. The stored-meta-block row is the effect at its extreme: it is essentially
+a memcpy benchmark (12 GB/s in absolute terms) in which the one-shot decoder
+performs one copy — its output `Vec` *is* the window — and the bounded decoder
+performs two, into the ring and out to the caller. That second copy is not a
+defect to be optimised away; it is the price of not holding the whole body in
+memory. Run `cargo run --release --example decode_profile` to reproduce the
+whole table, including the window sweep, and
+`cargo bench --bench brotli_bench -- brotli_decode_window` for the criterion
+version.
+
+Peak memory is the point of the exercise, and it is asserted in
+`tests/memory_limit.rs`: decoding a 64 MiB body through a 64 KiB output slice
+allocates under 12 MiB, and streaming 8 MiB through the `Read` adapter with a
+fixed 32 KiB buffer allocates under 12 MiB. The previous implementation
+allocated the entire compressed input *and* the entire decompressed output
+before serving the first byte.
+
+## What's new in 0.4.2
+
+- **`BrotliStream` — bounded, truly incremental decoding.** A push decoder that
+  makes progress from whatever input and output space it is given, with peak
+  memory proportional to the declared sliding window rather than to the stream.
+  Meta-block preludes are parsed atomically with bit-cursor rollback (bounded by
+  a 1 MiB header cap); the command loop is resumable at every literal, every
+  byte of a backward reference and every byte of a transformed dictionary word.
+  Chunking is not observable: one byte in and one byte out yields exactly the
+  bytes one call with everything would.
+- **`with_max_window`** (default 16 MiB) refuses an over-large declared window
+  while reading the stream header, before the ring is allocated. New
+  `BrotliError::WindowTooLarge`.
+- **`with_max_output`** on `BrotliStream` — the exact per-meta-block projection
+  the one-shot `decompress_with_limit` already used, now available to streaming
+  callers, and enforced before the body is downloaded.
+- **`BrotliDecompressor<R>` and `BrotliAsyncDecompressor` are re-based on
+  `BrotliStream`.** Both now produce output before the source reaches EOF.
+  Every public item is preserved. `Interrupted` is retried, `WouldBlock`
+  propagates with the decoder state intact, and a source that stops mid-stream
+  is an error rather than a short read. A source that is empty from its very
+  first read still yields an empty body without an error, as before.
+- **`BrotliStream::with_shape_recording`** exposes the decoder's per-meta-block
+  `MetaBlockShape` sequence, used as a differential oracle against
+  `decompress_reporting_shapes`: identical output bytes do not prove a resumable
+  header parser read the right fields at the right bit offsets, but an identical
+  shape sequence does. The `brotli-oracle` suite runs this against real
+  reference-`brotli` streams.
+- `BrotliError::Cancelled` now converts to `io::ErrorKind::Other` rather than
+  `InvalidData`, matching what the streaming adapters have always surfaced.
 
 ## What's new in 0.3.6
 

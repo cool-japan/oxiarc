@@ -133,6 +133,7 @@ pub fn parse_sequences_header(data: &[u8]) -> Result<SequencesHeader> {
 }
 
 /// Sequences decoder.
+#[derive(Debug)]
 pub struct SequencesDecoder {
     /// Literal length FSE table.
     ll_table: Option<FseTable>,
@@ -140,6 +141,13 @@ pub struct SequencesDecoder {
     of_table: Option<FseTable>,
     /// Match length FSE table.
     ml_table: Option<FseTable>,
+    /// `true` when `ll_table` currently holds the RFC 8878 predefined table,
+    /// so consecutive `Predefined` blocks reuse it instead of rebuilding.
+    ll_is_predefined: bool,
+    /// As `ll_is_predefined`, for the offset table.
+    of_is_predefined: bool,
+    /// As `ll_is_predefined`, for the match-length table.
+    ml_is_predefined: bool,
     /// Repeat offsets.
     repeat_offsets: [usize; 3],
 }
@@ -151,16 +159,35 @@ impl SequencesDecoder {
             ll_table: None,
             of_table: None,
             ml_table: None,
+            ll_is_predefined: false,
+            of_is_predefined: false,
+            ml_is_predefined: false,
             repeat_offsets: [1, 4, 8], // Default repeat offsets
         }
     }
 
-    /// Decode sequences section.
+    /// Decode sequences section, allocating a fresh vector for the result.
+    ///
+    /// Equivalent to [`decode_into`](Self::decode_into) with a fresh `Vec`;
+    /// kept for the one-shot decode path, whose callers want an owned buffer.
     pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<Sequence>, usize)> {
+        let mut out = Vec::new();
+        let consumed = self.decode_into(data, &mut out)?;
+        Ok((out, consumed))
+    }
+
+    /// Decode a sequences section, appending the sequences to `out`.
+    ///
+    /// `out` is cleared first. Returns the number of bytes of `data` the
+    /// sequences section occupies (always all of it — the sequences bitstream
+    /// runs to the end of the block). Reusing one buffer across blocks is what
+    /// keeps the incremental decoder allocation-free in the steady state.
+    pub fn decode_into(&mut self, data: &[u8], out: &mut Vec<Sequence>) -> Result<usize> {
+        out.clear();
         let header = parse_sequences_header(data)?;
 
         if header.num_sequences == 0 {
-            return Ok((Vec::new(), header.header_size));
+            return Ok(header.header_size);
         }
 
         let mut pos = header.header_size;
@@ -172,16 +199,21 @@ impl SequencesDecoder {
 
         // Decode sequences from bitstream
         let bitstream = &data[pos..];
-        let sequences = self.decode_sequences(bitstream, header.num_sequences)?;
+        self.decode_sequences(bitstream, header.num_sequences, out)?;
 
-        Ok((sequences, data.len()))
+        Ok(data.len())
     }
 
     /// Setup literal length table.
     fn setup_ll_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.ll_table = Some(predefined_ll_table()?);
+                // The predefined table never changes; rebuilding it per block
+                // would allocate on every compressed block in the stream.
+                if !self.ll_is_predefined || self.ll_table.is_none() {
+                    self.ll_table = Some(predefined_ll_table()?);
+                    self.ll_is_predefined = true;
+                }
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -192,11 +224,13 @@ impl SequencesDecoder {
                     });
                 }
                 self.ll_table = Some(rle_table(data[0]));
+                self.ll_is_predefined = false;
                 Ok(1)
             }
             CompressionMode::Fse => {
                 let (table, consumed) = read_fse_table_description(data, 35, LL_MAX_ACCURACY_LOG)?;
                 self.ll_table = Some(table);
+                self.ll_is_predefined = false;
                 Ok(consumed)
             }
             CompressionMode::Repeat => {
@@ -215,7 +249,12 @@ impl SequencesDecoder {
     fn setup_of_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.of_table = Some(predefined_of_table()?);
+                // The predefined table never changes; rebuilding it per block
+                // would allocate on every compressed block in the stream.
+                if !self.of_is_predefined || self.of_table.is_none() {
+                    self.of_table = Some(predefined_of_table()?);
+                    self.of_is_predefined = true;
+                }
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -226,11 +265,13 @@ impl SequencesDecoder {
                     });
                 }
                 self.of_table = Some(rle_table(data[0]));
+                self.of_is_predefined = false;
                 Ok(1)
             }
             CompressionMode::Fse => {
                 let (table, consumed) = read_fse_table_description(data, 31, OF_MAX_ACCURACY_LOG)?;
                 self.of_table = Some(table);
+                self.of_is_predefined = false;
                 Ok(consumed)
             }
             CompressionMode::Repeat => {
@@ -249,7 +290,12 @@ impl SequencesDecoder {
     fn setup_ml_table(&mut self, data: &[u8], mode: CompressionMode) -> Result<usize> {
         match mode {
             CompressionMode::Predefined => {
-                self.ml_table = Some(predefined_ml_table()?);
+                // The predefined table never changes; rebuilding it per block
+                // would allocate on every compressed block in the stream.
+                if !self.ml_is_predefined || self.ml_table.is_none() {
+                    self.ml_table = Some(predefined_ml_table()?);
+                    self.ml_is_predefined = true;
+                }
                 Ok(0)
             }
             CompressionMode::Rle => {
@@ -260,11 +306,13 @@ impl SequencesDecoder {
                     });
                 }
                 self.ml_table = Some(rle_table(data[0]));
+                self.ml_is_predefined = false;
                 Ok(1)
             }
             CompressionMode::Fse => {
                 let (table, consumed) = read_fse_table_description(data, 52, ML_MAX_ACCURACY_LOG)?;
                 self.ml_table = Some(table);
+                self.ml_is_predefined = false;
                 Ok(consumed)
             }
             CompressionMode::Repeat => {
@@ -288,7 +336,12 @@ impl SequencesDecoder {
     ///    without consuming bits).
     /// 3. State updates in order literal-length, match-length, offset — and
     ///    **no** update after the final sequence.
-    fn decode_sequences(&mut self, data: &[u8], count: usize) -> Result<Vec<Sequence>> {
+    fn decode_sequences(
+        &mut self,
+        data: &[u8],
+        count: usize,
+        out: &mut Vec<Sequence>,
+    ) -> Result<()> {
         let ll_table = self
             .ll_table
             .as_ref()
@@ -314,7 +367,12 @@ impl SequencesDecoder {
             ));
         }
 
-        let mut sequences = Vec::with_capacity(count);
+        // `Number_of_Sequences` is an attacker-controlled field that reaches
+        // ~98 000, i.e. a ~2.3 MB reservation from a three-byte header. Every
+        // sequence consumes at least one bit of the bitstream, so this is a
+        // sound upper bound on how many can actually be decoded: a valid block
+        // still gets its exact reservation, a lying header gets nothing.
+        out.reserve(count.min(data.len().saturating_mul(8)));
 
         for i in 0..count {
             let ll_entry = *ll_table.get(ll_state)?;
@@ -332,7 +390,7 @@ impl SequencesDecoder {
             let ml_value = decode_ml_value(ml_entry.symbol, &mut reader)?;
             let ll_value = decode_ll_value(ll_entry.symbol, &mut reader)?;
 
-            sequences.push(Sequence {
+            out.push(Sequence {
                 literal_length: ll_value,
                 match_length: ml_value,
                 offset: offset_and_reps,
@@ -368,12 +426,23 @@ impl SequencesDecoder {
             ));
         }
 
-        Ok(sequences)
+        Ok(())
     }
 
-    /// Reset repeat offsets (for new frame).
+    /// Reset all per-frame state.
+    ///
+    /// Clears the repeat offsets **and** the three FSE tables. The tables must
+    /// go: `CompressionMode::Repeat` in a new frame's first block is invalid,
+    /// and leaving the previous frame's tables in place would make the decoder
+    /// silently accept it with the wrong table instead of erroring.
     pub fn reset(&mut self) {
         self.repeat_offsets = [1, 4, 8];
+        self.ll_table = None;
+        self.of_table = None;
+        self.ml_table = None;
+        self.ll_is_predefined = false;
+        self.of_is_predefined = false;
+        self.ml_is_predefined = false;
     }
 }
 

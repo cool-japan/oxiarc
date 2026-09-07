@@ -36,10 +36,42 @@
 //!
 //! Brotli declares no total uncompressed size, so untrusted input should be
 //! decoded with [`decompress_with_limit`] (or
-//! [`BrotliDecompressor::with_max_output`]): the budget is enforced per
-//! meta-block *while* decoding, so a decompression bomb is rejected before
-//! its expansion is ever allocated. The unbounded entry points fall back to
-//! a built-in 256 MB guard.
+//! [`BrotliStream::with_max_output`] / [`BrotliDecompressor::with_max_output`]):
+//! the budget is enforced per meta-block *while* decoding, so a decompression
+//! bomb is rejected before its expansion is ever produced. The unbounded entry
+//! points fall back to a built-in 256 MB guard.
+//!
+//! ## Decoding a stream that arrives in pieces
+//!
+//! [`decompress`] needs the whole compressed stream in one slice and produces
+//! the whole output at once. For an HTTP body, a pipe, or anything else that
+//! arrives in chunks, use [`BrotliStream`]: a push decoder that makes progress
+//! from whatever input and output space it is given, with peak memory
+//! proportional to the stream's declared sliding window rather than to the
+//! stream. Feeding it one byte at a time into a one-byte output slice produces
+//! exactly the bytes one call with everything would. See the [`stream`] module
+//! for the memory model and the strictness guarantees.
+//!
+//! ```rust
+//! use oxiarc_brotli::{compress, BrotliStatus, BrotliStream};
+//! use oxiarc_core::traits::FlushMode;
+//!
+//! let compressed = compress(b"arrives in pieces", 5).expect("compress");
+//! let mut stream = BrotliStream::new().with_max_output(1 << 20);
+//! let mut decoded = Vec::new();
+//! let mut out = [0u8; 4];
+//! let mut fed = 0;
+//! loop {
+//!     let end = (fed + 3).min(compressed.len());
+//!     let flush = if end == compressed.len() { FlushMode::Finish } else { FlushMode::None };
+//!     let progress = stream.decode(&compressed[fed..end], &mut out, flush).expect("decode");
+//!     fed += progress.consumed;
+//!     decoded.extend_from_slice(&out[..progress.produced]);
+//!     if progress.status == BrotliStatus::StreamEnd { break; }
+//! }
+//! stream.finish().expect("complete stream");
+//! assert_eq!(decoded, b"arrives in pieces");
+//! ```
 //!
 //! ## Features
 //!
@@ -51,7 +83,10 @@
 //! - Distance ring buffer semantics per Section 4
 //! - Multiple quality levels (0-11); quality 0 = stored meta-blocks
 //! - Window sizes `lgwin` 10-24 (window = `(1 << lgwin) - 16` bytes)
-//! - Streaming Write/Read adapters (fully buffered; see [`streaming`])
+//! - Bounded incremental decoding ([`BrotliStream`]) with a real sliding
+//!   window, exact per-meta-block output caps and a declared-window ceiling
+//! - Incremental `Write` compressor and `Read`/`AsyncRead` decompressor
+//!   adapters (see [`streaming`] and [`async_brotli`](crate::async_brotli))
 //!
 //! ## Example
 //!
@@ -59,8 +94,8 @@
 //! use oxiarc_brotli::{compress, decompress};
 //!
 //! let data = b"Hello, Brotli!";
-//! let compressed = compress(data, 6).unwrap();
-//! let decompressed = decompress(&compressed).unwrap();
+//! let compressed = compress(data, 6).expect("compress");
+//! let decompressed = decompress(&compressed).expect("decompress");
 //! assert_eq!(decompressed, data);
 //! ```
 //!
@@ -75,13 +110,13 @@
 //! let mut compressed = Vec::new();
 //! let params = BrotliParams::default();
 //! let mut compressor = BrotliCompressor::new(&mut compressed, params);
-//! compressor.write_all(b"Hello, streaming Brotli!").unwrap();
-//! let compressed_output = compressor.finish().unwrap();
+//! compressor.write_all(b"Hello, streaming Brotli!").expect("write");
+//! let compressed_output = compressor.finish().expect("finish");
 //!
 //! // Decompress
 //! let mut decompressor = BrotliDecompressor::new(&compressed[..]);
 //! let mut output = Vec::new();
-//! decompressor.read_to_end(&mut output).unwrap();
+//! decompressor.read_to_end(&mut output).expect("read");
 //! ```
 
 #![warn(missing_docs)]
@@ -105,6 +140,8 @@ pub mod error;
 pub mod huffman;
 /// LZ77 matching engine.
 pub mod lz77;
+/// Bounded, truly incremental Brotli decoding.
+pub mod stream;
 /// Streaming compression and decompression.
 pub mod streaming;
 /// Shared RFC 7932 constant tables (lengths, commands, block counts).
@@ -128,6 +165,7 @@ pub use decompress::{
 };
 pub use error::{BrotliError, BrotliResult};
 pub use pool::{BrotliPool, PoolStats};
+pub use stream::{BrotliProgress, BrotliStatus, BrotliStream, DEFAULT_MAX_WINDOW};
 pub use streaming::{BrotliCompressor, BrotliDecompressor};
 
 #[cfg(feature = "parallel")]

@@ -14,6 +14,11 @@ members = [
     "oxiarc-lzma",
     "oxiarc-snappy",
     "oxiarc-szip",
+    "oxiarc-http",
+    "oxiarc-png",
+    "oxiarc-jpeg",
+    "oxiarc-tiff",
+    "oxiarc-image",
 ]
 
 [workspace.package]
@@ -42,6 +47,11 @@ oxiarc-snappy = { version = "0.4", path ="oxiarc-snappy" }
 oxiarc-brotli = { version = "0.4", path ="oxiarc-brotli" }
 oxiarc-archive = { version = "0.4", path ="oxiarc-archive" }
 oxiarc-szip = { version = "0.4", path = "oxiarc-szip" }
+oxiarc-http = { version = "0.4", path = "oxiarc-http" }
+oxiarc-png = { version = "0.4", path = "oxiarc-png" }
+oxiarc-jpeg = { version = "0.4", path = "oxiarc-jpeg" }
+oxiarc-tiff = { version = "0.4", path = "oxiarc-tiff" }
+oxiarc-image = { version = "0.4", path = "oxiarc-image" }
 
 # External dependencies
 thiserror = "2.0.18"
@@ -64,6 +74,7 @@ criterion = "0.8.2"
 weezl = "0.2.1"
 glob = "0.3.3"
 proptest = "1.11.0"
+half = "2.7.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

@@ -51,6 +51,17 @@ pub enum BrotliError {
     /// Invalid window size.
     #[error("invalid window size: {0}")]
     InvalidWindowSize(u32),
+    /// The stream declares a sliding window larger than the caller allows.
+    ///
+    /// Returned by [`crate::BrotliStream::with_max_window`] while reading the
+    /// stream header, before any window memory is allocated.
+    #[error("declared window of {declared} bytes exceeds the {max}-byte limit")]
+    WindowTooLarge {
+        /// The window the stream declared, `1 << WBITS`.
+        declared: usize,
+        /// The caller's ceiling.
+        max: usize,
+    },
     /// Invalid block type.
     #[error("invalid block type: {0}")]
     InvalidBlockType(u8),
@@ -72,6 +83,10 @@ impl From<BrotliError> for io::Error {
     fn from(err: BrotliError) -> Self {
         match err {
             BrotliError::Io(e) => e,
+            // Cancellation is not a data defect, so it keeps the
+            // `ErrorKind::Other` classification the streaming adapters have
+            // always surfaced; everything else is malformed input.
+            BrotliError::Cancelled => io::Error::other(BrotliError::Cancelled.to_string()),
             other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
         }
     }
@@ -91,6 +106,9 @@ impl From<BrotliError> for OxiArcError {
                 OxiArcError::memory_budget_exceeded(budget, requested)
             }
             BrotliError::Cancelled => OxiArcError::Cancelled,
+            BrotliError::WindowTooLarge { declared, max } => {
+                OxiArcError::memory_budget_exceeded(max, declared)
+            }
             other => OxiArcError::corrupted(0, other.to_string()),
         }
     }

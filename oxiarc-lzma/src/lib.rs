@@ -141,6 +141,12 @@ pub mod parallel;
 pub mod range_coder;
 pub mod streaming;
 
+/// XZ container format (`.xz`): stream/block framing, index, and the
+/// CRC-32 / CRC-64 / SHA-256 integrity checks around LZMA2 payloads.
+///
+/// Re-exported unchanged by `oxiarc-archive` as `oxiarc_archive::xz`.
+pub mod xz;
+
 // Re-exports
 pub use decoder::{LzmaDecoder, decompress, decompress_raw};
 pub use encoder::{LzmaEncoder, compress, compress_raw};

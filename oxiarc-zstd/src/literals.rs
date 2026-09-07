@@ -3,9 +3,9 @@
 //! The literals section contains literal bytes that are copied directly
 //! to the output, either uncompressed or Huffman-encoded.
 
-use crate::LiteralsBlockType;
 use crate::fse::FseBitReader;
 use crate::huffman::{HuffmanTable, read_huffman_table};
+use crate::{LiteralsBlockType, MAX_BLOCK_SIZE};
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Decoded literals section header.
@@ -77,6 +77,7 @@ pub fn parse_literals_header(data: &[u8]) -> Result<LiteralsHeader> {
                 _ => unreachable!(),
             };
 
+            check_regenerated_size(regenerated_size)?;
             Ok(LiteralsHeader {
                 block_type,
                 regenerated_size,
@@ -156,6 +157,7 @@ pub fn parse_literals_header(data: &[u8]) -> Result<LiteralsHeader> {
                 _ => unreachable!(),
             };
 
+            check_regenerated_size(regenerated_size)?;
             Ok(LiteralsHeader {
                 block_type,
                 regenerated_size,
@@ -167,7 +169,30 @@ pub fn parse_literals_header(data: &[u8]) -> Result<LiteralsHeader> {
     }
 }
 
+/// Reject a literals section that claims to regenerate more than a block can.
+///
+/// `Regenerated_Size` is a 20-bit field, so a three-byte header can claim just
+/// under 1 MiB — but the literals of a block are part of that block's output,
+/// which RFC 8878 caps at `Block_Maximum_Decompressed_Size` (at most 128 KiB).
+/// Checking it here, before anything is sized from the field, is what keeps the
+/// decoder's working set at the "one block" it advertises: without it a
+/// four-byte RLE literals section would size a one-megabyte buffer, and a
+/// compressed one would reserve the same, only to be rejected afterwards by the
+/// block's own output ceiling.
+fn check_regenerated_size(regenerated_size: usize) -> Result<()> {
+    if regenerated_size > MAX_BLOCK_SIZE {
+        return Err(OxiArcError::CorruptedData {
+            offset: 0,
+            message: format!(
+                "literals regenerated size {regenerated_size} exceeds the maximum block size {MAX_BLOCK_SIZE}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Literals decoder state.
+#[derive(Debug)]
 pub struct LiteralsDecoder {
     /// Huffman table for compressed literals.
     huffman_table: Option<HuffmanTable>,
@@ -181,8 +206,33 @@ impl LiteralsDecoder {
         }
     }
 
-    /// Decode literals section.
+    /// Forget any Huffman table carried over from a previous block.
+    ///
+    /// A `Treeless` literals section reuses the table decoded by an earlier
+    /// block *of the same frame*. Frames are independent, so a decoder reused
+    /// across frames must clear the table or it would silently accept a
+    /// `Treeless` section in a new frame's first block.
+    pub fn reset(&mut self) {
+        self.huffman_table = None;
+    }
+
+    /// Decode literals section, allocating a fresh buffer for the result.
+    ///
+    /// Equivalent to [`decode_into`](Self::decode_into) with a fresh `Vec`;
+    /// kept for the one-shot decode path, whose callers want an owned buffer.
     pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<u8>, usize)> {
+        let mut out = Vec::new();
+        let consumed = self.decode_into(data, &mut out)?;
+        Ok((out, consumed))
+    }
+
+    /// Decode a literals section, appending the literal bytes to `out`.
+    ///
+    /// `out` is cleared first. Returns the number of bytes of `data` the
+    /// literals section occupies. Reusing one buffer across blocks is what
+    /// keeps the incremental decoder allocation-free in the steady state.
+    pub fn decode_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        out.clear();
         let header = parse_literals_header(data)?;
         let content = &data[header.header_size..];
 
@@ -195,8 +245,8 @@ impl LiteralsDecoder {
                         message: "truncated raw literals".to_string(),
                     });
                 }
-                let literals = content[..header.regenerated_size].to_vec();
-                Ok((literals, header.header_size + header.regenerated_size))
+                out.extend_from_slice(&content[..header.regenerated_size]);
+                Ok(header.header_size + header.regenerated_size)
             }
             LiteralsBlockType::Rle => {
                 // Repeat single byte
@@ -206,8 +256,8 @@ impl LiteralsDecoder {
                         message: "missing RLE byte".to_string(),
                     });
                 }
-                let literals = vec![content[0]; header.regenerated_size];
-                Ok((literals, header.header_size + 1))
+                out.resize(header.regenerated_size, content[0]);
+                Ok(header.header_size + 1)
             }
             LiteralsBlockType::Compressed => {
                 // Decode Huffman table then decompress
@@ -228,13 +278,14 @@ impl LiteralsDecoder {
                     });
                 }
                 let stream_data = &content[table_size..header.compressed_size];
-                let literals = self.decode_huffman_streams(
+                self.decode_huffman_streams(
                     stream_data,
                     header.regenerated_size,
                     header.num_streams,
+                    out,
                 )?;
 
-                Ok((literals, header.header_size + header.compressed_size))
+                Ok(header.header_size + header.compressed_size)
             }
             LiteralsBlockType::Treeless => {
                 // Use previous Huffman table
@@ -253,24 +304,26 @@ impl LiteralsDecoder {
                 }
 
                 let stream_data = &content[..header.compressed_size];
-                let literals = self.decode_huffman_streams(
+                self.decode_huffman_streams(
                     stream_data,
                     header.regenerated_size,
                     header.num_streams,
+                    out,
                 )?;
 
-                Ok((literals, header.header_size + header.compressed_size))
+                Ok(header.header_size + header.compressed_size)
             }
         }
     }
 
-    /// Decode Huffman-compressed streams.
+    /// Decode Huffman-compressed streams, appending to `out`.
     fn decode_huffman_streams(
         &self,
         data: &[u8],
         total_size: usize,
         num_streams: usize,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let table = self
             .huffman_table
             .as_ref()
@@ -279,12 +332,13 @@ impl LiteralsDecoder {
                 message: "no Huffman table".to_string(),
             })?;
 
+        out.reserve(total_size);
         if num_streams == 1 {
             // Single stream
-            self.decode_single_stream(data, total_size, table)
+            self.decode_single_stream(data, total_size, table, out)
         } else {
             // 4 streams with jump table
-            self.decode_four_streams(data, total_size, table)
+            self.decode_four_streams(data, total_size, table, out)
         }
     }
 
@@ -298,11 +352,12 @@ impl LiteralsDecoder {
         data: &[u8],
         size: usize,
         table: &HuffmanTable,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let mut reader = FseBitReader::new(data)?;
-        let mut output = Vec::with_capacity(size);
+        let target = out.len() + size;
 
-        while output.len() < size {
+        while out.len() < target {
             let prefix = reader.peek_bits(table.max_bits()) as usize;
             let entry = table.entry(prefix)?;
             if entry.num_bits == 0 {
@@ -318,7 +373,7 @@ impl LiteralsDecoder {
                     message: "Huffman literals stream exhausted early".to_string(),
                 });
             }
-            output.push(entry.symbol);
+            out.push(entry.symbol);
         }
 
         if !reader.is_finished() {
@@ -328,7 +383,7 @@ impl LiteralsDecoder {
             });
         }
 
-        Ok(output)
+        Ok(())
     }
 
     /// Decode four interleaved Huffman streams.
@@ -337,7 +392,8 @@ impl LiteralsDecoder {
         data: &[u8],
         total_size: usize,
         table: &HuffmanTable,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         // Read jump table (6 bytes: 3 x 2-byte offsets)
         if data.len() < 6 {
             return Err(OxiArcError::CorruptedData {
@@ -385,14 +441,13 @@ impl LiteralsDecoder {
                 message: "4-stream literals size too small".to_string(),
             })?;
 
-        // Decode each stream
-        let mut output = Vec::with_capacity(total_size);
-        output.extend(self.decode_single_stream(stream1, size1, table)?);
-        output.extend(self.decode_single_stream(stream2, size2, table)?);
-        output.extend(self.decode_single_stream(stream3, size3, table)?);
-        output.extend(self.decode_single_stream(stream4, size4, table)?);
+        // Decode each stream, appending straight into the shared buffer.
+        self.decode_single_stream(stream1, size1, table, out)?;
+        self.decode_single_stream(stream2, size2, table, out)?;
+        self.decode_single_stream(stream3, size3, table, out)?;
+        self.decode_single_stream(stream4, size4, table, out)?;
 
-        Ok(output)
+        Ok(())
     }
 }
 

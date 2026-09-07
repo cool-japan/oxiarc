@@ -1,0 +1,57 @@
+[package]
+name = "oxiarc-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "HTTP content-coding (RFC 9110 Content-Encoding / Accept-Encoding: gzip, deflate, br, zstd) for OxiArc - Pure Rust, bounded, incremental"
+readme = "README.md"
+keywords = ["http", "gzip", "content-encoding", "brotli", "zstd"]
+categories = ["compression", "web-programming::http-client", "web-programming::http-server"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["gzip", "deflate"]
+# RFC 1952 gzip / x-gzip. Encode side lands in this crate now; the decode side
+# (`oxiarc_http::decode`) is a separate, later wave — see `lib.rs`.
+gzip = ["dep:oxiarc-deflate"]
+# RFC 1950 zlib-wrapped deflate (and the RFC 9110 §8.4.1.2 raw-deflate sniff,
+# decode side only). Shares `oxiarc-deflate` with `gzip`; the two features are
+# independent switches over the same dependency.
+deflate = ["dep:oxiarc-deflate"]
+# RFC 7932 Brotli.
+brotli = ["dep:oxiarc-brotli"]
+# RFC 8878 Zstandard, and `dcz` (Compression Dictionary Transport, RFC 9842)
+# when a dictionary is supplied — see `EncodeOptions::dictionary`.
+zstd = ["dep:oxiarc-zstd"]
+# Legacy UNIX `compress` / `x-compress`. Plumbing only in this wave: `oxiarc-lzw`
+# caps codes at 12 bits (`LzwConfig::validate`) and the `.Z` format needs 16, so
+# `ContentCoding::Compress::is_decodable()`/`is_encodable()` are unconditionally
+# `false` regardless of this feature until that lands upstream. Kept as a real
+# Cargo feature (rather than a `compile_error!`) so the crate's feature matrix —
+# `--no-default-features`, each feature alone — stays green.
+compress = ["dep:oxiarc-lzw"]
+# Async plumbing for the future decoder wave (`AsyncDecodedBody`). Declared now
+# so that wave only has to add new files plus a `lib.rs` re-export line.
+async-io = ["dep:tokio", "oxiarc-core/async-io"]
+
+[dependencies]
+oxiarc-core = { workspace = true }
+oxiarc-deflate = { workspace = true, optional = true }
+oxiarc-brotli = { workspace = true, optional = true }
+oxiarc-zstd = { workspace = true, optional = true }
+oxiarc-lzw = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -29,7 +29,7 @@ LZ4 is a lossless compression algorithm focused on compression and decompression
 - **Cancellation support** - `with_cancel(CancellationToken)` builder on compressor/decompressor types
 - **True bounded-memory streaming** - `Lz4Compressor` emits complete blocks on the fly with no full-input buffering
 - **State-machine block parser** - `Lz4Decompressor` processes one block at a time via an internal state machine
-- **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap working-set size
+- **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap **input-side** working-set size (the encoder's unflushed input and the decoder's buffered-but-not-yet-decoded compressed bytes); decompressed output is not itself capped by this budget
 - **Block-layer prefix dictionary** - `compress_block_with_dict` / `decompress_block_dict` free functions and `Lz4DictBlockEncoder` / `Lz4DictBlockDecoder` builders for prefix-dictionary block compression (dictionary truncated to last 64 KiB per LZ4 spec)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing, plus a dedicated dictionary round-trip suite (`tests/dict_block_roundtrip.rs`)
 - **LASTLITERALS(5) + block-independence compliance** - Encoders now honor the LZ4 end-of-block invariant (reference `lz4` previously rejected frames for common repetitive inputs); the frame decoder correctly follows the block-independence flag via a new `FrameDescriptor::with_block_independence` builder plus a rolling dictionary (`lz4 -BD` linked frames previously failed at block 2); verified byte-identical against reference `lz4 1.10.0` (fixed in 0.3.6)
