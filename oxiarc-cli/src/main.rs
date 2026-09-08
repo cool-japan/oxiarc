@@ -28,6 +28,7 @@ use style::{ColorChoice, Styler};
 #[command(long_about = "
 OxiArc is a Pure Rust implementation of common archive formats.
 Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2, Brotli, Snappy
+The detect and info subcommands additionally recognise PNG, JPEG and TIFF images by magic.
 
 Examples:
   oxiarc list archive.zip

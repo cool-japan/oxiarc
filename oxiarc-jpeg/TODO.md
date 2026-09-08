@@ -1,4 +1,4 @@
-# oxiarc-jpeg - Development Status (v0.4.2, in progress)
+# oxiarc-jpeg - Development Status (v0.4.2, 2026-09-08)
 
 Program context: root `TODO.md`, "Phase 8", items **W1-F1** (decoder),
 **W1-F2** (encoder) and **W1-F3** (arithmetic coding, OJPEG, `rayon`, fuzz

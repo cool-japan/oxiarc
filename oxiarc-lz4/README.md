@@ -7,7 +7,7 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-08-06) | 166 tests passing**
+**Version: 0.4.2 (2026-09-08) | 173 tests passing (158 via nextest + 15 doctests, `--all-features`)**
 
 ## Overview
 

@@ -1,4 +1,4 @@
-# oxiarc-tiff - Development Status (v0.4.2, complete)
+# oxiarc-tiff - Development Status (v0.4.2, 2026-09-08)
 
 Program context: root `TODO.md`, "Phase 8", items **W1-G0** (core),
 **W2-TIFF1** (codecs) and **W2-TIFF2** (completion: `compat`, `rayon`,
@@ -188,21 +188,43 @@ otherwise.
   smaller than the Huffman coding of the same row. libtiff parses the files
   (`tiffinfo` reports "Group 4 Options: uncompressed data") and, as documented,
   still cannot decode them.
-- **The compressed codecs miss the "whole-image decode <= 1.25x `tiffcp`"
-  gate.** Re-measured 2026-09-08 on 4096x4096, medians of nine interleaved
-  rounds: LZMA passes (1.15x RGB8, 1.16x Gray16), Deflate is 1.39x-1.58x, LZW
-  2.13x-2.41x, JPEG 2.37x and ZSTD 5.07x-6.24x; uncompressed and PackBits clear
-  it by an order of magnitude (0.11x, 0.20x). The TIFF layer is ~8 ms of those
-  figures — a codec-only strip measurement puts LZW at 122-144 MB/s, Deflate at
-  293-298 MB/s, ZSTD at 104-118 MB/s and LZMA at 23-24 MB/s, so the gap is
-  inside `oxiarc-lzw` / `oxiarc-zstd` / `oxiarc-lzma`, which this crate only
-  calls. **ZSTD is the outlier and the first place to look.** Follow-up belongs
-  to those crates.
+- **Four codecs now meet the "whole-image decode <= 1.25x `tiffcp`" gate;
+  ZSTD, LZMA, JPEG and the fax codecs still miss it.** *Earlier figures, taken
+  before `oxiarc-lzw` / `oxiarc-deflate` / `oxiarc-zstd` were rewritten:* LZMA
+  passed (1.15x RGB8, 1.16x Gray16), Deflate 1.39x-1.58x, LZW 2.13x-2.41x,
+  JPEG 2.37x, ZSTD 5.07x-6.24x, "ZSTD the outlier and the first place to look".
+  *Re-measured 2026-09-08* on the same geometry (4096x4096, 16-row strips,
+  `tiffcp`-written fixtures), medians of 15 **interleaved** rounds, three
+  independent runs at load average 110 down to 20, taking the median of the
+  three run medians:
+
+  | codec | before | now | gate |
+  |---|---|---|---|
+  | uncompressed | 0.11x | 0.19x / 0.13x | met |
+  | PackBits | 0.20x | 0.16x | met |
+  | LZW | 2.13x-2.41x | **1.00x-1.07x** | **met** (was missed) |
+  | Deflate | 1.39x-1.58x | 1.14x RGB8, 1.33x Gray16 | RGB8 **met**, Gray16 missed |
+  | ZSTD | 5.07x-6.24x | **0.96x Gray16**, 1.65x RGB8 | Gray16 **met**, RGB8 missed |
+  | LZMA | 1.15x-1.16x | 1.31x-1.32x | **missed** (was met) |
+  | JPEG | 2.37x | 1.90x | missed |
+  | CCITT G3 / G3-2D / G4 | 2.68x-3.40x | 4.80x-4.96x | missed (unlike work, below) |
+
+  The ZSTD and LZW movements are the codec rewrites landing. The LZMA row moved
+  the wrong way although nothing in `oxiarc-lzma` changed — and the reference
+  arm says why: `tiffcp`'s own LZMA time **halved** (2026→952 ms) where it moved
+  by under 15% on the three rewritten codecs, so that row measures a different
+  fixture, not a regression. Read it as "not comparable", not as "LZMA
+  regressed"; recorded as measured, not explained away. The controls (PackBits,
+  JPEG, and LZMA/CCITT modulo the fixture) reproduce their earlier band, which
+  is what makes the movers believable at this load. Remaining follow-up belongs
+  to `oxiarc-zstd` and `oxiarc-lzma`, which this crate only calls.
 - **The bilevel rows of that table compare unlike work.** `tiffcp -c none`
   copies 2 MB of packed bits; this crate expands them to 16 MB of
-  one-byte-per-pixel samples, which is 28.7 ms of a 65-86 ms figure. Net of
-  that the fax codecs run at roughly 1.5-2x. A packed-output decode path would
-  close it, and is not in any track's scope yet.
+  one-byte-per-pixel samples, which is the whole 5.30x uncompressed row
+  (29.3 ms against 5.5 ms, re-measured 2026-09-08; 28.7 ms when first measured).
+  Net of that expansion the fax codecs run at 1.87x-1.90x, reproducing the
+  earlier "roughly 1.5-2x". A packed-output decode path would close it, and is
+  not in any track's scope yet.
 - ~~**The JPEG *encoder* lives in this crate**~~ **Done 2026-09-08
   (TIFFPOLISH).** `compression/jpeg/encode.rs` now maps a TIFF `CodecContext`
   onto `oxiarc_jpeg::EncodeOptions` and calls `oxiarc_jpeg::Encoder`; see the

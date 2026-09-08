@@ -932,6 +932,11 @@ impl WrappedInflate {
                     if self.verify_checksum {
                         let computed = self.adler.finish();
                         if computed != stored {
+                            // RFC 1950 §8.2's Adler-32, not a CRC.
+                            // `OxiArcError::CrcMismatch` is the workspace's
+                            // generic checksum-mismatch error and its message
+                            // says "checksum mismatch" for exactly this
+                            // reason (FINALGATE F5).
                             return Err(self.fail(OxiArcError::crc_mismatch(stored, computed)));
                         }
                     }

@@ -108,7 +108,8 @@ impl DeflateFamilyDecoder {
     /// Only two error shapes can mean "what follows the last complete member
     /// is not an acceptable continuation", and only once at least one member
     /// has decoded: a rejected trailing byte, and a failed member magic.
-    /// Truncation (`UnexpectedEof`) and a bad checksum (`CrcMismatch`) are
+    /// Truncation (`UnexpectedEof`) and a bad checksum (`CrcMismatch`, the
+    /// zlib wrapper's Adler-32 trailer) are
     /// distinct variants, so neither is mistaken for trailing data.
     fn map_error(&self, error: oxiarc_core::OxiArcError) -> HttpCodingError {
         if self.inner.members_decoded() >= 1 {

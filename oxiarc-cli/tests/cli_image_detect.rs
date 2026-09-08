@@ -385,3 +385,19 @@ fn add_refuses_an_image_with_a_clear_error() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&extra);
 }
+
+/// FINALGATE F12: `oxiarc --help` listed only the archive formats, so a user
+/// had no way to learn from the banner that `detect`/`info` also recognise
+/// PNG, JPEG and TIFF — the feature this whole test file covers.
+#[test]
+fn help_banner_mentions_the_image_formats() {
+    let output = run(&["--help"]);
+    assert!(output.status.success(), "`oxiarc --help` failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in ["PNG", "JPEG", "TIFF", "detect", "info"] {
+        assert!(
+            stdout.contains(needle),
+            "`oxiarc --help` never mentions {needle}:\n{stdout}"
+        );
+    }
+}

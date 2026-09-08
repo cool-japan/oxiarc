@@ -405,52 +405,131 @@ TIFF layer is not where that time goes — the same image decodes in 4.1 ms with
 no codec at all — it is inside the shared `oxiarc-lzw` / `oxiarc-zstd` /
 `oxiarc-lzma` decoders, which is where the next round of work belongs.
 
-**The design target was 1.25x, and the compressed codecs do not meet it.** An
-independent re-measurement on poorly-compressible (photograph-like) 4000x3000
-RGB8 data, best of five, put LZW at 1.63x, Deflate at 1.24x, ZSTD at 2.77x and
-LZMA at 1.12x of `tiffcp -c none`; uncompressed at 0.09x and PackBits at 0.18x.
-Subtracting this crate's own no-codec decode time from each figure leaves
-essentially the whole gap inside the codec crate, so closing it is work for
-`oxiarc-lzw` / `oxiarc-zstd`, not for `oxiarc-tiff`.
+The design target was 1.25x. An independent re-measurement on
+poorly-compressible (photograph-like) 4000x3000 RGB8 data, best of five, put LZW
+at 1.63x, Deflate at 1.24x, ZSTD at 2.77x and LZMA at 1.12x of `tiffcp -c none`;
+uncompressed at 0.09x and PackBits at 0.18x. Subtracting this crate's own
+no-codec decode time from each figure left essentially the whole gap inside the
+codec crate, so closing it was work for `oxiarc-lzw` / `oxiarc-zstd`, not for
+`oxiarc-tiff`. **That work has since been done — see the 2026-09-08 table
+below**, where both LZW rows, RGB8 Deflate and Gray16 ZSTD now meet the target.
+The two paragraphs above are kept as the historical record of how it looked
+before.
 
 A third measurement, 4096x4096, 16-row strips, medians of nine **interleaved**
-rounds on a machine at load average 10-64 (so read the ratios, not the absolute
-times), with the per-image decoder pools in place:
+rounds at load average 10-64, taken with the per-image decoder pools in place,
+put LZW at 2.41x, Deflate at 1.58x, ZSTD at 6.24x, LZMA at 1.15x and JPEG at
+2.37x of `tiffcp -c none`, and concluded that "ZSTD is the outlier by a wide
+margin". **Those figures are superseded and that conclusion is no longer true.**
+They were measured before `oxiarc-lzw`, `oxiarc-deflate` and `oxiarc-zstd` were
+each rewritten underneath this crate. They are kept here as the "before" column
+so the movement is visible rather than quietly edited away.
 
-| fixture | codec | `tiffcp -c none` | ours, decode only | ratio |
+**Re-measured 2026-09-08.** Same geometry — 4096x4096, 16-row strips, every
+fixture written by `tiffcp -m 0 -r 16 -c <codec>` — medians of 15
+**interleaved** rounds (one `tiffcp` and one decode of the same fixture back to
+back, so a load spike hits both arms of a pair), **three independent runs** at
+load average **110 down to 20** on 8 cores. Ratios and absolute times are given
+as two separate tables, because they come from different aggregations and a
+single mixed table would contain numbers that do not divide into each other.
+
+**Ratios**, one column per run, and the median of the three run medians — this
+is the column the gate is judged on:
+
+| fixture | codec | run 1 (load 110→57) | run 2 (47→30) | run 3 (31→20) | median | before | <= 1.25x |
+|---|---|---|---|---|---|---|---|
+| RGB8 | uncompressed | 0.25x | 0.15x | 0.19x | **0.19x** | 0.11x | met |
+| RGB8 | PackBits | 0.18x | 0.15x | 0.16x | **0.16x** | 0.20x | met |
+| RGB8 | LZW | 1.28x | 1.07x | 1.07x | **1.07x** | 2.41x | **met** (was missed) |
+| RGB8 | Deflate | 1.13x | 1.14x | 1.16x | **1.14x** | 1.58x | **met** (was missed) |
+| RGB8 | ZSTD | 1.65x | 1.45x | 1.75x | 1.65x | 6.24x | missed |
+| RGB8 | LZMA | 1.33x | 1.32x | 1.27x | 1.32x | 1.15x | **missed** (was met) |
+| RGB8 | JPEG | 1.90x | 1.95x | 1.71x | 1.90x | 2.37x | missed |
+| Gray16 | uncompressed | 0.13x | 0.24x | 0.11x | **0.13x** | - | met |
+| Gray16 | LZW | 0.84x | 1.13x | 1.00x | **1.00x** | 2.13x | **met** (was missed) |
+| Gray16 | Deflate | 1.24x | 1.33x | 1.40x | 1.33x | 1.39x | missed |
+| Gray16 | ZSTD | 0.87x | 1.12x | 0.96x | **0.96x** | 5.07x | **met** (was missed) |
+| Gray16 | LZMA | 1.32x | 1.35x | 1.31x | 1.32x | 1.16x | **missed** (was met) |
+| bilevel | uncompressed | 2.73x | 5.32x | 5.30x | 5.30x | - | unlike work |
+| bilevel | Group 3 | 3.90x | 4.96x | 5.04x | 4.96x | 3.40x | missed |
+| bilevel | Group 3 2D | 4.17x | 4.80x | 4.89x | 4.80x | 3.33x | missed |
+| bilevel | Group 4 | 3.80x | 4.83x | 4.88x | 4.83x | 2.68x | missed |
+
+**Absolute times**, all from run 3 alone (load 31→20, the quietest of the
+three) so that every number in this table is internally consistent and its own
+quotient is its own row's ratio. They are not portable off this machine:
+
+| fixture | codec | `tiffcp -c none` | ours, decode only | run 3 ratio |
 |---|---|---|---|---|
-| RGB8 | uncompressed | 69.6 ms | 7.7 ms | **0.11x** |
-| RGB8 | PackBits | 62.2 ms | 12.7 ms | **0.20x** |
-| RGB8 | LZW | 215.8 ms | 519.8 ms | 2.41x |
-| RGB8 | Deflate | 146.7 ms | 232.2 ms | 1.58x |
-| RGB8 | ZSTD | 76.1 ms | 474.9 ms | 6.24x |
-| RGB8 | LZMA | 2026 ms | 2333 ms | **1.15x** |
-| RGB8 | JPEG | 79.9 ms | 189.3 ms | 2.37x |
-| Gray16 | LZW | 139.1 ms | 296.2 ms | 2.13x |
-| Gray16 | Deflate | 99.2 ms | 137.6 ms | 1.39x |
-| Gray16 | ZSTD | 62.8 ms | 318.4 ms | 5.07x |
-| Gray16 | LZMA | 1305 ms | 1519 ms | **1.16x** |
-| bilevel | Group 3 | 21.5 ms | 73.0 ms | 3.40x |
-| bilevel | Group 3 2D | 25.9 ms | 86.2 ms | 3.33x |
-| bilevel | Group 4 | 29.8 ms | 79.8 ms | 2.68x |
+| RGB8 | uncompressed | 33.5 ms | 6.2 ms | 0.19x |
+| RGB8 | PackBits | 40.9 ms | 6.7 ms | 0.16x |
+| RGB8 | LZW | 195.3 ms | 209.8 ms | 1.07x |
+| RGB8 | Deflate | 128.0 ms | 149.0 ms | 1.16x |
+| RGB8 | ZSTD | 90.7 ms | 159.1 ms | 1.75x |
+| RGB8 | LZMA | 952.0 ms | 1208.5 ms | 1.27x |
+| RGB8 | JPEG | 54.8 ms | 93.5 ms | 1.71x |
+| Gray16 | uncompressed | 37.5 ms | 4.0 ms | 0.11x |
+| Gray16 | LZW | 94.3 ms | 94.1 ms | 1.00x |
+| Gray16 | Deflate | 82.9 ms | 116.1 ms | 1.40x |
+| Gray16 | ZSTD | 53.5 ms | 51.4 ms | 0.96x |
+| Gray16 | LZMA | 475.2 ms | 621.3 ms | 1.31x |
+| bilevel | uncompressed | 5.5 ms | 29.3 ms | 5.30x |
+| bilevel | Group 3 | 9.2 ms | 46.5 ms | 5.04x |
+| bilevel | Group 3 2D | 9.8 ms | 47.8 ms | 4.89x |
+| bilevel | Group 4 | 9.9 ms | 48.1 ms | 4.88x |
 
-Subtracting the no-codec baseline from both arms isolates the codec itself,
-and that is the number worth acting on. For RGB8: `tiffcp` spends 69.6 ms with
-no codec and 76.1 ms with ZSTD, so its ZSTD decode is about **6 ms**; ours goes
-from 7.7 ms to 474.9 ms, so ours is about **467 ms**. LZW is 146 ms against
-512 ms and Deflate 77 ms against 225 ms by the same subtraction. The strip loop
-around them is 8 ms either way.
+**Four rows crossed the gate into "met"** — both LZW rows, RGB8 Deflate and
+Gray16 ZSTD — and ZSTD, the codec that was 5-6x, is now 0.96x on Gray16 and
+1.65x on RGB8. That is the three codec rewrites landing: `oxiarc-zstd`
+(~7x on TIFF-strip shapes), `oxiarc-lzw` (1.25x-2.6x) and `oxiarc-deflate`
+(1.04x-3.3x), each measured independently in its own crate.
 
-Two things that table is *not* saying. First, the bilevel rows compare unlike
-work: `tiffcp` copies 2 MB of packed bits and this crate expands them to 16 MB
-of one-byte-per-pixel samples, which is 28.7 ms of the figure on its own
-(measured with `-c none`). Subtract that and the fax codecs run at roughly
-1.5-2x. Second, the codec-only throughput of a single 4096-pixel-wide strip,
-with the pipeline out of the picture, is 122-144 MB/s for LZW, 293-298 MB/s for
-Deflate, 104-118 MB/s for ZSTD and 23-24 MB/s for LZMA — so the ranking of the
-gaps is a property of the codec crates, not of the strip loop above them.
-**ZSTD is the outlier by a wide margin** and is the first place a follow-up
-should look.
+**Why these ratios are believable on a machine at load 20-110.** PackBits, LZMA,
+JPEG and the three CCITT codecs were not touched by any of those rewrites, so
+they are the control: they should reproduce the earlier band, and they do
+(PackBits 0.16x against 0.20x, JPEG 1.90x against 2.37x). The movers are far
+outside that drift — ZSTD by 3.8x-5.3x, LZW by 2.1x-2.3x.
+
+**Two rows read honestly rather than favourably.** *LZMA moved the wrong way*
+(1.15x-1.16x to 1.31x-1.32x) although nothing in `oxiarc-lzma` changed. The
+`tiffcp` arm settles what happened, because libtiff did not change either, so
+where its own time is close the two fixtures are comparable:
+
+| codec | `tiffcp` then | `tiffcp` now | |
+|---|---|---|---|
+| LZW | 215.8 ms | 195.3 ms | 0.90x |
+| Deflate | 146.7 ms | 128.0 ms | 0.87x |
+| ZSTD | 76.1 ms | 90.7 ms | 1.19x |
+| uncompressed | 69.6 ms | 33.5 ms | 0.48x |
+| **LZMA** | **2026 ms** | **952 ms** | **0.47x** |
+
+The three rewritten codecs sit within ~15% on the reference arm, which is what
+makes their movement trustworthy. LZMA's reference arm **halved** on nominally
+identical geometry with an unchanged decoder — so that row is measuring a
+different fixture, not a regression. (Part of it is load: the uncompressed
+reference row moved by the same factor. But LZMA moved twice as far as any of
+the three codecs whose ratios we are relying on.) This fixture compresses
+2.5x/3.1x where the earlier perf sources compressed ~3.7x. *The bilevel rows still compare unlike work*: `tiffcp` copies 2 MB of
+packed bits and this crate expands them to 16 MB of one-byte-per-pixel samples,
+which is the whole 5.30x uncompressed row. Net of that expansion the fax codecs
+run at 1.87x-1.90x, reproducing the earlier "roughly 1.5-2x" figure.
+
+Subtracting each arm's own no-codec baseline isolates the codec, but on a shared
+machine it is a difference of two large noisy numbers and carries no useful
+ratio of its own — `tiffcp`'s RGB8 ZSTD codec time is `90.7 - 33.5`, two ~10%
+measurements subtracted. The ratio table above is the robust one, which is why
+the gate is judged on it. For the record, run 3's subtraction gives, for RGB8:
+LZW 161.8 ms against 203.6 ms, Deflate 94.5 ms against 142.8 ms, ZSTD 57.2 ms
+against 152.9 ms, and a strip loop of about 6 ms on our side either way.
+
+Where the remaining gap lives is now answered by each codec crate's own A/B
+harness rather than by a strip-level estimate. On TIFF-strip-shaped payloads
+they measure: **LZW 269-525 MB/s** (`oxiarc-lzw`, `examples/lzw_vs_libtiff.rs`,
+4096-pixel-wide strips), **ZSTD 520-950 MB/s** (`oxiarc-zstd`,
+`examples/decode_throughput.rs`, the `tiff288k`/`tiff1m` shapes) and **Deflate
+250-580 MB/s** (`oxiarc-deflate`, `examples/inflate_ab.rs`, `rgb8-image-rows`
+and `png-filtered-rows`). The earlier estimate of 122-144 MB/s for LZW,
+293-298 MB/s for Deflate and 104-118 MB/s for ZSTD predates all three rewrites.
 
 Group 4 decode got faster after this round: the 2D row decoder's `b1`/`b2`
 search restarted at changing element zero for every code word, which is

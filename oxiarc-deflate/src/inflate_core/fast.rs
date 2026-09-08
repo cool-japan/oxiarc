@@ -275,27 +275,11 @@ pub(super) fn symbols<S: InflateSink, const LIMITED: bool>(
         if distance <= pos {
             pos = copy_match_words(dst, pos, distance, length);
         } else {
-            // Straddles the window that precedes `dst`: the prefix comes
-            // from `history`, the rest from bytes this call just wrote.
-            let from_history = distance - pos;
-            let take = from_history.min(length);
-            let start = hist_len - from_history;
-            let copied = match (
-                history.get(start..start + take),
-                dst.get_mut(pos..pos + take),
-            ) {
-                (Some(src), Some(out)) => {
-                    out.copy_from_slice(src);
-                    true
+            match copy_straddling_match(dst, history, pos, distance, length) {
+                Some(next) => pos = next,
+                None => {
+                    break FastExit::Sink(OxiArcError::invalid_distance(distance, history_total));
                 }
-                _ => false,
-            };
-            if !copied {
-                break FastExit::Sink(OxiArcError::invalid_distance(distance, history_total));
-            }
-            pos += take;
-            if take < length {
-                pos = copy_match_words(dst, pos, distance, length - take);
             }
         }
         if LIMITED {
@@ -327,6 +311,47 @@ pub(super) fn symbols<S: InflateSink, const LIMITED: bool>(
         }
         FastExit::Sink(error) => Err(core.latch(error)),
     }
+}
+
+/// A match that reaches back past the start of `dst`: the prefix comes from
+/// `history`, the rest from bytes this call has just written.
+///
+/// Returns the new cursor, or `None` when the split does not land inside
+/// either buffer (which the caller reports as an invalid distance).
+///
+/// Out of line on purpose. It can only run while `pos < 32 KiB`, i.e. for
+/// the first few matches of a call, so a call costs nothing — while leaving
+/// it inline grows [`symbols`], which is the one function whose code layout
+/// the decoder's throughput depends on.
+///
+/// The tail is [`copy_within_dst`], **not** [`copy_match_words`]: the cursor
+/// has moved by `take` since the fast loop's output guard ran, so the 258
+/// bytes of room that guard proved no longer cover this write — `pos` is now
+/// exactly `distance`, which the loop bounds only by `dst.len()`.
+/// `copy_match_words`'s word-wide tail needs eight bytes of slack past the
+/// cursor and may have none here; `copy_within_dst` checks for that slack
+/// and falls back to a byte loop without it. Getting this wrong dropped the
+/// last one to seven bytes of such a match with no error at all — see
+/// `tests/inflate_fast_boundary.rs`.
+#[inline(never)]
+fn copy_straddling_match(
+    dst: &mut [u8],
+    history: &[u8],
+    pos: usize,
+    distance: usize,
+    length: usize,
+) -> Option<usize> {
+    let from_history = distance.checked_sub(pos)?;
+    let take = from_history.min(length);
+    let start = history.len().checked_sub(from_history)?;
+    let src = history.get(start..start.checked_add(take)?)?;
+    dst.get_mut(pos..pos.checked_add(take)?)?
+        .copy_from_slice(src);
+    let mut cursor = pos + take;
+    if take < length {
+        cursor = copy_within_dst(dst, cursor, distance, length - take);
+    }
+    Some(cursor)
 }
 
 /// Mask of the low `count` bits (`count <= 13` in every call site).
@@ -368,11 +393,28 @@ fn store_u64(buf: &mut [u8], at: usize, value: u64) {
 /// Everything else defers to [`copy_within_dst`], which stays out of line
 /// so the hot loop keeps its registers (measured: with the whole copy
 /// inlined the loop spills the bit accumulator).
+///
+/// **Precondition:** `pos + WORD_COPY_MAX + 8 <= dst.len()`. The word-wide
+/// tail store needs eight bytes of slack past the last byte of the match,
+/// and it does *not* check for them — an out-of-range word store would
+/// silently write nothing and drop the last one to seven bytes of the
+/// match. The fast loop's `FAST_OUTPUT_MARGIN` guard supplies that slack,
+/// but only for the cursor the guard itself saw: a caller that has already
+/// advanced the cursor inside the iteration (the second half of a match
+/// that starts in the history window) must use [`copy_within_dst`], which
+/// checks. The `debug_assert` below is what stops that mistake from being
+/// reintroduced silently.
 #[inline(always)]
 fn copy_match_words(dst: &mut [u8], pos: usize, distance: usize, length: usize) -> usize {
+    debug_assert!(
+        pos + WORD_COPY_MAX + 8 <= dst.len(),
+        "copy_match_words needs a full output margin; use copy_within_dst"
+    );
     if distance >= length && length <= WORD_COPY_MAX {
         // `src + length <= pos`, so the 8-byte reads below stay inside the
-        // bytes already written and never touch the destination.
+        // bytes already written and never touch the destination. The whole
+        // copy is at most `WORD_COPY_MAX` bytes and the fast loop holds
+        // 258 bytes of room, so every 8-byte access below is in bounds.
         let src = pos - distance;
         let mut k = 0usize;
         while k + 8 <= length {
@@ -380,14 +422,77 @@ fn copy_match_words(dst: &mut [u8], pos: usize, distance: usize, length: usize) 
             store_u64(dst, pos + k, word);
             k += 8;
         }
-        while k < length {
-            let byte = dst.get(src + k).copied().unwrap_or(0);
-            write_byte(dst, pos + k, byte);
-            k += 1;
+        if k < length {
+            // In bounds by the precondition: `k < length <= WORD_COPY_MAX`
+            // and `k` is a multiple of 8, so `pos + k + 8 <= pos +
+            // WORD_COPY_MAX + 8 <= dst.len()`;
+            // and `src + length <= pos`, so the source word is inside the
+            // bytes already written. Checking it again here costs two
+            // branches in the decoder's most frequent copy (measured: 8-16 %
+            // on match-heavy shapes).
+            merge_word(dst, pos + k, load_u64(dst, src + k), length - k);
         }
         return pos + length;
     }
     copy_within_dst(dst, pos, distance, length)
+}
+
+/// Write the low `len < 8` bytes of `source` at `pos`, leaving every byte
+/// from `pos + len` on **unchanged**.
+///
+/// The obvious byte loop costs two accesses per byte, and a DEFLATE match
+/// is most often 3-8 bytes long, so this tail is the copy the decoder
+/// performs most. Storing a whole word instead would clobber the `8 - len`
+/// bytes after the match — which the decoder promises never to touch
+/// outside the output it reports — so those bytes are read and merged back
+/// in: the store is a word wide, its *effect* is exactly `len` bytes.
+///
+/// Measured on 1 MiB payloads, `inflate_into`, against the byte loop:
+/// PNG-filtered rows +32 %, text +23 %, many-blocks text +19 %, long-match
+/// JSON +5 %, image rows (no matches) unchanged.
+#[inline(always)]
+fn write_partial_word(dst: &mut [u8], pos: usize, source: u64, len: usize) {
+    debug_assert!(len < 8);
+    if len < 8 && pos + 8 <= dst.len() {
+        merge_word(dst, pos, source, len);
+        return;
+    }
+    let bytes = source.to_le_bytes();
+    let mut i = 0usize;
+    while i < len {
+        let byte = bytes.get(i).copied().unwrap_or(0);
+        write_byte(dst, pos + i, byte);
+        i += 1;
+    }
+}
+
+/// The merge itself, without the room check: `dst[pos..pos + 8]` must exist.
+///
+/// `load_u64`/`store_u64` are themselves bounds checked (they read zero and
+/// write nothing out of range), so a violation could only lose bytes, never
+/// be unsound — and the `debug_assert` catches it in every test build.
+#[inline(always)]
+fn merge_word(dst: &mut [u8], pos: usize, source: u64, len: usize) {
+    debug_assert!(len < 8 && pos + 8 <= dst.len());
+    let current = load_u64(dst, pos);
+    // Bytes at or above `len` keep their current value.
+    let keep = u64::MAX << (len * 8);
+    store_u64(dst, pos, (source & !keep) | (current & keep));
+}
+
+/// [`write_partial_word`] sourced from `dst` itself, with the room check.
+#[inline]
+fn copy_short_tail(dst: &mut [u8], src: usize, pos: usize, len: usize) {
+    if src + 8 <= dst.len() {
+        write_partial_word(dst, pos, load_u64(dst, src), len);
+        return;
+    }
+    let mut i = 0usize;
+    while i < len {
+        let byte = dst.get(src + i).copied().unwrap_or(0);
+        write_byte(dst, pos + i, byte);
+        i += 1;
+    }
 }
 
 /// Above this many bytes a `memmove` (which `copy_within` lowers to, and
@@ -396,9 +501,11 @@ fn copy_match_words(dst: &mut [u8], pos: usize, distance: usize, length: usize) 
 ///
 /// A DEFLATE match averages well under 16 bytes on text and image data, so
 /// most copies take the word path, while the long runs of a highly
-/// repetitive stream take the vector path. Measured on 1 MiB of repetitive
-/// JSON (matches averaging ~50 bytes), forcing the word path costs 6 %.
-const WORD_COPY_MAX: usize = 32;
+/// repetitive stream take the vector path. Measured on 1 MiB payloads:
+/// forcing *everything* down the word path costs 6 % on repetitive JSON
+/// (matches averaging ~50 bytes), and the threshold itself was swept —
+/// 64 beats 32 (text +4 %, JSON +9 %) and beats 128 (text +3 %).
+const WORD_COPY_MAX: usize = 64;
 
 /// The LZ77 copy, entirely inside `dst`.
 ///
@@ -466,11 +573,8 @@ fn copy_within_dst(dst: &mut [u8], pos: usize, distance: usize, length: usize) -
         }
         // `done` is a multiple of the period, so the tail continues the
         // pattern at phase zero.
-        let mut i = 0usize;
-        while done + i < length {
-            let byte = tile.get(i).copied().unwrap_or(0);
-            write_byte(dst, pos + done + i, byte);
-            i += 1;
+        if done < length {
+            write_partial_word(dst, pos + done, word, length - done);
         }
         return pos + length;
     }
@@ -492,12 +596,201 @@ fn copy_within_dst(dst: &mut [u8], pos: usize, distance: usize, length: usize) -
             store_u64(dst, pos + done + k, word);
             k += 8;
         }
-        while k < step {
-            let byte = dst.get(src + done + k).copied().unwrap_or(0);
-            write_byte(dst, pos + done + k, byte);
-            k += 1;
+        if k < step {
+            copy_short_tail(dst, src + done + k, pos + done + k, step - k);
         }
         done += step;
     }
     pos + length
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The LZ77 copy, one byte at a time: the definition every fast path
+    /// below has to reproduce.
+    fn reference(base: &[u8], pos: usize, distance: usize, length: usize) -> Vec<u8> {
+        let mut out = base[..pos].to_vec();
+        for _ in 0..length {
+            let byte = out[out.len() - distance];
+            out.push(byte);
+        }
+        out[pos..].to_vec()
+    }
+
+    /// A buffer whose first `pos` bytes are recognisable history and whose
+    /// tail is a distinct filler, so a copy that writes one byte too far is
+    /// visible.
+    fn buffer(pos: usize, slack: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(pos + slack);
+        for i in 0..pos {
+            buf.push((i % 251) as u8);
+        }
+        buf.resize(pos + slack, 0xA5);
+        buf
+    }
+
+    /// Sweep every distance and length the fast loop can hand the copy
+    /// paths, against the byte-at-a-time definition — and assert that
+    /// **nothing past the match is touched**, which is the promise that
+    /// lets the decoder write straight into a caller's buffer.
+    ///
+    /// The sweep matters because the two paths take different branches at
+    /// `distance == 1`, `distance < 8`, `distance < length` and
+    /// `length > WORD_COPY_MAX`, and because the partial-word tail
+    /// (`merge_word`) is exactly the kind of code that is silently wrong
+    /// for one length.
+    #[test]
+    fn copy_paths_agree_with_a_byte_at_a_time_reference() {
+        const POS: usize = 1024;
+        const SLACK: usize = 400;
+        let base = buffer(POS, SLACK);
+
+        for distance in 1..=96usize {
+            for length in 1..=300usize {
+                if length > SLACK - 8 {
+                    continue;
+                }
+                let expect = reference(&base, POS, distance, length);
+
+                let mut fast = base.clone();
+                let end = copy_match_words(&mut fast, POS, distance, length);
+                assert_eq!(end, POS + length, "cursor: d={distance} l={length}");
+                assert_eq!(
+                    &fast[POS..POS + length],
+                    &expect[..],
+                    "copy_match_words: d={distance} l={length}"
+                );
+                assert_eq!(
+                    &fast[POS + length..],
+                    &base[POS + length..],
+                    "copy_match_words wrote past the match: d={distance} l={length}"
+                );
+
+                let mut slow = base.clone();
+                let end = copy_within_dst(&mut slow, POS, distance, length);
+                assert_eq!(end, POS + length, "cursor: d={distance} l={length}");
+                assert_eq!(
+                    &slow[POS..POS + length],
+                    &expect[..],
+                    "copy_within_dst: d={distance} l={length}"
+                );
+                assert_eq!(
+                    &slow[POS + length..],
+                    &base[POS + length..],
+                    "copy_within_dst wrote past the match: d={distance} l={length}"
+                );
+            }
+        }
+    }
+
+    /// A match that starts in the history window and finishes inside `dst`
+    /// must be exact for every split, including the ones whose tail lands in
+    /// the last eight bytes of the caller's buffer.
+    ///
+    /// That case is what the fast loop's once-per-iteration output guard does
+    /// **not** cover: the guard proves 258 bytes of room for the cursor it
+    /// saw, and this copy resumes at `pos + take`, which is exactly
+    /// `distance` and can be within eight bytes of the end of `dst`. A
+    /// word-wide store there writes nothing at all (`store_u64` is bounds
+    /// checked), which silently drops the last one to seven bytes of the
+    /// match. `dst` here is sized to end exactly at `pos + length`, so any
+    /// such drop shows up as a mismatch and any overshoot as a panic.
+    #[test]
+    fn a_straddling_copy_is_exact_including_at_the_end_of_the_buffer() {
+        for hist_len in [1usize, 7, 8, 9, 64, 300] {
+            let history: Vec<u8> = (0..hist_len).map(|i| (i % 251) as u8).collect();
+            for pos in [0usize, 1, 3, 8, 33] {
+                for length in 1..=120usize {
+                    for from_history in 1..=hist_len.min(40) {
+                        let distance = pos + from_history;
+                        // `dst` ends exactly at the match, so a word store
+                        // past `pos + length` has nowhere to land.
+                        for slack in [0usize, 1, 7, 8, 64] {
+                            let mut dst = vec![0u8; pos + length + slack];
+                            for (i, slot) in dst.iter_mut().take(pos).enumerate() {
+                                *slot = (200 + i % 41) as u8;
+                            }
+                            let tail_marker = 0xA5u8;
+                            for slot in dst.iter_mut().skip(pos) {
+                                *slot = tail_marker;
+                            }
+
+                            // Byte-at-a-time reference over history ++ dst[..pos].
+                            let mut reference: Vec<u8> = history.clone();
+                            reference.extend_from_slice(&dst[..pos]);
+                            for _ in 0..length {
+                                let byte = reference[reference.len() - distance];
+                                reference.push(byte);
+                            }
+                            let want = &reference[hist_len + pos..];
+
+                            let end =
+                                copy_straddling_match(&mut dst, &history, pos, distance, length)
+                                    .expect("the split lands inside both buffers");
+                            assert_eq!(
+                                end,
+                                pos + length,
+                                "cursor: h={hist_len} pos={pos} d={distance} l={length}"
+                            );
+                            assert_eq!(
+                                &dst[pos..pos + length],
+                                want,
+                                "bytes: h={hist_len} pos={pos} d={distance} l={length} slack={slack}"
+                            );
+                            assert!(
+                                dst[pos + length..].iter().all(|&b| b == tail_marker),
+                                "wrote past the match: h={hist_len} pos={pos} d={distance} \
+                                 l={length} slack={slack}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A split that does not land inside both buffers is reported, not
+    /// silently truncated — the fast loop turns `None` into
+    /// `InvalidDistance`.
+    #[test]
+    fn a_straddling_copy_reports_a_split_it_cannot_serve() {
+        let history = [1u8, 2, 3, 4];
+        let mut dst = [0u8; 64];
+        // Reaching further back than the history holds.
+        assert!(copy_straddling_match(&mut dst, &history, 2, 12, 4).is_none());
+        // A distance that does not actually straddle is still served.
+        assert!(copy_straddling_match(&mut dst, &history, 2, 6, 4).is_some());
+    }
+
+    /// The partial-word tail must write exactly `len` bytes for every
+    /// `len` and leave the rest of the word alone — checked both with room
+    /// for the eight-byte store (the merge path) and without it (the byte
+    /// loop), since only the first can be reached from the fast loop but
+    /// both are compiled.
+    #[test]
+    fn partial_word_writes_exactly_its_length() {
+        const POS: usize = 4;
+        for len in 0..8usize {
+            // `slack == 8` takes the merged word store; anything smaller
+            // has no room for it and falls back to the byte loop. The
+            // contract needs `POS + len <= dst.len()`, so the smallest
+            // legal slack is `len` itself.
+            for slack in len..=8usize {
+                let mut buf = vec![0xA5u8; POS + slack];
+                let source = u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+                write_partial_word(&mut buf, POS, source, len);
+                for (index, &byte) in buf.iter().enumerate() {
+                    let want = if (POS..POS + len).contains(&index) {
+                        (index - POS + 1) as u8
+                    } else {
+                        0xA5
+                    };
+                    assert_eq!(byte, want, "len={len} slack={slack} index={index}");
+                }
+            }
+        }
+    }
 }

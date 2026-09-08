@@ -600,39 +600,47 @@ impl ZstdDecoder {
         let dict_len = dict.len();
 
         for seq in sequences {
+            // A `Sequence` holds `u32`s because the format bounds all three
+            // below `2^32`; widening here is lossless on every pointer width
+            // this crate supports (32 and 64 bits) and keeps the arithmetic
+            // below in the type the buffers are indexed with.
+            let literal_length = seq.literal_length as usize;
+            let match_length = seq.match_length as usize;
+            let seq_offset = seq.offset as usize;
+
             // Copy literals
-            if seq.literal_length > 0 {
+            if literal_length > 0 {
                 let end = lit_pos
-                    .checked_add(seq.literal_length)
+                    .checked_add(literal_length)
                     .filter(|end| *end <= literals.len())
                     .ok_or_else(|| OxiArcError::CorruptedData {
                         offset: 0,
                         message: "literal length exceeds available literals".to_string(),
                     })?;
-                produced = charge_block(produced, seq.literal_length, rfc_max)?;
+                produced = charge_block(produced, literal_length, rfc_max)?;
                 append_literals(output, &literals[lit_pos..end]);
                 lit_pos = end;
             }
 
             // Copy match
-            if seq.match_length > 0 {
-                produced = charge_block(produced, seq.match_length, rfc_max)?;
+            if match_length > 0 {
+                produced = charge_block(produced, match_length, rfc_max)?;
                 let max_offset = output.len() + dict_len;
-                if seq.offset == 0 || seq.offset > max_offset {
+                if seq_offset == 0 || seq_offset > max_offset {
                     return Err(OxiArcError::CorruptedData {
                         offset: 0,
                         message: format!(
                             "invalid offset {} (output length {}, dict length {})",
-                            seq.offset,
+                            seq_offset,
                             output.len(),
                             dict_len
                         ),
                     });
                 }
 
-                if seq.offset <= output.len() {
+                if seq_offset <= output.len() {
                     // Normal case: the whole match lives in the output buffer.
-                    append_match(output, seq.offset, seq.match_length);
+                    append_match(output, seq_offset, match_length);
                 } else {
                     // Dictionary reference: the match starts inside the
                     // dictionary. The logical buffer is `[dict | output]`, so
@@ -641,10 +649,10 @@ impl ZstdDecoder {
                     // bytes start at output[0], i.e. at a distance of exactly
                     // `output.len()` behind the write cursor.
                     let combined = dict_len + output.len();
-                    let start_in_dict = combined - seq.offset;
-                    let from_dict = (dict_len - start_in_dict).min(seq.match_length);
+                    let start_in_dict = combined - seq_offset;
+                    let from_dict = (dict_len - start_in_dict).min(match_length);
                     output.extend_from_slice(&dict[start_in_dict..start_in_dict + from_dict]);
-                    let rest = seq.match_length - from_dict;
+                    let rest = match_length - from_dict;
                     if rest > 0 {
                         let offset = output.len();
                         append_match(output, offset, rest);

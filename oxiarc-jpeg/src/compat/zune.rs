@@ -243,7 +243,7 @@ impl<'a> JpegDecoder<'a> {
     ///
     /// # Errors
     ///
-    /// [`JpegError`] if the `APP2` chunks are malformed (a chunk-count
+    /// [`crate::JpegError`] if the `APP2` chunks are malformed (a chunk-count
     /// disagreement, a duplicate sequence number, or a total size over the
     /// crate's cap).
     pub fn icc_profile(&mut self) -> Result<Option<Vec<u8>>> {
@@ -267,7 +267,7 @@ impl<'a> JpegDecoder<'a> {
     ///
     /// # Errors
     ///
-    /// [`JpegError::Unsupported`] for a colour-space request this crate's
+    /// [`crate::JpegError::Unsupported`] for a colour-space request this crate's
     /// pipeline cannot produce from the source (e.g. `Rgb` from a CMYK
     /// source — `zune_jpeg` and this crate both convert YCbCr/YCCK sources
     /// but neither converts CMYK), and whatever

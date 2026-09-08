@@ -348,7 +348,8 @@ pub fn zlib_compress_with_dict(input: &[u8], level: u8, dictionary: &[u8]) -> Re
 /// not from the position immediately after the DEFLATE stream, so `input`
 /// must end exactly where the member ends. A slice carrying trailing bytes
 /// (padding, a second concatenated member, a container's next field) fails
-/// with [`OxiArcError::CrcMismatch`] rather than ignoring them. Callers
+/// with [`OxiArcError::CrcMismatch`] — the generic checksum-mismatch error,
+/// raised here for an **Adler-32** — rather than ignoring them. Callers
 /// that hold a buffer with an unknown tail — a PNG `IDAT` chain, a TIFF
 /// strip — should drive
 /// [`WrappedInflate`](crate::WrappedInflate)`::new(`[`InflateWrapper::Zlib`](crate::InflateWrapper)`)`
@@ -422,6 +423,8 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
     let stored_checksum = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let computed_checksum = Adler32::checksum(decompressed);
 
+    // `CrcMismatch` is the workspace's generic checksum-mismatch error; the
+    // checksum being compared here is RFC 1950 §8.2's Adler-32, not a CRC.
     if stored_checksum != computed_checksum {
         return Err(OxiArcError::crc_mismatch(
             computed_checksum,
@@ -454,8 +457,9 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// [`OxiArcError::BufferTooSmall`] when the stream decodes to more than
-/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] when the Adler-32
-/// does not match, plus the usual header/EOF/Huffman errors. Preset
+/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] (the generic
+/// checksum-mismatch error) when the **Adler-32** trailer does not match,
+/// plus the usual header/EOF/Huffman errors. Preset
 /// dictionaries are not supported on this path (no history precedes
 /// `output`); use [`zlib_decompress_with_dict`] for those.
 ///

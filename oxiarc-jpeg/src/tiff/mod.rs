@@ -15,9 +15,9 @@
 //! # Legacy OJPEG (`Compression = 6`)
 //!
 //! [`reconstruct_ojpeg`] and [`decode_ojpeg`] cover TIFF 6.0's withdrawn JPEG
-//! encoding, whose strips may carry no headers at all. See the [`ojpeg`]
-//! module documentation for the three spellings found in the wild and for
-//! what the TIFF layer has to resolve before calling in.
+//! encoding, whose strips may carry no headers at all. Their own
+//! documentation covers the three spellings found in the wild and what the
+//! TIFF layer has to resolve before calling in.
 
 mod ojpeg;
 

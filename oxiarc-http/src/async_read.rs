@@ -29,7 +29,7 @@ use oxiarc_core::traits::FlushMode;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::coding::ContentCoding;
-use crate::decode::{DecodeStatus, Decoder};
+use crate::decode::{DecodeStatus, Decoder, TrailingData};
 use crate::error::Result;
 use crate::limits::DecodeLimits;
 
@@ -178,10 +178,29 @@ impl<R> AsyncDecodedBody<R> {
             return Ok(());
         }
         match progress.status {
-            DecodeStatus::StreamEnd => {
+            // Reaching the end of the *coded* stream is not the same
+            // as reaching the end of the body's bytes. Closing here while
+            // the source may still hold data would make the trailing-data
+            // verdict depend on where the read boundary happened to fall:
+            // the four codings differ in whether they need a further byte
+            // to report `StreamEnd` at all, so `XXXX` appended to a `br`
+            // body was rejected when the stream and the garbage landed in
+            // one read and silently ACCEPTED when the body's last byte
+            // arrived on its own. Under a policy that inspects what
+            // follows, keep the body open until the source is spent — the
+            // next round refills from the source first, so it is not the
+            // repeat of an identical round the no-progress guard below
+            // exists to catch — and hand whatever arrives to the finished
+            // decoder, which applies `check_trailing` to it. Under
+            // `TrailingData::Ignore` there is nothing to check, so close
+            // at once and never read a byte the caller did not ask for.
+            DecodeStatus::StreamEnd
+                if self.src_eof || self.decoder.trailing_policy() == TrailingData::Ignore =>
+            {
                 self.decoder.close()?;
                 self.closed = true;
             }
+            DecodeStatus::StreamEnd => {}
             // The source is spent and the stream never ended: `close`
             // turns that into the truncation error it is.
             DecodeStatus::NeedInput if self.src_eof => {
@@ -203,7 +222,14 @@ impl<R> AsyncDecodedBody<R> {
         // Not when the body just closed: the last round of a clean decode is
         // legitimately `0/0`, because everything was already handed over and
         // all that remained was to verify the trailers.
-        if !self.closed && progress.consumed == 0 && progress.produced == 0 {
+        // Nor when the stream has ended and the body is deliberately still
+        // open (above): the next round polls the source rather than repeating
+        // this one.
+        if !self.closed
+            && progress.consumed == 0
+            && progress.produced == 0
+            && progress.status != DecodeStatus::StreamEnd
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "content-coding decoder made no progress: it neither consumed wire bytes \

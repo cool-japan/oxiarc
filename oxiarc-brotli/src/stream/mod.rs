@@ -243,6 +243,17 @@ pub struct BrotliStream {
     /// retry is pending. Drives the geometric retry schedule that keeps
     /// re-parsing linear rather than quadratic in the prelude's size.
     header_retry_at: usize,
+    /// [`BrotliStream::total_in`] at the moment of that same short attempt.
+    ///
+    /// `header_retry_at` counts bytes still held in `carry`, which is
+    /// compacted and rebased between calls and can even hold a whole byte
+    /// inside the bit accumulator instead — so it is a fine *size* proxy for
+    /// the prelude but is **not** comparable across calls. `total_in` is
+    /// monotone and never rebased, so it is what the schedule measures
+    /// arrival against. Comparing two `pending` values from different calls
+    /// was the FINALGATE-era stall: a byte could arrive, be gated, and then
+    /// look like "nothing new" for ever.
+    header_retry_total_in: u64,
     /// How many times an atomic prelude parse has been attempted. Diagnostic:
     /// it is what the retry-schedule test measures.
     header_attempts: u64,
@@ -298,6 +309,7 @@ impl BrotliStream {
             shapes: Vec::new(),
             record_shapes: false,
             header_retry_at: 0,
+            header_retry_total_in: 0,
             header_attempts: 0,
             fault: None,
             progress: None,
@@ -464,6 +476,7 @@ impl BrotliStream {
         self.total_out = 0;
         self.shapes.clear();
         self.header_retry_at = 0;
+        self.header_retry_total_in = 0;
         self.header_attempts = 0;
         self.fault = None;
         #[cfg(test)]
@@ -589,7 +602,7 @@ impl BrotliStream {
             // everything it is offered, then never copies its bytes at all.
             carry.clear();
             self.cursor = BitCursorState::start();
-            let outcome = self.run(&input[..take], output, more_possible);
+            let outcome = self.run(&input[..take], output, more_possible, take > 0);
             let consumed_bytes = self.cursor.bits_consumed() / 8;
             carry.extend_from_slice(&input[consumed_bytes..take]);
             self.cursor = BitReader::rebase_state(self.cursor, consumed_bytes);
@@ -597,7 +610,7 @@ impl BrotliStream {
             outcome
         } else {
             carry.extend_from_slice(&input[..take]);
-            let outcome = self.run(&carry, output, more_possible);
+            let outcome = self.run(&carry, output, more_possible, take > 0);
 
             // Compact the carry in place up to the resume point, amortised:
             // never a `remove(0)`, and never past a position the decoder may
@@ -652,6 +665,7 @@ impl BrotliStream {
         carry: &[u8],
         output: &mut [u8],
         more_possible: bool,
+        fresh_input: bool,
     ) -> BrotliResult<(usize, BrotliStatus)> {
         let mut reader = BitReader::resume(carry, self.cursor, more_possible);
         let mut written = 0usize;
@@ -705,9 +719,48 @@ impl BrotliStream {
                     // always let through by `1.125 * MAX_METABLOCK_HEADER`,
                     // well before the carry stops accepting input, so an
                     // oversized header is always reported rather than waited on.
-                    if more_possible && self.header_retry_at > 0 {
+                    // The schedule is skipped in two cases, both of which mean
+                    // "no further input is coming that would make waiting
+                    // worthwhile": `!more_possible` (the caller passed
+                    // `FlushMode::Finish`), and a call that offered no new
+                    // bytes at all. The second case is the drain call of a
+                    // pull-style caller — `decode(&[], out, ..)` after a
+                    // `NeedInput` — which is a request to make progress on
+                    // what the decoder already holds. Without it the schedule
+                    // could wait forever for input the caller had already
+                    // finished supplying: a stream whose first prelude parse
+                    // ran short with fewer than `MIN_HEADER_RETRY_STRIDE`
+                    // bytes still to come never got its retry, so `decode`
+                    // returned `NeedInput` for ever and `finish()` reported a
+                    // *complete* stream as `UnexpectedEof`. A retry is still
+                    // only worth running if some byte has arrived since the
+                    // last attempt, hence the `pending > header_retry_at`
+                    // guard, which also bounds the re-parse work of a caller
+                    // that alternates one-byte and empty calls to exactly what
+                    // passing `FlushMode::Finish` every call already costs.
+                    if self.header_retry_at > 0 && more_possible {
                         let stride = (self.header_retry_at / 8).max(MIN_HEADER_RETRY_STRIDE);
-                        if pending < self.header_retry_at.saturating_add(stride) {
+                        let due = self.header_retry_total_in.saturating_add(stride as u64);
+                        if fresh_input {
+                            // Ordinary case: the caller is still feeding, so
+                            // spread the re-parses out geometrically.
+                            if self.total_in < due {
+                                break BrotliStatus::NeedInput;
+                            }
+                        } else if self.total_in <= self.header_retry_total_in {
+                            // A `decode(&[], ..)` drain call with nothing new
+                            // since the last attempt: re-parsing would stop at
+                            // the same bit. Anything else falls through and is
+                            // retried immediately — the drain call is the
+                            // caller saying "this is all I have right now", so
+                            // waiting for a further `stride` bytes that may
+                            // never come would stall the stream. That stall was
+                            // real: a stream whose prelude parse ran short with
+                            // fewer than `MIN_HEADER_RETRY_STRIDE` bytes left to
+                            // come never got its retry, so `decode` returned
+                            // `NeedInput` for ever and `finish()` reported a
+                            // *complete* stream as `UnexpectedEof`, while the
+                            // same bytes fed in one call decoded fine.
                             break BrotliStatus::NeedInput;
                         }
                     }
@@ -715,10 +768,12 @@ impl BrotliStream {
                     match parse_meta_block_start(&mut reader, &self.budget, self.total_out) {
                         Ok(MetaBlockStart::LastEmpty) => {
                             self.header_retry_at = 0;
+                            self.header_retry_total_in = 0;
                             self.state = State::FinalPadding;
                         }
                         Ok(MetaBlockStart::Metadata { skip, is_last }) => {
                             self.header_retry_at = 0;
+                            self.header_retry_total_in = 0;
                             self.state = State::MetadataSkip {
                                 remaining: skip,
                                 is_last,
@@ -726,6 +781,7 @@ impl BrotliStream {
                         }
                         Ok(MetaBlockStart::Uncompressed { mlen }) => {
                             self.header_retry_at = 0;
+                            self.header_retry_total_in = 0;
                             self.announce_meta_block(mlen);
                             self.state = State::Uncompressed { remaining: mlen };
                         }
@@ -735,6 +791,7 @@ impl BrotliStream {
                             header,
                         }) => {
                             self.header_retry_at = 0;
+                            self.header_retry_total_in = 0;
                             self.announce_meta_block(mlen);
                             self.meta = Some(MetaBlockState {
                                 header,
@@ -757,6 +814,7 @@ impl BrotliStream {
                                 )));
                             }
                             self.header_retry_at = pending.max(1);
+                            self.header_retry_total_in = self.total_in;
                             break out_of_input(more_possible)?;
                         }
                         // Any other error is a genuine format violation.
@@ -1251,5 +1309,146 @@ mod tests {
         assert_eq!(stream.total_in(), compressed.len() as u64);
         assert!(stream.is_finished());
         assert_eq!(stream.window_size(), Some((1 << 22) - 16));
+    }
+    /// A pull-style caller that never passes `FlushMode::Finish` — it feeds
+    /// chunks with `FlushMode::None` and calls `finish()` at the end — must
+    /// still decode a complete stream, at **every** feed granularity.
+    ///
+    /// Regression (found by `fuzz_brotli_stream` once FINALGATE F9's window
+    /// and output caps made the target ~16x faster): the geometric prelude
+    /// retry schedule waits for the buffered input to grow by at least
+    /// `MIN_HEADER_RETRY_STRIDE` (64) bytes before re-attempting an atomic
+    /// meta-block prelude. If a stream's first prelude parse ran short with
+    /// fewer than 64 bytes still to come, that growth never arrived: `decode`
+    /// returned `NeedInput` for ever and `finish()` reported a *complete*
+    /// stream as `UnexpectedEof`, while the identical bytes fed in one call
+    /// decoded fine. The 23-byte fixture below is the exact libFuzzer
+    /// artifact: it decodes to 17 bytes through `decompress()` and through
+    /// `BrotliStream` fed whole, and used to fail for every chunk size 1..=20.
+    #[test]
+    fn a_prelude_retry_never_stalls_a_caller_that_only_uses_flush_none() {
+        // Two real Brotli streams, both libFuzzer artifacts: a 23-byte one
+        // (static-dictionary word + a run) that decodes to 17 bytes, and a
+        // 2-byte empty-last-meta-block one that decodes to nothing. Both used
+        // to stall for every chunk size below their own length.
+        for fixture in [
+            &[
+                0x02u8, 0x02, 0x00, 0x01, 0x04, 0xb8, 0xb8, 0xb8, 0xb8, 0x2c, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x40, 0x23, 0xb8, 0xb8, 0x2c, 0xb8, 0x00,
+            ][..],
+            &[0x0cu8, 0x0d][..],
+        ] {
+            check_every_granularity(fixture);
+        }
+    }
+
+    /// Feeds `fixture` at every chunk size through a caller that only ever
+    /// passes `FlushMode::None`, and requires the same bytes the one-shot
+    /// decoder produces plus a clean `finish()`.
+    fn check_every_granularity(fixture: &[u8]) {
+        let expected = crate::decompress(fixture).expect("the one-shot decoder accepts it");
+
+        for chunk in 1..=fixture.len() {
+            let mut stream = BrotliStream::new();
+            let mut out = Vec::new();
+            let mut sink = [0u8; 8];
+            let mut pos = 0usize;
+            let mut ended = false;
+            let mut calls = 0u32;
+
+            while !ended && pos < fixture.len() {
+                calls += 1;
+                assert!(calls < 100_000, "chunk {chunk}: no progress feeding input");
+                let end = (pos + chunk).min(fixture.len());
+                let progress = stream
+                    .decode(&fixture[pos..end], &mut sink, FlushMode::None)
+                    .unwrap_or_else(|e| panic!("chunk {chunk}: decode failed: {e}"));
+                out.extend_from_slice(&sink[..progress.produced]);
+                pos += progress.consumed;
+                ended = progress.status == BrotliStatus::StreamEnd;
+            }
+            // The drain loop: `decode(&[], ..)` says "nothing more right now",
+            // which must not leave the decoder waiting on input that will
+            // never come.
+            while !ended {
+                calls += 1;
+                assert!(calls < 100_000, "chunk {chunk}: no progress draining");
+                let progress = stream
+                    .decode(&[], &mut sink, FlushMode::None)
+                    .unwrap_or_else(|e| panic!("chunk {chunk}: drain failed: {e}"));
+                out.extend_from_slice(&sink[..progress.produced]);
+                match progress.status {
+                    BrotliStatus::StreamEnd => ended = true,
+                    BrotliStatus::NeedOutput => {}
+                    BrotliStatus::NeedInput => break,
+                }
+            }
+
+            stream.finish().unwrap_or_else(|e| {
+                panic!("chunk {chunk}: finish() rejected a complete stream: {e}")
+            });
+            assert_eq!(out, expected, "chunk {chunk}: wrong output");
+        }
+    }
+
+    /// A genuinely truncated stream must still be caught, at every
+    /// granularity — the stall fix must not turn "need more input" into
+    /// "silently accept a short stream".
+    #[test]
+    fn a_truncated_stream_is_still_rejected_under_flush_none() {
+        let data = b"truncation must still be caught, at every cut point at all".repeat(4);
+        let compressed = crate::compress(&data, 5).expect("compress");
+
+        for cut in 1..compressed.len() {
+            let mut stream = BrotliStream::new();
+            let mut sink = [0u8; 64];
+            let mut pos = 0usize;
+            let mut ended = false;
+            let mut failed = false;
+            let mut calls = 0u32;
+
+            while !ended && !failed && pos < cut {
+                calls += 1;
+                assert!(calls < 100_000, "cut {cut}: no progress");
+                let end = (pos + 3).min(cut);
+                match stream.decode(&compressed[pos..end], &mut sink, FlushMode::None) {
+                    Ok(progress) => {
+                        pos += progress.consumed;
+                        ended = progress.status == BrotliStatus::StreamEnd;
+                        if progress.consumed == 0 && progress.produced == 0 && !ended {
+                            break;
+                        }
+                    }
+                    Err(_) => failed = true,
+                }
+            }
+            while !ended && !failed {
+                calls += 1;
+                assert!(calls < 100_000, "cut {cut}: no progress draining");
+                match stream.decode(&[], &mut sink, FlushMode::None) {
+                    Ok(progress) => match progress.status {
+                        BrotliStatus::StreamEnd => ended = true,
+                        BrotliStatus::NeedOutput => {}
+                        BrotliStatus::NeedInput => break,
+                    },
+                    Err(_) => failed = true,
+                }
+            }
+            if !failed && !ended {
+                failed = stream.finish().is_err();
+            }
+            assert!(
+                failed || ended,
+                "cut {cut}: a truncated stream was neither rejected nor completed"
+            );
+            if ended {
+                // Only a cut that happens to land past the last meta-block can
+                // legitimately complete; it must then match the whole stream.
+                assert!(
+                    crate::decompress(&compressed[..cut]).is_ok(),
+                    "cut {cut}: streaming accepted what the one-shot decoder rejects"
+                );
+            }
+        }
     }
 }

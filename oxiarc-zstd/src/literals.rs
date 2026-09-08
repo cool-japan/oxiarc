@@ -838,6 +838,334 @@ mod tests {
         assert!(compared >= 5, "only {compared} sections were four-stream");
     }
 
+    /// Deterministic xorshift, so the sweeps below are reproducible without a
+    /// dependency.
+    fn next_rand(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Build a `table_log`-11 Huffman table — the longest code this crate's
+    /// own encoder emits, so the sweep below covers both the shape real frames
+    /// carry and the format's maximum.
+    ///
+    /// Weights `[1, 1, 2, ..., 10]` sum to 1024, so the table log is 11 and
+    /// the implied last symbol takes weight 11 (a one-bit code).
+    fn eleven_bit_table() -> HuffmanTable {
+        let weights: Vec<u8> = vec![1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let table = HuffmanTable::from_stored_weights(&weights).expect("valid table log 11");
+        assert_eq!(table.max_bits(), 11);
+        assert!(table.is_complete());
+        table
+    }
+
+    /// The distinct symbols a table decodes to, longest code first.
+    fn symbols_of(table: &HuffmanTable) -> Vec<u8> {
+        let mut seen: Vec<u8> = Vec::new();
+        for entry in table.entries() {
+            if !seen.contains(&entry.symbol) {
+                seen.push(entry.symbol);
+            }
+        }
+        seen
+    }
+
+    /// Every `(streams 1-3 length, stream 4 length)` split the four-stream
+    /// layout can produce must decode identically through the interleaved fast
+    /// path and through the sequential checked decoder.
+    ///
+    /// The fast path splits each stream three ways — whole groups of
+    /// [`GROUP`] symbols under a scheduled reload, a conditionally-reloading
+    /// tail while all four streams are still live, and the one-to-three
+    /// symbols streams 1-3 carry beyond stream 4 — and tops the containers up
+    /// at the first boundary. An off-by-one in any of those three regions, or
+    /// a missing reload between them, decodes to the wrong bytes rather than
+    /// to an error, so it has to be pinned by a differential rather than by a
+    /// round-trip. Both table logs are exercised because only a 12-bit table
+    /// can reach the reload budget's edge.
+    #[test]
+    fn every_stream_length_split_agrees_with_the_checked_decoder() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut cases = 0usize;
+        for table in [eleven_bit_table(), twelve_bit_table()] {
+            let pool = symbols_of(&table);
+            for quarter in 0..=19usize {
+                for short in 0..=3usize {
+                    if short > quarter {
+                        continue;
+                    }
+                    let size4 = quarter - short;
+                    let lengths = [quarter, quarter, quarter, size4];
+                    let symbols: Vec<Vec<u8>> = lengths
+                        .iter()
+                        .map(|&n| {
+                            (0..n)
+                                .map(|_| pool[(next_rand(&mut state) as usize) % pool.len()])
+                                .collect()
+                        })
+                        .collect();
+                    let encoded: Vec<Vec<u8>> =
+                        symbols.iter().map(|s| encode_stream(&table, s)).collect();
+                    let borrowed = [
+                        encoded[0].as_slice(),
+                        encoded[1].as_slice(),
+                        encoded[2].as_slice(),
+                        encoded[3].as_slice(),
+                    ];
+
+                    let total = quarter * 3 + size4;
+                    let mut fast = vec![0xCCu8; total];
+                    {
+                        let (a, rest) = fast.split_at_mut(quarter);
+                        let (b, rest) = rest.split_at_mut(quarter);
+                        let (c, d) = rest.split_at_mut(quarter);
+                        assert!(
+                            interleaved_pass(borrowed, [a, b, c, d], &table),
+                            "log {} quarter {quarter} short {short}: valid streams rejected",
+                            table.max_bits()
+                        );
+                    }
+
+                    let mut checked = vec![0xCCu8; total];
+                    {
+                        let (a, rest) = checked.split_at_mut(quarter);
+                        let (b, rest) = rest.split_at_mut(quarter);
+                        let (c, d) = rest.split_at_mut(quarter);
+                        for (stream, dst) in borrowed.iter().zip([a, b, c, d]) {
+                            decode_stream_checked(stream, dst, &table).expect("stream decodes");
+                        }
+                    }
+
+                    let expected: Vec<u8> = symbols.concat();
+                    assert_eq!(
+                        checked,
+                        expected,
+                        "log {} quarter {quarter} short {short}: reference decode is wrong",
+                        table.max_bits()
+                    );
+                    assert_eq!(
+                        fast,
+                        expected,
+                        "log {} quarter {quarter} short {short}: fast path disagrees",
+                        table.max_bits()
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 100, "only {cases} splits exercised");
+    }
+
+    /// Decode a four-stream section the way a purely sequential decoder would:
+    /// split the streams, then run the checked decoder over each in order.
+    fn sequential_four_streams(
+        stream_data: &[u8],
+        regenerated: usize,
+        table: &HuffmanTable,
+    ) -> Result<Vec<u8>> {
+        let streams = split_four_streams(stream_data)?;
+        let quarter = regenerated.div_ceil(4);
+        let _size4 =
+            regenerated
+                .checked_sub(quarter * 3)
+                .ok_or_else(|| OxiArcError::CorruptedData {
+                    offset: 0,
+                    message: "4-stream literals size too small".to_string(),
+                })?;
+        let mut out = vec![0u8; regenerated];
+        {
+            let (d0, rest) = out.split_at_mut(quarter);
+            let (d1, rest) = rest.split_at_mut(quarter);
+            let (d2, d3) = rest.split_at_mut(quarter);
+            decode_stream_checked(streams[0], d0, table)?;
+            decode_stream_checked(streams[1], d1, table)?;
+            decode_stream_checked(streams[2], d2, table)?;
+            decode_stream_checked(streams[3], d3, table)?;
+        }
+        Ok(out)
+    }
+
+    /// A corrupted four-stream literals section must produce *exactly* what a
+    /// sequential decoder produces — the same bytes when it still decodes, and
+    /// the same error message when it does not.
+    ///
+    /// This is the guarantee the fast path is documented to keep and the one
+    /// thing about it a caller can observe: it drops the per-symbol validity
+    /// test and the per-symbol over-read test, and recovers them by re-running
+    /// [`decode_stream_checked`] over each stream in order. Two failures would
+    /// be invisible to a round-trip test and are caught here — the fast path
+    /// *accepting* bytes the checked decoder refuses (silent corruption), and
+    /// the fast path *refusing* a stream the checked decoder accepts, which
+    /// would surface as the otherwise-unreachable "failed validation" error.
+    #[test]
+    fn a_corrupt_four_stream_section_matches_the_sequential_decoder_exactly() {
+        let mut state = 0x1357_9BDF_2468_ACE0u64;
+        let payload: Vec<u8> = (0..1600)
+            .map(|_| {
+                let r = next_rand(&mut state);
+                match r & 0x7 {
+                    0..=4 => b'a' + ((r >> 8) % 4) as u8,
+                    5..=6 => b'A' + ((r >> 8) % 8) as u8,
+                    _ => b'0' + ((r >> 8) % 10) as u8,
+                }
+            })
+            .collect();
+        let section = huffman_section(&payload).expect("a four-stream section");
+        let header = parse_literals_header(&section).expect("header");
+        let content = &section[header.header_size..];
+        let (table, table_size) = read_huffman_table(content).expect("table");
+        let stream_start = header.header_size + table_size;
+        let stream_end = header.header_size + header.compressed_size;
+        assert!(stream_end - stream_start > 6, "jump table plus streams");
+
+        let mut agreed = 0usize;
+        let mut refused = 0usize;
+        for offset in stream_start..stream_end {
+            for bit in [0u8, 3, 6] {
+                let mut mutated = section.clone();
+                mutated[offset] ^= 1 << bit;
+
+                let expected = sequential_four_streams(
+                    &mutated[stream_start..stream_end],
+                    header.regenerated_size,
+                    &table,
+                );
+                let mut scratch = vec![0x5Au8; 16];
+                let got = LiteralsDecoder::new()
+                    .decode_into(&mutated, &mut scratch)
+                    .map(|(_, produced)| scratch[..produced].to_vec());
+
+                match (&expected, &got) {
+                    (Ok(a), Ok(b)) => assert_eq!(
+                        a, b,
+                        "offset {offset} bit {bit}: fast path decoded different bytes"
+                    ),
+                    (Err(a), Err(b)) => {
+                        assert_eq!(
+                            a.to_string(),
+                            b.to_string(),
+                            "offset {offset} bit {bit}: different error"
+                        );
+                        refused += 1;
+                    }
+                    (Ok(_), Err(e)) => panic!(
+                        "offset {offset} bit {bit}: fast path refused a stream the \
+                         sequential decoder accepts: {e}"
+                    ),
+                    (Err(e), Ok(_)) => panic!(
+                        "offset {offset} bit {bit}: fast path accepted a stream the \
+                         sequential decoder refuses: {e}"
+                    ),
+                }
+                agreed += 1;
+            }
+        }
+        assert!(agreed > 500, "only {agreed} mutations compared");
+        assert!(
+            refused > 100,
+            "only {refused} mutations were refused at all"
+        );
+    }
+
+    /// The literals scratch buffer is grow-only and shared across blocks, so a
+    /// short section decoded after a long one must never expose the long one's
+    /// tail.
+    ///
+    /// `decode_into` reports `(consumed, produced)` and leaves everything above
+    /// `produced` untouched on purpose — that is what removes the per-block
+    /// `resize` memset. The contract only holds if every caller slices to
+    /// `produced`; this pins the buffer's own half of it, in all four literals
+    /// block types.
+    #[test]
+    fn a_reused_scratch_never_exposes_the_previous_block() {
+        let long: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let mut decoder = LiteralsDecoder::new();
+        let mut scratch = Vec::new();
+
+        let long_section = crate::compressed_block::encode_literals_section_for_test(&long)
+            .expect("encode the long section");
+        let (_, produced) = decoder
+            .decode_into(&long_section, &mut scratch)
+            .expect("long section decodes");
+        assert_eq!(&scratch[..produced], &long[..]);
+        let grown = scratch.len();
+        assert!(grown >= long.len());
+
+        for short in [
+            b"tiny".to_vec(),
+            vec![b'Z'; 9],
+            (0..37u8).collect::<Vec<u8>>(),
+        ] {
+            let section = crate::compressed_block::encode_literals_section_for_test(&short)
+                .expect("encode the short section");
+            let (_, produced) = decoder
+                .decode_into(&section, &mut scratch)
+                .expect("short section decodes");
+            assert_eq!(produced, short.len(), "produced length");
+            assert_eq!(&scratch[..produced], &short[..], "short section bytes");
+            assert_eq!(
+                scratch.len(),
+                grown,
+                "the scratch must not shrink or regrow"
+            );
+        }
+    }
+
+    /// Arbitrary bytes offered as a literals section must be parsed or
+    /// refused, never panic, and never report more literals than the buffer
+    /// it filled.
+    ///
+    /// The section header is the first attacker-controlled length in a block,
+    /// and the rewritten decoder sizes a grow-only buffer from it and hands
+    /// the caller a `(consumed, produced)` pair instead of a `Vec` whose
+    /// length speaks for itself. Both halves of that contract are checked
+    /// here on inputs no encoder would ever produce: `produced` must be
+    /// within the buffer, `consumed` within the input, and neither the
+    /// four-stream jump table nor the Huffman table reader may index out of
+    /// bounds.
+    #[test]
+    fn arbitrary_bytes_are_parsed_or_refused_but_never_panic() {
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut scratch = Vec::new();
+        let mut decoded = 0usize;
+        for len in [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 20, 40, 100, 300, 1000] {
+            for _ in 0..200 {
+                let data: Vec<u8> = (0..len)
+                    .map(|_| (next_rand(&mut state) >> 24) as u8)
+                    .collect();
+                let mut decoder = LiteralsDecoder::new();
+                if let Ok((consumed, produced)) = decoder.decode_into(&data, &mut scratch) {
+                    assert!(
+                        consumed <= data.len(),
+                        "consumed {consumed} of {}",
+                        data.len()
+                    );
+                    assert!(
+                        produced <= scratch.len(),
+                        "produced {produced} of a {}-byte buffer",
+                        scratch.len()
+                    );
+                    assert!(produced <= MAX_BLOCK_SIZE, "produced {produced}");
+                    decoded += 1;
+                }
+                // A `Treeless` section is only meaningful after a table has
+                // been decoded, so drive that path too by reusing a decoder
+                // that has one.
+                let mut warm = LiteralsDecoder::new();
+                let _ = warm.decode_into(&data, &mut scratch);
+                let _ = warm.decode_into(&data, &mut scratch);
+            }
+        }
+        assert!(
+            decoded > 100,
+            "only {decoded} random sections decoded at all"
+        );
+    }
+
     #[test]
     fn test_parse_raw_literals_small() {
         // Raw literals, size format 0/2, 5 bits size

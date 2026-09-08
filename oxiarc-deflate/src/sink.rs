@@ -261,6 +261,11 @@ impl InflateSink for GrowSink<'_> {
 pub(crate) struct BoundedSink<'a, 'h> {
     dst: &'a mut [u8],
     pos: usize,
+    /// Where this sink started writing. `written()` counts from here, not
+    /// from `dst[0]`, so a resumed sink reports what *this* call produced —
+    /// which is what the decoder's limit handling means by "has this call
+    /// produced anything yet".
+    start: usize,
     history: Option<&'h History>,
 }
 
@@ -270,6 +275,7 @@ impl<'a, 'h> BoundedSink<'a, 'h> {
         Self {
             dst,
             pos: 0,
+            start: 0,
             history,
         }
     }
@@ -287,7 +293,12 @@ impl<'a, 'h> BoundedSink<'a, 'h> {
         history: Option<&'h History>,
     ) -> Self {
         let pos = position.min(dst.len());
-        Self { dst, pos, history }
+        Self {
+            dst,
+            pos,
+            start: pos,
+            history,
+        }
     }
 
     #[inline]
@@ -480,7 +491,7 @@ impl InflateSink for BoundedSink<'_, '_> {
 
     #[inline(always)]
     fn written(&self) -> usize {
-        self.pos
+        self.pos - self.start
     }
 }
 

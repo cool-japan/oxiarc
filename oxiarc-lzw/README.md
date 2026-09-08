@@ -25,7 +25,7 @@ LZW is a dictionary-based compression algorithm used in TIFF images, GIF animati
 - **Configurable** - Adjustable code width (9-16 bits; 12 is the TIFF/GIF ceiling, 16 the `compress` one)
 - **Early change** - Code width increases before table full
 - **Zero-allocation strip decode** - `decompress_tiff_into(src, &mut dst)` expands codes straight into a caller-supplied buffer through a packed prefix/suffix code table; no allocation per decoded code, and none at all beyond the fixed table
-- **Within 1.4x of libtiff** - the decoder is measured against libtiff 4.7.1's own `LZWDecode` on strips libtiff produced: **0.73-0.80x of its throughput**, i.e. 1.25x-1.37x of its decode time (see [Performance](#performance) and `examples/lzw_vs_libtiff.rs`)
+- **Within 1.4x of libtiff** - the decoder is measured against libtiff 4.7.1's own `LZWDecode` on strips libtiff produced: **0.73-0.80x of its throughput**, i.e. 1.25x-1.37x of its decode time (see [Performance](#performance) and `examples/lzw_vs_libtiff.rs`). Re-measured 2026-09-08 at load average 56-66 the band widens to 1.00x-1.56x of libtiff's decode time; that is a noisier measurement rather than a slower decoder — rows that agree to +-0.01x on a quiet machine scattered by +-0.3x at that load — so the figure quoted here, taken on a quiet one, remains the better estimate
 - **Old-style LZW** - `LzwConfig::TIFF_OLD_STYLE` decodes streams written with the standard (late) code-width change instead of TIFF's early change, i.e. writers that followed TIFF 6.0's pseudo-code literally
 - **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs`, `tests/tiffcp_strip_decode.rs` and the pinned fixtures in `tests/data/`), and GIF image data is checked against Pillow's own GIF decoder in both directions, including every minimum code size 2-8 (`tests/gif_oracle.rs`, feature `gif-oracle`)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs, for the generic codec and for `.Z`
@@ -168,14 +168,20 @@ part.
 | incompressible | 64 KiB - 1 MiB | 30 ms | 107 ms | 41 ms | 3.56x | **1.36x** | 2.62x |
 
 An independent sweep at load 7.3 and smaller runs at load 4.5-5.5 give the
-same ratios to within 0.02. On a *busy* box the estimator is what matters:
-a median over a handful of rounds scatters badly (individual fixtures
-anywhere from 1.09x to 2.03x above about load 20, both arms alike), but the
-**minimum** over many interleaved rounds does not, because contention can
-only ever inflate a sample. A 15-round re-measurement at load 26-36 taken
-that way reproduced the whole matrix — RGB8 1.33-1.34x, Gray16 1.25x, text
-1.27-1.28x, incompressible 1.35-1.37x, worst case **1.367x** — so the
-figures above survive a loaded machine when they are read as minima.
+same ratios to within 0.02. What matters on a busy box is measuring over
+*many* interleaved rounds rather than a few: a single round scatters (0.91x
+to 1.79x observed on individual rounds at load 26-36), but both the median
+and the minimum over 15 interleaved rounds are stable to 0.01. A 15-round
+re-measurement at load 26-36 reproduced the whole matrix — RGB8 1.33-1.34x,
+Gray16 1.25x, text 1.27-1.28x, incompressible 1.35-1.37x, worst case
+**1.367x** — and a 7-round run at load 46 gave a worst case of 1.41x. That
+series continues: three 7-round runs on 2026-09-08 at **load 56-66** gave
+per-row medians of 1.00x-1.56x (median of the three run medians per row), worst
+case **1.56x**, with rows that agree to +-0.01x on a quiet machine scattering by
++-0.3x — `text r64` came out at 0.95x, 1.55x and 1.00x on the same bytes. The
+band widens with load and its centre does not move, which is the point: quote an
+estimator over many interleaved rounds, never a single round, and read the
+quiet-machine figures above as the estimate of the code's cost.
 
 The figures are flat across the strip-size sweep (60 KiB, 256 KiB, 1 MiB),
 so building one code table per strip costs under 1.3 us. GIF image data

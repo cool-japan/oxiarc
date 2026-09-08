@@ -7,7 +7,7 @@ Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-07) — 275 tests passing (+ 11 doctests, 13 with
+**Version 0.4.2** (2026-09-08) — 277 tests passing (+ 12 doctests, 14 with
 `--all-features`).
 
 **What's new in 0.4.2**:

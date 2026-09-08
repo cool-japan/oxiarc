@@ -46,6 +46,9 @@
       Gray16 55 / 103 / **69 ms** (1.86x -> **1.25x**),
       text 23 / 38 / **30 ms** (1.62x -> **1.28x**),
       incompressible 30 / 107 / **41 ms** (3.56x -> **1.36x**).
+      Re-measured 2026-09-08 at load 56-66 (three runs of 7 interleaved
+      rounds): per-row medians 1.00x-1.56x of libtiff, worst case 1.56x —
+      the same centre with a load-widened band, not a slower decoder.
       Flat across the strip-size sweep, so one table per strip costs
       under 1.3 us
 - [x] `gif_decompress` moved onto the shared decode loop (new in 0.4.2): it

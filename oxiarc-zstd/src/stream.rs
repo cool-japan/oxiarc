@@ -336,7 +336,7 @@ impl ZstdStream {
     /// because they keep no window ring: [`decompress_with_limit`] and
     /// [`decompress_multi_frame_with_limit`] refuse only a declaration past the
     /// reference decoder's own 128 MiB ceiling (raised further by a larger
-    /// output limit — see [`limit_window`]), and the unbounded
+    /// output limit — see `limit_window`), and the unbounded
     /// [`crate::decompress`] and [`crate::decompress_multi_frame`] apply none
     /// at all, since their output `Vec` *is* their window and a declaration
     /// alone costs no memory there.
@@ -1207,20 +1207,25 @@ fn execute_sequences(
     let mut produced = 0usize;
 
     for seq in sequences {
-        if seq.literal_length > 0 {
+        // A `Sequence` holds `u32`s because the format bounds all three below
+        // `2^32`; widening here is lossless on every pointer width this crate
+        // supports (32 and 64 bits).
+        let literal_length = seq.literal_length as usize;
+        let match_length = seq.match_length as usize;
+        if literal_length > 0 {
             let end = lit_pos
-                .checked_add(seq.literal_length)
+                .checked_add(literal_length)
                 .filter(|e| *e <= literals.len())
                 .ok_or_else(|| {
                     OxiArcError::corrupted(0, "literal length exceeds available literals")
                 })?;
-            produced = charge(produced, seq.literal_length, limits)?;
+            produced = charge(produced, literal_length, limits)?;
             window.push(&literals[lit_pos..end])?;
             lit_pos = end;
         }
-        if seq.match_length > 0 {
-            produced = charge(produced, seq.match_length, limits)?;
-            window.copy_match(seq.offset, seq.match_length)?;
+        if match_length > 0 {
+            produced = charge(produced, match_length, limits)?;
+            window.copy_match(seq.offset as usize, match_length)?;
         }
     }
 
@@ -1409,10 +1414,10 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 /// than `max_output` is refused *before* anything is decoded.
 ///
 /// The declared `Window_Size` is bounded only against
-/// [`limit_window`]`(max_output)` — the larger of `max_output` and the
+/// `limit_window(max_output)` — the larger of `max_output` and the
 /// reference decoder's own 128 MiB default. It is deliberately not tied to
 /// `max_output`: a piped `zstd -3` frame declares a 2 MiB window whatever its
-/// payload, so that rule would reject ordinary input (see [`limit_window`]).
+/// payload, so that rule would reject ordinary input (see `limit_window`).
 ///
 /// The unbounded [`crate::decompress`] and [`crate::decompress_multi_frame`]
 /// apply no window ceiling at all: their output `Vec` is their window, so a
@@ -1451,13 +1456,13 @@ pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
 /// dropped, trailing bytes that start no frame end the stream gracefully once
 /// at least one frame has been decoded, and garbage *before* any frame is an
 /// error — but the total output is bounded by `max_output`, and the declared
-/// window against [`limit_window`], exactly as in [`decompress_with_limit`].
+/// window against `limit_window`, exactly as in [`decompress_with_limit`].
 ///
 /// # Errors
 ///
 /// [`OxiArcError::MemoryBudgetExceeded`] when the frames would produce more
 /// than `max_output` bytes in total, or one declares a window past
-/// [`limit_window`]`(max_output)`; otherwise the usual corrupted-data errors.
+/// `limit_window(max_output)`; otherwise the usual corrupted-data errors.
 ///
 /// # Example
 ///

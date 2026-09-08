@@ -10,7 +10,9 @@
 
 mod common;
 
-use oxiarc_http::{ContentCoding, DecodeLimits, DecodedBody, Decoder, FlushMode, decode_body};
+use oxiarc_http::{
+    ContentCoding, DecodeLimits, DecodedBody, Decoder, FlushMode, TrailingData, decode_body,
+};
 use proptest::prelude::*;
 
 fn encode(coding: &ContentCoding, plain: &[u8]) -> Vec<u8> {
@@ -476,5 +478,126 @@ proptest! {
             let wire = encode(&coding, &plain);
             prop_assert_eq!(decode_in_chunks(&coding, &wire, chunk), plain.clone(), "{}", coding);
         }
+    }
+}
+
+/// The trailing-garbage verdict must not depend on the *read granularity*
+/// either — not just on where a two-way split falls.
+///
+/// Regression: the adapters closed the body the moment the coded stream
+/// reported `StreamEnd`, without first establishing that the source was
+/// spent. The four codings differ in whether they need a further byte to
+/// report `StreamEnd` at all, so with the body delivered one byte per `read`
+/// the `br` stream ended on a round of its own and `XXXX` was never read:
+/// `read_to_end` returned `Ok(20_000)` where every other coding, and `br` at
+/// every coarser granularity, returned an error. Found while fixing a
+/// `BrotliStream` stall that had been masking it (the stalled decoder kept
+/// asking for input, which pulled the garbage in by accident).
+#[test]
+fn trailing_garbage_is_rejected_one_byte_at_a_time() {
+    let plain = common::text(20_000);
+    for coding in codings() {
+        if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+            // No end-of-stream marker: every byte is body. See the sibling
+            // test above.
+            continue;
+        }
+        let wire = encode(&coding, &plain);
+
+        // One byte per `read`, garbage included.
+        let mut parts: Vec<Vec<u8>> = wire.iter().map(|b| vec![*b]).collect();
+        parts.extend(b"XXXX".iter().map(|b| vec![*b]));
+        let mut body = DecodedBody::with_codings(
+            Parts { parts, index: 0 },
+            std::slice::from_ref(&coding),
+            &DecodeLimits::default(),
+        )
+        .expect("decoder");
+        assert!(
+            body.read_to_vec().is_err(),
+            "{coding}: trailing garbage slipped through at one-byte read granularity"
+        );
+
+        // And the clean body at the same granularity must still decode.
+        let parts: Vec<Vec<u8>> = wire.iter().map(|b| vec![*b]).collect();
+        let mut body = DecodedBody::with_codings(
+            Parts { parts, index: 0 },
+            std::slice::from_ref(&coding),
+            &DecodeLimits::default(),
+        )
+        .expect("decoder");
+        assert_eq!(
+            body.read_to_vec().expect("a clean body must still decode"),
+            plain,
+            "{coding}: clean body at one-byte granularity"
+        );
+    }
+}
+
+/// `TrailingData::Ignore` must still close as soon as the coded stream ends,
+/// without reading a byte the caller never asked for — the deferred close is
+/// only for policies that actually inspect what follows.
+#[test]
+fn an_ignore_policy_closes_without_draining_the_source() {
+    let plain = common::text(4_000);
+    for coding in codings() {
+        if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+            continue;
+        }
+        let wire = encode(&coding, &plain);
+        let mut parts: Vec<Vec<u8>> = wire.iter().map(|b| vec![*b]).collect();
+        parts.push(b"XXXX".to_vec());
+        let decoder = Decoder::new(std::slice::from_ref(&coding), &DecodeLimits::default())
+            .expect("decoder")
+            .trailing_data(TrailingData::Ignore);
+        let mut body = DecodedBody::with_decoder(Parts { parts, index: 0 }, decoder);
+        assert_eq!(
+            body.read_to_vec()
+                .expect("Ignore must accept trailing data"),
+            plain,
+            "{coding}: Ignore policy"
+        );
+    }
+}
+
+/// `TrailingData::AllowZeros` is the third adapter path through the deferred
+/// close: unlike `Ignore` it *does* inspect what follows, so the body must
+/// stay open until the source is spent, and unlike `Reject` a run of NULs is
+/// an acceptable tail. Both halves are pinned at one-byte read granularity,
+/// the shape that exposed the granularity dependence in the first place.
+#[test]
+fn an_allow_zeros_policy_is_granularity_independent_too() {
+    let plain = common::text(4_000);
+    for coding in codings() {
+        if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+            continue;
+        }
+        let wire = encode(&coding, &plain);
+
+        // NUL padding is accepted.
+        let mut parts: Vec<Vec<u8>> = wire.iter().map(|b| vec![*b]).collect();
+        parts.extend(std::iter::repeat_n(vec![0u8], 8));
+        let decoder = Decoder::new(std::slice::from_ref(&coding), &DecodeLimits::default())
+            .expect("decoder")
+            .trailing_data(TrailingData::AllowZeros);
+        let mut body = DecodedBody::with_decoder(Parts { parts, index: 0 }, decoder);
+        assert_eq!(
+            body.read_to_vec()
+                .expect("AllowZeros must accept a NUL tail"),
+            plain,
+            "{coding}: AllowZeros with a NUL tail"
+        );
+
+        // A non-zero tail is still rejected, at the same granularity.
+        let mut parts: Vec<Vec<u8>> = wire.iter().map(|b| vec![*b]).collect();
+        parts.extend(b"XXXX".iter().map(|b| vec![*b]));
+        let decoder = Decoder::new(std::slice::from_ref(&coding), &DecodeLimits::default())
+            .expect("decoder")
+            .trailing_data(TrailingData::AllowZeros);
+        let mut body = DecodedBody::with_decoder(Parts { parts, index: 0 }, decoder);
+        assert!(
+            body.read_to_vec().is_err(),
+            "{coding}: AllowZeros must still reject a non-zero tail"
+        );
     }
 }

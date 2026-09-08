@@ -31,12 +31,24 @@ pub enum OxiArcError {
         method: String,
     },
 
-    /// CRC checksum mismatch.
-    #[error("CRC mismatch: expected {expected:#x}, computed {computed:#x}")]
+    /// A stored checksum did not match the one computed over the decoded
+    /// bytes.
+    ///
+    /// The variant is named for the CRC-32 that raises it most often, but
+    /// it carries **every** whole-stream checksum this workspace verifies:
+    /// ZIP/gzip/LZH/CAB CRC-32, gzip's `FHCRC` header CRC-16, xz's and
+    /// Zstandard's frame checks, and zlib's **Adler-32** trailer (RFC 1950
+    /// §2.2 and §8.2 — `oxiarc_deflate`'s zlib framing, which PNG, TIFF
+    /// Deflate strips and HTTP `Content-Encoding: deflate` all decode
+    /// through). The message therefore says "checksum mismatch" rather than
+    /// naming an algorithm it cannot know: it used to say "CRC mismatch"
+    /// for an Adler-32, which sent a debugging user looking for the wrong
+    /// field. Each raise site names its own algorithm in its rustdoc.
+    #[error("checksum mismatch: expected {expected:#x}, computed {computed:#x}")]
     CrcMismatch {
-        /// Expected CRC value from archive.
+        /// Expected checksum value, as stored in the stream.
         expected: u32,
-        /// Computed CRC value from data.
+        /// Checksum actually computed over the decoded bytes.
         computed: u32,
     },
 
@@ -151,7 +163,10 @@ impl OxiArcError {
         }
     }
 
-    /// Create a CRC mismatch error.
+    /// Create a checksum mismatch error.
+    ///
+    /// Covers every whole-stream checksum, not only CRC-32 — see
+    /// [`OxiArcError::CrcMismatch`].
     pub fn crc_mismatch(expected: u32, computed: u32) -> Self {
         Self::CrcMismatch { expected, computed }
     }
@@ -231,8 +246,16 @@ mod tests {
         let err = OxiArcError::invalid_magic(vec![0x50, 0x4B], vec![0x1F, 0x8B]);
         assert!(err.to_string().contains("Invalid magic"));
 
+        // FINALGATE F5: the message must not name an algorithm the variant
+        // cannot know — it also carries zlib's Adler-32 trailer.
         let err = OxiArcError::crc_mismatch(0x12345678, 0xDEADBEEF);
-        assert!(err.to_string().contains("CRC mismatch"));
+        let text = err.to_string();
+        assert!(text.contains("checksum mismatch"), "{text}");
+        assert!(!text.contains("CRC mismatch"), "{text}");
+        assert!(
+            text.contains("0x12345678") && text.contains("0xdeadbeef"),
+            "{text}"
+        );
 
         let err = OxiArcError::unsupported_method("-lh9-");
         assert!(err.to_string().contains("-lh9-"));

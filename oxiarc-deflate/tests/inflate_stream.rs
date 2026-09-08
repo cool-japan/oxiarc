@@ -9,6 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use oxiarc_core::error::OxiArcError;
 use oxiarc_core::traits::FlushMode;
 use oxiarc_deflate::{
     Deflater, InflateStatus, InflateStream, InflateWrapper, TrailingPolicy, WrappedInflate,
@@ -548,7 +549,14 @@ fn f5_gzip_fhcrc_is_verified_by_default() {
     bad[12] ^= 0xFF;
     let mut decoder = WrappedInflate::new(InflateWrapper::Gzip);
     let err = wrapped_decode(&mut decoder, &bad, 1, 8, payload.len()).expect_err("bad FHCRC");
-    assert!(err.to_string().contains("CRC"), "{err}");
+    // `FHCRC` really is a CRC-16, but the shared variant carries every
+    // checksum this workspace verifies, so the message is algorithm-neutral
+    // (FINALGATE F5).
+    assert!(
+        matches!(err, OxiArcError::CrcMismatch { .. }),
+        "expected a checksum mismatch, got {err:?}"
+    );
+    assert!(err.to_string().contains("checksum mismatch"), "{err}");
 
     // Opting out accepts it.
     let mut decoder = WrappedInflate::new(InflateWrapper::Gzip).verify_header_crc(false);
@@ -679,7 +687,12 @@ fn f8_zlib_fdict_streams() {
         WrappedInflate::new(InflateWrapper::Zlib).with_dictionary(b"a different dictionary");
     let err = wrapped_decode(&mut decoder, &compressed, 1, 9, payload.len())
         .expect_err("wrong dictionary");
-    assert!(err.to_string().contains("CRC"), "{err}");
+    // `DICTID` is an Adler-32 of the dictionary, not a CRC.
+    assert!(
+        matches!(err, OxiArcError::CrcMismatch { .. }),
+        "expected a checksum mismatch, got {err:?}"
+    );
+    assert!(err.to_string().contains("checksum mismatch"), "{err}");
 
     // No dictionary at all.
     let mut decoder = WrappedInflate::new(InflateWrapper::Zlib);

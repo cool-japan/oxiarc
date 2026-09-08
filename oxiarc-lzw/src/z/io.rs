@@ -108,7 +108,7 @@ impl<R: Read> ZReader<R> {
     /// Consume the adapter and return the inner reader.
     ///
     /// The reader is **not** positioned at the end of the `.Z` stream: this
-    /// adapter pulls up to [`READ_CHUNK`] bytes at a time, so it will
+    /// adapter pulls up to `READ_CHUNK` (16 KiB) bytes at a time, so it will
     /// normally have consumed some bytes past the last code. Anything still
     /// buffered — decoded output not yet handed out, and compressed input
     /// not yet decoded — is dropped. Use this to recover ownership, not to

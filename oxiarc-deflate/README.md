@@ -7,7 +7,7 @@ Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-07) — 422 tests passing (381 via `cargo nextest run --all-features` + 41 doctests).
+**Version 0.4.2** (2026-09-08) — 507 tests passing (455 via `cargo nextest run --all-features` + 52 doctests).
 
 **What's new in 0.4.2**: **Resumable inflate, and every decode path re-based on it.** New `InflateStream` (raw DEFLATE) and `WrappedInflate` (gzip/zlib/raw/auto framing) are push decoders: an arbitrary byte split of the same stream yields byte-identical output, because a half-parsed Huffman header, a partially consumed byte and a half-copied match all survive across calls. New `InflateReader<R: Read>` and `AsyncInflateReader<R: AsyncRead>` (feature `async-io`) drive them from any source, with a mandatory 64 KiB output staging buffer, `Interrupted` retry, `WouldBlock` propagated (never turned into a bogus end-of-stream), and truncation reported as an `io::Error` rather than a short read.
 
@@ -503,6 +503,159 @@ enters the number. macOS aarch64, release:
 
 The low end is incompressible data (where both encoders are memcpy-bound) and
 the high end is run-heavy data.
+
+### Decode throughput
+
+`cargo run --release --example inflate_ab` decodes the **same bytes** through
+all four entry points — `inflate()`, `InflateStream`, `WrappedInflate`,
+`InflateReader` — plus `inflate_into`, and against python's
+`zlib.decompress`, over six data shapes x three sizes x levels 1/6/9. Every
+arm's output is checked against the original before it is timed, and the
+rounds are interleaved so a loaded machine cannot favour one side.
+
+The reference is CPython 3.14 on macOS, which links `/usr/lib/libz.1.dylib`
+1.2.12 — Apple's tuned system zlib, not stock zlib; that is the bar the
+ratios below are measured against.
+
+**Before / after, interleaved.** Both binaries — the crate as it was before
+this work and as it is now — are run alternately on the same corpora, so
+neither side gets a quieter machine than the other (this one is shared; the
+runs below carried a load average of ~40-50).
+
+Every figure below is a **median**: the harness takes the median of its
+iterations inside a round, and these tables take the median of that across
+the interleaved rounds (three at 64 KiB and 1 MiB, two at 16 MiB). Ranges
+span levels 1/6/9. The last column repeats the same ratio computed from each
+round's *best* iteration rather than its median — the load-robust figure.
+The two diverge on a machine at load ~45, and quoting only the kinder of
+them per row would make the table unfalsifiable, so both are here.
+
+1 MiB payloads:
+
+| Shape | `inflate_into` before -> after | worst arm vs python, medians | best-of-round |
+|-------|------------------------------:|-----------------------------:|--------------:|
+| png-filtered-rows | 1008-1032 -> 1649-1701 (1.6x) | 0.52-0.61x -> **0.86-0.87x** | 0.51-0.58x -> 0.77-0.83x |
+| text | 576-989 -> 910-1625 (1.6x) | 0.41-0.54x -> **0.65-0.78x** | 0.39-0.51x -> 0.63-0.74x |
+| many-blocks-text | 478-572 -> 696-868 (1.5x) | 0.45-0.48x -> **0.66-0.72x** | 0.44-0.47x -> 0.64-0.70x |
+| repetitive-json | 2964-3298 -> 3773-3812 (1.1-1.3x) | 0.96-0.97x -> **1.10-1.13x** | 0.87-0.93x -> 1.01-1.02x |
+| rgb8-image-rows | 278-281 -> 307-310 (1.1x) | 0.56-0.60x -> **0.65-0.67x** | 0.57-0.60x -> 0.65-0.66x |
+| incompressible | 30848-32832 -> 31048-34090 (1.0x) | 2.54-2.80x -> **2.75-2.92x** | 2.34-2.41x -> 2.38-2.49x |
+
+64 KiB payloads (same method):
+
+| Shape | `inflate_into` before -> after | worst arm vs python, medians | best-of-round |
+|-------|------------------------------:|-----------------------------:|--------------:|
+| text | 318-798 -> 1037-1659 (2.1-3.3x) | 0.28-0.47x -> **0.60-0.79x** | 0.39-0.52x -> 0.67-0.78x |
+| png-filtered-rows | 2058-4412 -> 4673-8772 (2.0-2.3x) | 0.91-1.00x -> **1.22-1.67x** | 1.47-1.61x -> 1.37-1.77x |
+| many-blocks-text | 327-517 -> 804-934 (1.8-2.9x) | 0.37-0.47x -> **0.59-0.66x** | 0.44-0.47x -> 0.63-0.71x |
+| rgb8-image-rows | 187-188 -> 276-304 (1.5-1.6x) | 0.38-0.40x -> **0.46-0.61x** | 0.55-0.58x -> 0.60-0.62x |
+| repetitive-json | 1502-2451 -> 1936-3311 (0.8-1.9x) | 0.61-0.89x -> **0.68-0.87x** | 0.83-0.87x -> 0.91-0.93x |
+| incompressible | 12932-21129 -> 15625-22061 (0.7-1.6x) | 1.19-2.11x -> **1.14-1.56x** | 1.92-1.97x -> 1.72-2.07x |
+
+At 64 KiB a decode is 20-40 microseconds, so these rows carry the most
+noise: `repetitive-json` and `incompressible` even print a *slowdown* at one
+level each on medians while their best-of-round figures improve, which is
+timer scatter, not a regression. `incompressible` decodes stored blocks — a
+`memcpy` on both sides, never the target of this work. The 64 KiB
+`png-filtered-rows` row is degenerate for the opposite reason (4096-pixel
+scanlines mean 64 KiB is five rows, which compress 126x).
+
+The shapes are chosen for what they exercise:
+
+| Shape | What it costs |
+|-------|---------------|
+| `rgb8-image-rows` | almost pure literals — one table lookup per output byte, the decoder's hardest case |
+| `png-filtered-rows` | short literals plus short matches (a filtered scanline) |
+| `text` | the mixed case: literals and matches interleaved |
+| `repetitive-json` | long matches — the copy path |
+| `incompressible` | stored blocks — a `memcpy` |
+| `many-blocks-text` | a `Z_FULL_FLUSH` every 8 KiB, so the per-block Huffman table build dominates |
+
+16 MiB payloads (median of two interleaved rounds):
+
+| Shape | `inflate_into` before -> after | worst arm vs python, medians | best-of-round |
+|-------|------------------------------:|-----------------------------:|--------------:|
+| png-filtered-rows | 330-398 -> 491-583 (1.4-1.7x) | 0.36-0.46x -> **0.51-0.60x** | 0.38-0.43x -> 0.56-0.61x |
+| text | 489-907 -> 767-1578 (1.6-1.7x) | 0.39-0.52x -> **0.58-0.77x** | 0.40-0.54x -> 0.64-0.66x |
+| many-blocks-text | 474-536 -> 609-668 (1.2-1.3x) | 0.39-0.52x -> **0.66-0.72x** | 0.44-0.51x -> 0.67-0.76x |
+| repetitive-json | 2386-3335 -> 3607-3770 (1.1-1.6x) | 0.78-1.05x -> **0.74-1.05x** | 0.80-0.88x -> 0.76-1.02x |
+| rgb8-image-rows | 227-241 -> 242-274 (1.0-1.2x) | 0.54-0.64x -> **0.58-0.67x** | 0.57-0.59x -> 0.61-0.68x |
+| incompressible | 22978-27938 -> 24364-27174 (1.0x) | 2.23-3.00x -> **1.78-2.36x** | 2.04-2.46x -> 1.66-1.86x |
+
+**Where this lands, stated exactly.** The requirement was >= 0.60x of zlib
+on every shape, target 0.80x, and the reference here is CPython 3.14 on
+Apple's *tuned* system `libz` 1.2.12, not stock zlib. On medians:
+
+* **1 MiB: met on every shape and level** (0.65x-2.92x), with png-filtered
+  rows (0.86x), long-match JSON (1.10x-1.13x) and stored blocks (2.75x+)
+  past the 0.80x target.
+* **64 KiB: met on four of the six shapes.** `rgb8-image-rows` at level 6
+  measures 0.46x and `many-blocks-text` at level 9 0.59x. On the
+  best-of-round figure those same rows are 0.60x and 0.71x, and then every
+  64 KiB shape is at or above 0.60x — `rgb8-image-rows` exactly on the line.
+* **16 MiB: met on three of the six shapes** (`many-blocks-text`
+  0.66x-0.72x, `repetitive-json` 0.74x-1.05x, `incompressible` 1.78x+).
+  PNG-filtered rows measure 0.51x-0.60x, `rgb8-image-rows` 0.58x-0.67x and
+  `text` 0.58x-0.77x. On best-of-round five of the six are at or above
+  0.61x and png-filtered rows are 0.56x-0.61x. **Re-measured 2026-09-08**
+  across three more full 54-row passes, interleaved, at load average 60-71:
+  PNG-filtered rows at 16 MiB land at **0.47x-0.67x on medians and
+  0.48x-0.57x on best-of-round** — the same band and the same verdict, a
+  little lower at the top because those passes ran at a higher load than the
+  originals'. The whole-matrix worst arm came out at 0.47x, 0.48x and 0.41x
+  in the three runs, on three *different* rows (`many-blocks-text` @ 64 KiB
+  L9, `png-filtered-rows` @ 16 MiB L6, `text` @ 1 MiB L9), which is what a
+  load-bound measurement of microsecond rows looks like. The PNG corpus is only 2.6x
+  compressible at 16 MiB (against 7.9x at 1 MiB), i.e. at that size it is a
+  second literal-heavy shape.
+
+None of the shortfalls is a regression. On the four decode-bound shapes
+(`png-filtered-rows`, `rgb8-image-rows`, `text`, `many-blocks-text`) the
+python ratio improves in **all 36 rows** (four shapes x three levels x
+three sizes) and `inflate_into` is 1.04x (16 MiB image rows, which are
+memory-bound) to 3.3x (64 KiB text) faster. The two `memcpy`-bound shapes,
+`incompressible` (stored blocks) and `repetitive-json` (long matches), are
+unchanged within noise and scatter in both directions; neither is a target
+of this work, and both stay in the matrix as regression guards.
+
+The low end is the same two shapes throughout: nearly-pure literals
+(`rgb8-image-rows`, ~0.65x — one dependent table load per output byte, with
+no match copies to amortise it) and 16 MiB working sets. At 16 MiB *every*
+arm slows down, `inflate_into` — which stages nothing and retains no
+history — included, and the five arms stay within ~10 % of each other, so
+the cost is the working set rather than the push machinery; that split was
+not isolated further.
+
+At the other sizes the arms are likewise within a few percent of each
+other, with `inflate_into` into a pre-sized buffer the fastest.
+
+What the fast loop does per symbol, and why:
+
+* **One packed table entry.** `decode_table::DecodeTable` folds the symbol
+  kind, the code length, the extra-bit count and the payload (literal byte,
+  length base, distance base) into one `u32`, so a literal costs one masked
+  load and a match needs no `LENGTH_EXTRA_BITS` / `DISTANCE_EXTRA_BITS` /
+  `LENGTH_BASE` / `DISTANCE_BASE` lookups at all.
+* **One refill per iteration.** `BitCache::refill_bulk` brings the
+  accumulator to at least 56 bits with a single unaligned 64-bit load, which
+  covers the 48 bits a literal-plus-match iteration can consume; the
+  invariant is checked once per iteration, so no inner step re-checks how
+  many bits it has.
+* **Up to three literals per 32-bit peek**, with one `consume` for the
+  batch. Image rows are essentially all literals, and this is what the
+  batching is for.
+* **Word-sized match copies.** A short non-overlapping match is copied in
+  8-byte chunks inline; `memmove` is used only above 64 bytes
+  (`WORD_COPY_MAX`), where its vector width wins. (At DEFLATE's average
+  match length the *call* costs more than the copy.)
+* **The output cursor in a register.** The fast loop writes through the
+  caller's slice with a local cursor, and the growable entry points decode
+  into the tail of the buffer they are filling — so the window is written
+  once and back-references resolve in place.
+* **Allocation-free steady state.** Tables are rebuilt into their existing
+  buffers with zlib's one-pass `inflate_table` algorithm (counting sort plus
+  a backwards-incremented reversed code, no per-symbol bit reversal), and
+  the fixed tables are built once per process.
 
 ### Per-call cost
 

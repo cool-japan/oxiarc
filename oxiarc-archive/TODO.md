@@ -223,41 +223,44 @@
 
 ## Test Coverage
 
-Unit tests (in-module `#[cfg(test)]`), by area (recounted 2026-08-03 via
-`cargo nextest list -p oxiarc-archive --all-features`; the previous table
-predated several rounds of hardening work — CSPRNG-sourced ZIP crypto, 7z
-coder-chain budgeting, repair-module regression tests, and TAR PAX 1.0
-sparse support among them):
+Unit tests (in-module `#[cfg(test)]`), by area (recounted 2026-09-08 via
+`cargo nextest list -p oxiarc-archive --all-features`; the 2026-08-03 table
+this replaces predated the 0.4.2 cycle and still listed an `xz` unit-test
+module that no longer exists — `oxiarc-archive`'s `xz` is now a thin
+re-export of `oxiarc_lzma::xz`, whose tests live in that crate):
 
-- zip: 109 (headers, reader, writer, Zip64, data descriptors, streaming, encryption)
+- zip: 120 (headers, reader, writer, Zip64, data descriptors, streaming, encryption)
 - tar: 69 (PAX 0.1/1.0 sparse, GNU old-format sparse, GNU long names)
 - lzh: 55
+- cab: 50
 - iso9660: 26 (including cyclic-directory and depth/size-bound DoS guards)
-- xz: 20
-- sevenz (7z): 16
-- repair: 16
+- gzip: 21 (multi-member RFC 1952 §2.2 decode, trailing-padding vs garbage,
+  `FHCRC`, `with_max_output` bomb caps — 13 of these new in 0.4.2)
 - detect: 16
-- cab: 14
+- repair: 16
+- sevenz (7z): 16
 - brotli: 14
 - snappy: 12
 - bzip2: 11
 - zstd: 9
-- gzip: 8
 - lz4: 6
 - repair_zip / repair_tar: 4 / 3
 - async_zip / async_tar / async_lzh: 4 / 3 / 3
 
-Integration-test suites under `tests/` (110 tests across 19 files):
-`cab_interop`, `iso9660_interop`, `iso_sevenz_mutation`, `lzh_corpus_reader`,
-`lzh_ext_headers`, `lzh_japanese_names`, `lzh_large_payload`,
-`lzh_lha_oracle`, `lzh_lhd_lh1`, `sevenz_interop`, `tar_pax_japanese`,
-`tar_sparse_stream`, `test_multifile_bug`, `test_simple_deflate`,
-`xz_cli_interop`, `zip_cli_interop`, `zip_encryption_e2e`,
-`zip_name_encoding`, `zip_xz_sevenz_hardening`.
+Integration-test suites under `tests/` (125 tests across 21 files):
+`cab_interop` (11), `iso9660_interop` (11), `iso_sevenz_mutation` (4),
+`lzh_corpus_reader` (3), `lzh_ext_headers` (10), `lzh_japanese_names` (5),
+`lzh_large_payload` (2), `lzh_legacy_methods` (5), `lzh_legacy_oracle` (10),
+`lzh_lha_oracle` (6), `lzh_lhd_lh1` (4), `sevenz_interop` (8),
+`tar_pax_japanese` (11), `tar_sparse_stream` (2), `test_multifile_bug` (1),
+`test_simple_deflate` (2), `xz_cli_interop` (3), `zip_cli_interop` (6),
+`zip_encryption_e2e` (4), `zip_name_encoding` (6),
+`zip_xz_sevenz_hardening` (11).
 
-**Total: 528 tests** (`cargo nextest run -p oxiarc-archive --all-features`;
-497 with default features — the difference is the opt-in oracle-gated tests
-that shell out to reference tools).
+**Total: 583 tests** (458 unit + 125 integration;
+`cargo nextest run -p oxiarc-archive --all-features`, measured 2026-09-08),
+plus 31 doctests. Fewer with default features — the difference is the opt-in
+oracle-gated tests that shell out to reference tools.
 
 ## Code Statistics
 

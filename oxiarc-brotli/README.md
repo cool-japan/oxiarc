@@ -7,7 +7,7 @@ Pure Rust Brotli compression/decompression implementation (RFC 7932), part of th
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-08) | 343 tests + 21 doctests passing | Reference-interop verified (both directions)**
+**Version: 0.4.2 (2026-09-08) | 349 tests + 21 doctests passing | Reference-interop verified (both directions)**
 
 ## Features
 

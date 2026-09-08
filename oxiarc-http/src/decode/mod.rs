@@ -461,6 +461,16 @@ impl Decoder {
         }
     }
 
+    /// The trailing-data policy this decoder applies.
+    ///
+    /// Crate-private: the `Read`/`AsyncRead` adapters need it to decide
+    /// whether reaching the end of the coded stream is enough to close the
+    /// body, or whether the source must first be shown to be exhausted. See
+    /// `DecodedBody::fill`.
+    pub(crate) fn trailing_policy(&self) -> TrailingData {
+        self.trailing
+    }
+
     /// The codings this decoder undoes, in application order.
     ///
     /// Empty for a pass-through decoder; `identity` never appears.

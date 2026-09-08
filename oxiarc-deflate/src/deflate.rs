@@ -1,6 +1,7 @@
 //! DEFLATE compression (RFC 1951).
 //!
-//! [`Deflater`] drives the zlib-equivalent encoder in [`crate::encoder`]:
+//! [`Deflater`] drives the zlib-equivalent encoder in this crate's private
+//! `encoder` module:
 //! a persistent 32 KiB window with hash chains, zlib's per-level
 //! `configuration_table`, greedy matching at levels 1-3 and lazy matching
 //! (with the `TOO_FAR` rule) at levels 4-9, blocks cut at 16 383 symbols, and

@@ -155,11 +155,18 @@ Targets, in the priority order called out for this hardening pass:
      `fuzz_wrapped_inflate` (`WrappedInflate` fine vs coarse split, all four
      of `Raw`/`Zlib`/`Gzip`/`Auto`), `fuzz_inflate_reader` (`InflateReader`
      under adversarial short reads vs a direct `WrappedInflate` drive),
-     `fuzz_brotli_stream` (`BrotliStream` vs `oxiarc_brotli::decompress`),
-     `fuzz_zstd_stream` (`ZstdStream` vs `decompress_multi_frame`;
-     see that target's module doc for why only "both accept ⇒ byte-equal"
-     is asserted), and `fuzz_png_streaming` (`StreamingDecoder`'s event
-     sequence, whole-buffer vs piecewise, through one shared helper).
+     `fuzz_brotli_stream` (`BrotliStream` vs `oxiarc_brotli::decompress`,
+     with the harness's window capped at 1 MiB so a `WBITS = 24` input costs
+     a refusal instead of a 16 MiB allocation — a `WindowTooLarge` from the
+     chunked path is the one excluded divergence, see that target's module
+     doc),
+     `fuzz_zstd_stream` (`ZstdStream` vs `decompress_multi_frame`; accept/
+     refuse agreement is asserted in both directions, not just "both accept
+     ⇒ byte-equal" — see that target's module doc for the one documented
+     exception, a declared-window ceiling split, and the history of how the
+     other three initially-suspected exceptions were closed instead), and
+     `fuzz_png_streaming` (`StreamingDecoder`'s event sequence, whole-buffer
+     vs piecewise, through one shared helper).
    - *Never-panic decoder entry points*: `fuzz_png_decode`,
      `fuzz_jpeg_decode`, `fuzz_tiff_read`, `fuzz_tiff_ifd` (header/IFD chain
      only — cheaper, so it spends its whole budget on the parsing surface),

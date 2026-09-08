@@ -722,7 +722,11 @@ fn decompress_single_file_full(
     let (decompressed, original_name) = match format {
         ArchiveFormat::Gzip => {
             // gzip stores the uncompressed size (mod 2^32) as the trailing
-            // ISIZE field; use it as a guard before allocating.
+            // ISIZE field; use it as a guard before allocating. For a
+            // concatenated multi-member stream (RFC 1952 §2.2) that is only
+            // the *last* member's size, so it is an early-out, not the
+            // enforcement point: `with_max_output` below bounds the running
+            // total across every member, inside a DEFLATE block.
             if data.len() >= 4 {
                 let declared_size = u32::from_le_bytes([
                     data[data.len() - 4],
@@ -733,6 +737,9 @@ fn decompress_single_file_full(
                 check_memory_limit("gzip stream", declared_size, memory_limit)?;
             }
             let mut gzip = oxiarc_archive::GzipReader::new(reader)?;
+            if let Some(limit) = memory_limit {
+                gzip = gzip.with_max_output(limit);
+            }
             let name = gzip.header().filename.clone();
             (gzip.decompress()?, name)
         }

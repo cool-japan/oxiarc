@@ -286,9 +286,13 @@ fn oversized_literals_header_allocates_nothing() {
 
 /// `Number_of_Sequences` must not drive a reservation the bitstream cannot back.
 ///
-/// The three-byte form reaches 98 047, i.e. a ~2.3 MB `Vec<Sequence>`
+/// The three-byte form reaches 98 047, i.e. a ~1.2 MB `Vec<Sequence>`
 /// reservation bought with three bytes. Every sequence consumes at least one
 /// bit, so the reservation is clamped to `bitstream_len * 8`.
+///
+/// The ceiling asserted below is deliberately independent of `size_of::<Sequence>()`
+/// — it only has to be far below the unclamped reservation, whatever that
+/// costs per sequence.
 fn lying_sequence_count_allocates_nothing() {
     let mut payload = vec![0x00u8]; // empty Raw literals section
     payload.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // Number_of_Sequences = 98047

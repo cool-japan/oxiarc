@@ -24,8 +24,8 @@
 
 use oxiarc_core::traits::{CompressStatus, Compressor, DecompressStatus, Decompressor, FlushMode};
 use oxiarc_deflate::{
-    Deflater, Inflater, ZlibStreamDecoder, deflate, gzip_compress, gzip_decompress, inflate,
-    zlib_compress,
+    Deflater, InflateWrapper, Inflater, WrappedInflate, ZlibStreamDecoder, deflate, gzip_compress,
+    gzip_decompress, inflate, zlib_compress,
 };
 use std::io::Read;
 
@@ -490,4 +490,49 @@ fn test_zlib_stream_decoder_header_error_semantics() {
         .read_to_end(&mut output)
         .expect("trailing garbage after a complete member is tolerated");
     assert_eq!(output, b"payload");
+}
+
+/// FINALGATE F5: zlib's trailer is an **Adler-32**, not a CRC. The shared
+/// [`OxiArcError::CrcMismatch`] variant carries both (renaming it would be a
+/// breaking API change on a published crate), so the *message* must not name
+/// an algorithm the variant cannot know. It used to read "CRC mismatch" and
+/// sent anyone debugging a TIFF Deflate strip, a PNG `IDAT` chain or an HTTP
+/// `Content-Encoding: deflate` body looking for a CRC field that is not
+/// there.
+#[test]
+fn test_zlib_adler32_mismatch_is_not_reported_as_a_crc() {
+    let mut stream = zlib_compress(b"adler-32 guarded payload", 6).expect("zlib_compress");
+    let last = stream.len() - 1;
+    stream[last] ^= 0xFF;
+
+    // One-shot path.
+    let error = oxiarc_deflate::zlib_decompress(&stream).expect_err("a bad Adler-32 must fail");
+    assert!(
+        matches!(error, oxiarc_core::error::OxiArcError::CrcMismatch { .. }),
+        "unexpected error variant: {error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("checksum mismatch"), "{text}");
+    assert!(
+        !text.contains("CRC mismatch"),
+        "an Adler-32 failure must not be reported as a CRC: {text}"
+    );
+
+    // Streaming path (`WrappedInflate`), which PNG/TIFF/HTTP all use.
+    let mut core = WrappedInflate::new(InflateWrapper::Zlib);
+    let mut sink = vec![0u8; 256];
+    let error = core
+        .inflate(&stream, &mut sink, FlushMode::Finish)
+        .expect_err("a bad Adler-32 must fail on the streaming path too");
+    let text = error.to_string();
+    assert!(text.contains("checksum mismatch"), "{text}");
+    assert!(!text.contains("CRC mismatch"), "{text}");
+
+    // A genuine CRC-32 failure (gzip) reports through the same variant and
+    // the same wording — accurate for both, wrong for neither.
+    let mut gz = gzip_compress(b"crc guarded payload", 6).expect("gzip_compress");
+    let crc_byte = gz.len() - 8;
+    gz[crc_byte] ^= 0xFF;
+    let error = gzip_decompress(&gz).expect_err("a bad CRC-32 must fail");
+    assert!(error.to_string().contains("checksum mismatch"), "{error}");
 }

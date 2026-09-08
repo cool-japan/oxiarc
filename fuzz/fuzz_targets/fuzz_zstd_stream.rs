@@ -1,88 +1,146 @@
 //! Fuzz target for `oxiarc_zstd::ZstdStream`, the bounded resumable push
-//! decoder: fed at random split points, it must never panic or hang, and
-//! whenever it agrees with the whole-buffer reference
-//! `oxiarc_zstd::decompress_multi_frame()` that an input decodes, the two
-//! must produce byte-identical output.
+//! decoder: fed at random split points and compared against the
+//! whole-buffer reference `oxiarc_zstd::decompress_multi_frame()` (the
+//! crate's own one-shot counterpart to `ZstdStream::new()`'s
+//! `multi_frame: true` default — see "Reference-function choice" in
+//! History below).
+//!
+//! # Contract
+//!
+//! 1. **Never panic or hang.** A `CALL_GUARD` bounds `decode()` calls, so a
+//!    stalled state machine fails as a crash rather than a libFuzzer
+//!    timeout.
+//! 2. **`Ok` + `Ok` ⇒ byte-identical.** Whenever both sides accept the
+//!    input, their output must match exactly.
+//! 3. **`Err(reference)` + `Ok(stream)` is always a bug.** As of the ZSTD4
+//!    hardening pass (History, below), the legacy one-shot core
+//!    `decompress_multi_frame()` still uses refuses everything `ZstdStream`
+//!    refuses; there is no remaining, legitimate way for the streaming path
+//!    to accept something the reference does not.
+//! 4. **`Ok(reference)` + `Err(stream)` is a bug _unless_ the stream's error
+//!    is `OxiArcError::MemoryBudgetExceeded { budget: MAX_WINDOW_SIZE, .. }`
+//!    exactly** — the one surviving, deliberate split (finding 3 below),
+//!    and the only exception this target carves out.
+//!
+//! Rule 4's carve-out is pinned to the exact `budget` value, not just the
+//! error variant, so it cannot silently widen to swallow an unrelated
+//! defect even if the crate's internals change later: `decompress_multi_
+//! frame()` keeps no window ring of its own — its output `Vec` *is* the
+//! window, so a declared `Window_Size` costs it nothing and any declaration
+//! is accepted (`decompress`'s "Resource policy" doc section in
+//! `frame.rs`) — while `ZstdStream::new()` defaults to an 8 MiB
+//! `with_max_window` ceiling (`MAX_WINDOW_SIZE`, never changed by this
+//! target, which never calls `with_max_window`) and refuses a larger
+//! declared window in `begin_frame`, before a single block is decoded,
+//! reporting `budget: self.max_window` — always exactly `MAX_WINDOW_SIZE`
+//! here. Under *this* target's configuration (`ZstdStream::new()`, no
+//! `with_max_output` call) that window check is the *only* place
+//! `MemoryBudgetExceeded` can come from at all: with `max_output: None`,
+//! `check_budget` is a no-op, and the other `MemoryBudgetExceeded` site
+//! (`charge`'s own output-budget branch, inside block execution) is
+//! provably unreachable — `budget_max` degenerates to `rfc_max` when
+//! unbounded, which `charge_block` has already enforced (as a
+//! `CorruptedData` error, not `MemoryBudgetExceeded`) by the time `charge`
+//! re-checks it — and `ZstdWindow` (`window.rs`) is self-contained, with no
+//! `MemoryBudgetExceeded` site of its own (it does not wrap `oxiarc_core`'s
+//! `RingBuffer`, which does have one). So today, matching the variant alone
+//! would already be exact, not merely a loose net — but matching the exact
+//! `budget` value is strictly stronger for no extra cost: a future
+//! `MemoryBudgetExceeded` from anywhere else in the crate, reported with
+//! any other `budget`, still fails this guard and surfaces as a crash
+//! rather than being absorbed by a carve-out whose original justification
+//! no longer covers it.
+//!
+//! # History
 //!
 //! **Reference-function choice, and why it is not the single-frame
-//! `decompress()`:** `ZstdStream::new()` sets `multi_frame: true`
-//! (`stream.rs:277`) — after the first frame's `StreamEnd`, feeding it more
-//! bytes transparently starts decoding a second concatenated frame, exactly
-//! like `decompress_multi_frame` (concatenating each frame's output), *not*
-//! like the single-frame `decompress()` (which decodes only the first frame
-//! and silently ignores everything after it, undocumented in its own
-//! signature). An earlier version of this target compared against
-//! `decompress()` and immediately found a 2-concatenated-frame input where
-//! `decompress()` returned one frame's output while `ZstdStream` correctly
-//! returned both frames' — not a crate bug, a wrong-reference-function bug
-//! in this target, fixed by switching to `decompress_multi_frame`.
+//! `decompress()`:** an earlier version of this target compared against
+//! `decompress()`, which decodes only the first frame and silently drops
+//! everything after it — wrong, because `ZstdStream::new()` sets
+//! `multi_frame: true` and, after one frame's `StreamEnd`, transparently
+//! starts decoding a second concatenated frame. Fixed by switching to
+//! `decompress_multi_frame()`, the crate's actual one-shot counterpart.
 //!
-//! **`decompress_multi_frame()` accepting where `ZstdStream` refuses is
-//! deliberately *not* asserted as a bug** (see the `Ok`+`Err` match arm).
-//! This was not the starting assumption — it is the conclusion of six
-//! separate fuzzing iterations against this exact pair, each initially
-//! treated as "add one more named carve-out", until the pattern itself
-//! became the finding. In order, all discovered empirically, unseeded,
-//! inside roughly ten cumulative minutes of fuzzing a pair nothing had ever
-//! compared against each other before this session:
+//! **Four distinct, independently-rooted `Ok(reference)` + `Err(stream)`
+//! divergences**, found unseeded across several fuzzing passes once the
+//! reference-function bug above was fixed (original analysis: track
+//! FUZZCLI; hardening: track ZSTD4; further verification: track
+//! ZSTD4-verify). Three are now fixed in code shared by both paths; the
+//! fourth remains a deliberate, permanent split and is the sole exception
+//! contract rule 4 (above) carves out:
 //!
-//! 1. A frame whose `Dictionary_ID` names a dictionary the caller did not
-//!    supply (`stream.rs`'s `begin_frame`; error text
-//!    `"requires dictionary ID"` — pinned contract: `oxiarc-zstd/src/
-//!    read.rs`'s own `dictionary_id_frame_is_refused_without_a_dictionary`
-//!    test asserts on this exact substring). RFC 8878-correct; the legacy
-//!    per-frame decoder never checked it.
-//! 2. A block whose regenerated size exceeds `min(Window_Size, 128 KiB)`
-//!    further bounded by any declared `Frame_Content_Size` (`stream.rs`'s
-//!    `block_rfc_max`, doc-commented there as "exceeding it is always a
-//!    format error"). RFC 8878-correct; the legacy path never checked it.
-//! 3. A frame declaring a `Window_Size` over `ZstdStream::new()`'s default
-//!    `with_max_window` ceiling (`"memory budget exceeded"`) — the legacy
-//!    path has no window ceiling at all (exactly why `decompress_with_
-//!    limit`/`decompress_multi_frame_with_limit` exist as *separate*,
-//!    purpose-built bounded entry points: the bare `decompress_multi_
-//!    frame()` used as this target's reference was never meant to be
-//!    resource-safe on untrusted input by itself).
-//! 4. Three *different* symptoms of one root cause — `decompress_multi_
-//!    frame`'s outer loop breaking the instant it meets fewer than 4 bytes,
-//!    an unrecognized 4-byte magic, or (inside a skippable frame) a
-//!    truncated size field, at *any* position including the very first,
-//!    and returning whatever was accumulated (`Ok(vec![])` before anything
-//!    decoded — its own doc comment: "trailing garbage is tolerated",
-//!    which turns out to apply to *leading* garbage too). Observed
-//!    `ZstdStream` error texts for the identical condition:
-//!    `"truncated Zstandard frame magic"`, `"Invalid magic number: ..."`,
-//!    `"truncated skippable frame size"` — a fourth phrasing is plausible.
-//!    `ZstdStream`'s own EOF-handling comment (`stream.rs:585-591`) says it
-//!    means to match `decompress_multi_frame` exactly here, and its coded
-//!    condition just doesn't cover this one boundary case — the most
-//!    likely of the four to be a fixable `ZstdStream` bug rather than an
-//!    intentional split, but still not this track's crate to fix.
+//! 1. **`Dictionary_ID` never validated by the legacy path — FIXED,
+//!    shared.** A frame naming a dictionary the caller did not supply
+//!    decoded to silently wrong bytes via `decompress_multi_frame()` while
+//!    `ZstdStream` correctly refused it. `frame::require_dictionary` is now
+//!    the single implementation both paths call, producing the identical
+//!    `OxiArcError::InvalidHeader` ("requires dictionary ID ...").
+//! 2. **A block's regenerated size was never checked against
+//!    `min(Window_Size, 128 KiB)` (further bounded by any declared
+//!    `Frame_Content_Size`) by the legacy path — FIXED, shared.**
+//!    `frame::charge_block` is now called from both `ZstdStream`'s
+//!    per-sequence executor and the legacy `execute_sequences`, so a block
+//!    over the RFC ceiling is refused identically on both paths, with the
+//!    same "block regenerated size N exceeds the frame maximum M" text.
+//! 3. **`ZstdStream::new()`'s default `with_max_window` ceiling has no
+//!    equivalent in the legacy path — DELIBERATE, DOCUMENTED, PERMANENT.**
+//!    A frame declaring an ~11 MB window decoded fine via
+//!    `decompress_multi_frame()` (its output `Vec` is its window) but was
+//!    refused by `ZstdStream` with `MemoryBudgetExceeded`. Investigated and
+//!    confirmed structurally unfixable-as-a-shared-rule by track ZSTD4: a
+//!    `Window_Size` is not an output size, and an ordinary piped
+//!    `zstd -3`/`--long` frame declares a window with nothing to do with
+//!    its payload length — a rule phrased purely in terms of the
+//!    declaration cannot refuse the malicious shape and accept the benign
+//!    one, since the two are structurally identical. This is why the
+//!    bounded one-shot helpers (`decompress_with_limit`,
+//!    `decompress_multi_frame_with_limit`) exist as *separate*,
+//!    purpose-built entry points rather than a tightened
+//!    `decompress_multi_frame()` — and why this target does not compare
+//!    against them instead: their window ceiling is
+//!    `max(max_output, 128 MiB)` (`zstd -d`'s own default), which can
+//!    never be pushed down to `ZstdStream::new()`'s 8 MiB by any choice of
+//!    `max_output`, so no such reference reproduces this exact split (and
+//!    a budgeted reference would also newly diverge in rule 3's direction,
+//!    refusing on output size alone for any input past its budget that
+//!    `ZstdStream::new()`, having no `with_max_output` of its own, still
+//!    accepts). This is the one exception contract rule 4 encodes.
+//! 4. **EOF/frame-boundary classification — FIXED, shared.** Originally
+//!    reported as three different symptoms of one root cause (an
+//!    unrecognized leading magic, a magic cut short by EOF, or a truncated
+//!    skippable-frame size field, each returning `Ok(vec![])` from
+//!    `decompress_multi_frame()` instead of an error, at any position
+//!    including the very first). Track ZSTD4 traced this to the *legacy*
+//!    path being the lenient one, not a `ZstdStream` bug: `ZstdStream`'s
+//!    own EOF condition already matched its stated intent. Both
+//!    `decompress_multi_frame` and `decompress_multi_frame_with_dict` now
+//!    share one `multi_frame_scan` that mirrors `ZstdStream`'s state
+//!    machine exactly (see `decompress_multi_frame`'s own "Where the
+//!    stream ends" doc section). Track ZSTD4-verify's follow-up pass found
+//!    and fixed one more edge in the same family: a *skippable* frame in
+//!    front of the real frame was walked past by `ZstdStream`,
+//!    `decompress_into` and `decompress_with_limit`, but rejected by
+//!    `decompress`/`decompress_multi_frame`/`ZstdDecoder::decode_frame` —
+//!    also now shared (`frame::skippable_prefix_len`).
 //!
-//! No two of these four share a root cause, and the fourth **had already
-//! replaced two prior string-matched carve-outs with a structural one**
-//! before finding #3 (window budget) — a fresh, fifth, again-distinct
-//! category — arrived. Chasing a sixth or seventh would not change the
-//! conclusion: `ZstdStream` is a Wave-1 ground-up rewrite deliberately
-//! hardened against exactly these classes of input (spec conformance,
-//! resource bounds, EOF classification); the legacy `ZstdDecoder::
-//! decode_frame` core `decompress_multi_frame` still uses was never
-//! revisited to match. That is a real, useful thing for a differential
-//! target to know about this pair, but it means "the legacy path accepted,
-//! `ZstdStream` refused" is not evidence of anything by itself — only a
-//! **byte mismatch when both sides accept**, or a panic/hang, is. Flagging
-//! findings 1-3 (and the shape of 4) for whoever next owns `oxiarc-zstd`:
-//! either harden the legacy path to match, or document the split
-//! explicitly (the same shape as gzip's `FHCRC`, Phase 8 owner decision 1).
-//!
-//! `ZstdStream` accepting where `decompress_multi_frame()` refuses (the
-//! reverse direction) is not asserted either, for the same reason.
+//! **Track FUZZTIGHTEN** (this track) restored the strong contract above
+//! now that findings 1, 2 and 4 are closed: three of the four original
+//! causes for "reference accepts, stream refuses" are gone, and the fourth
+//! has a precise, structural test (rule 4) rather than a blanket
+//! same-direction carve-out. The reverse direction (`Err(reference)` +
+//! `Ok(stream)`, rule 3) was re-verified with no exception at all — see
+//! ZSTD4's "Agreement sweep" (3,411 single-byte mutations over 7 frames, 0
+//! divergences) and ZSTD4-verify's `adversarial_truncation_and_mutation_
+//! agree_across_paths` test (5,600+ inputs) — and this track's own
+//! 120-second corpus-seeded run found none either; see the FUZZTIGHTEN
+//! handoff for the exact iteration count.
 #![no_main]
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
+use oxiarc_core::error::OxiArcError;
 use oxiarc_core::traits::FlushMode;
-use oxiarc_zstd::{ZstdStatus, ZstdStream};
+use oxiarc_zstd::{MAX_WINDOW_SIZE, ZstdStatus, ZstdStream};
 
 /// Deliberately small relative to typical fuzz inputs, so `NeedOutput` is
 /// exercised on anything but a tiny payload.
@@ -163,11 +221,39 @@ fuzz_target!(|data: &[u8]| {
                  decompress_multi_frame()"
             );
         }
-        // `ZstdStream` is a deliberately hardened rewrite of a legacy core
-        // `decompress_multi_frame` still uses unmodified (see the module
-        // doc comment for the four distinct, empirically-confirmed reasons
-        // this direction alone proves nothing): only agreement when *both*
-        // sides accept, and never panicking or hanging, are asserted.
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) | (Err(_), Err(_)) => {}
+        (Err(reference_err), Ok(_)) => {
+            panic!(
+                "decompress_multi_frame() refused input that chunked ZstdStream \
+                 (granularity {chunk_size}) accepted -- every known cause of this \
+                 direction was closed by the ZSTD4 hardening pass (see the module \
+                 doc's History section, finding 1/2/4): {reference_err}"
+            );
+        }
+        (Ok(_), Err(stream_err)) => {
+            // Pinned to the exact budget value `begin_frame` reports for
+            // *this* stream's window ceiling (`ZstdStream::new()` never
+            // calls `with_max_window`, so `self.max_window` is always
+            // `MAX_WINDOW_SIZE` here), not just the error variant. A
+            // `MemoryBudgetExceeded` with any other budget -- from a future
+            // call site this module doc's enumeration did not anticipate,
+            // not merely from a source it already ruled out -- fails this
+            // guard and is correctly still treated as a bug, so this carve-
+            // out cannot silently widen if the crate's internals change.
+            assert!(
+                matches!(
+                    stream_err,
+                    OxiArcError::MemoryBudgetExceeded { budget, .. } if *budget == MAX_WINDOW_SIZE
+                ),
+                "chunked ZstdStream (granularity {chunk_size}) refused input that \
+                 decompress_multi_frame() accepted, and the refusal was not the one \
+                 documented exception (a declared-window ceiling of exactly \
+                 MAX_WINDOW_SIZE -- see the module doc's Contract rule 4 / History \
+                 finding 3): {stream_err}"
+            );
+        }
+        // Independent detection points inside each core; neither side
+        // refusing for a reason the other also refuses for is asserted as
+        // a bug.
+        (Err(_), Err(_)) => {}
     }
 });

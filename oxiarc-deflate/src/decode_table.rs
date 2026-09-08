@@ -382,9 +382,71 @@ impl DecodeTable {
         // Root prefix of the sub-table being filled; `u32::MAX` can never
         // equal a real prefix, so the first long code starts a sub-table.
         let mut low = u32::MAX;
-        let mut table_span;
+        // Size of the table the *last* fill went into, which is where the
+        // next sub-table starts. Seeded with the root table's size, because
+        // the first code may already need a sub-table: when every code in
+        // the alphabet is longer than the root index (a legal, if
+        // degenerate, incomplete code — a single 15-bit distance code, say)
+        // there is no root slot to replicate into at all.
+        let mut table_span = root_size;
 
         loop {
+            // Start a sub-table whenever this code is longer than the root
+            // index and its root prefix is one no sub-table covers yet.
+            //
+            // zlib's `inflate_table` makes this test *after* filling each
+            // symbol, which works there because zlib widens the root to the
+            // shortest code (`if (min > root) root = min;`) and rejects
+            // incomplete sets outright, so its first code always fits the
+            // root. This table tolerates incomplete codes — `HuffmanTree`
+            // does, and the two must agree — so the first code can be
+            // longer than the root, and the test has to run before the
+            // first fill: with `curr` still the root width and `drop_bits`
+            // still zero, the replication stride `1 << (len - drop_bits)`
+            // would exceed `1 << curr` and the fill loop's `fill -= incr`
+            // would wrap (a panic in a debug build, a loop that never
+            // reaches zero in a release one). Everything else about the
+            // test is unchanged: at this point `huff`, `len` and
+            // `remaining` hold exactly what they held at the end of the
+            // previous iteration, which is where zlib evaluates it.
+            if len > usize::from(root_bits) && (huff & root_mask) != low {
+                if drop_bits == 0 {
+                    drop_bits = usize::from(root_bits);
+                }
+                next_base += table_span;
+
+                // Width of the new sub-table: enough for this prefix's
+                // codes, grown while the code space below it is still
+                // unaccounted for.
+                curr = len - drop_bits;
+                let mut space = 1i32 << curr;
+                while curr + drop_bits < max_length {
+                    let deeper = remaining.get(curr + drop_bits).copied().unwrap_or(0);
+                    space -= i32::from(deeper);
+                    if space <= 0 {
+                        break;
+                    }
+                    curr += 1;
+                    space <<= 1;
+                }
+
+                let need = next_base.saturating_add(1usize << curr);
+                if need > MAX_TABLE_INDEX + 1 {
+                    return Err(OxiArcError::invalid_header(
+                        "Huffman decode table too large",
+                    ));
+                }
+                if table.len() < need {
+                    table.resize(need, HOLE);
+                }
+                low = huff & root_mask;
+                if let Some(slot) = table.get_mut(low as usize) {
+                    *slot = SUBTABLE
+                        | ((next_base as u32) << PAYLOAD_SHIFT)
+                        | ((curr as u32) << EXTRA_SHIFT);
+                }
+            }
+
             let symbol = sorted.get(sym).copied().unwrap_or(0);
             let entry = kind.entry_body(symbol) | (len as u32);
 
@@ -427,45 +489,6 @@ impl DecodeTable {
                     len = code_lengths
                         .get(usize::from(next_symbol))
                         .map_or(max_length, |l| usize::from(*l));
-                }
-            }
-
-            // A new prefix that needs a sub-table.
-            if len > usize::from(root_bits) && (huff & root_mask) != low {
-                if drop_bits == 0 {
-                    drop_bits = usize::from(root_bits);
-                }
-                next_base += table_span;
-
-                // Width of the new sub-table: enough for this prefix's
-                // codes, grown while the code space below it is still
-                // unaccounted for.
-                curr = len - drop_bits;
-                let mut space = 1i32 << curr;
-                while curr + drop_bits < max_length {
-                    let deeper = remaining.get(curr + drop_bits).copied().unwrap_or(0);
-                    space -= i32::from(deeper);
-                    if space <= 0 {
-                        break;
-                    }
-                    curr += 1;
-                    space <<= 1;
-                }
-
-                let need = next_base.saturating_add(1usize << curr);
-                if need > MAX_TABLE_INDEX + 1 {
-                    return Err(OxiArcError::invalid_header(
-                        "Huffman decode table too large",
-                    ));
-                }
-                if table.len() < need {
-                    table.resize(need, HOLE);
-                }
-                low = huff & root_mask;
-                if let Some(slot) = table.get_mut(low as usize) {
-                    *slot = SUBTABLE
-                        | ((next_base as u32) << PAYLOAD_SHIFT)
-                        | ((curr as u32) << EXTRA_SHIFT);
                 }
             }
         }
@@ -530,9 +553,19 @@ mod tests {
         cache
     }
 
+    /// What one [`assert_agrees`] call actually compared, so a sweep can
+    /// prove it did not go vacuous.
+    #[derive(Default)]
+    struct Compared {
+        /// Bit patterns checked through both structures.
+        patterns: u64,
+        /// `HuffmanTree` rejected the shape, so nothing was compared.
+        rejected: bool,
+    }
+
     /// Every bit pattern must decode to the same code length and the same
     /// symbol semantics through both structures.
-    fn assert_agrees(lengths: &[u8], kind: TableKind) {
+    fn assert_agrees(lengths: &[u8], kind: TableKind) -> Compared {
         let tree = match HuffmanTree::from_code_lengths(lengths) {
             Ok(tree) => tree,
             Err(_) => {
@@ -540,14 +573,17 @@ mod tests {
                     DecodeTable::from_code_lengths(kind, lengths).is_err(),
                     "HuffmanTree rejected the lengths but DecodeTable accepted them"
                 );
-                return;
+                return Compared {
+                    patterns: 0,
+                    rejected: true,
+                };
             }
         };
         let table = DecodeTable::from_code_lengths(kind, lengths).expect("decode table");
         assert_eq!(table.max_len(), tree.max_code_length(), "max length");
         let width = tree.max_code_length();
         if width == 0 {
-            return;
+            return Compared::default();
         }
         for bits in 0..(1u32 << width) {
             let cache = cache_with(bits, width);
@@ -606,6 +642,10 @@ mod tests {
                     }
                 }
             }
+        }
+        Compared {
+            patterns: 1u64 << width,
+            rejected: false,
         }
     }
 
@@ -680,6 +720,185 @@ mod tests {
                 continue;
             }
             assert_agrees(&lengths, kind);
+        }
+    }
+
+    /// A far wider shape sweep than
+    /// [`pseudorandom_shapes_agree_with_huffman_tree`], aimed at the places
+    /// a one-pass table build goes wrong: codes that sit exactly on the
+    /// root/sub-table boundary, populations of many maximum-length codes
+    /// (which force several sub-tables), single-symbol alphabets at every
+    /// length, and deliberately incomplete codes (legal here, since
+    /// `HuffmanTree` accepts them and this table must not disagree with it).
+    ///
+    /// Every shape is compared against [`HuffmanTree`] for **every** bit
+    /// pattern of the alphabet's maximum code length, so a sub-table that is
+    /// one entry short, a replication stride that is off by a factor of two
+    /// or a hole that should have been a code all show up as a mismatch
+    /// rather than as a rare wrong byte in a decoded stream.
+    #[test]
+    fn a_wide_shape_sweep_agrees_with_huffman_tree() {
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut shapes = 0usize;
+        let mut patterns = 0u64;
+        let mut deep = 0usize;
+        let mut note = |c: Compared| {
+            if !c.rejected {
+                shapes += 1;
+                patterns += c.patterns;
+            }
+        };
+
+        // Single-symbol alphabets at every code length, both alphabets.
+        //
+        // The lengths above each alphabet's root width (10 for
+        // literal/length, 9 for distance) are the shapes whose *shortest*
+        // code does not fit the root table — the case zlib avoids by
+        // widening the root and rejecting incomplete sets, and the one that
+        // used to panic in debug and loop forever in release. `deep` counts
+        // them so the sweep cannot silently stop covering them.
+        for len in 1..=MAX_CODE_LENGTH {
+            let mut litlen = vec![0u8; 288];
+            litlen[7] = len as u8;
+            if len > usize::from(TableKind::LitLen.root_bits()) {
+                deep += 1;
+            }
+            note(assert_agrees(&litlen, TableKind::LitLen));
+            let mut dist = vec![0u8; 32];
+            dist[3] = len as u8;
+            if len > usize::from(TableKind::Distance.root_bits()) {
+                deep += 1;
+            }
+            note(assert_agrees(&dist, TableKind::Distance));
+        }
+
+        // Whole populations pinned to one length, including the two lengths
+        // either side of each alphabet's root width.
+        for len in 1..=MAX_CODE_LENGTH {
+            let population = 1usize << len;
+            let mut litlen = vec![0u8; 288];
+            for slot in litlen.iter_mut().take(population.min(288)) {
+                *slot = len as u8;
+            }
+            note(assert_agrees(&litlen, TableKind::LitLen));
+            let mut dist = vec![0u8; 32];
+            for slot in dist.iter_mut().take(population.min(32)) {
+                *slot = len as u8;
+            }
+            note(assert_agrees(&dist, TableKind::Distance));
+        }
+
+        // Randomised shapes, half of them then punched full of holes so the
+        // incomplete-code path is swept as hard as the complete one.
+        for round in 0..200 {
+            let (alphabet, kind) = if round % 2 == 0 {
+                (288usize, TableKind::LitLen)
+            } else {
+                (32usize, TableKind::Distance)
+            };
+            let mut lengths = vec![0u8; alphabet];
+            let mut remaining = 1u64 << MAX_CODE_LENGTH;
+            // Bias towards long codes on some rounds, so sub-tables are
+            // built and refilled rather than always being one deep.
+            let long_bias = round % 3 == 0;
+            for slot in lengths.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let len = if long_bias {
+                    9 + (next() % 7) as u8
+                } else {
+                    1 + (next() % 15) as u8
+                };
+                let cost = 1u64 << (MAX_CODE_LENGTH - usize::from(len));
+                if cost > remaining || next() % 4 == 0 {
+                    continue;
+                }
+                *slot = len;
+                remaining -= cost;
+            }
+            if lengths.iter().all(|&l| l == 0) {
+                continue;
+            }
+            note(assert_agrees(&lengths, kind));
+
+            // The same shape with a random third of its symbols removed:
+            // still canonical, deliberately incomplete.
+            let mut holed = lengths.clone();
+            for slot in holed.iter_mut() {
+                if next() % 3 == 0 {
+                    *slot = 0;
+                }
+            }
+            if holed.iter().any(|&l| l != 0) {
+                note(assert_agrees(&holed, kind));
+            }
+        }
+
+        // The sweep is only worth anything if it really compared a large
+        // number of bit patterns *and* really covered the degenerate shapes
+        // this test exists for. A refactor that made `assert_agrees` return
+        // early would otherwise leave a green test proving nothing.
+        assert!(
+            shapes > 400 && patterns > 10_000_000 && deep == 11,
+            "the shape sweep went vacuous: {shapes} shapes, {patterns} bit \
+             patterns, {deep} shapes whose shortest code exceeds the root"
+        );
+    }
+
+    /// Rebuilding in place must produce exactly the table a fresh build
+    /// would, for a long sequence of unrelated shapes — the steady state a
+    /// stream of dynamic blocks puts the decoder in.
+    #[test]
+    fn a_long_rebuild_sequence_never_diverges_from_a_fresh_build() {
+        let mut state = 0x0BAD_F00D_1234_5678u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut reused = DecodeTable::new(TableKind::LitLen);
+        for _ in 0..64 {
+            let mut lengths = vec![0u8; 288];
+            let mut remaining = 1u64 << MAX_CODE_LENGTH;
+            for slot in lengths.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let len = 1 + (next() % 15) as u8;
+                let cost = 1u64 << (MAX_CODE_LENGTH - usize::from(len));
+                if cost > remaining || next() % 3 == 0 {
+                    continue;
+                }
+                *slot = len;
+                remaining -= cost;
+            }
+            if lengths.iter().all(|&l| l == 0) {
+                continue;
+            }
+            let fresh = match DecodeTable::from_code_lengths(TableKind::LitLen, &lengths) {
+                Ok(fresh) => fresh,
+                Err(_) => {
+                    assert!(
+                        reused.rebuild(&lengths).is_err(),
+                        "rebuild accepted a shape a fresh build rejected"
+                    );
+                    continue;
+                }
+            };
+            reused.rebuild(&lengths).expect("rebuild");
+            assert_eq!(reused.max_len(), fresh.max_len());
+            for bits in 0..(1u32 << fresh.max_len()) {
+                assert_eq!(reused.entry(bits), fresh.entry(bits), "bits {bits:#x}");
+            }
         }
     }
 

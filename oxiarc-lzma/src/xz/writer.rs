@@ -63,7 +63,7 @@ impl XzWriter {
     ///
     /// Input longer than this is split across several blocks, each with its
     /// own index record — a plain `.xz` stream that any decoder reads. The
-    /// default ([`DEFAULT_BLOCK_SIZE`], 64 MiB) is chosen so that a block
+    /// default (`DEFAULT_BLOCK_SIZE`, 64 MiB) is chosen so that a block
     /// can never exceed the compressed-size limit the reader enforces; the
     /// setter exists mainly so the multi-block path is testable with small
     /// payloads, but it is also the knob to reach for if a consumer wants

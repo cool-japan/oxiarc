@@ -12,7 +12,7 @@
 //! A `.xz` *file* is **one or more** such streams, optionally separated and
 //! terminated by Stream Padding (runs of null bytes whose total length is a
 //! multiple of four) — which is what `cat a.xz b.xz` and parallel
-//! compressors produce. [`decompress`] decodes every stream and
+//! compressors produce. [`decompress`](crate::xz::decompress) decodes every stream and
 //! concatenates the results, matching `xz -d`; trailing bytes that are
 //! neither padding nor a further stream are an error rather than a silent
 //! short read.
@@ -34,25 +34,31 @@
 //! codecs that need `.xz` without pulling in eight archive codecs — TIFF
 //! `Compression = 34925` writes **a complete `.xz` stream per strip/tile**,
 //! typically with `LZMA_CHECK_NONE` — depend on `oxiarc-lzma` alone and use
-//! [`decompress_into`] / [`decompress_with_limit`] / [`XzDecoder`].
+//! [`decompress_into`](crate::xz::decompress_into) /
+//! [`decompress_with_limit`](crate::xz::decompress_with_limit) /
+//! [`XzDecoder`](crate::xz::XzDecoder).
 //!
 //! # Bounded decoding
 //!
-//! [`decompress`] is unbounded (it grows a `Vec` to whatever the stream
-//! produces). Untrusted input should use [`decompress_into`] (decode into a
-//! caller-sized buffer) or [`decompress_with_limit`] (decode with an
+//! [`decompress`](crate::xz::decompress) is unbounded (it grows a `Vec` to
+//! whatever the stream produces). Untrusted input should use
+//! [`decompress_into`](crate::xz::decompress_into) (decode into a
+//! caller-sized buffer) or
+//! [`decompress_with_limit`](crate::xz::decompress_with_limit) (decode with an
 //! explicit output cap); both enforce the limit *during* decoding, chunk by
 //! chunk, so a decompression bomb is rejected before it is materialised.
 //!
-//! # Decoding many streams: reuse [`XzDecoder`]
+//! # Decoding many streams: reuse [`XzDecoder`](crate::xz::XzDecoder)
 //!
-//! [`decompress_into`] is a thin one-shot wrapper: every call builds a
+//! [`decompress_into`](crate::xz::decompress_into) is a thin one-shot wrapper:
+//! every call builds a
 //! fresh LZMA2 window (dictionary) from nothing. That is the right choice
 //! for a handful of streams, but a TIFF `Compression = 34925` image can
 //! carry thousands of strips, each its own complete `.xz` stream — and
 //! rebuilding a multi-megabyte dictionary buffer (and repeatedly growing it
 //! one `Vec::push` at a time) thousands of times over is pure waste when
-//! every strip uses the same dictionary size. [`XzDecoder`] keeps that
+//! every strip uses the same dictionary size.
+//! [`XzDecoder`](crate::xz::XzDecoder) keeps that
 //! buffer allocated across calls: construct one, feed it every strip in
 //! turn, and only a genuine change in dictionary size forces a fresh
 //! allocation.

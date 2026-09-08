@@ -7,7 +7,7 @@ Thin `image`-crate-shaped facade over `oxiarc-png`, `oxiarc-jpeg` and `oxiarc-ti
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 122 tests passing (109 unit + integration via
+**Version: 0.4.2 (2026-09-08) | 158 tests passing (145 unit + integration via
 `cargo nextest`, 13 doctests) | Pure Rust, `#![forbid(unsafe_code)]`**
 
 `oxiarc-image` exists so that a project depending on the `image` crate only for

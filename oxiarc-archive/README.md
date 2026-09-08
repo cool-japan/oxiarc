@@ -7,7 +7,7 @@ Container format support for OxiArc - parsing and extraction of archive formats.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-08-06) | 524 tests passing**
+**Version: 0.4.2 (2026-09-08) | 614 tests passing (583 via nextest + 31 doctests, `--all-features`)**
 
 
 ## Features

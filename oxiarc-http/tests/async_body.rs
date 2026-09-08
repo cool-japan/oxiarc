@@ -256,3 +256,51 @@ fn a_non_default_trailing_policy_reaches_the_async_adapter() {
         assert_eq!(out, plain);
     });
 }
+
+/// The async twin of `chunking::trailing_garbage_is_rejected_one_byte_at_a_time`.
+///
+/// Regression: `AsyncDecodedBody` closed the body the moment the coded stream
+/// reported `StreamEnd`, without first establishing that the source was
+/// spent, so with one byte per poll the `br` stream ended on a poll of its own
+/// and the appended `XXXX` was never read — `read_to_end` returned
+/// `Ok(20_000)` where every other coding errored. The `step = 1` leg of
+/// `trailing_garbage_is_rejected_whatever_the_poll_boundaries` covers the same
+/// ground; this test states the property on its own so a future change to that
+/// loop cannot quietly drop it.
+#[test]
+fn trailing_garbage_is_rejected_one_byte_per_poll() {
+    let plain = common::text(20_000);
+    runtime().block_on(async {
+        for coding in codings() {
+            if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+                continue;
+            }
+            let wire = encode(&coding, &plain);
+            let mut with_garbage = wire.clone();
+            with_garbage.extend_from_slice(b"XXXX");
+
+            let mut body = oxiarc_http::AsyncDecodedBody::with_codings(
+                Stuttering::new(with_garbage, 1),
+                std::slice::from_ref(&coding),
+                &DecodeLimits::default(),
+            )
+            .expect("decoder");
+            let mut out = Vec::new();
+            assert!(
+                body.read_to_end(&mut out).await.is_err(),
+                "{coding}: trailing garbage slipped through at one byte per poll"
+            );
+
+            // The clean body at the same granularity must still decode.
+            let mut body = oxiarc_http::AsyncDecodedBody::with_codings(
+                Stuttering::new(wire.clone(), 1),
+                std::slice::from_ref(&coding),
+                &DecodeLimits::default(),
+            )
+            .expect("decoder");
+            let mut out = Vec::new();
+            body.read_to_end(&mut out).await.expect("clean body");
+            assert_eq!(out, plain, "{coding}: clean body at one byte per poll");
+        }
+    });
+}

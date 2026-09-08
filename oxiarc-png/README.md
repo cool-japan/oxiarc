@@ -7,8 +7,7 @@ Pure Rust PNG (ISO/IEC 15948, W3C PNG 3rd Edition) and APNG codec, part of the O
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Decoder%20%2B%20Encoder%20%2B%20APNG%20complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 303 tests passing (316 with `--all-features`, i.e.
-`parallel` + `png-oracle`; 30 of the 303 are doctests)**
+**Version: 0.4.2 (2026-09-08) | 335 tests passing (303 via nextest + 32 doctests, `--all-features`)**
 
 The decoder, the encoder, and the APNG compositor are complete and validated against
 CPython Pillow in both directions — including Pillow's own APNG writer/reader as an

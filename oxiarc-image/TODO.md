@@ -226,13 +226,15 @@ per-crate detail; the root file only tracks the one-line summary.
 
 ## Test Coverage
 
-Measured 2026-09-07 (`cargo nextest run -p oxiarc-image --all-features` +
+Measured 2026-09-08 (`cargo nextest run -p oxiarc-image --all-features` +
 `cargo test --doc -p oxiarc-image --all-features`).
 
-- **109** unit + integration tests via `cargo nextest` (69 unit in `src/`, 40 across
-  `tests/{roundtrip,sniffing,error_mapping}.rs`)
+- **145** unit + integration tests via `cargo nextest` (87 unit in `src/`, 58 across
+  `tests/{roundtrip,sniffing,error_mapping,adversarial,conversions}.rs` — the last
+  two added by the adversarial verification pass: 12 always-on malformed-input
+  hardening tests and a golden conversion table)
 - **13** doctests (`cargo test --doc`)
-- **122 total**, 0 failing
+- **158 total**, 0 failing
 
 ## Code Statistics
 

@@ -225,7 +225,7 @@ impl<R: Read> ZstdStreamDecoder<R> {
     /// answer covers both the bytes the push decoder buffered internally and
     /// the staging remainder behind them, in stream order. It cannot cover
     /// bytes that were never read: whatever is still inside the inner reader
-    /// stays there, and [`ZstdStreamDecoder::into_inner`]-style recovery is not
+    /// stays there, and `ZstdStreamDecoder::into_inner`-style recovery is not
     /// offered precisely because the boundary is only knowable here.
     pub fn unused_input(&self) -> &[u8] {
         &self.unused

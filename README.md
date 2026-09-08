@@ -39,6 +39,13 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 - **Store** - No compression
 - **AEC/SZIP** (CCSDS-121.0-B-2) - Adaptive entropy coding for scientific datasets
 
+### HTTP Content-Coding and Image Formats (new in 0.4.2)
+- **HTTP `Content-Encoding`/`Accept-Encoding`** (`oxiarc-http`) - decode and encode `gzip`, `deflate`, `br`, `zstd`, legacy `compress` (`.Z`), and RFC 9842 shared-dictionary `dcb`/`dcz`; RFC 9110 negotiation, chained codings, bounded-memory decode limits
+- **PNG** (`oxiarc-png`, ISO/IEC 15948) - every colour type/depth, Adam7 interlacing, APNG, Apple `CgBI`, `png`-0.18-shaped compat facade
+- **JPEG** (`oxiarc-jpeg`, ITU-T T.81) - baseline/progressive/lossless, arithmetic coding (SOF9-11), reduced/enlarged-scale decode, `zune_jpeg`/`jpeg-decoder`/`image`-shaped compat facades
+- **TIFF** (`oxiarc-tiff`, TIFF 6.0 + BigTIFF) - LZW/Deflate/ZSTD/LZMA/JPEG/PackBits/CCITT G3/G4 (incl. uncompressed mode), `rayon` parallel strips/tiles, `tiff`-0.11-shaped compat facade
+- **Image facade** (`oxiarc-image`) - thin `image`-0.25-crate-shaped `DynamicImage`/`ImageReader`/codec API over PNG/JPEG/TIFF, for drop-in migration off the `image` crate
+
 ### Core Features
 - **Pure Rust** - No C/Fortran dependencies, 100% safe Rust
 - **Reference-Interop Verified** - Every codec is validated by differential tests against the reference implementation, in both directions (see [Reference-Implementation Differential Testing](#reference-implementation-differential-testing-oracles))
@@ -87,25 +94,33 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 ```
 +----------------------------------------------------------+
 | L4: Unified API (oxiarc-cli)                             |
-|     CLI with progress bars, verbose mode, filters        |
+|     CLI with progress bars, verbose mode, filters,       |
+|     PNG/JPEG/TIFF detect+info fallback                   |
++----------------------------------------------------------+
+| L3.5: Image + HTTP (new in 0.4.2)                         |
+|     oxiarc-image: image-0.25-shaped facade over PNG/JPEG/TIFF |
+|     oxiarc-http: Content-Encoding gzip/deflate/br/zstd/compress/dcb/dcz |
+|     oxiarc-png:  PNG (ISO/IEC 15948) + APNG               |
+|     oxiarc-jpeg: JPEG (ITU-T T.81) + arithmetic + OJPEG   |
+|     oxiarc-tiff: TIFF 6.0 + BigTIFF, all baseline codecs  |
 +----------------------------------------------------------+
 | L3: Container (oxiarc-archive)                           |
 |     ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660 |
 +----------------------------------------------------------+
 | L2: Codecs                                               |
-|     oxiarc-deflate: DEFLATE (RFC 1951) + async + GZip    |
-|     oxiarc-lzma: LZMA/LZMA2                              |
+|     oxiarc-deflate: DEFLATE (RFC 1951) + async + GZip + resumable inflate |
+|     oxiarc-lzma: LZMA/LZMA2 + reusable .xz decoder        |
 |     oxiarc-lzhuf: LZH (lh0, lh1, lh4, lh5, lh6, lh7, lhd) |
 |     oxiarc-bzip2: BWT + MTF + Huffman                    |
 |     oxiarc-lz4: LZ4 block/frame                          |
-|     oxiarc-zstd: Zstandard (RFC 8878 FSE + Huffman)      |
-|     oxiarc-lzw: LZW (GIF/TIFF, MSB/LSB bitstream)       |
-|     oxiarc-brotli: Brotli (RFC 7932)                     |
+|     oxiarc-zstd: Zstandard (RFC 8878 FSE + Huffman), push decoder |
+|     oxiarc-lzw: LZW (GIF/TIFF/.Z, MSB/LSB bitstream, 9-16 bit) |
+|     oxiarc-brotli: Brotli (RFC 7932), push decoder, shared dict |
 |     oxiarc-snappy: Snappy (block + framed)                |
 |     oxiarc-szip: AEC/SZIP (CCSDS-121.0-B-2 adaptive entropy coding)    |
 +----------------------------------------------------------+
 | L1: Core (oxiarc-core)                                   |
-|     BitReader/Writer, RingBuffer, CRC-16/32/64 (simd-8)  |
+|     BitReader/Writer, RingBuffer, CRC-16/32/64 (simd-8), SHA-256 |
 +----------------------------------------------------------+
 ```
 
@@ -113,22 +128,27 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), EntryBuilder, Serde | ~6,043 | 171 |
-| `oxiarc-deflate` | DEFLATE (RFC 1951) + async deflate + GZip (multi-member) + true streaming (GzipStream/ZlibStream) | ~9,893 | 273 |
-| `oxiarc-lzhuf` | LZH compression (lh0, lh1, lh4, lh5, lh6, lh7, lhd) with LZSS + Huffman + custom dictionaries | ~6,606 | 252 |
+| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), SHA-256, EntryBuilder, Serde | ~7,086 | 200 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951), zlib-faithful encoder, resumable `InflateStream`/`WrappedInflate`, async deflate, GZip (multi-member) | ~23,129 | 455 |
+| `oxiarc-lzhuf` | LZH compression (lh0, lh1, lh4, lh5, lh6, lh7, lhd) with LZSS + Huffman + custom dictionaries | ~9,782 | 269 |
 | `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + multi-table Huffman, multi-stream decode, de-randomisation | ~3,303 | 104 |
-| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~5,971 | 151 |
-| `oxiarc-zstd` | Zstandard (RFC 8878) with FSE + Huffman + XXHash64, dictionary support, multi-frame | ~7,336 | 200 |
-| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool, multi-chunk `.xz` | ~7,957 | 178 |
-| `oxiarc-archive` | 13 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660) + async ZIP + archive repair | ~22,153 | 590 |
-| `oxiarc-lzw` | LZW compression (GIF/TIFF incl. TIFF 6.0 Clear Code) with MSB/LSB bitstream, streaming encoder/decoder | ~2,775 | 93 |
-| `oxiarc-brotli` | Brotli compression (RFC 7932) with the full Appendix A static dictionary, quality 0-11, streaming | ~7,153 | 237 |
-| `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~4,304 | 132 |
+| `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~6,229 | 158 |
+| `oxiarc-zstd` | Zstandard (RFC 8878) with FSE + Huffman + XXHash64, `ZstdStream` push decoder, dictionary support, multi-frame | ~15,031 | 341 |
+| `oxiarc-lzma` | LZMA/LZMA2 with range coding + hash chains + memory pool, reusable `xz::XzDecoder`, multi-block `.xz` writer | ~13,417 | 277 |
+| `oxiarc-archive` | 13 container formats (ZIP, TAR, GZIP, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, Snappy, ISO 9660) + async ZIP + archive repair | ~24,395 | 583 |
+| `oxiarc-lzw` | LZW compression (GIF/TIFF/`.Z`, TIFF 6.0 Clear Code, 9-16 bit codes) with MSB/LSB bitstream, streaming encoder/decoder | ~9,638 | 233 |
+| `oxiarc-brotli` | Brotli compression (RFC 7932) with the full Appendix A static dictionary, quality 0-11, shared dictionaries, `dcb` framing, streaming | ~15,232 | 349 |
+| `oxiarc-snappy` | Snappy compression (block + framed format) with CRC32C, memory pool, dictionaries, async I/O | ~4,306 | 132 |
 | `oxiarc-szip` | AEC/SZIP (CCSDS-121.0-B-2): encode/decode/encode_bytes, SzipParams, libaec-interoperable | ~1,902 | 46 |
-| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, man pages | ~6,897 | 92 |
-| **Total** | **Pure Rust archive/compression library** | **~92,598 code lines (339 Rust files; 394 workspace-wide incl. fuzz/docs/scripts)** | **2,519** |
+| `oxiarc-http` | HTTP `Content-Encoding`/`Accept-Encoding`: gzip/deflate/br/zstd/compress/dcb/dcz, negotiation, bounded decode limits | ~9,094 | 310 |
+| `oxiarc-png` | PNG (ISO/IEC 15948) decoder/encoder: every colour type/depth, Adam7, APNG, `CgBI`, `png`-0.18-shaped compat | ~15,144 | 303 |
+| `oxiarc-jpeg` | JPEG (ITU-T T.81) decoder/encoder: baseline/progressive/lossless/arithmetic, scaled decode, compat facades | ~28,077 | 591 |
+| `oxiarc-tiff` | TIFF 6.0 + BigTIFF decoder/encoder: LZW/Deflate/ZSTD/LZMA/JPEG/PackBits/CCITT, `rayon`, `tiff`-0.11-shaped compat | ~26,601 | 535 |
+| `oxiarc-image` | Thin `image`-0.25-crate-shaped facade over PNG/JPEG/TIFF (`DynamicImage`, `ImageReader`, no image processing) | ~4,301 | 145 |
+| `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, PNG/JPEG/TIFF detect/info, man pages | ~7,844 | 124 |
+| **Total** | **Pure Rust archive/compression library** | **~224,511 code lines (678 Rust files; 714 workspace-wide incl. fuzz)** | **5,155** |
 
-Lines are tokei Rust code lines per crate (src + tests + examples); the Tests column is nextest (all-features, per-crate); the workspace additionally has 139 doctests (not attributed per crate), for 2,658 tests total. Measured 2026-08-06.
+Lines are tokei Rust code lines per crate (src + tests + examples); the Tests column is nextest (all-features, per-crate); the workspace additionally has 346 doctests (not attributed per crate), for **5,501 tests total**. Measured 2026-09-08.
 
 ## Installation
 
@@ -224,7 +244,8 @@ The standard compression used in ZIP, GZIP, and PNG:
 - LZ77 dictionary compression with 32KB sliding window
 - Canonical Huffman coding
 - Supports stored, fixed, and dynamic blocks
-- Compression levels 0-9
+- Compression levels 0-9, encoder byte-identical to CPython `zlib.compress` at every level 1-9 (a faithful port of zlib's `deflate.c`/`trees.c`; `Deflater::with_strategy` exposes `Z_DEFAULT_STRATEGY`/`Z_FILTERED`/`Z_HUFFMAN_ONLY`/`Z_RLE`/`Z_FIXED`). Level 0's stored blocks are cut at 65535 bytes where zlib cuts at its pending-buffer bound, so the bytes differ there — valid, round-tripping, and never larger than CPython's
+- Resumable, genuinely incremental decode core (`InflateStream`, `WrappedInflate` for zlib/gzip framing, `InflateReader`/`AsyncInflateReader`) shared by `oxiarc-png`'s `IDAT` chain, `oxiarc-http`'s response bodies and `oxiarc-tiff`'s strips — no `read_to_end`-then-decode
 
 ### LZH (lh0, lh1, lh4, lh5, lh6, lh7, lhd)
 
@@ -241,6 +262,7 @@ Advanced compression used in 7z and XZ:
 - Range coding for entropy encoding
 - Context-dependent probability models
 - 11-bit probability model (2048 states)
+- Reusable `xz::XzDecoder` (keeps its dictionary/probability-model/coder-state allocation across many same-dictionary-size `.xz` streams — built for TIFF's thousands-of-strips-per-image case) and multi-block `XzWriter` (`with_block_size`, per-block `CheckType`)
 
 ### Bzip2
 
@@ -261,26 +283,31 @@ Ultra-fast compression:
 
 Modern fast compression (RFC 8878):
 - Full decoder: FSE (predefined, RLE, custom `FSE_Compressed`, and repeat modes) plus 1- and 4-stream Huffman literals — differentially verified byte-identical against reference `zstd` (incl. dictionary frames), with the RFC 8878 LIFO/MSB-first backward bitstream
-- Encoder: Huffman-compressed literal sections (chosen when they beat Raw/RLE, self-verified per section); sequences use the RFC 8878 predefined/RLE FSE tables — RFC-valid and accepted by `zstd -d`, but custom block-optimal sequence tables are not emitted yet, so ratio on some inputs trails the reference encoder
+- Encoder: Huffman-compressed literal sections (chosen when they beat Raw/RLE, self-verified per section); sequences now also emit `FSE_Compressed_Mode` custom tables (predefined/RLE/custom, whichever costs fewest bits including the table description, chosen per literal-length/offset/match-length category) alongside the RFC-valid predefined/RLE tables
+- `ZstdStream` push decoder — genuinely incremental (no `read_to_end`), a real sliding-window ring, memory ceilings enforced before a block is decoded, `with_max_output`/`with_max_window`/`with_multi_frame`/`with_dictionary`
+- Decode throughput rebuilt around the reference decoder's data layout (bulk bit-container refills, four-stream lockstep Huffman literals, pattern-doubling overlapping-match copies) — 2-8x faster on the shapes that were per-byte-work-bound, at parity with `zstd -b -d` (0.5x-4x) on 11 of 12 measured shapes
 - XXHash64 checksums
 - Dictionary support
 
 ### LZW
 
 Lempel-Ziv-Welch compression:
-- GIF LZW codec with configurable initial code size
-- LSB-first bitstream packing (GIF standard)
-- MSB-first bitstream packing (TIFF standard) with TIFF 6.0 Clear Code semantics — interoperable with libtiff/Pillow/GDAL in both directions (oxiarc's encoded output is byte-identical to libtiff's)
-- Variable bit widths (2-12 bits) with clear/EOI codes
+- GIF LZW codec with configurable initial code size, differentially verified against Pillow's own decoder in both directions
+- LSB-first bitstream packing (GIF standard); explicit `LzwBitOrder` on `LzwConfig` lets any generic entry point use either order
+- MSB-first bitstream packing (TIFF standard) with TIFF 6.0 Clear Code semantics — interoperable with libtiff/Pillow/GDAL in both directions (oxiarc's encoded output is byte-identical to libtiff's); `TIFF_COMPAT_LSB` for libtiff's pre-1993 `LZWDecodeCompat` strips
+- Variable bit widths, now **9-16 bits** (was 12-bit-capped before 0.4.2), with clear/EOI codes
+- The legacy UNIX `compress(1)`/`.Z` container (`oxiarc_lzw::z`), both directions, byte-identical to `compress -b N -c` and readable by/producing output readable by `gzip -dc`/`uncompress -c`
+- Decoder rebuilt to libtiff's own `LZWDecode` algorithm shape: 1.25x-2.6x faster, now within 1.25x-1.37x of libtiff 4.7.1's own decode time (re-measured 2026-09-08 on a machine at load 56-66, where the band widens to 1.00x-1.56x — load scatter, not a slower decoder; see `oxiarc-lzw/README.md`)
 
 ### Brotli (RFC 7932)
 
 Modern compression format:
-- Full RFC 7932 decoder: block-type switching, context maps with the exact §7.1 context tables, the complete distance code space, metadata meta-blocks — differentially verified byte-identical against the reference `brotli` CLI (qualities 0-11, windows 10-24)
+- Full RFC 7932 decoder: block-type switching, context maps with the exact §7.1 context tables, the complete distance code space, metadata meta-blocks, shared (custom LZ77) dictionaries — differentially verified byte-identical against the reference `brotli` CLI (qualities 0-11, windows 10-24)
 - The complete, byte-exact 122,784-byte Appendix A static dictionary with all 121 word transforms (UTF-8-aware ferment casing)
-- RFC-conformant encoder accepted by `brotli -d`; ratio trails the reference encoder at quality 10-11 and on structured binary data (no encode-side block-splitting/context modeling — a ratio limitation, not a correctness one)
+- Encoder does literal/insert-copy/distance block-type splitting and per-context histogram assignment at quality 10-11 (coordinate-ascent search, keeps the smaller of split-vs-unsplit), plus shared-dictionary-aware matching — RFC-conformant, accepted by `brotli -d`, and a shared dictionary can never cost ratio (every meta-block is tried both ways)
 - Quality levels 0-11 (fast to best compression)
-- Streaming compression/decompression API
+- `Content-Encoding: dcb` (RFC 9842) framing for HTTP compression-dictionary transport (`oxiarc-brotli::dcb`, wired through `oxiarc-http`)
+- Streaming compression/decompression API (`BrotliStream` push decoder)
 
 ### AEC/SZIP (CCSDS-121.0-B-2)
 
@@ -291,27 +318,178 @@ Adaptive entropy coding for scientific data:
 - `SzipParams` struct for encoding/decoding configuration
 - `encode` / `decode` / `encode_bytes` entry points
 
+## HTTP Content-Coding and Image Formats (new in 0.4.2)
+
+Five new crates close the two routes an ecosystem-wide dependency audit found
+pulling `flate2` into 39 of 93 `~/work` project lockfiles: `ureq`'s default
+`gzip` feature (`oxiarc-http`), and the `image` crate's `png`/`tiff` codecs
+(`oxiarc-png`, `oxiarc-jpeg`, `oxiarc-tiff`, and the `oxiarc-image` facade
+over all three). All five ship `#![forbid(unsafe_code)]`. Every snippet below
+is lifted verbatim (module-level rustdoc hidden lines removed) from a
+doctest that passes in this crate as of this release.
+
+### `oxiarc-http` — `Content-Encoding`/`Accept-Encoding`
+
+```rust
+use oxiarc_http::{AcceptEncoding, ContentCoding, EncodeOptions, encode_body, negotiate};
+
+fn main() {
+    // Client side: advertise every coding this build can decode.
+    let accept = AcceptEncoding::all_supported();
+    let header_value = accept.to_header_value(); // None => send no header at all
+
+    // Server side: negotiate against what it received, and only what this
+    // build can actually produce. Filter by `is_encodable` so the list tracks
+    // this crate's own compiled-in features rather than being hardcoded.
+    let available: Vec<ContentCoding> = [
+        ContentCoding::Zstd,
+        ContentCoding::Brotli,
+        ContentCoding::Gzip,
+        ContentCoding::Deflate,
+    ]
+    .into_iter()
+    .filter(ContentCoding::is_encodable)
+    .collect();
+    let chosen = negotiate(header_value.as_deref(), &available)
+        .expect("identity is always acceptable here, so this never fails");
+
+    let body = b"hello, world! hello, world! hello, world!";
+    if let Some(coding) = chosen {
+        let compressed = encode_body(&coding, body, EncodeOptions::default())
+            .expect("`available` only ever contains codings this build can encode");
+        assert!(compressed.len() < body.len());
+        // ... set Content-Encoding: coding.as_str(), Content-Length, Vary: Accept-Encoding
+    }
+}
+```
+
+`oxiarc-http`'s default features are `gzip` + `deflate` only. `br`, `zstd`,
+the legacy `compress`, and the RFC 9842 `dcb`/`dcz` codings each need their
+own Cargo feature (`brotli`, `zstd`, `compress`, `dcb`, `dcz`), so a
+default-feature client never advertises a coding it cannot decode:
+`AcceptEncoding::all_supported()` returns exactly `"gzip, deflate"` there,
+and `is_decodable(Brotli)` is `false`. See the feature matrix in
+`oxiarc-http/README.md`.
+
+Recipes for `ureq` 3, `reqwest` and `oxihttp` ship as runnable
+`oxiarc-http/examples/`.
+
+### `oxiarc-png`
+
+```rust
+use std::fs::File;
+
+fn main() -> Result<(), oxiarc_png::DecodingError> {
+    let decoder = oxiarc_png::Decoder::new(File::open("image.png")?);
+    let mut reader = decoder.read_info()?;
+    while let Some(row) = reader.next_row()? {
+        let _pixels: &[u8] = row.data();
+    }
+    Ok(())
+}
+```
+
+### `oxiarc-jpeg`
+
+```rust
+use oxiarc_jpeg::{Decoder, InputColor, Subsampling, EncodeOptions,
+                  encode_to_vec_with_options};
+
+fn main() -> Result<(), oxiarc_jpeg::JpegError> {
+    let pixels = vec![90u8; 16 * 16 * 3];
+    let options = EncodeOptions {
+        quality: 92,
+        subsampling: Subsampling::S444,
+        ..Default::default()
+    };
+    let jpeg = encode_to_vec_with_options(&pixels, 16, 16, InputColor::Rgb, &options)?;
+
+    let decoded = Decoder::new(&jpeg[..]).decode()?;
+    assert_eq!(decoded.len(), 16 * 16 * 3);
+    assert!(decoded.iter().all(|&v| v.abs_diff(90) <= 2));
+    Ok(())
+}
+```
+
+### `oxiarc-tiff`
+
+```rust
+use oxiarc_tiff::{ColorType, Decoder, Encoder, ImageSpec, Samples};
+use std::io::Cursor;
+
+fn main() -> Result<(), oxiarc_tiff::TiffError> {
+    // Build a 4x2 greyscale image so the example is self-contained.
+    let pixels: Vec<u8> = vec![0, 40, 80, 120, 160, 200, 240, 255];
+    let mut buffer = Cursor::new(Vec::new());
+    let mut encoder = Encoder::new(&mut buffer)?;
+    encoder.write_image(&ImageSpec::new(4, 2, ColorType::Gray(8)), &pixels)?;
+    encoder.finish()?;
+
+    let mut decoder = Decoder::new(Cursor::new(buffer.into_inner()))?;
+    assert_eq!(decoder.dimensions()?, (4, 2));
+    assert_eq!(decoder.color_type()?, ColorType::Gray(8));
+    match decoder.read_image()? {
+        Samples::U8(data) => assert_eq!(data, pixels),
+        other => panic!("unexpected sample type: {:?}", other.sample_type()),
+    }
+    Ok(())
+}
+```
+
+### `oxiarc-image` — the `image`-crate-shaped facade
+
+```toml
+[dependencies]
+image = { package = "oxiarc-image", version = "0.4" }
+```
+
+```rust
+use oxiarc_image::{ImageBuffer, Rgb};
+
+fn main() {
+    let buf: ImageBuffer<Rgb<u8>> = ImageBuffer::from_fn(4, 4, |x, _y| Rgb::new(x as u8 * 60, 0, 0));
+    let image = oxiarc_image::DynamicImage::ImageRgb8(buf);
+
+    let path = std::env::temp_dir().join("example_encode.png");
+    image.save(&path).expect("save");
+    let reread = oxiarc_image::open(&path).expect("reopen");
+    assert_eq!(reread.dimensions(), (4, 4));
+}
+```
+
+### CLI: detecting and inspecting images
+
+```bash
+oxiarc detect photo.jpg      # -> "PNG image (not an archive)" / JPEG / TIFF
+oxiarc info image.png        # dimensions, colour type, bit depth, compression,
+                              # chunk/segment/IFD summary
+```
 
 ## Status
 
 | Crate           | Status  | Public API | Tests Passing |
 |-----------------|---------|------------|---------------|
-| oxiarc-core     | Stable  | 228        | 171           |
-| oxiarc-deflate  | Stable  | 168        | 273           |
-| oxiarc-lzhuf    | Stable  | 106        | 252           |
-| oxiarc-bzip2    | Stable  | 56         | 104           |
-| oxiarc-lz4      | Stable  | 126        | 151           |
-| oxiarc-zstd     | Stable  | 161        | 200           |
-| oxiarc-lzma     | Stable  | 188        | 178           |
-| oxiarc-archive  | Stable  | 438        | 590           |
-| oxiarc-lzw      | Stable  | 67         | 93            |
-| oxiarc-brotli   | Stable  | 101        | 237           |
-| oxiarc-snappy   | Stable  | 35         | 132           |
-| oxiarc-szip     | Stable  | 27         | 46            |
-| oxiarc-cli      | Stable  | 45         | 92            |
-| **Total**       |         | **1,746**  | **2,519**     |
+| oxiarc-core     | Stable  | 306        | 200           |
+| oxiarc-deflate  | Stable  | 294        | 455           |
+| oxiarc-lzhuf    | Stable  | 138        | 269           |
+| oxiarc-bzip2    | Stable  | 46         | 104           |
+| oxiarc-lz4      | Stable  | 133        | 158           |
+| oxiarc-zstd     | Stable  | 197        | 341           |
+| oxiarc-lzma     | Stable  | 290        | 277           |
+| oxiarc-archive  | Stable  | 474        | 583           |
+| oxiarc-lzw      | Stable  | 104        | 233           |
+| oxiarc-brotli   | Stable  | 195        | 349           |
+| oxiarc-snappy   | Stable  | 48         | 132           |
+| oxiarc-szip     | Stable  | 29         | 46            |
+| oxiarc-http     | Stable  | 99         | 310           |
+| oxiarc-png      | Stable  | 505        | 303           |
+| oxiarc-jpeg     | Stable  | 244        | 591           |
+| oxiarc-tiff     | Stable  | 654        | 535           |
+| oxiarc-image    | Stable  | 143        | 145           |
+| oxiarc-cli      | Stable  | 71         | 124           |
+| **Total**       |         | **3,969**  | **5,155**     |
 
-Test counts measured 2026-08-06 (nextest, all features, per-crate, 0 failed, 0 ignored; the workspace additionally has 139 doctests not attributed per crate, for 2,658 tests total); public-API item counts are the v0.3.6 snapshot. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions. Ahead of a 1.0 release, 18 public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
+Test counts measured 2026-09-08 (nextest, all features, per-crate, 0 failed, 0 skipped; the workspace additionally has 346 doctests not attributed per crate, for **5,501 tests total**). Public-API item counts are a `rg '^\s*pub (fn|struct|enum|trait|const|static|type|mod)'` sweep over each crate's `src/`, measured the same day — a coarser proxy than a rustdoc item count, and not directly comparable to any pre-0.4.2 snapshot that used a different methodology, but current and consistent across all 18 crates. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions (the five new 0.4.2 crates — `oxiarc-http`, `oxiarc-png`, `oxiarc-jpeg`, `oxiarc-tiff`, `oxiarc-image` — each carry their own live reference-oracle suite from day one; see the table below). Ahead of a 1.0 release, 18+ public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, `ContentCoding`, `UnsupportedReason`, `ColorSpace`, `ImageFormat`, `DynamicImage`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes
@@ -334,6 +512,9 @@ Streaming compression/decompression support in `oxiarc-deflate`:
 | **Brotli** | ✅ | ✅ | Brotli (RFC 7932) | None | Quality levels 0-11, full Appendix A static dictionary; `.br` file-path CLI support via extension fallback (raw Brotli has no magic bytes) |
 | **Snappy** | ✅ | ✅ | Snappy | CRC32C | Block and framed formats |
 | **ISO 9660** | ✅ | ❌ | Store | None | Read-only; list/extract/info/detect support |
+| **PNG** | ✅ | ✅ | DEFLATE (zlib) | CRC-32 (per chunk) | ISO/IEC 15948; every colour type/depth, Adam7, APNG, Apple `CgBI` (lenient default, strict rejects); `oxiarc-cli detect`/`info` recognise it (not an archive format) |
+| **JPEG** | ✅ | ✅ | DCT + Huffman/arithmetic | None (entropy-coded) | ITU-T T.81; baseline/extended/progressive/lossless, arithmetic (SOF9-11, default-on), OJPEG; scaled decode (`Scale` 1-16/8); `oxiarc-cli detect`/`info` recognise it |
+| **TIFF** | ✅ | ✅ | None/PackBits/CCITT/LZW/Deflate/ZSTD/LZMA/JPEG | None (per-strip codec checksums where applicable) | TIFF 6.0 + BigTIFF; classic + BigTIFF, both byte orders, `rayon` parallel strips/tiles; `oxiarc-cli detect`/`info` recognise it |
 
 ### ZIP Encryption
 
@@ -367,9 +548,15 @@ Two layers keep this permanent:
 | `oxiarc-snappy` | `snappy-oracle` | `python3` + `cramjam` |
 | `oxiarc-deflate` | `zlib-oracle` | `python3` (zlib/gzip) + `gzip` CLI |
 | `oxiarc-lzw` | `tiff-oracle` | `python3` + Pillow (libtiff), `tiffcp` when present |
+| `oxiarc-lzw` | `z-oracle` | `compress`/`uncompress`/`gzip` (`.Z` container) |
+| `oxiarc-lzw` | `gif-oracle` | `python3` + Pillow (GIF) |
 | `oxiarc-szip` | `libaec-oracle` | libaec (compiled harness; `LIBAEC_PREFIX` env var) |
 | `oxiarc-lzhuf` | `lha-oracle` | `lha` (Lhasa) CLI |
 | `oxiarc-archive` | `zip-oracle`, `xz-oracle`, `lha-oracle` | Info-ZIP `zip`/`unzip` + Python `zipfile`; `xz`; `lha` |
+| `oxiarc-http` | `http-oracle` | `python3` (zlib/gzip) + `brotli`/`zstd`/`compress`/`uncompress`/`gzip` CLIs |
+| `oxiarc-png` | `png-oracle` | `python3` + Pillow, both directions |
+| `oxiarc-jpeg` | `jpeg-oracle` | `cjpeg`/`djpeg`/`tjbench` (libjpeg-turbo), Pillow tolerance cross-check |
+| `oxiarc-tiff` | `tiff-oracle` (own, per-crate feature — unrelated to `oxiarc-lzw`'s feature of the same name; Cargo features are crate-namespaced) | `tiffcp`/`tiffinfo` (libtiff), `python3` + Pillow/`tifffile` |
 
 ```bash
 # Run one codec's live oracle against the reference tool
@@ -385,11 +572,39 @@ cargo nextest run --workspace --all-features
 
 Verified interop snapshot (last full run 2026-07-13, live tools; unchanged in 0.4.0 — this release's DEFLATE/zlib decoder rewrite changed no wire format or output, so the DEFLATE/zlib/gzip result below still holds): zstd 64/64 corpus + 101/101 wide frames decode byte-identical, 85/85 oxiarc frames accepted by `zstd -d`; brotli 608/608 decode / 588/588 accepted; xz 5.8.3 60/60 decode / 8/8 encode; bzip2 1.0.8 324/324 both directions; lz4 1.10.0 11/11 + 44/44 + 3/3 linked; TIFF-LZW 125/125 vs Pillow/libtiff (encoder byte-identical to libtiff); libaec 1.1.4 2450/2450 decode + 4900/4900 encode; DEFLATE/zlib/gzip bit-exact vs CPython + gzip CLI.
 
+**0.4.2 additions** (each new format crate ships its own live oracle from its first wave, not bolted on afterwards): `oxiarc-brotli` shared dictionaries **72/72** reference `-D` streams decode byte-identical, **96/96** oxiarc streams accepted by `brotli -d -D`; `oxiarc-lzw`'s new `.Z` container **64/64** reference `compress` streams decode byte-identical, **64/64** oxiarc streams byte-identical to `compress -b N -c`, **160/160** decode via `gzip -dc`/`uncompress -c`, and GIF (previously only ever round-tripped against itself) is now **20/20** Pillow-written GIFs decode byte-identical + **20/20** oxiarc GIFs read back correctly in Pillow; `oxiarc-jpeg` baseline/progressive output is byte-identical to `cjpeg`/`djpeg -dct int` including 12-bit, optimized Huffman and arithmetic coding (SOF9/10), with scaled decode (`M` in `{1,2,4,8}`) also byte-identical and the other twelve `M` values within a measured numeric tolerance (peak error 3); `oxiarc-png` decodes and encodes both directions against Pillow across every colour type/depth/interlacing combination; `oxiarc-tiff` round-trips every codec (LZW/Deflate/ZSTD/LZMA/JPEG/PackBits/CCITT G3/G4, incl. the new uncompressed mode, which libtiff can *parse* but not decode — `tiffinfo` reports it correctly, `tiffcp` reports "not supported") against `tiffcp`/`tiffinfo`/Pillow/`tifffile`; `oxiarc-zstd`'s legacy one-shot decode path is now hardened to match the streaming `ZstdStream` decoder on every RFC-forbidden frame shape a 983,701-execution differential fuzz campaign could find. Per-crate READMEs carry the exact counts and dates.
+
 ## Performance
 
 ### Benchmark Results
 
-Real-world performance measured on various data types:
+Real-world performance measured on various data types.
+
+> **Every codec figure in this repository was re-measured on 2026-09-08**
+> (interleaved arms, medians, three independent runs wherever a row straddles
+> its gate, machine load average quoted next to every table — it ranged from
+> 110 down to 18 on 8 cores during that window, so **the ratios are the
+> result and the absolute times are not portable**). Headline movements, all
+> against the reference tool for that codec:
+>
+> | matrix | before | 2026-09-08 |
+> |---|---|---|
+> | `oxiarc-tiff` whole-image vs `tiffcp -c none`, ZSTD | 5.07x-6.24x | **0.96x-1.65x** |
+> | same, LZW | 2.13x-2.41x | **1.00x-1.07x** |
+> | same, Deflate | 1.39x-1.58x | **1.14x-1.33x** |
+> | same, LZMA | 1.15x-1.16x | 1.31x-1.32x (moved the wrong way) |
+> | `oxiarc-zstd` vs `zstd -b -d`, 50 MB text L3 | 0.43x-0.55x | 0.43x-0.54x (confirmed) |
+> | `oxiarc-deflate` vs Apple's tuned libz, PNG rows @ 16 MiB | 0.51x-0.60x | 0.47x-0.67x (confirmed) |
+> | `oxiarc-brotli` push vs one-shot, copy-dense @ lgwin 22 | 0.80x | 0.71x-0.76x |
+> | `oxiarc-lzw` vs libtiff `LZWDecode` | 1.25x-1.37x | 1.00x-1.56x (load scatter) |
+>
+> Four rows of the TIFF matrix crossed the `<= 1.25x` gate into "met" (both
+> LZW rows, RGB8 Deflate, Gray16 ZSTD) and one crossed out of it (LZMA). The
+> per-crate READMEs carry the full tables, the fixtures and the method; root
+> `TODO.md` Known Issue 11 carries the gate bookkeeping.
+
+The figures below predate that pass and cover the compression *encoders*,
+which it did not re-measure:
 
 #### LZ77 (DEFLATE) Compression Throughput
 | Level | Uniform Data | Text Data | Binary Data |
@@ -818,7 +1033,7 @@ fn detect_format() -> oxiarc_core::error::Result<()> {
 # Build all crates
 cargo build --release
 
-# Run all tests (2,329 via nextest + 139 doctests = 2,468)
+# Run all tests (5,155 via nextest + 346 doctests = 5,501)
 cargo nextest run --workspace --all-features
 cargo test --doc --workspace --all-features
 
@@ -832,8 +1047,9 @@ cargo install --path oxiarc-cli
 ## Requirements
 
 - Rust 1.85+ (Edition 2024)
-- No external C libraries or compression dependencies
+- No external C libraries or compression dependencies for the shipped libraries (default features are 100% Pure Rust — see Known Issue #8 in `TODO.md` for the one dev-only exception, `criterion`'s benchmark harness)
 - Optional: `indicatif` for progress bars (CLI only)
+- Optional, for the live oracle suites only (never required to build or use the library — every oracle feature self-skips when its tool is absent): `zstd`, `brotli`, `xz`, `bzip2`, `lz4`, `lha` (Lhasa) CLIs; Info-ZIP `zip`/`unzip`; libaec; `python3` with `zlib`/`gzip` (stdlib), Pillow 12.1, `numpy`, `tifffile`, and `cramjam`; libtiff's `tiffcp`/`tiffinfo`; libjpeg-turbo's `cjpeg`/`djpeg`/`tjbench`
 
 ## Contributing
 

@@ -27,7 +27,7 @@ use oxiarc_core::error::{OxiArcError, Result};
 
 /// A reusable `.xz` decoder context.
 ///
-/// See the [module documentation](self) for why this exists and when it
+/// See the [module documentation](crate::xz) for why this exists and when it
 /// helps. Each [`XzDecoder::decompress_into`] call decodes one complete,
 /// independent `.xz` stream — the same contract
 /// [`decompress_into`](super::decompress_into) has — but keeps its LZMA2
@@ -102,6 +102,34 @@ impl XzDecoder {
     ///
     /// The cap is checked after every LZMA2 chunk, not after a stream has
     /// been fully expanded, matching [`XzReader::with_max_output`].
+    ///
+    /// A cap tighter than `dst` reports as
+    /// [`OxiArcError::MemoryBudgetExceeded`], never as
+    /// [`OxiArcError::BufferTooSmall`] — the buffer was not the binding
+    /// constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_core::error::OxiArcError;
+    /// use oxiarc_lzma::xz::{XzDecoder, compress};
+    ///
+    /// let stream = compress(&vec![0u8; 100_000], 6).expect("compress");
+    /// let mut scratch = vec![0u8; 100_000];
+    ///
+    /// let mut decoder = XzDecoder::new().with_max_output(1_000);
+    /// assert!(matches!(
+    ///     decoder.decompress_into(&stream, &mut scratch),
+    ///     Err(OxiArcError::MemoryBudgetExceeded { .. })
+    /// ));
+    ///
+    /// // The same scratch buffer, no configured cap: it is big enough.
+    /// let mut decoder = XzDecoder::new();
+    /// assert_eq!(
+    ///     decoder.decompress_into(&stream, &mut scratch).expect("decode"),
+    ///     100_000
+    /// );
+    /// ```
     #[must_use]
     pub fn with_max_output(mut self, max_output: u64) -> Self {
         self.max_output = Some(max_output);
@@ -117,16 +145,21 @@ impl XzDecoder {
     /// written to `dst` (which may be fewer than `dst.len()`), and a stream
     /// that would expand past `dst` (or past a configured
     /// [`Self::with_max_output`] cap, if smaller) is rejected *during*
-    /// decoding with [`OxiArcError::BufferTooSmall`] rather than expanded
-    /// first. The only difference is that repeated calls on the same
-    /// `XzDecoder` reuse the LZMA2 dictionary buffer, probability model and
-    /// coder state whenever the stream's declared dictionary size matches
-    /// the one already cached — see the [module documentation](self).
+    /// decoding rather than expanded first. The only difference is that
+    /// repeated calls on the same `XzDecoder` reuse the LZMA2 dictionary
+    /// buffer, probability model and coder state whenever the stream's
+    /// declared dictionary size matches the one already cached — see the
+    /// [module documentation](crate::xz).
     ///
     /// # Errors
     ///
-    /// - [`OxiArcError::BufferTooSmall`] if the stream expands past `dst`
-    ///   (or the configured cap).
+    /// - [`OxiArcError::BufferTooSmall`] if the stream expands past `dst`.
+    /// - [`OxiArcError::MemoryBudgetExceeded`] if a
+    ///   [`Self::with_max_output`] cap *tighter than `dst`* stopped the
+    ///   decode: the caller's buffer was big enough, their own ceiling was
+    ///   not. The two are kept distinct so a caller reusing one large
+    ///   scratch buffer can tell "your buffer is short" from "your budget
+    ///   tripped".
     /// - The usual framing/CRC errors for a corrupt or truncated stream.
     ///
     /// A failed call still keeps whatever LZMA2 decoder this context had
@@ -148,18 +181,30 @@ impl XzDecoder {
             self.last_reuses = reader.lzma2_reuses();
         }
 
-        // Same reporting as the free function `decompress_into`: a budget
-        // trip becomes `BufferTooSmall` (the cap here always derives from
-        // `dst`, whether or not `with_max_output` narrowed it further), and
-        // an oversized-but-otherwise-valid result is still checked against
-        // `dst` explicitly since the running check inside decode only fires
-        // once the *running total* exceeds the cap, not once the final
-        // size is known to.
+        // Reporting follows *which* bound actually tripped. When the cap is
+        // `dst` itself (no `with_max_output`, or one no tighter than `dst`),
+        // a budget trip is the caller's buffer being too short, and
+        // `BufferTooSmall` is the honest error — the same one the free
+        // function `decompress_into` raises. When `with_max_output` set a
+        // *tighter* cap than `dst`, the caller's buffer was fine and their
+        // own configured ceiling is what stopped the decode, so
+        // `MemoryBudgetExceeded` passes through unchanged. Folding the two
+        // together used to produce a self-contradictory
+        // `BufferTooSmall { needed: 100000, available: 100000 }` for
+        // `with_max_output(1000)` into a 100,000-byte `dst`, and left the
+        // caller no way to tell a short buffer from a tripped budget
+        // (FINALGATE F4).
+        let cap_is_dst = match self.max_output {
+            Some(configured) => configured >= dst.len() as u64,
+            None => true,
+        };
         let data = outcome.map_err(|err| match err {
-            OxiArcError::MemoryBudgetExceeded { requested, .. } => OxiArcError::BufferTooSmall {
-                needed: requested,
-                available: dst.len(),
-            },
+            OxiArcError::MemoryBudgetExceeded { requested, .. } if cap_is_dst => {
+                OxiArcError::BufferTooSmall {
+                    needed: requested,
+                    available: dst.len(),
+                }
+            }
             other => other,
         })?;
         if data.len() > dst.len() {
@@ -390,16 +435,19 @@ mod tests {
         let before = decoder
             .decompress_into(&stream, &mut buf)
             .expect_err("a 1 KiB cap must reject a ~100 KB stream before reset");
-        assert!(matches!(before, OxiArcError::BufferTooSmall { .. }));
+        assert!(matches!(before, OxiArcError::MemoryBudgetExceeded { .. }));
 
         decoder.reset();
 
         let after = decoder
             .decompress_into(&stream, &mut buf)
             .expect_err("the same 1 KiB cap must still apply after reset");
-        assert!(matches!(after, OxiArcError::BufferTooSmall { .. }));
+        assert!(matches!(after, OxiArcError::MemoryBudgetExceeded { .. }));
     }
 
+    /// A cap narrower than `dst` still caps — and, since FINALGATE F4,
+    /// says so: `dst` was big enough, the caller's own ceiling is what
+    /// stopped the decode.
     #[test]
     fn with_max_output_narrower_than_dst_still_caps() {
         let payload = xorshift_bytes(0x9, 100_000);
@@ -411,8 +459,8 @@ mod tests {
             .decompress_into(&stream, &mut buf)
             .expect_err("a 1 KiB cap must reject a ~100 KB stream even with a large dst");
         assert!(
-            matches!(err, OxiArcError::BufferTooSmall { .. }),
-            "expected BufferTooSmall, got {err:?}"
+            matches!(err, OxiArcError::MemoryBudgetExceeded { .. }),
+            "expected MemoryBudgetExceeded, got {err:?}"
         );
     }
 
@@ -1323,5 +1371,63 @@ mod tests {
             primed_err.to_string().contains("dictionary size"),
             "expected a dictionary-size refusal, got {primed_err}"
         );
+    }
+    /// FINALGATE F4: a `with_max_output` cap *tighter than `dst`* is the
+    /// caller's own budget tripping, not their buffer being short, so it
+    /// must report as `MemoryBudgetExceeded`. It used to be folded into a
+    /// self-contradictory `BufferTooSmall { needed: n, available: n }`.
+    #[test]
+    fn a_tighter_configured_cap_reports_as_a_budget_not_a_short_buffer() {
+        let payload = vec![0u8; 100_000];
+        let stream = xz::compress(&payload, 6).expect("compress");
+        let mut scratch = vec![0u8; payload.len()];
+
+        let mut decoder = XzDecoder::new().with_max_output(1_000);
+        let error = decoder
+            .decompress_into(&stream, &mut scratch)
+            .expect_err("a 1000-byte cap must stop a 100000-byte stream");
+        assert!(
+            matches!(error, OxiArcError::MemoryBudgetExceeded { .. }),
+            "expected MemoryBudgetExceeded, got {error:?}"
+        );
+        assert!(
+            !error.to_string().contains("Buffer too small"),
+            "a configured budget must not masquerade as a short buffer: {error}"
+        );
+
+        // The same buffer with no configured cap is big enough.
+        let mut decoder = XzDecoder::new();
+        assert_eq!(
+            decoder
+                .decompress_into(&stream, &mut scratch)
+                .expect("decode"),
+            payload.len()
+        );
+    }
+
+    /// The other half of F4: when `dst` really is the binding constraint —
+    /// no cap, or a cap no tighter than `dst` — `BufferTooSmall` is still
+    /// what comes back, and it still reports `dst.len()` as `available`.
+    #[test]
+    fn a_short_dst_still_reports_buffer_too_small_with_or_without_a_looser_cap() {
+        let payload = vec![0u8; 100_000];
+        let stream = xz::compress(&payload, 6).expect("compress");
+        let mut short = vec![0u8; 1_000];
+
+        for cap in [None, Some(1_000u64), Some(4_000_000u64)] {
+            let mut decoder = XzDecoder::new();
+            if let Some(limit) = cap {
+                decoder = decoder.with_max_output(limit);
+            }
+            let error = decoder
+                .decompress_into(&stream, &mut short)
+                .expect_err("a 1000-byte dst must stop a 100000-byte stream");
+            match error {
+                OxiArcError::BufferTooSmall { available, .. } => {
+                    assert_eq!(available, short.len(), "cap {cap:?}");
+                }
+                other => panic!("cap {cap:?}: expected BufferTooSmall, got {other:?}"),
+            }
+        }
     }
 }

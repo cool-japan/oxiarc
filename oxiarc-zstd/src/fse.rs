@@ -40,6 +40,19 @@ pub struct FseTable {
     accuracy_log: u8,
 }
 
+/// The corruption error for an FSE state that fell outside its table.
+///
+/// Shared by [`FseTable::get`] and by callers that index [`FseTable::entries`]
+/// directly, so the two report the same thing for the same input.
+#[cold]
+#[inline(never)]
+pub fn state_out_of_range(state: usize, table_size: usize) -> OxiArcError {
+    OxiArcError::corrupted(
+        0,
+        format!("FSE state {state} out of range (table size {table_size})"),
+    )
+}
+
 impl FseTable {
     /// Create a new FSE table with given accuracy log and symbol probabilities.
     ///
@@ -167,16 +180,22 @@ impl FseTable {
     /// Get table entry for a given state, bounds-checked.
     #[inline]
     pub fn get(&self, state: usize) -> Result<&FseTableEntry> {
-        self.entries.get(state).ok_or_else(|| {
-            OxiArcError::corrupted(
-                0,
-                format!(
-                    "FSE state {} out of range (table size {})",
-                    state,
-                    self.entries.len()
-                ),
-            )
-        })
+        self.entries
+            .get(state)
+            .ok_or_else(|| state_out_of_range(state, self.entries.len()))
+    }
+
+    /// The decode table itself, for a loop that indexes it many times.
+    ///
+    /// A `&FseTable` reaches its entries through a `Vec` header, so every
+    /// lookup reloads a pointer and a length; the sequence loop performs three
+    /// per sequence and hoists the slices out with this instead. The
+    /// bounds check itself stays — an FSE state is derived from the bitstream
+    /// and a corrupt one must be refused, not masked into range — and
+    /// [`state_out_of_range`] keeps the message identical to [`Self::get`]'s.
+    #[inline]
+    pub fn entries(&self) -> &[FseTableEntry] {
+        &self.entries
     }
 
     /// Get the accuracy log.

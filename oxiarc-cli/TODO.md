@@ -176,7 +176,7 @@
 
 ## Test Coverage
 
-- 121 tests passing (16 integration-test files under `tests/` — including
+- 124 tests passing (16 integration-test files under `tests/` — including
   `cli_image_detect` new in 0.4.2 (Phase 8: `detect`/`info` PNG/JPEG/TIFF
   recognition, plus every other subcommand's image-aware refusal) — plus
   library unit tests in `main.rs`/`utils.rs`/`windows.rs`/`style.rs`/

@@ -171,7 +171,12 @@
       demand and sized from the code space still unaccounted for.
 - [x] Proven equal to `HuffmanTree` for **every bit pattern** of every shape
       it is built from (`decode_table_agrees_with_huffman_tree`, plus a
-      48-shape pseudorandom sweep and an in-place-rebuild differential)
+      48-shape pseudorandom sweep and an in-place-rebuild differential), and
+      then over a further 460 shapes / 12.5 M bit patterns
+      (`a_wide_shape_sweep_agrees_with_huffman_tree`: single-symbol alphabets
+      at every length 1..=15, whole populations pinned to one length, 200
+      randomised shapes and the same shapes punched full of holes) plus 64
+      in-place rebuilds each compared entry-for-entry with a fresh build
 - [x] Fixed tables built once per process (`OnceLock`), never per block
 - [x] Steady-state allocation-free: scratch reuse plus a power-of-two
       sub-table reservation. Resident scratch *fell* — the two per-tree
@@ -189,9 +194,14 @@
 - [x] Match copies in machine words: short non-overlapping matches inline in
       8-byte chunks (never `memmove`, whose call costs more than the copy at
       DEFLATE's average match length), byte fill for distance 1, word tiling
-      with pattern doubling for distances 2-7, and `copy_within` above 32
-      bytes where the vector `memmove` wins. **No write ever goes past the
-      reported output** — the caller's buffer tail is untouched, as before.
+      with pattern doubling for distances 2-7, and `copy_within` above 64
+      bytes (`WORD_COPY_MAX`) where the vector `memmove` wins. **No write ever
+      goes past the reported output** — the caller's buffer tail is untouched,
+      as before. The half of a match that starts in the history window and
+      finishes inside the caller's buffer goes through
+      `copy_straddling_match`, out of line, and its tail is the *bounds
+      checked* copy: it resumes at a cursor the fast loop's once-per-iteration
+      output guard never saw.
 - [x] The growable path (`inflate()` / `InflateStream::inflate_to_vec`)
       decodes into the tail of the buffer it is filling through
       `BoundedSink::resumed`, so the window is written once and
@@ -202,6 +212,87 @@
       sizes x levels 1/6/9, every arm's output checked before it is timed
 - [x] `benches/deflate_bench.rs::inflate_shapes` — per-shape decode
       throughput (image rows, PNG-filtered rows, text, long matches, stored)
+- [x] Measured by running the pre-track binary (commit `9a3b7bc`, built as a
+      standalone snapshot) and the current one **alternately** on the same
+      corpora, so a shared machine cannot favour one side. All figures are
+      medians (median across the interleaved rounds of each round's own
+      median): on the four decode-bound shapes `inflate_into` is
+      **1.04x-3.3x faster** and the worst-arm-vs-python ratio improves in
+      all 36 measured rows (the two `memcpy`-bound shapes scatter within
+      noise). Against the
+      ">= 0.60x" gate: met on every shape and level at 1 MiB (0.65x-2.92x),
+      on four of six shapes at 64 KiB (`rgb8-image-rows` 0.46x at L6,
+      `many-blocks-text` 0.59x at L9) and on three of six at 16 MiB
+      (png-filtered 0.51x-0.60x, rgb8 0.58x-0.67x, text 0.58x-0.77x). On the
+      load-robust best-of-round figure every 64 KiB and 1 MiB shape clears
+      0.60x and five of six do at 16 MiB. Re-measured 2026-09-08 (three more
+      full 54-row passes, interleaved, load 60-71): png-filtered at 16 MiB
+      lands at 0.47x-0.67x on medians and 0.48x-0.57x on best-of-round — same
+      band, same verdict. Reference: CPython 3.14 linking
+      Apple's tuned `/usr/lib/libz.1.dylib` 1.2.12; full tables in
+      `README.md`.
+### Defects found and fixed by the adversarial verification pass
+
+- [x] **Silent output corruption at the output-buffer edge.** A match that
+      starts in the history window resumes inside `dst` at a cursor the fast
+      loop's once-per-iteration output guard never saw — exactly `distance`,
+      which can be within eight bytes of the end of the caller's buffer. The
+      word-wide tail store there wrote *nothing* (`store_u64` is bounds
+      checked), so the last one to seven bytes of the match were left as
+      whatever the caller's buffer already held while the decoder reported
+      them as produced (a `debug_assert` caught it only in debug builds).
+      Reachable from `InflateStream::inflate` with any output buffer of
+      32 KiB or less — the shape `oxiarc-png` uses for IDAT rows,
+      `oxiarc-tiff` for strips and `oxiarc-http` for body chunks. The
+      straddling copy now lives in `copy_straddling_match` and its tail is
+      the bounds-checked `copy_within_dst`. Pinned by
+      `tests/inflate_fast_boundary.rs` (crafted fixed-Huffman streams that
+      end a match at every offset in the last words of buffers of eight
+      different sizes) and by
+      `fast::tests::a_straddling_copy_is_exact_including_at_the_end_of_the_buffer`.
+- [x] **Panic / non-terminating loop on a crafted dynamic block.** The port
+      of zlib's `inflate_table` kept `root = min(root, max_len)` but dropped
+      `if (min > root) root = min`. An alphabet whose *shortest* code exceeds
+      the root index is necessarily **incomplete** (a complete code with every
+      code >= 11 bits needs 2048 symbols; the alphabet has 288), and zlib
+      rejects incomplete sets outright — verified: CPython answers
+      `zlib.error: Error -3 ... invalid literal/lengths set`. That is why no
+      oracle in the suite covered it. This crate deliberately tolerates
+      incomplete codes (as `HuffmanTree` always has, and `DecodeTable` is
+      required to agree with it), so for it the shape is reachable —
+      `HDIST = 1` with a single 15-bit distance code, say. The replication
+      stride then exceeded the
+      table size and `fill -= incr` wrapped: a subtract-overflow panic in
+      debug, and in release a fill loop whose counter never reaches zero
+      (confirmed: a release test timed out after 120 s). The sub-table
+      creation now runs *before* the first fill instead of after it, which
+      leaves every non-degenerate shape byte-identical while giving the
+      degenerate ones the sub-table their codes need. It is a **0.4.2
+      regression**, not a pre-existing hole: the crate's other decoder,
+      `Inflater` (the pre-0.4.2 `HuffmanTree` symbol loop), decodes the
+      fixture correctly. Pinned by
+      `tests/inflate_fast_boundary.rs::a_block_whose_shortest_code_exceeds_the_table_root_is_handled`,
+      by `a_long_code_block_agrees_with_the_huffman_tree_decoder` (the same
+      shape carrying real output, decoded through the packed-table path, the
+      push decoder and the independent `HuffmanTree` decoder, all three
+      required to agree, plus an assertion that CPython still rejects it), and
+      by the 460-shape `HuffmanTree` differential — which now carries a
+      vacuity guard requiring 400+ shapes, 10 M+ bit patterns and all 11
+      degenerate shapes.
+- [x] Both fixes A/B'd against the pre-fix binary, interleaved in both
+      orders over 12 rounds: every shape within ±1.3 %, against a ±2-3 %
+      noise floor measured on the `memcpy`-bound rows.
+
+- [x] Changes measured and **rejected**, all reproduced across rounds: an
+      11-bit literal/length root (libdeflate's choice) costs 7 % on image
+      rows; a branchless two-literal commit costs 7 % on image rows (it puts
+      a second dependent table load on every match's critical path too);
+      folding the distance decode into the length's peek costs 8 % on
+      PNG-filtered rows; and shrinking the fast loop's output margin below
+      the longest match — worth ~3 % on a push decoder — changes how many
+      trailing bytes land in the accumulator, which
+      `reset_clears_the_accumulator_but_next_member_keeps_it` pins. Each is
+      documented at the constant or the step it concerns.
 
 ## Future Enhancements
 
@@ -283,26 +374,40 @@
 ## Test Coverage
 
 `cargo nextest run -p oxiarc-deflate --all-features` + `cargo test --doc -p oxiarc-deflate --all-features`
-(verified 2026-09-07): **422 tests** — 381 nextest (217 in-crate unit tests +
-164 integration tests) and 41 doctests. Zero failures, zero skips.
+(re-measured 2026-09-08 by the docs track, from the real per-binary nextest
+output, after DEFENC/DEFENC-verify's encoder rewrite and INFLATEPERF/
+INFLATEPERF-verify's fast-loop work both landed, plus the FINALGATE F5
+regression test): **507 tests** — 455
+nextest (214 in-crate unit tests + 241 integration tests across 15 files)
+and 52 doctests. Zero failures, zero skips.
 
-Integration suites:
+Integration suites (exact per-binary counts from a real `nextest` run, not
+estimated):
 
 | Suite | Tests | Covers |
 |-------|-------|--------|
 | `inflate_stream` | 50 | Split invariance (S1-S8), format coverage (F1-F12), robustness (R1-R17) for `InflateStream`/`WrappedInflate` |
 | `compliance` | 32 | RFC 1951 block types, spec-inflater cross-checks, parallel GZIP round-trips |
-| `inflate_reader` | 23 | `Interrupted`/`WouldBlock`, truncation as `io::Error`, the zlib short-tail rule, raw padding-bit vs trailing-byte framing, read granularity, the `Decompressor` sticky-fault two-call regression |
-| `wrapper_regressions` | 16 | DEFLATE-01..05, with CPython gzip/zlib fixtures |
+| `inflate_reader` | 31 | `Interrupted`/`WouldBlock`, truncation as `io::Error`, the zlib short-tail rule, raw padding-bit vs trailing-byte framing, read granularity, the `Decompressor` sticky-fault two-call regression |
+| `encoder_behaviour` | 23 | (**new, DEFENC**) Level table, lazy-vs-greedy decisions, `max_lazy`/`TOO_FAR`, block-type selection through an independent block walker, call-size invariance, cross-call matching, the optimal parser over every corpus — no external tool needed |
+| `wrapper_regressions` | 17 | DEFLATE-01..05, with CPython gzip/zlib fixtures, plus the FINALGATE F5 Adler-32-is-not-a-CRC message regression |
 | `inflate_differential` | 15 | Seven decode paths compared byte-for-byte over the corpus at four levels |
 | `edge_cases` | 14 | Empty input, maximum-length matches, boundary sizes |
-| `zlib_oracle` | 12 | Live CPython `zlib`/`gzip` + system `gzip` CLI differential, both directions, both `Read` adapters (self-skipping) |
+| `zlib_oracle` | 13 | Live CPython `zlib`/`gzip` + system `gzip` CLI differential, both directions, both `Read` adapters (self-skipping) |
+| `adversarial_verify` | 13 | Mutation/truncation robustness sweeps |
+| `zlib_encoder_oracle` | 11 | (**new, DEFENC**) Byte-identity with CPython `zlib.compress`/`compressobj` at every level and strategy, behind `zlib-oracle` |
+| `inflate_fast_boundary` | 11 | (**new, INFLATEPERF/INFLATEPERF-verify**) Hand-built fixed-Huffman streams pinning the straddling-match buffer-edge fix and the malformed-Huffman-table-root fix, both mutation-checked to fail in a **release** build with either fix reverted |
+| `encoder_adversarial` | 8 | (**new, DEFENC-verify**) 26 boundary sizes × 11 shapes × every level/strategy/call pattern/flush mode/dictionary |
 | `proptest_roundtrip` | 2 | Property-based round-trip and no-panic |
+| `allocation_steady_state` | 1 | (**new, DEFENC-verify**) Counting global allocator: `InflateStream` allocates zero times in the steady state across chunk/output-buffer shapes |
 
-In-crate unit tests by module: streaming 40, zlib 30, parallel 19, lz77 18,
-deflate 15, window 14, sink 11, optimal 10, huffman 9, tables 7, inflate 7,
-reader 6, pool 6, gzip 6, stream 5, wrapper 4, raw_stream 4, async_deflate 4,
-async_reader 2.
+In-crate unit tests: 214, spread across the modules the encoder rewrite and
+the fast-loop work both touched (`encoder/*`, `decode_table`, `fast`, plus
+every pre-existing module below) — not re-broken-down per module this pass
+(the docs track's own scope is cross-file consistency, not a full internal
+audit); the per-suite table above is the exact, re-measured figure that
+matters for cross-referencing against the root `TODO.md`/`README.md`
+totals.
 
 ## Code Statistics
 
@@ -318,16 +423,16 @@ under the 1500-line target):
 | zlib.rs | 1,199 |
 | inflate.rs | 1,166 |
 | inflate_core.rs | 1,054 |
-| stream.rs | 887 |
-| sink.rs | 726 |
+| stream.rs | 935 |
+| sink.rs | 737 |
 | decode_table.rs | 719 |
 | reader.rs | 717 |
+| inflate_core/fast.rs | 677 |
 | lz77.rs | 642 |
 | window.rs | 578 |
 | parallel.rs | 562 |
 | pool.rs | 534 |
 | deflate.rs | 513 |
-| inflate_core/fast.rs | 503 |
 | tables.rs | 345 |
 | async_reader.rs | 330 |
 | async_deflate.rs | 322 |
@@ -335,7 +440,7 @@ under the 1500-line target):
 | gzip.rs | 268 |
 | optimal.rs | 261 |
 | lib.rs | 116 |
-| **Total** | **15,674** |
+| **Total** | **15,907** |
 
 ## Known Limitations
 

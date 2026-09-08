@@ -3,7 +3,8 @@
 use oxiarc_core::Crc32;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
-use oxiarc_deflate::{deflate, inflate};
+use oxiarc_core::traits::FlushMode;
+use oxiarc_deflate::{InflateStatus, InflateWrapper, TrailingPolicy, WrappedInflate, deflate};
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -211,24 +212,80 @@ impl GzipHeader {
     }
 }
 
+/// Staging buffer size for [`GzipReader::decompress`], both directions.
+///
+/// Matches `oxiarc_deflate::InflateReader`'s own 64 KiB staging buffer.
+const GZIP_STAGE: usize = 64 * 1024;
+
+/// A [`Read`] adapter that copies every byte it hands out into a sink.
+///
+/// [`GzipReader::new`] parses the first member's header eagerly (so
+/// [`GzipReader::header`] can be read before any decoding, and so a
+/// non-gzip input fails at construction), but the streaming decoder used by
+/// [`GzipReader::decompress`] re-parses the framing itself. Those header
+/// bytes are gone from the underlying reader by then, so they are captured
+/// here and replayed in front of it.
+struct TeeReader<'a, R: Read> {
+    inner: &'a mut R,
+    sink: &'a mut Vec<u8>,
+}
+
+impl<R: Read> Read for TeeReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let filled = self.inner.read(buf)?;
+        if let Some(fresh) = buf.get(..filled) {
+            self.sink.extend_from_slice(fresh);
+        }
+        Ok(filled)
+    }
+}
+
 /// GZIP reader that decompresses data.
+///
+/// Concatenated multi-member streams (RFC 1952 §2.2 — `cat a.gz b.gz`,
+/// `pigz`, `bgzip`, rsyncable gzips, and oxiarc's own
+/// `compress_gzip_parallel` output) decode to the concatenation of every
+/// member's contents. Trailing `0x00` padding after the last member is
+/// tolerated, as the `gzip` CLI and CPython's `gzip` module do.
 pub struct GzipReader<R: Read> {
-    /// Underlying reader.
+    /// Underlying reader, positioned just past the first member's header.
     reader: R,
-    /// Parsed header.
+    /// Parsed header of the first member.
     header: GzipHeader,
+    /// The first member's header bytes verbatim, replayed into the
+    /// streaming decoder by [`GzipReader::decompress`].
+    header_bytes: Vec<u8>,
     /// Optional progress handle.
     progress: Option<ProgressHandle>,
+    /// Optional cap on the total decompressed size, enforced *during*
+    /// decoding. See [`GzipReader::with_max_output`].
+    max_output: Option<u64>,
 }
 
 impl<R: Read> GzipReader<R> {
     /// Create a new GZIP reader.
+    ///
+    /// # Errors
+    ///
+    /// [`OxiArcError::InvalidMagic`] if the input does not start with the
+    /// gzip magic, [`OxiArcError::UnsupportedMethod`] for a compression
+    /// method other than DEFLATE, and [`OxiArcError::Io`] for a header that
+    /// ends early.
     pub fn new(mut reader: R) -> Result<Self> {
-        let header = GzipHeader::read(&mut reader)?;
+        let mut header_bytes = Vec::new();
+        let header = {
+            let mut tee = TeeReader {
+                inner: &mut reader,
+                sink: &mut header_bytes,
+            };
+            GzipHeader::read(&mut tee)?
+        };
         Ok(Self {
             reader,
             header,
+            header_bytes,
             progress: None,
+            max_output: None,
         })
     }
 
@@ -239,12 +296,68 @@ impl<R: Read> GzipReader<R> {
         self
     }
 
-    /// Get the header.
+    /// Refuse to decode more than `limit` bytes in total, across every
+    /// member of the stream.
+    ///
+    /// The cap is enforced *inside* a DEFLATE block, so a decompression
+    /// bomb is rejected with [`OxiArcError::MemoryBudgetExceeded`] before
+    /// its expansion is ever allocated — unlike a post-decode size check.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_archive::{GzipReader, gzip};
+    /// use oxiarc_core::error::OxiArcError;
+    ///
+    /// let bomb = gzip::compress(&vec![0u8; 1 << 20], 9).expect("compress");
+    /// let mut reader = GzipReader::new(std::io::Cursor::new(bomb))
+    ///     .expect("header")
+    ///     .with_max_output(64 * 1024);
+    /// assert!(matches!(
+    ///     reader.decompress(),
+    ///     Err(OxiArcError::MemoryBudgetExceeded { .. })
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn with_max_output(mut self, limit: u64) -> Self {
+        self.max_output = Some(limit);
+        self
+    }
+
+    /// Get the header of the stream's first member.
     pub fn header(&self) -> &GzipHeader {
         &self.header
     }
 
     /// Decompress the data.
+    ///
+    /// Streams the input through `oxiarc_deflate`'s resumable gzip core
+    /// rather than buffering the whole compressed file, and decodes **every**
+    /// member of a concatenated stream (RFC 1952 §2.2), concatenating their
+    /// contents. Each member's CRC-32 and `ISIZE` trailer is verified, as is
+    /// its `FHCRC` header checksum when present.
+    ///
+    /// # Errors
+    ///
+    /// [`OxiArcError::CrcMismatch`] for a bad CRC-32 or `FHCRC`,
+    /// [`OxiArcError::CorruptedData`] for an `ISIZE` mismatch or a malformed
+    /// DEFLATE stream, [`OxiArcError::UnexpectedEof`] for a truncated
+    /// member, [`OxiArcError::InvalidMagic`] for non-zero trailing garbage,
+    /// and [`OxiArcError::MemoryBudgetExceeded`] when
+    /// [`GzipReader::with_max_output`] is exceeded.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use oxiarc_archive::{GzipReader, gzip};
+    ///
+    /// // Two independently-compressed members, concatenated.
+    /// let mut stream = gzip::compress(b"first ", 6).expect("compress");
+    /// stream.extend_from_slice(&gzip::compress(b"second", 6).expect("compress"));
+    ///
+    /// let mut reader = GzipReader::new(std::io::Cursor::new(stream)).expect("header");
+    /// assert_eq!(reader.decompress().expect("decompress"), b"first second");
+    /// ```
     pub fn decompress(&mut self) -> Result<Vec<u8>> {
         // Emit entry start progress
         let stream_name = self
@@ -257,49 +370,86 @@ impl<R: Read> GzipReader<R> {
             handle.on_entry(&stream_name, 0);
         }
 
-        // Read all remaining data (compressed + trailer)
-        let mut compressed = Vec::new();
-        self.reader.read_to_end(&mut compressed)?;
-
-        if compressed.len() < 8 {
-            return Err(OxiArcError::unexpected_eof(8));
+        let mut core = WrappedInflate::new(InflateWrapper::Gzip)
+            .multi_member(true)
+            .trailing_policy(TrailingPolicy::AllowZeros);
+        if let Some(limit) = self.max_output {
+            core = core.with_max_output(limit);
         }
 
-        // Trailer is last 8 bytes
-        let trailer = &compressed[compressed.len() - 8..];
-        let expected_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-        let expected_size =
-            u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as usize;
+        // The first member's header was consumed by `new`; replay it in
+        // front of whatever is left of the reader.
+        let head = std::mem::take(&mut self.header_bytes);
+        let mut source = std::io::Cursor::new(head).chain(&mut self.reader);
 
-        // Decompress (without trailer)
-        let deflate_data = &compressed[..compressed.len() - 8];
-        let decompressed = inflate(deflate_data)?;
+        let mut in_buf = vec![0u8; GZIP_STAGE];
+        let mut out_buf = vec![0u8; GZIP_STAGE];
+        let mut output = Vec::new();
+        let mut filled = 0usize;
+        let mut pos = 0usize;
+        let mut eof = false;
+        let mut idle = 0u8;
 
-        // Verify CRC
-        let actual_crc = Crc32::compute(&decompressed);
-        if actual_crc != expected_crc {
-            return Err(OxiArcError::crc_mismatch(expected_crc, actual_crc));
-        }
+        loop {
+            if pos == filled && !eof {
+                pos = 0;
+                filled = 0;
+                loop {
+                    match source.read(&mut in_buf) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(read) => {
+                            filled = read;
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
 
-        // Verify size
-        if decompressed.len() != expected_size {
-            return Err(OxiArcError::corrupted(
-                0,
-                format!(
-                    "Size mismatch: expected {}, got {}",
-                    expected_size,
-                    decompressed.len()
-                ),
-            ));
+            // At source EOF the whole stream is in hand, so `Finish`: a
+            // member that ends early is an error rather than a request for
+            // more input.
+            let flush = if eof {
+                FlushMode::Finish
+            } else {
+                FlushMode::None
+            };
+            let progress = core.inflate(
+                in_buf.get(pos..filled).unwrap_or_default(),
+                &mut out_buf,
+                flush,
+            )?;
+            pos += progress.consumed;
+            if let Some(fresh) = out_buf.get(..progress.produced) {
+                output.extend_from_slice(fresh);
+            }
+            if progress.status == InflateStatus::StreamEnd {
+                break;
+            }
+            if progress.consumed == 0 && progress.produced == 0 {
+                idle += 1;
+                if idle >= 2 {
+                    return Err(OxiArcError::corrupted(
+                        output.len() as u64,
+                        "gzip decoder made no progress",
+                    ));
+                }
+            } else {
+                idle = 0;
+            }
         }
 
         // Emit completion progress
         if let Some(ref handle) = self.progress {
-            handle.on_progress(decompressed.len() as u64, None);
+            handle.on_progress(output.len() as u64, None);
             handle.on_finish();
         }
 
-        Ok(decompressed)
+        Ok(output)
     }
 }
 
@@ -514,5 +664,216 @@ mod tests {
             "on_finish not called"
         );
         assert_eq!(*sink.progress_calls.lock().expect("progress_calls lock"), 1);
+    }
+
+    /// FINALGATE F1 regression: a valid RFC 1952 §2.2 concatenated stream
+    /// (`cat a.gz b.gz`, `pigz`, `bgzip`) must decode to the concatenation
+    /// of every member. Before this fix `decompress` read the whole file,
+    /// treated its *last* 8 bytes as the only trailer and inflated
+    /// everything before them as one member, so every multi-member `.gz`
+    /// failed with a spurious `CRC mismatch`.
+    #[test]
+    fn test_gzip_multi_member_concatenated() {
+        let mut stream = compress(b"first member;", 6).expect("compress first");
+        stream.extend_from_slice(&compress(b"second member;", 6).expect("compress second"));
+        stream.extend_from_slice(&compress(b"third member", 9).expect("compress third"));
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        let decompressed = reader.decompress().expect("decompress multi-member");
+        assert_eq!(decompressed, b"first member;second member;third member");
+    }
+
+    /// The first member's header is still what `header()` reports, even
+    /// though later members carry their own.
+    #[test]
+    fn test_gzip_multi_member_reports_first_header() {
+        let mut stream =
+            compress_with_filename(b"alpha", "a.txt", 6).expect("compress_with_filename");
+        stream.extend_from_slice(
+            &compress_with_filename(b"beta", "b.txt", 6).expect("compress_with_filename"),
+        );
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        assert_eq!(reader.header().filename, Some("a.txt".to_string()));
+        assert_eq!(reader.decompress().expect("decompress"), b"alphabeta");
+    }
+
+    /// Trailing NUL padding after the last member is tolerated (tape blocks),
+    /// exactly as the `gzip` CLI and CPython's `gzip` module do.
+    #[test]
+    fn test_gzip_trailing_zero_padding_is_tolerated() {
+        let mut stream = compress(b"padded payload", 6).expect("compress");
+        stream.extend_from_slice(&[0u8; 512]);
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        assert_eq!(reader.decompress().expect("decompress"), b"padded payload");
+    }
+
+    /// Non-zero trailing garbage is still rejected.
+    #[test]
+    fn test_gzip_trailing_garbage_is_rejected() {
+        let mut stream = compress(b"payload", 6).expect("compress");
+        stream.extend_from_slice(b"garbage");
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        assert!(
+            reader.decompress().is_err(),
+            "trailing garbage must be rejected"
+        );
+    }
+
+    /// A corrupt payload still fails with `CrcMismatch`, not silently.
+    #[test]
+    fn test_gzip_corrupt_payload_is_a_crc_mismatch() {
+        let original = vec![b'z'; 4096];
+        let mut stream = compress(&original, 6).expect("compress");
+        let last = stream.len() - 9;
+        stream[last] ^= 0x01;
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        let error = reader.decompress().expect_err("corruption must be caught");
+        assert!(
+            matches!(
+                error,
+                OxiArcError::CrcMismatch { .. } | OxiArcError::CorruptedData { .. }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// A stream cut short mid-member is an error, never a short read.
+    #[test]
+    fn test_gzip_truncated_member_is_an_error() {
+        let stream = compress(&vec![7u8; 100_000], 6).expect("compress");
+        for cut in [10, 20, stream.len() / 2, stream.len() - 1] {
+            let mut reader =
+                GzipReader::new(Cursor::new(stream[..cut].to_vec())).expect("GzipReader::new");
+            assert!(
+                reader.decompress().is_err(),
+                "truncation at {cut} must be rejected"
+            );
+        }
+    }
+
+    /// A truncated *second* member is an error too: the multi-member loop
+    /// must not stop silently at a member boundary.
+    #[test]
+    fn test_gzip_truncated_second_member_is_an_error() {
+        let mut stream = compress(b"complete first member", 6).expect("compress");
+        let second = compress(&vec![3u8; 50_000], 6).expect("compress");
+        stream.extend_from_slice(&second[..second.len() - 5]);
+
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        assert!(
+            reader.decompress().is_err(),
+            "a truncated later member must be rejected"
+        );
+    }
+
+    /// `with_max_output` refuses a bomb *during* decoding.
+    #[test]
+    fn test_gzip_max_output_rejects_a_bomb() {
+        let bomb = compress(&vec![0u8; 4 << 20], 9).expect("compress bomb");
+        let mut reader = GzipReader::new(Cursor::new(bomb))
+            .expect("GzipReader::new")
+            .with_max_output(64 * 1024);
+        let error = reader.decompress().expect_err("the cap must be reported");
+        assert!(
+            matches!(error, OxiArcError::MemoryBudgetExceeded { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The budget spans the whole stream, not one member: three members of
+    /// 40 KB each must trip a 64 KB cap.
+    #[test]
+    fn test_gzip_max_output_is_cumulative_across_members() {
+        let member = vec![1u8; 40 * 1024];
+        let mut stream = compress(&member, 6).expect("compress");
+        stream.extend_from_slice(&compress(&member, 6).expect("compress"));
+        stream.extend_from_slice(&compress(&member, 6).expect("compress"));
+
+        let mut reader = GzipReader::new(Cursor::new(stream))
+            .expect("GzipReader::new")
+            .with_max_output(64 * 1024);
+        let error = reader.decompress().expect_err("the cap must be reported");
+        assert!(
+            matches!(error, OxiArcError::MemoryBudgetExceeded { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// An in-budget payload is unaffected by the cap (no false positives).
+    #[test]
+    fn test_gzip_max_output_allows_an_in_budget_payload() {
+        let payload = vec![9u8; 32 * 1024];
+        let stream = compress(&payload, 6).expect("compress");
+        let mut reader = GzipReader::new(Cursor::new(stream))
+            .expect("GzipReader::new")
+            .with_max_output(64 * 1024);
+        assert_eq!(reader.decompress().expect("decompress"), payload);
+    }
+
+    /// A member whose `FHCRC` header checksum is corrupt is rejected, as
+    /// `gzip -d` rejects it. (0.4.1 skipped the field entirely.)
+    #[test]
+    fn test_gzip_bad_header_crc_is_rejected() {
+        let payload = b"header-crc guarded";
+        let inner = compress(payload, 6).expect("compress");
+        // Rebuild the stream with FLG.FHCRC set and a correct CRC16, then
+        // flip it.
+        let mut header = inner[..10].to_vec();
+        header[3] |= flags::FHCRC;
+        let crc16 = (Crc32::compute(&header) & 0xFFFF) as u16;
+        let mut good = header.clone();
+        good.extend_from_slice(&crc16.to_le_bytes());
+        good.extend_from_slice(&inner[10..]);
+
+        let mut reader = GzipReader::new(Cursor::new(good.clone())).expect("GzipReader::new");
+        assert_eq!(reader.decompress().expect("decompress"), payload);
+
+        let mut bad = good;
+        bad[10] ^= 0xFF;
+        let mut reader = GzipReader::new(Cursor::new(bad)).expect("GzipReader::new");
+        let error = reader.decompress().expect_err("a bad FHCRC must be caught");
+        assert!(
+            matches!(error, OxiArcError::CrcMismatch { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The streaming decoder must agree with `oxiarc_deflate`'s own
+    /// one-shot gzip path on every shape tested here.
+    #[test]
+    fn test_gzip_reader_agrees_with_deflate_one_shot() {
+        let mut stream = compress(b"agreement, member one. ", 6).expect("compress");
+        stream.extend_from_slice(&compress(&vec![42u8; 70_000], 9).expect("compress"));
+        stream.extend_from_slice(&compress(b"", 6).expect("compress"));
+
+        let mut reader = GzipReader::new(Cursor::new(stream.clone())).expect("GzipReader::new");
+        let streamed = reader.decompress().expect("streaming decompress");
+        let one_shot = oxiarc_deflate::gzip_decompress(&stream).expect("one-shot decompress");
+        assert_eq!(streamed, one_shot);
+    }
+
+    /// A payload larger than the 64 KiB staging buffer exercises the refill
+    /// loop in both directions.
+    #[test]
+    fn test_gzip_payload_larger_than_the_staging_buffer() {
+        // Deliberately incompressible (a xorshift PRNG), so the *compressed*
+        // stream is bigger than one staging buffer and the refill loop runs.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let payload: Vec<u8> = (0..400_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let stream = compress(&payload, 6).expect("compress");
+        assert!(stream.len() > GZIP_STAGE, "fixture must span refills");
+        let mut reader = GzipReader::new(Cursor::new(stream)).expect("GzipReader::new");
+        assert_eq!(reader.decompress().expect("decompress"), payload);
     }
 }

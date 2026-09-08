@@ -7,7 +7,7 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-08) | 121 tests passing**
+**Version: 0.4.2 (2026-09-08) | 124 tests passing**
 
 
 ## Features
@@ -356,7 +356,7 @@ extracted/created file may be left on disk.
 ```
 Error: Invalid magic number: expected [50, 4B], found [00, 00]
 Error: Unsupported compression method: LZMA
-Error: CRC mismatch: expected 0xABCD1234, computed 0x12345678
+Error: checksum mismatch: expected 0xabcd1234, computed 0x12345678
 Error: Corrupted data at offset 1234
 Error: unsupported or unrecognized archive format for mystery.bin: Unknown
 ```

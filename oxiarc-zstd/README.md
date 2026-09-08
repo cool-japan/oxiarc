@@ -7,7 +7,7 @@ Pure Rust implementation of Zstandard (zstd) compression algorithm.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 309 tests passing (297 unit/integration + 12 doctests)**
+**Version: 0.4.2 (2026-09-08) | 356 tests passing (341 unit/integration + 15 doctests, `--all-features`)**
 
 ## Overview
 
@@ -330,29 +330,47 @@ round of each arm in turn so machine load moves them together. Run it with
 cargo run --release -p oxiarc-zstd --example decode_throughput
 ```
 
-| shape (level) | frame bytes | `decompress_into` | `decompress` | `ZstdStream` 64 KiB | `zstd -b -d` | best ratio |
-|---|---|---|---|---|---|---|
-| RGB8 TIFF strip 288 KiB (1) | 281 KiB | 871 | 940 | 911 | 1314 | **0.72x** |
-| RGB8 TIFF strip 288 KiB (3) | 263 KiB | 804 | 874 | 830 | 1657 | 0.53x |
-| RGB8 TIFF strip 288 KiB (9) | 263 KiB | 752 | 879 | 842 | 1685 | 0.52x |
-| RGB8 TIFF strip 288 KiB (19) | 176 KiB | 182 | 199 | 185 | 345 | 0.58x |
-| RGB8 TIFF strip 1 MiB (1) | 977 KiB | 876 | 907 | 885 | 1264 | **0.72x** |
-| RGB8 TIFF strip 1 MiB (3) | 880 KiB | 511 | 572 | 522 | 1000 | 0.57x |
-| RGB8 TIFF strip 1 MiB (9) | 911 KiB | 578 | 665 | 589 | 1148 | 0.58x |
-| RGB8 TIFF strip 1 MiB (19) | 629 KiB | 164 | 177 | 161 | 249 | **0.71x** |
-| text corpus 50 MB (3) | 9.2 MB | 555 | 594 | 668 | 1207 | 0.55x |
-| text corpus 50 MB (19) | 5.9 MB | 1068 | 1079 | 1144 | 2050 | 0.56x |
-| incompressible 8 MiB (3) | 8 MiB | 9462 | 7126 | 8280 | 10238 | **0.92x** |
-| highly repetitive 8 MiB (3) | 801 B | 10012 | 7483 | 9291 | 2670 | **3.75x** |
+| shape (level) | `decompress_into` | `decompress` | `ZstdStream` 64 KiB | `zstd -b -d` | best ratio |
+|---|---|---|---|---|---|
+| RGB8 TIFF strip 288 KiB (1) | 926 | 947 | 913 | 1316 | **0.72x** |
+| RGB8 TIFF strip 288 KiB (3) | 921 | 969 | 925 | 1632 | 0.59x |
+| RGB8 TIFF strip 288 KiB (9) | 975 | 1047 | 964 | 1706 | 0.61x |
+| RGB8 TIFF strip 288 KiB (19) | 193 | 213 | 196 | 359 | 0.59x |
+| RGB8 TIFF strip 1 MiB (1) | 945 | 957 | 926 | 1259 | **0.76x** |
+| RGB8 TIFF strip 1 MiB (3) | 561 | 607 | 560 | 948 | 0.64x |
+| RGB8 TIFF strip 1 MiB (9) | 624 | 684 | 621 | 1079 | 0.63x |
+| RGB8 TIFF strip 1 MiB (19) | 171 | 186 | 171 | 278 | 0.67x |
+| text corpus 50 MB (3) | 702 | 622 | 698 | 1531 | 0.46x |
+| text corpus 50 MB (19) | 1236 | 1122 | 1235 | 2368 | 0.52x |
+| incompressible 8 MiB (3) | 9507 | 6900 | 8190 | 11815 | **0.80x** |
+| highly repetitive 8 MiB (3) | 10220 | 6899 | 9082 | 2846 | **3.59x** |
 
-MB/s of *output* (1 MB = 1e6 B), best of 13 interleaved rounds, Apple Silicon,
-`zstd` 1.5.7, machine shared with other builds at load averages 45-57 on 8
-cores. "best ratio" is the fastest of our three arms over `zstd -b -d`.
+MB/s of *output* (1 MB = 1e6 B), Apple Silicon, `zstd` 1.5.7, best of two
+7-round interleaved runs taken back to back inside one window on a machine
+shared with other builds at load averages 27-37 on 8 cores. The reference
+column is the *higher* of the two readings taken in that same window, which
+favours libzstd. "best ratio" is the fastest of our three arms over it.
 
 **Read the ratios, not the absolute numbers**, and read the *best-of* column on
 a shared machine: contention can only slow a round down, so the fastest round is
 the least contaminated. The example prints medians and best-of side by side, plus
 the load average, precisely so a reader can tell the two apart.
+
+**How stable is this?** Across three full runs of the matrix at load averages
+between 14 and 64, every row above held at or over 0.5x except the 50 MB text
+corpus at level 3, which ranged 0.43x-0.58x — that shape is the most
+memory-bound of the set and its *reference* reading alone varied by a factor of
+1.5 between runs. It is the one row this crate does not claim clears 0.5x.
+
+**Re-confirmed 2026-09-08.** The verifier that first pinned this row asked for a
+quieter re-measurement of the two `text50m` rows specifically. Two further
+**15-round** interleaved runs (load average 18→84 and 80→21 on 8 cores)
+reproduce the straddle exactly rather than resolving it: level 3 lands at 0.54x
+and 0.43x, level 19 at 0.53x and 0.50x. The rest of the matrix held — the TIFF
+strip shapes at 0.53x-0.81x, incompressible at 0.80x-0.90x and highly
+repetitive at 3.8x. **No figure in the table above needed changing**; this
+machine simply never got quiet enough during that window to do better than
+confirm the published range.
 
 Where the remaining gap is: on literal-dense frames (a photographic TIFF strip
 compresses to ~1.1x, so nearly every output byte is a Huffman-coded literal) the
@@ -369,12 +387,12 @@ one-shot*:
 
 | shape (level) | one-shot | `ZstdStream` | vs one-shot |
 |---|---|---|---|
-| RGB8 TIFF strip 288 KiB (3) | 874 | 830 | 0.95x |
-| RGB8 TIFF strip 1 MiB (9) | 665 | 589 | 0.89x |
-| text corpus 50 MB (3) | 594 | 668 | **1.12x** |
-| text corpus 50 MB (19) | 1079 | 1144 | 1.06x |
-| incompressible 8 MiB (3) | 7126 | 8280 | **1.16x** |
-| highly repetitive 8 MiB (3) | 7483 | 9291 | **1.24x** |
+| RGB8 TIFF strip 288 KiB (3) | 969 | 925 | 0.95x |
+| RGB8 TIFF strip 1 MiB (9) | 684 | 621 | 0.91x |
+| text corpus 50 MB (3) | 622 | 698 | **1.12x** |
+| text corpus 50 MB (19) | 1122 | 1235 | **1.10x** |
+| incompressible 8 MiB (3) | 6900 | 8190 | **1.19x** |
+| highly repetitive 8 MiB (3) | 6899 | 9082 | **1.32x** |
 
 Every shape clears the gate. Where the push decoder is *slower* the gap is the
 one extra copy that bounded memory costs: the one-shot decoder writes each byte
@@ -382,7 +400,7 @@ into a growing `Vec` and hands the `Vec` over, while a windowed decoder writes
 it into the ring and then copies it out to the caller. Where it is faster, the
 one-shot path is paying for the owned `Vec` it returns — a fresh allocation and
 its first-touch page faults on every call, which `decompress_into` avoids
-entirely (see the table above, where `decompress_into` is 33 % ahead of
+entirely (see the table above, where `decompress_into` is 38 % ahead of
 `decompress` on incompressible data).
 
 Steady-state allocations after warm-up are **zero** over `Raw`/`RLE` blocks, and

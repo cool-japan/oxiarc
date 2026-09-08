@@ -171,8 +171,16 @@
       15.4 us** at lgwin 10 — within 2.6 % of irreducible at a 4 MiB window and
       within 8 % at a 1 KiB one, both halves of each comparison taken from the
       same runs.
-- [ ] Copy-dense streams at large windows: **0.80x**, against a 0.85x target —
-      the one shape of the four that misses it. (Was 0.72-0.74x; the
+- [ ] Copy-dense streams at large windows: **0.71x-0.76x**, against a 0.85x
+      target — the one shape of the four that misses it. (Re-measured
+      2026-09-08 at load average 60-76, three runs of best-of-12 at the
+      `64k/64k` gate shape: 0.76x, 0.71x, 0.72x on minima and 0.79x, 0.70x,
+      0.74x paired. BROTLI3-verify had recorded **0.80x**, which came from a
+      spread of 0.77x/0.80x/0.88x at load ~19, i.e. the optimistic end of its
+      own scatter; the verdict is the same at either figure. The other three
+      shapes re-measure at 27.7x / 10.0x, 29.1x / 14.8x and 1.18x, all met,
+      and the stored-block row reproduces its copy-floor model exactly —
+      0.34x measured against a 0.34x floor.) (Was 0.72-0.74x; the
       shared-dictionary overrun fix took `CmdState` from 40 bytes to 24 by
       dropping the `distance`/`tail` fields the straddle continuation needed,
       which is one store per command on the hottest path, and moved this row to
@@ -318,7 +326,7 @@
 - corruption_robustness: 4, interop_vectors: 19, high_entropy_roundtrip: 8,
   encoder_bugs: 7, pool: 8, progress_cancel: 10, proptest: 2, async: 17
   (including the async adapter's shared-dictionary round trip), doctests: 21
-- Total: 343 tests + 21 doctests passing (with `--all-features`)
+- Total: 349 tests + 21 doctests passing (with `--all-features`)
 
 ## Code Statistics
 

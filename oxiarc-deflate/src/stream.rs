@@ -86,7 +86,7 @@
 //! or per strip (APNG, TIFF) must carry its own file-level budget.
 
 use oxiarc_core::BitCache;
-use oxiarc_core::error::Result;
+use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::traits::FlushMode;
 
 use crate::inflate_core::{ActiveTrees, InflateCore, InflateState, Trees, drive};
@@ -473,6 +473,7 @@ impl InflateStream {
             let rest = input.get(consumed..).unwrap_or_default();
             // Field-wise borrows (as in `inflate`), so the dictionary can be
             // read while the core is driven mutably.
+            let before = filled;
             let mut in_pos = 0usize;
             self.core.bits_base = self.core.cache.consumed();
             let status = {
@@ -492,9 +493,26 @@ impl InflateStream {
             self.core.bits_base = self.core.cache.consumed();
             self.core.total_in += in_pos as u64;
             consumed += in_pos;
+            let produced = filled - before;
             match status {
                 InflateStatus::StreamEnd => break,
-                InflateStatus::NeedOutput => continue,
+                // Growing only helps if the decoder actually filled the
+                // buffer.
+                InflateStatus::NeedOutput if produced > 0 => continue,
+                InflateStatus::NeedOutput => {
+                    // Room was left and nothing came out: only a configured
+                    // limit stops the decoder that way, and it has latched
+                    // the error the next call would replay. Report it now
+                    // rather than doubling the buffer again — and never
+                    // return the short output as if it were the stream.
+                    return Err(match &self.core.fault {
+                        Some(fault) => fault.to_error(),
+                        None => OxiArcError::corrupted(
+                            self.core.total_in,
+                            "decoder made no progress with output space left",
+                        ),
+                    });
+                }
                 // `Finish` was requested and the whole remaining stream was
                 // handed over, so `NeedInput` means the decoder is waiting
                 // for a byte that will never come. `inflate_sink` has
@@ -752,6 +770,36 @@ mod tests {
 
         stream.reset();
         assert_eq!(stream.buffered_bits(), 0);
+    }
+
+    /// `inflate_to_vec` decodes into the tail of a buffer it grows, so its
+    /// sink starts with a non-zero cursor and its growth loop reacts to
+    /// `NeedOutput`. A configured cap must therefore come back as an
+    /// *error*, never as a bigger buffer or a short `Ok`.
+    ///
+    /// Two independent guards make that true — the sink counts what *this*
+    /// call produced (so the decoder's "has anything come out yet" test
+    /// still means what it says), and the loop refuses to grow after a
+    /// `NeedOutput` that produced nothing — and the fault latch would catch
+    /// it even if both were removed. The test pins the behaviour rather
+    /// than any one of the three.
+    #[test]
+    fn a_capped_growable_decode_reports_the_cap_instead_of_growing_forever() {
+        let body = vec![b'x'; 512 * 1024];
+        let compressed = deflate(&body, 6).expect("deflate");
+
+        let mut stream = InflateStream::new().with_max_output(4096);
+        let error = stream
+            .inflate_to_vec(&compressed)
+            .expect_err("the cap must be reported");
+        assert!(
+            matches!(error, OxiArcError::MemoryBudgetExceeded { .. }),
+            "unexpected error: {error:?}"
+        );
+
+        // The same stream without a cap still decodes in full.
+        let mut plain = InflateStream::new();
+        assert_eq!(plain.inflate_to_vec(&compressed).expect("inflate"), body);
     }
 
     #[test]
