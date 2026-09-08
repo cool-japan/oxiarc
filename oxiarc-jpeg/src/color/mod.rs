@@ -20,7 +20,48 @@ pub enum ColorSpace {
     /// Four components of `Y`, `Cb`, `Cr`, `K` (Adobe transform 2).
     Ycck,
     /// The component count is outside `1..=4`, or no heuristic applied: the
-    /// samples are delivered untransformed.
+    /// samples are delivered untransformed. This is what a decode reports
+    /// for any frame whose component count the crate's own colour-space
+    /// heuristic cannot name (or a caller's own
+    /// [`crate::DecodeOptions::output_color_space`] chooses), and libjpeg
+    /// reaches it only through `JCS_UNKNOWN`.
+    ///
+    /// The encoder accepts it as an explicit
+    /// [`EncodeOptions::jpeg_color_space`](crate::EncodeOptions::jpeg_color_space)
+    /// only at `Unknown(2)`: sequential ids `1`/`2`, one quantisation and
+    /// Huffman slot, no subsampling and no colour transform — libjpeg's
+    /// `JCS_UNKNOWN` shape, and the one two-component JPEG frame exists for
+    /// at all. One, three and four components already have named colour
+    /// spaces above, so `Unknown(1)`, `Unknown(3)` and `Unknown(4)` have no
+    /// [`InputColor`](crate::InputColor) wired to them and are refused with
+    /// [`crate::JpegError::InvalidEncodeParameter`], as is any count above
+    /// four (T.81 allows more, but no table slot, sampling-factor or
+    /// component-identifier array in this crate is sized past four).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), oxiarc_jpeg::JpegError> {
+    /// use oxiarc_jpeg::{ColorSpace, Decoder, EncodeOptions, InputColor, encode_to_vec_with_options};
+    ///
+    /// // Luminance and alpha, both kept — the alpha survives as a second,
+    /// // untransformed component instead of being dropped.
+    /// let pixels = [10u8, 200, 20, 210, 30, 220]; // (Y, A) x 3 pixels
+    /// let options = EncodeOptions {
+    ///     jpeg_color_space: Some(ColorSpace::Unknown(2)),
+    ///     ..Default::default()
+    /// };
+    /// let jpeg = encode_to_vec_with_options(&pixels, 3, 1, InputColor::LumaAlpha, &options)?;
+    ///
+    /// let mut decoder = Decoder::new(&jpeg[..]);
+    /// let info = decoder.read_info()?;
+    /// assert_eq!(info.num_components, 2);
+    /// assert_eq!(info.output_color_space, ColorSpace::Unknown(2));
+    /// assert!(!info.has_jfif && !info.has_adobe, "JCS_UNKNOWN writes neither marker");
+    /// assert_eq!(decoder.decode()?.len(), pixels.len());
+    /// # Ok(())
+    /// # }
+    /// ```
     Unknown(u8),
 }
 

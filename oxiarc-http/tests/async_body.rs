@@ -73,6 +73,8 @@ fn encode(coding: &ContentCoding, plain: &[u8]) -> Vec<u8> {
         ContentCoding::Brotli => oxiarc_brotli::compress(plain, 4).expect("brotli"),
         #[cfg(feature = "zstd")]
         ContentCoding::Zstd => oxiarc_zstd::compress(plain).expect("zstd"),
+        #[cfg(feature = "compress")]
+        ContentCoding::Compress => oxiarc_lzw::z::compress(plain, 16).expect("compress"),
         ContentCoding::Identity => plain.to_vec(),
         other => panic!("no encoder wired for {other}"),
     }
@@ -85,6 +87,7 @@ fn codings() -> Vec<ContentCoding> {
         ContentCoding::Deflate,
         ContentCoding::Brotli,
         ContentCoding::Zstd,
+        ContentCoding::Compress,
     ]
     .into_iter()
     .filter(ContentCoding::is_decodable)
@@ -153,7 +156,11 @@ fn a_truncated_async_body_is_an_error_not_a_short_read() {
     let plain = common::text(50_000);
     runtime().block_on(async {
         for coding in codings() {
-            if coding == ContentCoding::Identity {
+            if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+                // `.Z` has no end-of-information code (see
+                // `ContentCoding::Compress`'s doc comment): truncation is a
+                // documented short read here, not the bug this test hunts
+                // for.
                 continue;
             }
             let wire = encode(&coding, &plain);
@@ -206,7 +213,10 @@ fn trailing_garbage_is_rejected_whatever_the_poll_boundaries() {
     let plain = common::text(20_000);
     runtime().block_on(async {
         for coding in codings() {
-            if coding == ContentCoding::Identity {
+            if coding == ContentCoding::Identity || coding == ContentCoding::Compress {
+                // `.Z` cannot distinguish "the stream ended" from "more
+                // codes happened to follow" — see
+                // `ContentCoding::Compress`'s doc comment.
                 continue;
             }
             let wire = encode(&coding, &plain);

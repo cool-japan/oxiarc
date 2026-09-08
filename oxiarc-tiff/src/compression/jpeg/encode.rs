@@ -16,7 +16,8 @@
 //! | `RGB`, 3 channels | `ColorSpace::Rgb`, **no** colour transform, ids `R`/`G`/`B` |
 //! | `Separated`, 4 channels | `ColorSpace::Cmyk`, no transform, ids `C`/`M`/`Y`/`K` |
 //! | anything else, 1 channel | `ColorSpace::Luma`, id 1 |
-//! | anything else, 3 or 4 channels | the same templates with ids 1.. (libjpeg's `JCS_UNKNOWN` layout) |
+//! | anything else, 2 channels | `ColorSpace::Unknown(2)`, no transform, ids 1/2 (libjpeg's `JCS_UNKNOWN`) |
+//! | anything else, 3 or 4 channels | the `Rgb`/`Cmyk` templates with ids 1.. (also `JCS_UNKNOWN`'s layout) |
 //! | `YCbCrSubSampling` (530) | the luma sampling factors, chroma always 1x1 |
 //! | quality | `jpeg_quality_scaling` with `force_baseline`, as libtiff's `jpeg_set_quality(.., TRUE)` |
 //!
@@ -25,7 +26,12 @@
 //! that would turn an RGB TIFF strip into a YCbCr frame, and a TIFF strip
 //! carries no `Adobe` marker to say so, so the file would decode with its
 //! colours transformed twice. `JFIF` and `Adobe` are suppressed for the same
-//! reason — TTN2 keeps colour in `PhotometricInterpretation`.
+//! reason — TTN2 keeps colour in `PhotometricInterpretation`. The
+//! two-channel row needs no identifier override the way the 3- and
+//! 4-channel rows do: `ColorSpace::Unknown(2)`'s own `Auto` default is
+//! already sequential `1`/`2`, so `plan` asks for `ComponentIds::Auto` there
+//! and `ComponentIds::Sequential` only where a named template's own letter
+//! ids have to be overridden.
 //!
 //! # Tag 347 and the chunks
 //!
@@ -41,11 +47,14 @@
 //! # What it refuses
 //!
 //! * anything but 8-bit samples, which is what `tiffcp -c jpeg` refuses too;
-//! * a chunk with two channels, or more than four. JPEG's own colour-space
-//!   templates cover 1, 3 and 4 components; libjpeg reaches a two-component
-//!   frame only through `JCS_UNKNOWN`, which `oxiarc-jpeg` does not encode.
-//!   Such a chunk is named in the error rather than silently losing a
-//!   channel.
+//! * a chunk with more than four channels: T.81 does not forbid it, but no
+//!   quantisation slot, sampling-factor or component-identifier array in
+//!   `oxiarc-jpeg` is sized past four, and no known photometric needs it.
+//!   (A two-channel chunk — greyscale plus alpha, most commonly — was
+//!   refused here up to `oxiarc-jpeg` 0.4.2's own two-component support;
+//!   `tests/roundtrip.rs`'s
+//!   `a_two_channel_jpeg_page_round_trips_chunky_through_jcs_unknown` is the
+//!   regression test that it no longer is.)
 
 use oxiarc_jpeg::{
     ColorSpace, ComponentIds, EncodeOptions, Encoder, InputColor, JpegError, RestartInterval,
@@ -77,7 +86,7 @@ pub(super) struct Plan {
 /// # Errors
 /// [`UnsupportedError::BitsPerSample`] for anything but 8-bit samples, and
 /// [`UnsupportedError::Conversion`] for a channel count JPEG's colour-space
-/// templates do not cover.
+/// templates do not cover (more than four).
 pub(super) fn plan(cx: &CodecContext<'_>, quality: u8) -> Result<Plan> {
     let width = u16::try_from(cx.width).map_err(|_| TiffError::IntOverflow)?;
     let height = u16::try_from(cx.height).map_err(|_| TiffError::IntOverflow)?;
@@ -98,18 +107,27 @@ pub(super) fn plan(cx: &CodecContext<'_>, quality: u8) -> Result<Plan> {
             (InputColor::Cmyk, ColorSpace::Cmyk, ComponentIds::Auto)
         }
         (_, 1) => (InputColor::Luma, ColorSpace::Luma, ComponentIds::Auto),
+        // libjpeg's `JCS_UNKNOWN` layout, two components: sequential
+        // identifiers `1`/`2`, one quantisation and Huffman slot, no
+        // subsampling and no colour transform — `ColorSpace::Unknown(2)`'s
+        // own `Auto` default is already this shape, so no identifier
+        // override is needed here (unlike the 3- and 4-channel rows below,
+        // which repurpose the `Rgb`/`Cmyk` templates and so must override
+        // their letter ids).
+        (_, 2) => (
+            InputColor::LumaAlpha,
+            ColorSpace::Unknown(2),
+            ComponentIds::Auto,
+        ),
         // libjpeg's `JCS_UNKNOWN` layout: sequential identifiers, one
         // quantisation and Huffman slot, no subsampling and no colour
         // transform. The `Rgb` and `Cmyk` templates carry exactly that shape,
         // so only the identifiers have to be overridden.
         (_, 3) => (InputColor::Rgb, ColorSpace::Rgb, ComponentIds::Sequential),
         (_, 4) => (InputColor::Cmyk, ColorSpace::Cmyk, ComponentIds::Sequential),
-        (_, other) => {
+        (_, _other) => {
             return Err(TiffError::Unsupported(UnsupportedError::Conversion(
-                match other {
-                    2 => "a two-channel JPEG frame needs libjpeg's JCS_UNKNOWN layout",
-                    _ => "JPEG frames carry at most four components",
-                },
+                "JPEG frames carry at most four components",
             )));
         }
     };
@@ -297,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_samples_and_two_channel_chunks_are_named() {
+    fn deep_samples_are_named_and_five_channel_chunks_too() {
         let deep = [16u16];
         let cx = context(PhotometricInterpretation::BlackIsZero, &deep, 1);
         assert!(matches!(
@@ -305,13 +323,38 @@ mod tests {
             Err(TiffError::Unsupported(UnsupportedError::BitsPerSample(_)))
         ));
 
+        // Five channels has no JPEG colour-space template either (the crate's
+        // own component arrays are all sized for at most four) — this is the
+        // count `deep_samples_and_wide_frames_are_refused_on_write` in
+        // `super::super::tests` (`mod.rs`) also checks, from the other
+        // module's public `encode` wrapper.
+        let bits = [8u16; 5];
+        let cx = context(PhotometricInterpretation::BlackIsZero, &bits, 5);
+        assert!(matches!(
+            plan(&cx, 75),
+            Err(TiffError::Unsupported(UnsupportedError::Conversion(_)))
+        ));
+    }
+
+    /// A two-channel chunk (greyscale plus alpha, most commonly) now plans
+    /// as `oxiarc-jpeg`'s two-component `JCS_UNKNOWN` layout instead of being
+    /// refused: `InputColor::LumaAlpha` carries both samples through with no
+    /// colour transform, and `ColorSpace::Unknown(2)`'s own `Auto` default
+    /// already gives sequential ids `1`/`2`, so `plan` need not override
+    /// them the way it does for the 3- and 4-channel "anything else" rows.
+    #[test]
+    fn a_two_channel_chunk_plans_as_jcs_unknown() {
         let bits = [8u16; 2];
         let cx = context(PhotometricInterpretation::BlackIsZero, &bits, 2);
-        let error = plan(&cx, 75).expect_err("two channels");
-        assert!(
-            error.to_string().contains("JCS_UNKNOWN"),
-            "the refusal must name the reason: {error}"
+        let chunk_plan = plan(&cx, 75).expect("two channels now plan");
+        assert_eq!(chunk_plan.color, InputColor::LumaAlpha);
+        assert_eq!(
+            chunk_plan.options.jpeg_color_space,
+            Some(ColorSpace::Unknown(2))
         );
+        assert_eq!(chunk_plan.options.component_ids, ComponentIds::Auto);
+        let chunk = encode_chunk(&vec![9u8; 16 * 16 * 2], &chunk_plan, false).expect("encode");
+        assert_eq!(frame_component_ids(&chunk), vec![1, 2]);
     }
 
     #[test]

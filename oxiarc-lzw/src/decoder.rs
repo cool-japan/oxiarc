@@ -1,88 +1,164 @@
 //! LZW decoder (decompression).
 //!
-//! The decoder walks the shared prefix/suffix table
-//! ([`crate::dictionary::LzwDictionary`]) and expands every code directly
-//! into the output buffer, so no allocation happens per decoded code. Two
-//! output sinks share the same decode loop:
+//! One decode loop ([`decode_into_sink`]) serves every dialect this crate
+//! implements. It walks the shared prefix/suffix code table
+//! ([`crate::dictionary::LzwDictionary`]) and expands each code directly
+//! into the output, so nothing is allocated per decoded code.
 //!
-//! * a growable [`Vec<u8>`] bounded by the caller's `expected_size`
-//!   ([`LzwDecoder::decode`]), and
-//! * a caller-supplied `&mut [u8]`
-//!   ([`crate::decompress_tiff_into`]), which allocates nothing at all.
+//! # Shape of the loop
+//!
+//! The loop follows libtiff's `LZWDecode`, because that is the fastest
+//! production LZW decoder available to compare against and its structure is
+//! what makes it fast:
+//!
+//! * the new table entry is stored **before** the current code is emitted,
+//!   with the entry's own `first` byte used as its suffix when the code
+//!   being read *is* the entry being created — one comparison in place of a
+//!   separate KwKwK branch;
+//! * each entry carries its string's `length`, so the number of output
+//!   bytes is known before a single one is written and the run can be
+//!   written backwards from its end with no scratch buffer;
+//! * each entry carries a `repeated` flag (all bytes equal), so the runs a
+//!   flat image region produces are emitted with a fill instead of a chain
+//!   walk;
+//! * one-byte and two-byte strings are written from the entry's `first` and
+//!   `suffix` fields without touching the chain at all — the dominant case
+//!   for incompressible data, where LZW emits about one code per byte.
+//!
+//! Two output sinks share the loop: a growable [`Vec<u8>`] bounded by the
+//! caller's `expected_size` ([`LzwDecoder::decode`]) and a caller-supplied
+//! `&mut [u8]` ([`crate::decompress_tiff_into`]), which allocates nothing
+//! at all.
 
-use crate::bits::LzwCodeReader;
-use crate::bitstream_lsb::LsbBitReader;
-use crate::bitstream_msb::MsbBitReader;
+use crate::bits::{CodeOrder, LsbCodes, MsbCodes};
 use crate::config::{LzwBitOrder, LzwConfig};
-use crate::dictionary::LzwDictionary;
+use crate::dictionary::{CodeEntry, LzwDictionary, learn_entry, write_chain};
 use crate::error::{LzwError, Result};
 
-/// Upper bound on the output capacity reserved up-front in
-/// [`LzwDecoder::decode`] (64 KiB).
+/// Size of the first output block [`VecSink`] zero-fills (8 KiB).
 ///
 /// `expected_size` may come from untrusted framing, so pre-reserving it
 /// verbatim lets tiny malicious inputs force enormous allocations
-/// (resource-exhaustion DoS). Reserving at most this much and letting the
-/// `Vec` grow geometrically keeps allocation proportional to bytes actually
-/// decoded while still avoiding realloc churn for typical TIFF strips.
-const MAX_INITIAL_CAPACITY: usize = 64 * 1024;
+/// (resource-exhaustion DoS). The sink instead zero-fills a block at a time,
+/// doubling as it goes and never past the decode limit, so allocation stays
+/// proportional to bytes actually decoded — and one `memset` covers
+/// thousands of codes instead of one `Vec::resize` per code.
+const INITIAL_BLOCK: usize = 8 * 1024;
+
+/// Sentinel for "no previous code" (just after a table reset).
+///
+/// A `u32` sentinel rather than `Option<u16>`: `u16` has no niche, so the
+/// `Option` would cost the same four bytes plus a discriminant test, and
+/// the comparison against a sentinel is what the loop needs anyway.
+const NO_PREV: u32 = u32::MAX;
 
 /// Destination for decoded bytes.
 ///
-/// The sink also carries the decode limit: the loop stops as soon as
-/// [`LzwSink::space`] reaches zero, which is what makes both a bounded
-/// `Vec` and a fixed slice work with one decode loop.
+/// Every method may assume the caller has already checked that
+/// [`LzwSink::space`] is large enough; the decode loop tracks the remaining
+/// space itself so that the sink is not re-queried per code.
 pub(crate) trait LzwSink {
     /// Bytes that may still be written before decoding must stop.
     fn space(&self) -> usize;
 
-    /// Absolute offset of the next byte to be written, counted from the
-    /// first byte this decode produced.
-    fn position(&self) -> usize;
+    /// Append one byte. `space() >= 1`.
+    fn push_byte(&mut self, byte: u8);
 
-    /// Reserve exactly `len` bytes (`len <= self.space()`) and return them
-    /// for the caller to fill.
+    /// Append `len` copies of `byte`. `space() >= len`.
+    fn fill(&mut self, byte: u8, len: usize);
+
+    /// Reserve exactly `len` bytes (`len <= space()`) and return them for
+    /// the caller to fill.
     fn reserve(&mut self, len: usize) -> &mut [u8];
 
-    /// Append `len` bytes copied from absolute offset `src` of the output
-    /// produced so far. The caller guarantees `src + len <= position()`, so
-    /// source and destination never overlap.
-    fn copy_earlier(&mut self, src: usize, len: usize);
+    /// Bytes written so far.
+    fn written(&self) -> usize;
 }
 
 /// Sink that appends to a `Vec<u8>` until `limit` bytes have been produced.
+///
+/// The vector is grown in zero-filled blocks and truncated to
+/// [`VecSink::written`] when the decode finishes, so the per-code cost is a
+/// single length comparison rather than a `resize` call.
 pub(crate) struct VecSink<'a> {
     out: &'a mut Vec<u8>,
+    written: usize,
+    /// Mirror of `out.len()`, so the per-code capacity check compares two
+    /// locals instead of loading the vector's length from memory.
+    filled: usize,
     limit: usize,
 }
 
 impl<'a> VecSink<'a> {
+    /// Wrap `out` (which must be empty) with a decode limit of `limit`.
     pub(crate) fn new(out: &'a mut Vec<u8>, limit: usize) -> Self {
-        Self { out, limit }
+        let filled = out.len();
+        Self {
+            out,
+            written: 0,
+            filled,
+            limit,
+        }
+    }
+
+    /// Make sure `len` more bytes are addressable.
+    #[inline(always)]
+    fn ensure(&mut self, len: usize) {
+        if self.written + len > self.filled {
+            self.grow(len);
+        }
+    }
+
+    /// Zero-fill a fresh block. Cold: once per block, not once per code.
+    #[cold]
+    fn grow(&mut self, len: usize) {
+        let need = self.written + len;
+        let target = need
+            .max(self.filled.saturating_mul(2))
+            .max(INITIAL_BLOCK)
+            .min(self.limit)
+            .max(need);
+        self.out.resize(target, 0);
+        self.filled = self.out.len();
     }
 }
 
 impl LzwSink for VecSink<'_> {
-    #[inline]
+    #[inline(always)]
     fn space(&self) -> usize {
-        self.limit.saturating_sub(self.out.len())
+        self.limit.saturating_sub(self.written)
     }
 
-    #[inline]
-    fn position(&self) -> usize {
-        self.out.len()
+    #[inline(always)]
+    fn push_byte(&mut self, byte: u8) {
+        self.ensure(1);
+        if let Some(slot) = self.out.get_mut(self.written) {
+            *slot = byte;
+            self.written += 1;
+        }
     }
 
-    #[inline]
+    #[inline(always)]
+    fn fill(&mut self, byte: u8, len: usize) {
+        self.ensure(len);
+        let start = self.written;
+        if let Some(run) = self.out.get_mut(start..start + len) {
+            run.fill(byte);
+            self.written += len;
+        }
+    }
+
+    #[inline(always)]
     fn reserve(&mut self, len: usize) -> &mut [u8] {
-        let start = self.out.len();
-        self.out.resize(start + len, 0);
-        &mut self.out[start..]
+        self.ensure(len);
+        let start = self.written;
+        self.written += len;
+        &mut self.out[start..start + len]
     }
 
-    #[inline]
-    fn copy_earlier(&mut self, src: usize, len: usize) {
-        self.out.extend_from_within(src..src + len);
+    #[inline(always)]
+    fn written(&self) -> usize {
+        self.written
     }
 }
 
@@ -93,189 +169,295 @@ pub(crate) struct SliceSink<'a> {
 }
 
 impl<'a> SliceSink<'a> {
+    /// Wrap `dst`; decoding stops once it is full.
     pub(crate) fn new(dst: &'a mut [u8]) -> Self {
         Self { dst, written: 0 }
-    }
-
-    /// Bytes written so far.
-    pub(crate) fn written(&self) -> usize {
-        self.written
     }
 }
 
 impl LzwSink for SliceSink<'_> {
-    #[inline]
+    #[inline(always)]
     fn space(&self) -> usize {
         self.dst.len() - self.written
     }
 
-    #[inline]
-    fn position(&self) -> usize {
-        self.written
+    #[inline(always)]
+    fn push_byte(&mut self, byte: u8) {
+        if let Some(slot) = self.dst.get_mut(self.written) {
+            *slot = byte;
+            self.written += 1;
+        }
     }
 
-    #[inline]
+    #[inline(always)]
+    fn fill(&mut self, byte: u8, len: usize) {
+        let start = self.written;
+        if let Some(run) = self.dst.get_mut(start..start + len) {
+            run.fill(byte);
+            self.written += len;
+        }
+    }
+
+    #[inline(always)]
     fn reserve(&mut self, len: usize) -> &mut [u8] {
         let start = self.written;
         self.written += len;
         &mut self.dst[start..start + len]
     }
 
-    #[inline]
-    fn copy_earlier(&mut self, src: usize, len: usize) {
-        let start = self.written;
-        self.dst.copy_within(src..src + len, start);
-        self.written += len;
+    #[inline(always)]
+    fn written(&self) -> usize {
+        self.written
     }
 }
 
-/// Strings at least this long are copied from their previous occurrence in
-/// the output instead of being rebuilt byte by byte through the prefix
-/// chain. Below it the chain walk wins, because the copy path costs an
-/// extra table load and a `memcpy` call for a handful of bytes.
-const COPY_BACK_THRESHOLD: usize = 16;
+/// The `next_code` value at which the code width grows, or `u32::MAX` when
+/// `width` has already reached `max_width`.
+///
+/// The decoder adds a table entry one iteration later than the encoder, so
+/// its `next_code` is always one behind and it must widen one code sooner
+/// to stay in step: when the encoder adds entry 511 its `next_code` becomes
+/// 512 and it widens to 10 bits while the decoder is still at 511. The
+/// decoder threshold is therefore the encoder's minus one — `2^width - 1`
+/// with TIFF's early change and `2^width` with the standard (late) rule.
+#[inline(always)]
+fn grow_threshold(width: u32, max_width: u32, early_change: bool) -> u32 {
+    if width >= max_width {
+        return u32::MAX;
+    }
+    // `width < max_width <= 16`, so the shift cannot overflow.
+    if early_change {
+        (1u32 << width) - 1
+    } else {
+        1u32 << width
+    }
+}
+
+/// Emit the string of an already-loaded table entry, clipped to `space`
+/// bytes, and return how many bytes were written.
+///
+/// Writing fewer bytes than the string holds keeps its **leading** bytes,
+/// which is what a decoder does when the last code of a strip expands past
+/// the end of the caller's buffer (libtiff's `LZWDecode` does the same).
+///
+/// `entry` is passed in rather than looked up because the decode loop has
+/// already loaded it (and, for the KwKwK case, has just built it), so the
+/// three fast paths below touch the code table zero times.
+#[inline(always)]
+fn emit_entry<S: LzwSink>(
+    entries: &[CodeEntry],
+    entry: CodeEntry,
+    sink: &mut S,
+    space: usize,
+) -> usize {
+    let full = usize::from(entry.length());
+    if full == 1 {
+        // Single byte: the overwhelmingly common case for data LZW cannot
+        // compress, where almost every code is a root.
+        sink.push_byte(entry.suffix());
+        return 1;
+    }
+    let want = full.min(space);
+    if want == 0 {
+        return 0;
+    }
+    if entry.repeated() {
+        // Every byte of the string is the same, so a clipped run is still
+        // just a shorter run.
+        sink.fill(entry.suffix(), want);
+    } else if want == 1 {
+        sink.push_byte(entry.first());
+    } else if want == 2 && full == 2 {
+        // Two bytes are the whole string: `first` then `suffix`, no walk.
+        let out = sink.reserve(2);
+        if let Some(pair) = out.first_chunk_mut::<2>() {
+            pair[0] = entry.first();
+            pair[1] = entry.suffix();
+        }
+    } else {
+        let out = sink.reserve(want);
+        write_chain(entries, entry, full, out);
+    }
+    want
+}
 
 /// Core LZW decode loop, shared by every entry point.
 ///
 /// Decoding stops when the sink is full, when the EOI code is read, or with
-/// an error. Running out of input while the sink still has space is an
-/// error ([`LzwError::UnexpectedEof`]) — a truncated stream is never
-/// reported as success.
-pub(crate) fn decode_into_sink<S: LzwSink, R: LzwCodeReader>(
+/// an error. `EOF_IS_ERROR` selects what running out of input means while
+/// the sink still has space: an error for framed dialects such as a TIFF
+/// strip ([`LzwError::UnexpectedEof`] — a truncated stream is never
+/// reported as success), and a normal stop for GIF image data, which simply
+/// ends when its sub-blocks do.
+///
+/// Everything the loop touches per code — the bit position, the code width
+/// and its mask, the allocation cursor, the remaining output space and the
+/// previous code's entry — is a local for the duration of the run and is
+/// written back to the table once at the end. That leaves one table load
+/// and one table store per code and no other memory traffic besides the
+/// input window and the output. See [`grow_threshold`] for the code-width
+/// synchronisation rule.
+///
+/// `CLEAR_ALLOWED` mirrors `LzwConfig::use_clear_code` as a constant for
+/// the same class of reason: as a runtime field it stayed live inside the
+/// loop and the optimiser turned it into a per-code branch at the loop head
+/// (`ldur`/`cbz` in the emitted arm64) even though it is only read on the
+/// rare reserved-code path.
+///
+/// The sink is taken **by value** for the same reason: behind a `&mut` the
+/// optimiser wrote the output cursor back to the sink's struct on every
+/// code (again visible in the emitted arm64 as a reload of the sink pointer
+/// plus a store). Owned, its fields are scalars the register allocator can
+/// keep. Returns the number of bytes written.
+// Never inlined into `LzwDecoder::run`: with both bit orders inlined into
+// one caller the optimiser merges the two loop bodies and reintroduces a
+// per-code branch on the packing (seen in the emitted arm64 as a `tbz` at
+// the loop head, and worth ~6 % of throughput).
+#[inline(never)]
+pub(crate) fn decode_into_sink<
+    const EOF_IS_ERROR: bool,
+    const CLEAR_ALLOWED: bool,
+    O: CodeOrder,
+    S: LzwSink,
+>(
     dict: &mut LzwDictionary,
-    reader: &mut R,
-    sink: &mut S,
-) -> Result<()> {
+    data: &[u8],
+    mut sink: S,
+) -> Result<usize> {
     dict.reset();
+    let (entries, saved, limits) = dict.parts();
+    let slots = entries.len();
+    if slots == 0 || limits.min_bits == 0 || limits.max_bits > LzwConfig::MAX_SUPPORTED_BITS {
+        return Err(LzwError::InvalidBitWidth(limits.max_bits));
+    }
+    // `code & slot_mask <= slot_mask == slots - 1 < slots` for every code,
+    // so a masked index is always in bounds — and the optimiser can prove
+    // it, which is what keeps the per-output-byte chain walk free of bounds
+    // checks. Codes above the table are rejected before any access anyway.
+    // `slots == max_code + 1`, so the slot mask *is* the largest assignable
+    // code: one loop-invariant register does both jobs.
+    let slot_mask = slots - 1;
+    let max_code = slot_mask as u32;
+    let total_bits = (data.len() as u64) << 3;
+    let first_code = u32::from(limits.first_code);
+    let max_width = u32::from(limits.max_bits);
+    let min_width = u32::from(limits.min_bits).clamp(1, 16);
+    // The two reserved codes are adjacent — `LzwConfig::eoi_code` is
+    // `clear_code + 1` by construction — so one unsigned compare separates
+    // "ordinary code" from "ClearCode or EOI". Two compares per code, in
+    // the hottest place there is, become one. The invariant is checked here
+    // rather than assumed, because the loop below depends on it.
+    if limits.eoi_code != limits.clear_code.wrapping_add(1) {
+        return Err(LzwError::InvalidBitWidth(limits.min_bits));
+    }
 
-    let clear_code = dict.clear_code();
-    let eoi_code = dict.eoi_code();
-    let uses_clear_code = dict.config().use_clear_code;
-    let mut prev_code: Option<u16> = None;
+    let mut next_code = first_code;
+    let mut width = min_width;
+    let mut code_mask = (1u32 << width) - 1;
+    // `next_code` value at which the code width must grow, or `u32::MAX`
+    // once the width has reached its ceiling. Precomputing it keeps the
+    // per-code width bookkeeping down to one compare, with the shift and
+    // the early-change rule evaluated only on the (rare) growth itself.
+    let mut grow_at = grow_threshold(width, max_width, limits.early_change);
+    let mut bit = 0u64;
+    let mut space = sink.space();
+    let mut prev = NO_PREV;
+    let mut parent = CodeEntry::default();
+    let mut failure: Option<LzwError> = None;
 
-    while sink.space() > 0 {
-        let code = reader.read_code(dict.current_bits())?;
+    while space > 0 {
+        if bit + u64::from(width) > total_bits {
+            if EOF_IS_ERROR {
+                failure = Some(LzwError::UnexpectedEof { position: bit });
+            }
+            break;
+        }
+        let window = O::window(data, (bit >> 3) as usize);
+        let code = O::extract(window, (bit & 7) as u32, width, code_mask);
+        bit += u64::from(width);
 
-        if code == clear_code {
+        if code.wrapping_sub(limits.clear_code) <= 1 {
+            if code == limits.eoi_code {
+                break;
+            }
+            if !CLEAR_ALLOWED {
+                failure = Some(LzwError::InvalidClearCode { position: bit });
+                break;
+            }
             // TIFF 6.0 mandates a ClearCode at the start of every strip and
             // again whenever the encoder's table reaches entry 4094;
             // encoders may also emit one at any other point (libtiff's
             // compression-ratio checkpoint resets), so accept it anywhere.
-            if !uses_clear_code {
-                return Err(LzwError::InvalidClearCode {
-                    position: reader.code_bits_read(),
-                });
-            }
-            dict.reset();
-            prev_code = None;
+            width = min_width;
+            code_mask = (1u32 << width) - 1;
+            grow_at = grow_threshold(width, max_width, limits.early_change);
+            next_code = first_code;
+            prev = NO_PREV;
+            parent = CodeEntry::default();
             continue;
         }
 
-        if code == eoi_code {
+        let mut entry = entries[code as usize & slot_mask];
+
+        if u32::from(code) < next_code {
+            // Ordinary case: the entry to emit is already in the table, and
+            // the entry to create is `string(prev) ++ first(code)`. The
+            // first code after a reset has nothing to extend, and a full
+            // table has nowhere to put it.
+            if prev != NO_PREV && next_code <= max_code {
+                let created = learn_entry(prev as u16, parent, entry.first());
+                entries[next_code as usize & slot_mask] = created;
+                next_code += 1;
+                if next_code >= grow_at {
+                    width += 1;
+                    code_mask = (code_mask << 1) | 1;
+                    grow_at = grow_threshold(width, max_width, limits.early_change);
+                }
+            }
+        } else if u32::from(code) == next_code && prev != NO_PREV && next_code <= max_code {
+            // KwKwK: the code being read *is* the entry about to be
+            // created, so create it first — its last byte is the first byte
+            // of the previous string — and then emit it.
+            let created = learn_entry(prev as u16, parent, parent.first());
+            entries[next_code as usize & slot_mask] = created;
+            entry = created;
+            next_code += 1;
+            if next_code >= grow_at {
+                width += 1;
+                code_mask = (code_mask << 1) | 1;
+                grow_at = grow_threshold(width, max_width, limits.early_change);
+            }
+        } else {
+            // Past the end of the table, or a KwKwK the full table can no
+            // longer serve, or the first code after a reset naming an entry
+            // that does not exist yet.
+            failure = Some(LzwError::InvalidCode(code));
             break;
         }
 
-        match prev_code {
-            None => {
-                // The first code after a reset must already be in the table.
-                if u32::from(code) >= dict.next_code() {
-                    return Err(LzwError::InvalidCode(code));
-                }
-            }
-            Some(prev) => {
-                if u32::from(code) < dict.next_code() {
-                    // Ordinary case: the new entry is prev ++ first(code).
-                    if !dict.is_full() {
-                        let byte = dict.first_byte(code);
-                        dict.add_entry_decode(prev, byte)?;
-                    }
-                } else if u32::from(code) == dict.next_code() {
-                    // KwKwK: the code being read is the entry we are about
-                    // to create, so create it first and then emit it.
-                    if dict.is_full() {
-                        return Err(LzwError::InvalidCode(code));
-                    }
-                    let byte = dict.first_byte(prev);
-                    dict.add_entry_decode(prev, byte)?;
-                } else {
-                    return Err(LzwError::InvalidCode(code));
-                }
-            }
-        }
-
-        // Expand the code straight into the sink. When the string is longer
-        // than the space left, only its leading bytes are written and the
-        // loop then exits — the same result the previous implementation
-        // produced by expanding fully and truncating afterwards.
-        let full_len = dict.entry_len(code) as usize;
-        let write_len = full_len.min(sink.space());
-        if write_len > 0 {
-            let start = sink.position();
-            let copied = write_len >= COPY_BACK_THRESHOLD
-                && copy_from_output(dict, code, write_len, full_len, sink);
-            if !copied {
-                let out = sink.reserve(write_len);
-                dict.expand(code, out);
-            }
-            if write_len == full_len {
-                dict.set_output_offset(code, start);
-            }
-        }
-
-        prev_code = Some(code);
+        space -= emit_entry(entries, entry, &mut sink, space);
+        prev = u32::from(code);
+        parent = entry;
     }
 
-    Ok(())
-}
-
-/// Try to produce `code`'s bytes by copying them from earlier in the output
-/// instead of walking its prefix chain one byte at a time.
-///
-/// Two shapes cover almost every long string LZW produces:
-///
-/// * the whole string is already in the output (a repeated code), or
-/// * its *parent* is — which is exactly the KwKwK / "growing run" shape a
-///   flat image region produces, where every code is one byte longer than
-///   the code emitted just before it.
-///
-/// Returns `false` when neither applies and the caller must walk the chain.
-#[inline]
-fn copy_from_output<S: LzwSink>(
-    dict: &LzwDictionary,
-    code: u16,
-    write_len: usize,
-    full_len: usize,
-    sink: &mut S,
-) -> bool {
-    if let Some(source) = dict.output_offset(code) {
-        sink.copy_earlier(source, write_len);
-        return true;
+    saved.next_code = next_code;
+    saved.current_bits = width as u8;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(sink.written()),
     }
-    let parent = dict.prefix_of(code);
-    let Some(source) = dict.output_offset(parent) else {
-        return false;
-    };
-    // string(code) == string(parent) ++ suffix(code), and string(parent) is
-    // known to be present in full at `source`.
-    let parent_len = full_len - 1;
-    let copy_len = write_len.min(parent_len);
-    if copy_len > 0 {
-        sink.copy_earlier(source, copy_len);
-    }
-    if write_len > copy_len {
-        let tail = sink.reserve(write_len - copy_len);
-        // Exactly one byte can remain: the entry's own suffix.
-        if let Some(slot) = tail.first_mut() {
-            *slot = dict.suffix_byte(code);
-        }
-    }
-    true
 }
 
 /// LZW decoder for decompression.
+///
+/// Constructing one allocates the code table, so a caller decoding many
+/// strips of the same image should build a single decoder and call
+/// [`LzwDecoder::decode_into`] per strip: every decode begins with a table
+/// reset, which is O(1). `crate::decompress_tiff_into` is the one-shot
+/// convenience wrapper and pays the table allocation per call.
 #[derive(Debug)]
 pub struct LzwDecoder {
-    /// Dictionary for code lookup.
+    /// Code table for code lookup.
     dict: LzwDictionary,
 }
 
@@ -315,20 +497,9 @@ impl LzwDecoder {
     /// [`LzwError::InvalidClearCode`] when a ClearCode appears in a
     /// configuration that does not use clear codes.
     pub fn decode(&mut self, input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-        // Clamp the up-front reservation: `expected_size` is untrusted (see
-        // MAX_INITIAL_CAPACITY). The Vec grows on demand beyond this.
-        let mut output = Vec::with_capacity(expected_size.min(MAX_INITIAL_CAPACITY));
-        let mut sink = VecSink::new(&mut output, expected_size);
-        match self.dict.config().bit_order {
-            LzwBitOrder::Msb => {
-                let mut reader = MsbBitReader::new(input);
-                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
-            }
-            LzwBitOrder::Lsb => {
-                let mut reader = LsbBitReader::new(input);
-                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
-            }
-        }
+        let mut output = Vec::new();
+        let written = self.run::<true, _>(input, VecSink::new(&mut output, expected_size))?;
+        output.truncate(written);
         Ok(output)
     }
 
@@ -342,18 +513,31 @@ impl LzwDecoder {
     ///
     /// Same as [`LzwDecoder::decode`].
     pub fn decode_into(&mut self, input: &[u8], dst: &mut [u8]) -> Result<usize> {
-        let mut sink = SliceSink::new(dst);
-        match self.dict.config().bit_order {
-            LzwBitOrder::Msb => {
-                let mut reader = MsbBitReader::new(input);
-                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+        self.run::<true, _>(input, SliceSink::new(dst))
+    }
+
+    /// Run the decode loop with the code packing this configuration
+    /// selects.
+    fn run<const EOF_IS_ERROR: bool, S: LzwSink>(
+        &mut self,
+        input: &[u8],
+        sink: S,
+    ) -> Result<usize> {
+        let config = *self.dict.config();
+        match (config.bit_order, config.use_clear_code) {
+            (LzwBitOrder::Msb, true) => {
+                decode_into_sink::<EOF_IS_ERROR, true, MsbCodes, S>(&mut self.dict, input, sink)
             }
-            LzwBitOrder::Lsb => {
-                let mut reader = LsbBitReader::new(input);
-                decode_into_sink(&mut self.dict, &mut reader, &mut sink)?;
+            (LzwBitOrder::Msb, false) => {
+                decode_into_sink::<EOF_IS_ERROR, false, MsbCodes, S>(&mut self.dict, input, sink)
+            }
+            (LzwBitOrder::Lsb, true) => {
+                decode_into_sink::<EOF_IS_ERROR, true, LsbCodes, S>(&mut self.dict, input, sink)
+            }
+            (LzwBitOrder::Lsb, false) => {
+                decode_into_sink::<EOF_IS_ERROR, false, LsbCodes, S>(&mut self.dict, input, sink)
             }
         }
-        Ok(sink.written())
     }
 
     /// Reset the decoder to initial state.

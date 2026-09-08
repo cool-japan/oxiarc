@@ -72,9 +72,14 @@
       assumed: `p1`/`p2` are *not* seeded from the dictionary, the dictionary sits
       *beyond* the declared window, it stays reachable for the whole stream, and it
       is addressed relative to `max_backward = min(window_size, produced)`.
-      A shared-dictionary reference *is* pushed onto the distance ring; a copy that
-      runs past the end of the dictionary continues in the produced output at the
-      same distance
+      A shared-dictionary reference *is* pushed onto the distance ring; a copy
+      that would run past the end of the dictionary is a **format error**, not a
+      copy that continues in the produced output — the dictionary is a compound
+      history block, not a prefix glued in front of the sliding window. That is
+      the reference decoder's rule, re-derived every oracle run by
+      `test_oracle_reference_rejects_a_copy_past_the_dictionary_end`: two
+      hand-built streams differing only in one copy length, one accepted
+      byte-identically and one rejected as "corrupt input"
 - [x] `shared_dict::MAX_SHARED_DICTIONARY` (16 MiB), refused by every entry point
 - [x] Encoder side: `lz77_compress_with_prefix` seeds the match finder with the
       dictionary, caps matches at the boundary and arbitrates by gain; each
@@ -92,14 +97,16 @@
       `compress`/`decompress` keep their plain-Brotli meaning at the crate root
 - [x] Tests: `tests/shared_dictionary.rs` (dictionary sizes 0 / 1 KiB / 64 KiB /
       larger than the window, every quality and lgwin, chunk invariance, boundary
-      distances, straddling copies, wrong-dictionary rejection, budget, `reset`,
+      distances, a copy running past the dictionary's end refused identically at
+      every chunking, wrong-dictionary rejection, budget, `reset`,
       the `Read` adapter, a `dcb` fixture assembled from our own encoder, the
       crate-root aliases, and the dictionary id against the FIPS 180-4 vectors),
       the async adapter's dictionary round trip through a 7-byte trickling source
       with a 256-byte staging buffer (`tests/async_brotli_tests.rs`), plus two
-      self-skipping `brotli-oracle` legs: 45/45 reference `-D` streams decode
-      byte-identically and 48/48 of our `-D` streams are accepted by
-      `brotli -d -D`
+      self-skipping `brotli-oracle` legs: 72/72 reference `-D` streams decode
+      byte-identically, 96/96 of our `-D` streams are accepted by `brotli -d -D`
+      (70 of them smaller than the dictionary-free encoding), and the
+      dictionary-overrun pair above
 
 ### Public API
 - [x] compress(data, quality) -> BrotliResult<Vec<u8>>
@@ -151,18 +158,28 @@
       same history split at every interesting boundary (`mirrored`/`pending` ×
       distance × count) against one flat history.
       Measured, 64 KiB in / 64 KiB out, median of five runs of 25 interleaved
-      repetitions: repetitive **9.5x** (lgwin 22) / **24.9x** (lgwin 10), single
-      repeated byte **19.7x** / **29.6x**, literal-dominated hex dump **1.21x**,
-      stored **0.33x** at lgwin 22 against a **0.34x** measured copy floor and
-      **1.01x** at lgwin 10 against **1.01x** — i.e. the stored shape is at its
-      physical floor, 97-100 % of it. The `copy floor` row models exactly the
-      irreducible work (every byte to the caller, the still-reachable tail to
-      the ring) and is timed against the same one-shot decode as every other
-      row, so the two ratios share a denominator.
-- [ ] Copy-dense streams at large windows: 0.76x, against a 0.85x target — the
-      one shape of the four that misses it.
+      repetitions (quotient of the median times): repetitive **9.7x** (lgwin 22)
+      / **27.1x** (lgwin 10), single repeated byte **14.8x** / **29.6x**,
+      literal-dominated hex dump **1.12x**, stored **0.34x** at lgwin 22 and
+      **0.96x** at lgwin 10 (the two stored rows re-measured 2026-09-08 after the
+      dictionary-overrun fix, three runs of 41 interleaved repetitions). The stored shape is at its physical floor: the
+      `copy floor` row models exactly the irreducible work (every byte to the
+      caller, the still-reachable tail to the ring, the same per-call
+      allocations) and is timed against the same one-shot decode as every other
+      row; comparing the two bounded implementations directly, the decoder takes
+      **42.6 us against the model's 41.5 us** at lgwin 22 and **16.6 us against
+      15.4 us** at lgwin 10 — within 2.6 % of irreducible at a 4 MiB window and
+      within 8 % at a 1 KiB one, both halves of each comparison taken from the
+      same runs.
+- [ ] Copy-dense streams at large windows: **0.80x**, against a 0.85x target —
+      the one shape of the four that misses it. (Was 0.72-0.74x; the
+      shared-dictionary overrun fix took `CmdState` from 40 bytes to 24 by
+      dropping the `distance`/`tail` fields the straddle continuation needed,
+      which is one store per command on the hottest path, and moved this row to
+      a paired median of 0.80x over three runs of 41 interleaved repetitions —
+      spread 0.77-0.88x at load average ~19.)
       The 2.94 MB hex-dump payload is literal-dominated only at lgwin 10 (95,605
-      copy commands, 1.21x — faster than the one-shot decoder); at lgwin 22 the
+      copy commands, 1.12x — faster than the one-shot decoder); at lgwin 22 the
       same payload becomes 570,440 copy
       commands of a mean 5.0 bytes at a mean distance of 116,525 — 97 % of the
       output — and 65 % of them read their source out of the ring because the
@@ -186,6 +203,15 @@
       change — a whole-meta-block fast path that runs the one-shot loop when the
       caller's slice is large enough to hold the rest of the meta-block — which
       would not help the 64 KiB gate row and so was not taken.
+      Re-measured 2026-09-08 by the BROTLI3-verify pass: the residual is real
+      and reproducible (min and paired estimators agree, and all four drive
+      shapes — 64k/64k, `Vec` sink, whole/256k, 1k/256k — land within a few
+      percent of each other), so this stays open as a reported deviation rather
+      than a measurement artefact. Removing the remaining 7.9 % `memmove` cannot
+      close it on its own; the next real step is narrowing `CmdState` further
+      (every field fits in a `u32`, which would take it to 16 bytes), and that
+      needs an explicit `distance <= u32::MAX` validation first so the narrowing
+      cannot become a truncation.
 - [ ] SIMD-accelerated matching
 - [ ] Multi-threaded compression
 - [x] Memory pool for per-encode allocations (`BrotliPool`)
@@ -285,7 +311,7 @@
 - brotli_oracle: 17 (differential sweeps vs the `brotli` CLI, including an
   incremental-decode leg asserting byte- *and* shape-identity, rejection of
   every prefix of every reference stream, and both shared-dictionary legs —
-  45/45 reference `-D` streams in and 48/48 of ours out; feature-gated,
+  72/72 reference `-D` streams in and 96/96 of ours out; feature-gated,
   self-skipping)
 - memory_limit: 7 (counting global allocator; bomb rejection and the
   window-bounded peak of the push decoder and the `Read` adapter)

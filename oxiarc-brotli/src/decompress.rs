@@ -882,11 +882,10 @@ fn decode_compressed_meta_block(
                         "copy length exceeds meta-block length".to_string(),
                     ));
                 }
-                let from_dict = copy_length.min(available);
-                output.extend_from_slice(&shared[offset..offset + from_dict]);
-                if from_dict < copy_length {
-                    copy_straddle_tail(output, distance, copy_length - from_dict, max_distance)?;
+                if copy_length > available {
+                    return Err(dictionary_overrun(distance, copy_length, available));
                 }
+                output.extend_from_slice(&shared[offset..offset + copy_length]);
             }
             shared_dict::DistanceSource::Static { word_id } => {
                 // Static dictionary reference (Section 8). Never pushed to the
@@ -923,37 +922,37 @@ fn decode_compressed_meta_block(
     Ok(shape)
 }
 
-/// Finish a shared-dictionary copy that ran past the end of the dictionary.
+/// The error for a shared-dictionary copy that runs past the end of the
+/// dictionary.
 ///
-/// The dictionary sits immediately before the reachable window, so a copy that
-/// exhausts it continues in the produced output at the *same* distance.
+/// A shared-dictionary reference addresses `dict_len - (distance -
+/// max_backward)` and may take at most the bytes from there to the end of the
+/// dictionary: the dictionary is a *compound* history block, not a prefix
+/// glued to the sliding window, so a copy cannot walk out of it and continue in
+/// the produced output. `brotli 1.1.0` rejects such a stream ("corrupt input")
+/// — verified in `tests/brotli_oracle.rs::
+/// test_oracle_reference_rejects_a_copy_past_the_dictionary_end`, which feeds
+/// the reference two streams differing only in one copy length.
 ///
-/// Kept out of line deliberately. The backward-reference loop it sits next to
-/// is the hottest loop in this decoder, and its speed turned out to depend on
-/// the exact shape of the code around it: inlining this rare continuation into
-/// the same function tripled the decode time of a copy-dominated stream
-/// (measured: 616 us -> 2.10 ms on a 1 MiB repetitive payload). Out of line,
-/// the hot loop's code generation cannot be perturbed by it at all.
+/// Kept out of line and `#[cold]` deliberately. The backward-reference loop
+/// this sits next to is the hottest loop in this decoder, and its speed turned
+/// out to depend on the exact shape of the code around it: inlining a rare
+/// continuation into the same function tripled the decode time of a
+/// copy-dominated stream (measured: 616 us -> 2.10 ms on a 1 MiB repetitive
+/// payload). Out of line, the hot loop's code generation cannot be perturbed
+/// by it at all.
+#[cold]
 #[inline(never)]
-fn copy_straddle_tail(
-    output: &mut Vec<u8>,
+pub(crate) fn dictionary_overrun(
     distance: usize,
-    count: usize,
-    max_distance: usize,
-) -> BrotliResult<()> {
-    // `output` only grows, so one bounds check before the run is exactly as
-    // strict as one per byte.
-    if distance > output.len() {
-        return Err(BrotliError::InvalidDistance {
-            distance,
-            max_distance,
-        });
-    }
-    for _ in 0..count {
-        let byte = output[output.len() - distance];
-        output.push(byte);
-    }
-    Ok(())
+    copy_length: usize,
+    available: usize,
+) -> BrotliError {
+    BrotliError::CorruptedData(format!(
+        "shared-dictionary copy of {copy_length} bytes at distance {distance} runs {} bytes \
+         past the end of the dictionary (only {available} available)",
+        copy_length - available
+    ))
 }
 
 /// Convert a distance symbol into a distance (RFC 7932 Section 4).

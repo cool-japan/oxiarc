@@ -48,7 +48,14 @@
 //! [`decompress_tiff_into`] decodes a TIFF LZW strip straight into a
 //! caller-supplied buffer using the classical prefix/suffix code table, so
 //! no allocation happens per decoded code (and none at all beyond the code
-//! table itself):
+//! table itself). On strips libtiff wrote it reaches **0.73-0.80x of the
+//! throughput** of libtiff 4.7.1's own `LZWDecode`, i.e. it takes 1.25x to
+//! 1.37x of libtiff's time; `examples/lzw_vs_libtiff.rs` reproduces the
+//! comparison and the crate README records the measurement conditions
+//! (absolute times are load-dependent, only the ratio is portable). A caller
+//! decoding many strips of one image should build a single [`LzwDecoder`]
+//! and call [`LzwDecoder::decode_into`] per strip, which resets the table
+//! in O(1) instead of allocating one per call:
 //!
 //! ```rust
 //! use oxiarc_lzw::{compress_tiff, decompress_tiff_into};

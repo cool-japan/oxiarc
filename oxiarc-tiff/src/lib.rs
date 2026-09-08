@@ -81,8 +81,9 @@
 //!   4.7.1, `tiffcp -c g3` and `-c g4` write byte-identical strips for a
 //!   `MinIsWhite` and a `MinIsBlack` page holding the same bits, so a coded
 //!   *white* run is a run of zero bits whatever tag 262 says. Group 3/4
-//!   uncompressed mode is reported by name rather than decoded, exactly as
-//!   libtiff reports it.
+//!   uncompressed mode (T.4 §4.2.1.3.2) is decoded unconditionally and
+//!   written only when [`ImageSpec::with_ccitt_uncompressed`] asks for it,
+//!   because libtiff 4.7.1 cannot read it back.
 //! * A JPEG page's `SOF` sampling factors win over `YCbCrSubSampling` (TTN2);
 //!   a disagreement is an error only under [`Leniency::Strict`]. TIFF JPEG
 //!   carries no `JFIF` and no `Adobe` marker, so colour stays in

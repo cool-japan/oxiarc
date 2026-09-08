@@ -13,9 +13,12 @@
 //! `lha-oracle` pattern used elsewhere in the workspace.
 #![cfg(feature = "brotli-oracle")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::hand_built_dictionary_copy;
 use oxiarc_brotli::{
     BrotliParams, BrotliStatus, BrotliStream, MetaBlockShape, compress_with_dictionary,
     compress_with_params, decompress, decompress_reporting_shapes, decompress_with_dictionary,
@@ -1322,5 +1325,88 @@ fn test_oracle_oxiarc_dictionary_encode_reference_decode() {
     eprintln!(
         "[brotli-oracle] {total} oxiarc `-D` streams accepted by the reference decoder \
          ({smaller} smaller than the dictionary-free encoding)"
+    );
+}
+
+/// A shared-dictionary copy may not run past the end of the dictionary — and
+/// this is the reference decoder saying so, not us.
+///
+/// Two hand-built streams differ in exactly one field, the copy length of a
+/// single command that reads the dictionary's last 4 bytes:
+///
+/// * copy 4 stops at the dictionary's end. `brotli -d -D` accepts it and
+///   reproduces the bytes this crate produces.
+/// * copy 5, 10 and 22 would continue past it. `brotli -d -D` reports
+///   "corrupt input" for every one of them.
+///
+/// So the dictionary is a compound history block, not a prefix glued in front
+/// of the sliding window: a copy cannot walk out of it and carry on in the
+/// produced output. Both of this crate's decoders reject the overruns
+/// (`shared_dictionary.rs::a_copy_running_past_the_dictionary_end_is_refused_at_every_chunking`);
+/// this test is what stops that decision from silently drifting back, because
+/// it re-derives it from the reference every run.
+#[test]
+fn test_oracle_reference_rejects_a_copy_past_the_dictionary_end() {
+    let Some(brotli) = find_brotli() else {
+        eprintln!("[brotli-oracle] `brotli` not on PATH; skipping (not a failure)");
+        return;
+    };
+    if !brotli_supports_dictionary(&brotli) {
+        eprintln!("[brotli-oracle] `brotli` has no --dictionary; skipping (not a failure)");
+        return;
+    }
+    let dir = scratch_dir("dictoverrun");
+    let dict_path = dir.join("dict.bin");
+    let input = dir.join("in.br");
+    let output = dir.join("out.bin");
+
+    let mut checked = 0usize;
+    for copy_len in [4u32, 5, 10, 22] {
+        let (stream, dict, expected) = hand_built_dictionary_copy(copy_len);
+        std::fs::write(&dict_path, &dict).expect("write dictionary");
+        std::fs::write(&input, &stream).expect("write stream");
+        let _ = std::fs::remove_file(&output);
+        let status = Command::new(&brotli)
+            .args(["-d", "-f", "-D"])
+            .arg(&dict_path)
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .status()
+            .expect("spawn brotli -d -D");
+        checked += 1;
+        match expected {
+            Some(want) => {
+                assert!(
+                    status.success(),
+                    "reference rejected a legal dictionary copy of {copy_len} bytes"
+                );
+                let got = std::fs::read(&output).expect("read reference output");
+                assert_eq!(got, want, "reference bytes for copy {copy_len}");
+                assert_eq!(
+                    decompress_with_dictionary(&stream, &dict).expect("oxiarc control"),
+                    want,
+                    "oxiarc bytes for copy {copy_len}"
+                );
+            }
+            None => {
+                assert!(
+                    !status.success(),
+                    "reference ACCEPTED a copy of {copy_len} bytes running past the \
+                     dictionary's end; this crate's decoders reject it, so the two \
+                     have diverged and the rejection must be revisited"
+                );
+                assert!(
+                    decompress_with_dictionary(&stream, &dict).is_err(),
+                    "oxiarc accepted a copy {copy_len} past the dictionary's end"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(checked, 4, "dictionary-overrun oracle did not run");
+    eprintln!(
+        "[brotli-oracle] reference accepts a dictionary copy that stops at the end \
+         and rejects all 3 that run past it"
     );
 }

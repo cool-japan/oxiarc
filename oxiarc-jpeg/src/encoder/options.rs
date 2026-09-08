@@ -13,13 +13,23 @@ use crate::quant::QuantTable;
 /// How the caller's samples are laid out, and what they mean.
 ///
 /// The variants that carry alpha exist because callers usually have RGBA
-/// buffers; the alpha channel is dropped, since JPEG has no place to put it.
+/// buffers; by default the alpha channel is dropped, since none of JPEG's
+/// *named* colour spaces has a place to put it.
+/// [`LumaAlpha`](InputColor::LumaAlpha) is the one exception: asking for
+/// [`ColorSpace::Unknown(2)`](crate::ColorSpace::Unknown) instead of the
+/// default `Luma` keeps the alpha channel, as a second, untransformed
+/// component (see [`EncodeOptions::jpeg_color_space`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InputColor {
     /// One channel of luminance.
     Luma,
-    /// Luminance followed by an alpha channel that is discarded.
+    /// Luminance followed by an alpha channel.
+    ///
+    /// Dropped by default (the target colour space is `Luma`, one
+    /// component); kept, as a second component with no colour transform, by
+    /// asking for [`ColorSpace::Unknown(2)`](crate::ColorSpace::Unknown)
+    /// explicitly.
     LumaAlpha,
     /// Red, green, blue.
     Rgb,

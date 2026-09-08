@@ -25,7 +25,7 @@
 //! which keeps the window allocated. Without a state the codec still works; it
 //! just allocates per chunk.
 //!
-//! The cache is a [`Pool`](super::pool::Pool), not a single slot: a worker
+//! The cache is a `Pool` (`compression::pool`), not a single slot: a worker
 //! takes a machine out for the length of its chunk and puts it back after, so
 //! a `rayon` decode of a Deflate page runs one machine per worker instead of
 //! queueing every worker behind one mutex. `reset()` before every chunk is

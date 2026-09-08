@@ -132,10 +132,117 @@ the table description. Measured on a 1.5 MB structured-record corpus:
   its entropy tables into `LiteralsDecoder`/`SequencesDecoder` and its three
   repeat offsets — a well-defined follow-up, deliberately out of the Phase 8
   contract (which specifies `with_dictionary(Vec<u8>)` only).
+- **The legacy one-shot decoders and `ZstdStream` enforce the same format rules,
+  from shared code** (`frame::require_dictionary`, `frame::block_rfc_max`,
+  `frame::charge_block`), after differential fuzzing (`fuzz_zstd_stream`) found
+  four inputs the legacy path accepted and `ZstdStream` refused: a frame naming a
+  `Dictionary_ID` with no dictionary supplied, a block regenerating more than
+  `min(Window_Size, 128 KiB)`, an ~11 MB declared window, and leading garbage
+  before any frame. Three are now format errors on both paths; frame-boundary
+  classification is shared too (`frame::multi_frame_scan` mirrors the stream's
+  state machine, including "a skippable frame does not count as a decoded
+  frame"). Pinned by `tests/legacy_hardening.rs`, which drives both paths over
+  every case, including the fuzzer's own artifacts.
+- **The declared `Window_Size` is the one deliberate split**, and it is about
+  memory rather than conformance: `ZstdStream` keeps a real ring and refuses a
+  declaration above `with_max_window` (8 MiB default); the one-shot decoders keep
+  no ring — their output `Vec` is the window — and accept any declaration;
+  `decompress_with_limit` / `decompress_multi_frame_with_limit` refuse only above
+  `max(max_output, 128 MiB)`, 128 MiB being `zstd -d`'s own
+  `ZSTD_WINDOWLOG_MAX_DEFAULT`. Tying that ceiling to the caller's limit is
+  measurably wrong: with `zstd` 1.5.7, a payload piped through `-3` declares a
+  2 MiB window and one piped through `--long=24 -6` declares 16 MiB, whatever the
+  payload's length and with no `Frame_Content_Size` to fall back on, so
+  `Window_Size > limit` rejects ordinary reference frames (it fails
+  `oracle_bounded_helpers_on_reference_frames` outright). The 11 MB frame that
+  motivated the rule is structurally identical to those, so no declaration-only
+  rule can separate them.
+- **A skippable frame in front of a Zstandard frame is metadata on every entry
+  point** (`frame::skippable_prefix_len`). `zstd -d` decodes `[skippable][frame]`
+  exactly like `[frame]`, and so did `ZstdStream` / `decompress_into` /
+  `decompress_with_limit`, but `decompress` / `decompress_frame` /
+  `ZstdDecoder::decode_frame` stopped at the skippable magic with
+  `InvalidMagic` — the last accept/refuse divergence between the two families,
+  found by the adversarial sweep in `tests/legacy_verify.rs`. `decompress_frame`
+  counts the prefix in the bytes it reports consumed. A *truncated* skippable
+  frame stays an error wherever it sits.
+- **`ZstdDecoder::decode_frame` resets per-frame state on entry.** Before, a
+  decoder reused after a failed frame carried that frame's partial output into
+  the next call — silently when the next frame declared neither a checksum nor a
+  `Frame_Content_Size` (131 076 bytes returned where 4 were expected). Pinned by
+  `legacy_verify::a_reused_decoder_does_not_carry_a_failed_frame_into_the_next_one`.
+  `reset()` stays public but is no longer something a caller must remember.
+- **The block ceiling is the RFC's, deliberately stricter than `zstd -d` in one
+  corner.** RFC 8878 §3.1.1.2.3 caps a block at `min(Window_Size, 128 KiB)`;
+  measured against `zstd` 1.5.7, the reference decoder lets a block past that cap
+  when the frame also declares a larger `Frame_Content_Size` (e.g. a 1 KiB window
+  with `Frame_Content_Size` = 2048 and one 2048-byte `Raw` block decodes there and
+  is refused here). No encoder produces such a frame: a `--zstd=wlog=10` frame
+  declares a 1 KiB window next to a content size up to 500 KB and still keeps
+  every block inside 1 KiB (pinned by
+  `legacy_verify::oracle::reference_frames_with_a_tiny_declared_window_still_decode`).
+  The gap is pinned in both directions by
+  `legacy_verify::oracle::the_block_ceiling_is_stricter_than_the_reference_only_where_the_rfc_says_so`,
+  which also asserts this crate is never *more* lenient than the reference.
 - Throughput (interleaved A/B, best of 40, 1 MiB payloads): incremental decode is
   0.92x the one-shot path on entropy-coded data — the price of the one extra
   ring-to-caller copy that bounded memory requires — and 2.10x on raw-block data.
   The audit gate is 0.85x.
+
+## Decode throughput (2026-09-08)
+
+The decoder was rebuilt around the reference decoder's data layout after a
+TIFF-strip measurement put it ~8x behind `libzstd`. Measurement harness:
+`examples/decode_throughput.rs` (criterion-free, interleaved rounds against
+`zstd -b -d`, medians **and** best-of, load average printed). Design notes worth
+keeping:
+
+- **`FseBitReader` keeps a 64-bit container** (`src/backward_bits.rs`), not a
+  per-read byte gather. The gather cost up to five bounds-checked byte loads per
+  `read_bits`, and a literals stream calls it once per output byte.
+- **`BitCursor` is the register-resident half of it.** A loop that drives
+  `&mut FseBitReader` puts the container and the consumed-bit count in memory;
+  `detach()` hands the loop a `Copy` cursor instead. Nothing reattaches — a
+  decode either runs a bitstream to its end or fails.
+- **Reloads are scheduled, not tested.** The literals loop reloads once per four
+  symbols per stream (four 12-bit codes fit a fresh container) and the sequence
+  loop twice per sequence (offset+match-length extras, then literal-length extra
+  plus the three state updates). A conditional reload is a data-dependent branch
+  that mispredicts at roughly the rate it fires.
+- **Literals decode four streams in lockstep** — that is what RFC 8878's
+  four-stream layout is *for*: four independent `peek -> load -> skip` chains
+  instead of one. The checked sequential decoder is kept and is re-run over the
+  four streams, in order, whenever the fast pass reports anything wrong, so every
+  pinned error message and the order in which the four streams report them are
+  unchanged.
+- **`HuffmanTable::is_complete()`** is computed once per table so the per-symbol
+  validity test leaves the inner loop. A table with an undefined prefix is
+  refused by `interleaved_pass` rather than trusted.
+- **Overlapping matches use pattern doubling** on both paths (`frame::append_match`,
+  `window::copy_match`): the run length goes `offset, 2*offset, 4*offset, ...`
+  because a back-reference is periodic with every multiple of its offset. The
+  old loop was `out[i % offset]` — an integer *division* per output byte.
+- **`src/short_copy.rs`** exists because `copy_from_slice`/`copy_within` are
+  `memcpy`/`memmove` **calls** at runtime lengths, and a block is a stream of
+  3-20 byte runs; `_platform_memmove` was 51 % of the 50 MB text decode. Short
+  runs go through a fixed-width word ladder (with an overlapping tail, which
+  never writes past the run — the window's next bytes are live history).
+- **The ring has no `%`.** `cap` is not a power of two, so every `% cap` was a
+  real `udiv`; each is one conditional subtraction now (`window::wrap`).
+- **The ring grows in place** and zeroes only the new tail. Allocating a fresh
+  buffer per growth zeroed ~2x the final capacity over a doubling sequence.
+- **Scratch buffers are reused.** The legacy `ZstdDecoder` now owns `lit_buf`
+  and `seq_buf` like `ZstdStream` does (it allocated a fresh `Vec` per block),
+  and the literals buffer is grow-only, so its `resize` memset stops happening
+  after the first few blocks.
+- **`xxhash::read_u64_le`** is one fixed-width load; it was eight
+  bounds-checked byte loads and was not being inlined (10 % of a literal-dense
+  decode).
+
+Known, deliberate and *not* a pathology: `decompress`/`ZstdDecoder::decode_frame`
+return an owned `Vec`, so an incompressible frame pays first-touch page faults
+for a fresh buffer on every call, which `decompress_into` (writing into the
+caller's buffer) does not. Use `decompress_into` when the output size is known.
 
 ## Pending
 

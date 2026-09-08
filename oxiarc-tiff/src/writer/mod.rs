@@ -237,6 +237,12 @@ pub struct ImageSpec {
     ///
     /// `0`, the default, writes none, which is what libtiff writes.
     pub jpeg_restart_rows: u16,
+    /// Whether the CCITT encoders may use T.4 uncompressed mode.
+    ///
+    /// `false`, the default: libtiff refuses to *read* the mode, so a file
+    /// that used it uninvited would be unreadable there. See
+    /// [`ImageSpec::with_ccitt_uncompressed`].
+    pub ccitt_uncompressed: bool,
     /// Arbitrary extra tags: GeoTIFF, ICC, XMP, `DocumentName`, ...
     pub extra_tags: Vec<(u16, Value)>,
 }
@@ -278,6 +284,7 @@ impl ImageSpec {
             // therefore has to say so explicitly.
             ycbcr_subsampling: matches!(color, ColorType::YCbCr(_)).then_some((1, 1)),
             jpeg_restart_rows: 0,
+            ccitt_uncompressed: false,
             extra_tags: Vec::new(),
         }
     }
@@ -388,6 +395,34 @@ impl ImageSpec {
     #[must_use]
     pub fn with_jpeg_restart_rows(mut self, rows: u16) -> Self {
         self.jpeg_restart_rows = rows;
+        self
+    }
+
+    /// Lets the CCITT encoders fall into T.4 uncompressed mode (§4.2.1.3.2)
+    /// for rows where it is smaller, and sets the option-tag bit that says so
+    /// (`T4Options` bit 1 for Group 3, `T6Options` bit 1 for Group 4).
+    ///
+    /// The mode transmits pixels at about one bit each instead of Huffman
+    /// coding runs, so it wins on dithered or halftoned regions — where fax
+    /// coding *expands* the data — and loses everywhere else. The encoder
+    /// prices both codings of every row exactly and picks the smaller, so
+    /// turning this on can only shrink a page.
+    ///
+    /// # Interoperability
+    ///
+    /// **libtiff 4.7.1 cannot read uncompressed mode** (`Fax3Decode2D`
+    /// reports `Uncompressed data (not supported)`), and neither can the
+    /// readers built on it. It parses the file — `tiffinfo` reports the tags
+    /// and the option bit — but the pixels of any row that used the mode do
+    /// not come out. Leave this off for files that have to be read
+    /// elsewhere; this crate reads its own output, and every other
+    /// uncompressed-mode file, either way.
+    ///
+    /// Ignored for compression 2 and 32771 (the bare RLE dialects), which
+    /// have no option tag to declare it in.
+    #[must_use]
+    pub fn with_ccitt_uncompressed(mut self, allowed: bool) -> Self {
+        self.ccitt_uncompressed = allowed;
         self
     }
 

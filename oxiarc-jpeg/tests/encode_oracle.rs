@@ -1275,3 +1275,193 @@ fn our_abbreviated_strips_are_byte_identical_to_libtiffs() {
     }
     require_comparisons(compared, "libtiff strip parity");
 }
+
+/// A two-component frame (`ColorSpace::Unknown(2)`, libjpeg's `JCS_UNKNOWN`
+/// shape) against `djpeg -verbose`.
+///
+/// **What this proves, and what it does not.** libjpeg-turbo has no output
+/// module for a colour space it cannot map to grayscale or RGB (`wrppm.c`,
+/// `wrbmp.c`, `wrgif.c`, `wrtarga.c`, `wrrle.c` all `ERREXIT` with "output
+/// must be grayscale or RGB" before a single scanline is produced), and
+/// `-grayscale`/`-rgb` refuse the conversion outright ("Unsupported color
+/// conversion request", `jdcolor.c`'s `JERR_CONVERSION_NOTIMPL`) — checked
+/// by hand on this machine, not asserted here, since asserting an external
+/// tool's *refusal* pins nothing about this crate. `tjbench` and Pillow were
+/// checked the same way: TurboJPEG's `tj3DecompressHeader` cannot even name
+/// the colour space, and Pillow's `Image.open` raises
+/// `UnidentifiedImageError` before returning a image object at all. **None
+/// of the three tools can decode a single pixel of a two-component frame,
+/// on any machine**, because none has an output path for it — this is not
+/// a gap in this crate.
+///
+/// What `-verbose` (`jdmarker.c`'s marker printer, which runs during
+/// `jpeg_read_header` and so *before* the output module is even selected)
+/// **does** reach: the frame header and the scan header. This test asserts
+/// djpeg's own trace names the exact shape this crate wrote — `Nf = 2`,
+/// identifiers `1`/`2`, `Hi = Vi = 1` for both (no subsampling), quantisation
+/// table `0` for both, and a scan naming both components on Huffman table
+/// `0` — and that the failure is the *expected* one at the *expected* point
+/// (the output-format check, after the scan header is printed), not an
+/// earlier parse error that would mean this crate wrote something libjpeg
+/// considers malformed.
+///
+/// The one thing no external tool anywhere can check is whether the
+/// *entropy-coded sample values* are correct — see
+/// `two_component_channels_decompose_to_cjpeg_djpeg_reference_pixels` below
+/// for how much of that gap this crate closes anyway, and
+/// `two_component_frames_round_trip_and_keep_both_channels` (`encode_api.rs`)
+/// for the part that is genuinely internal-only.
+#[test]
+fn djpeg_verbose_parses_our_two_component_frame_and_scan_header() {
+    if !oracle_support::tool_available("djpeg") {
+        eprintln!("djpeg unavailable; skipping");
+        return;
+    }
+    let width = 24u16;
+    let height = 18u16;
+    let pixels: Vec<u8> = (0..u32::from(width) * u32::from(height) * 2)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let options = EncodeOptions {
+        quality: 80,
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg = encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+        .expect("encode");
+
+    let input = oracle_support::temp_path("verbose_2c", "jpg");
+    std::fs::write(&input, &jpeg).expect("write");
+    let output = Command::new("djpeg")
+        .args(["-verbose", "-verbose"])
+        .arg(&input)
+        .output()
+        .expect("spawn djpeg");
+    let _ = std::fs::remove_file(&input);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "djpeg unexpectedly succeeded — no output module exists for this colour \
+         space, so success here would mean the frame decoded as something else \
+         entirely:\n{stderr}"
+    );
+    for expected in [
+        format!("Start Of Frame 0xc0: width={width}, height={height}, components=2"),
+        "Component 1: 1hx1v q=0".to_string(),
+        "Component 2: 1hx1v q=0".to_string(),
+        "Start Of Scan: 2 components".to_string(),
+        "Component 1: dc=0 ac=0".to_string(),
+        "Component 2: dc=0 ac=0".to_string(),
+    ] {
+        assert!(
+            stderr.contains(&expected),
+            "djpeg -verbose did not print {expected:?}:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with("PPM output must be grayscale or RGB"),
+        "djpeg failed somewhere other than the expected output-format check \
+         (a parse failure earlier would mean it rejected the frame or scan \
+         header, not merely the pixel format):\n{stderr}"
+    );
+}
+
+/// Decomposes a two-component frame into the two libjpeg-turbo *can* fully
+/// decode, closing most of the gap `djpeg_verbose_parses_our_two_component_
+/// frame_and_scan_header` leaves open.
+///
+/// `ColorSpace::Unknown(2)`'s component template puts **both** components on
+/// quantisation and Huffman slot 0 — the same slot a plain one-component
+/// `Luma` frame uses — and neither is subsampled, so for a frame with no
+/// restart markers the sequence of quantised coefficients the entropy coder
+/// sees for component *N* of the two-component frame is, block for block,
+/// identical to the sequence a standalone one-component frame of that same
+/// channel's pixels would produce at the same quality: the MCU grid, the DC
+/// prediction chain and the dummy-block copy rule are all per-component
+/// state, blind to how many *other* components share the frame (`plan.rs`'s
+/// own `component_template` doc explains why the table slots have to agree
+/// for this to hold).
+///
+/// So: split the source image into its two channels, encode *each alone* as
+/// a standalone grayscale frame with real `cjpeg -dct int`, decode *that*
+/// with real `djpeg -dct int` — both fully external, and grayscale byte
+/// parity with `cjpeg`/`djpeg` is what `baseline_output_is_byte_identical_
+/// to_cjpeg` already covers for every quality and shape — and require it to
+/// equal this crate's own two-component encode, decoded by this crate's own
+/// decoder, one channel at a time. A mismatch here would mean this crate's
+/// two-component DCT/quantisation/entropy-coding path disagrees with the
+/// (independently, externally verified) single-component path it is built
+/// from, for a component that happens to share a frame with another one.
+///
+/// What this still does **not** prove: that libjpeg would decode the *real*
+/// two-component *interleaved* bitstream to these values — no tool can run
+/// that entropy decoder at all (see the sibling test). It does prove the
+/// coefficients each component's own pipeline produces are libjpeg-correct.
+#[test]
+fn two_component_channels_decompose_to_cjpeg_djpeg_reference_pixels() {
+    if !tools_available() {
+        eprintln!("libjpeg tools absent; skipping");
+        return;
+    }
+    let mut compared = 0usize;
+    for &(width, height) in &[(16usize, 16), (17, 9), (33, 5)] {
+        for quality in [50u8, 75, 95] {
+            let mut channel_a = vec![0u8; width * height];
+            let mut channel_b = vec![0u8; width * height];
+            let mut combined = vec![0u8; width * height * 2];
+            for y in 0..height {
+                for x in 0..width {
+                    let index = y * width + x;
+                    let a = ((x * 7 + y * 13) % 256) as u8;
+                    let b = if (x / 3 + y / 2) % 2 == 0 { 220 } else { 24 };
+                    channel_a[index] = a;
+                    channel_b[index] = b;
+                    combined[index * 2] = a;
+                    combined[index * 2 + 1] = b;
+                }
+            }
+
+            let options = EncodeOptions {
+                quality,
+                jpeg_color_space: Some(ColorSpace::Unknown(2)),
+                ..Default::default()
+            };
+            let jpeg = encode_to_vec_with_options(
+                &combined,
+                width as u16,
+                height as u16,
+                InputColor::LumaAlpha,
+                &options,
+            )
+            .expect("encode");
+            let mut decoder = Decoder::new(&jpeg[..]);
+            decoder.read_info().expect("info");
+            let ours = decoder.decode().expect("decode");
+            let (ours_a, ours_b): (Vec<u8>, Vec<u8>) =
+                ours.chunks_exact(2).map(|pair| (pair[0], pair[1])).unzip();
+
+            for (label, ours_channel, source_channel) in
+                [("A", &ours_a, &channel_a), ("B", &ours_b, &channel_b)]
+            {
+                let reference_jpeg = cjpeg(
+                    &["-quality", &quality.to_string(), "-dct", "int"],
+                    &pnm(source_channel, width, height, 1),
+                )
+                .expect("cjpeg reference");
+                let decoded = djpeg(&["-dct", "int", "-pnm"], &reference_jpeg)
+                    .expect("djpeg reference decode");
+                let reference: Vec<u8> = decoded.samples.iter().map(|&v| v as u8).collect();
+                assert!(
+                    *ours_channel == reference,
+                    "{width}x{height} q{quality} channel {label}: {}",
+                    describe(ours_channel, &reference)
+                );
+                compared += 1;
+            }
+        }
+    }
+    require_comparisons(compared, "two-component channel decomposition");
+}

@@ -28,14 +28,14 @@ deflate = ["dep:oxiarc-deflate"]
 # RFC 7932 Brotli.
 brotli = ["dep:oxiarc-brotli"]
 # RFC 8878 Zstandard, and `dcz` (Compression Dictionary Transport, RFC 9842)
-# when a dictionary is supplied — see `EncodeOptions::dictionary`.
+# when a dictionary is supplied — see `EncodeOptions::dictionary`. `brotli`
+# carries the same coding's `dcb` variant.
 zstd = ["dep:oxiarc-zstd"]
-# Legacy UNIX `compress` / `x-compress`. Plumbing only in this wave: `oxiarc-lzw`
-# caps codes at 12 bits (`LzwConfig::validate`) and the `.Z` format needs 16, so
-# `ContentCoding::Compress::is_decodable()`/`is_encodable()` are unconditionally
-# `false` regardless of this feature until that lands upstream. Kept as a real
-# Cargo feature (rather than a `compile_error!`) so the crate's feature matrix —
-# `--no-default-features`, each feature alone — stays green.
+# Legacy UNIX `compress` / `x-compress` — `oxiarc_lzw::z`'s `.Z` container,
+# both directions (`Decoder`/`decode_body` decode; `encode_body`/`Encoder`
+# encode). `.Z` has no end-of-information code: a truncated body decodes to
+# a valid, silently short prefix, not an error — see
+# `ContentCoding::Compress`'s doc comment.
 compress = ["dep:oxiarc-lzw"]
 # `AsyncDecodedBody`, the `tokio::io::AsyncRead` twin of `DecodedBody`.
 async-io = ["dep:tokio", "oxiarc-core/async-io"]

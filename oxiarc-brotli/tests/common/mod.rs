@@ -465,3 +465,112 @@ pub fn decode_incremental(
 pub fn call_budget(data: &[u8]) -> u64 {
     (data.len() as u64 + 1) * 64 + 4_000_000
 }
+
+/// Hand-build a one-meta-block stream whose single command copies `copy_len`
+/// bytes out of the shared dictionary, starting 4 bytes before its end.
+///
+/// `copy_len <= 4` stops inside the dictionary; anything longer would run past
+/// its end. Neither this crate's encoder nor `brotli 1.1.0 -D` emits the
+/// latter — both stop a dictionary match at the dictionary's end — so the
+/// decoders' path for it can only be reached by a stream written by hand. The
+/// stream is otherwise legal RFC 7932: one literal block type, one
+/// insert-and-copy type and one distance type, each with a single-symbol
+/// *simple* prefix code (which costs zero bits per symbol), so the whole
+/// meta-block is a handful of header fields plus two extra-bit fields.
+///
+/// Layout produced below, in bit order:
+///
+/// ```text
+/// WBITS=16                      0
+/// ISLAST=1, ISLASTEMPTY=0       1 0
+/// MNIBBLES=4, MLEN-1            00, 5 + copy_len - 1 in 16 bits
+/// NBLTYPES L/I/D = 1            0 0 0
+/// NPOSTFIX=0, NDIRECT=0         00, 0000
+/// context mode LSB6             00
+/// NTREESL=1, NTREESD=1          0 0
+/// literal code: simple, 'A'     01, 00, 8 bits
+/// insert-and-copy code          01, 00, 10 bits
+/// distance code: symbol 19      01, 00, 6 bits
+/// copy extra bits               copy_len - base
+/// distance extra bits (dist 9)  00
+/// padding                       zeros to the byte boundary
+/// ```
+///
+/// Returns the stream, the dictionary, and the bytes the stream means when it
+/// is legal (`None` when the copy runs past the dictionary's end).
+pub fn hand_built_dictionary_copy(copy_len: u32) -> (Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
+    use oxiarc_brotli::bit_writer::BitWriter;
+    use oxiarc_brotli::huffman::alphabet_bits;
+    use oxiarc_brotli::tables::{COPY_LENGTH_CODES, INSERT_LENGTH_CODES, decompose_command};
+
+    let insert_len = 5u32;
+    let distance = 9usize;
+    // With `insert_len` literals produced, `max_backward` is 5, so distance 9
+    // reaches 4 bytes past it: the dictionary's last 4 bytes.
+    let available = 4usize;
+
+    // The insert-and-copy symbol for (insert 5, copy `copy_len`) with an
+    // explicit distance. Found by inverting the crate's own decomposition, so
+    // the test cannot drift from the table it is testing against.
+    let mut found = None;
+    for sym in 0u16..704 {
+        let (ins_code, cpy_code, implicit) = decompose_command(sym);
+        if implicit {
+            continue;
+        }
+        let (ins_base, ins_extra) = INSERT_LENGTH_CODES[ins_code as usize];
+        let (cpy_base, cpy_extra) = COPY_LENGTH_CODES[cpy_code as usize];
+        if ins_base == insert_len
+            && ins_extra == 0
+            && cpy_base <= copy_len
+            && copy_len < cpy_base + (1u32 << cpy_extra)
+        {
+            found = Some((sym, cpy_base, cpy_extra));
+            break;
+        }
+    }
+    let (ic_symbol, cpy_base, cpy_extra) =
+        found.expect("an insert-5 command symbol must exist for this copy length");
+
+    let mut w = BitWriter::with_capacity(64);
+    w.write_bit(false).expect("wbits"); // WBITS = 16
+    w.write_bit(true).expect("islast");
+    w.write_bit(false).expect("islastempty");
+    w.write_bits(0, 2).expect("mnibbles"); // 4 nibbles
+    w.write_bits(insert_len + copy_len - 1, 16).expect("mlen");
+    for _ in 0..3 {
+        w.write_bit(false).expect("nbltypes"); // L, I, D = 1
+    }
+    w.write_bits(0, 2).expect("npostfix");
+    w.write_bits(0, 4).expect("ndirect");
+    w.write_bits(0, 2).expect("context mode"); // LSB6
+    w.write_bit(false).expect("ntreesl");
+    w.write_bit(false).expect("ntreesd");
+    // Three single-symbol simple prefix codes.
+    for (alphabet, symbol) in [
+        (256u32, u32::from(b'A')),
+        (704, u32::from(ic_symbol)),
+        (64, 19),
+    ] {
+        w.write_bits(1, 2).expect("hskip"); // hskip == 1 -> simple
+        w.write_bits(0, 2).expect("nsym-1"); // one symbol
+        w.write_bits(symbol, alphabet_bits(alphabet))
+            .expect("symbol");
+    }
+    // The command: symbols cost no bits, only the extra-bit fields remain.
+    w.write_bits(copy_len - cpy_base, u32::from(cpy_extra))
+        .expect("copy extra");
+    w.write_bits(0, 2).expect("distance extra"); // distance 9 = base 9 + 0
+    w.flush();
+    let stream = w.finish();
+
+    let dict: Vec<u8> = (0..100u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let expected = (copy_len as usize <= available).then(|| {
+        let mut out = vec![b'A'; insert_len as usize];
+        out.extend_from_slice(&dict[dict.len() - copy_len as usize..]);
+        assert_eq!(out.len(), (insert_len + copy_len) as usize);
+        assert_eq!(distance, 9);
+        out
+    });
+    (stream, dict, expected)
+}

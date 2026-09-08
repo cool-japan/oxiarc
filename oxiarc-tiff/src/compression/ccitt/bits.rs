@@ -158,6 +158,12 @@ impl BitWriter {
         Self::default()
     }
 
+    /// Empties the writer, keeping its buffer.
+    pub(super) fn clear(&mut self) {
+        self.out.clear();
+        self.used = 0;
+    }
+
     /// Bits written so far.
     pub(super) fn bit_len(&self) -> usize {
         self.out

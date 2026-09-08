@@ -3,7 +3,8 @@
 //! Sequences describe LZ77-style back-references using literal lengths,
 //! match lengths, and offsets.
 
-use crate::fse::{FseBitReader, FseTable, FseTableEntry, read_fse_table_description};
+use crate::backward_bits::{BitCursor, FseBitReader};
+use crate::fse::{FseTable, FseTableEntry, read_fse_table_description};
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Maximum accuracy log for literal-length FSE tables (RFC 8878).
@@ -168,8 +169,10 @@ impl SequencesDecoder {
 
     /// Decode sequences section, allocating a fresh vector for the result.
     ///
-    /// Equivalent to [`decode_into`](Self::decode_into) with a fresh `Vec`;
-    /// kept for the one-shot decode path, whose callers want an owned buffer.
+    /// Equivalent to [`decode_into`](Self::decode_into) with a fresh `Vec`.
+    /// Both decode paths use `decode_into` with a buffer they reuse across
+    /// blocks; this stays for tests, which want an owned result.
+    #[cfg(test)]
     pub fn decode(&mut self, data: &[u8]) -> Result<(Vec<Sequence>, usize)> {
         let mut out = Vec::new();
         let consumed = self.decode_into(data, &mut out)?;
@@ -355,12 +358,19 @@ impl SequencesDecoder {
             .as_ref()
             .ok_or_else(|| OxiArcError::corrupted(0, "missing match length table"))?;
 
-        let mut reader = FseBitReader::new(data)?;
+        // The bitstream position is held as a detached, register-resident
+        // cursor: a sequence costs six to nine bit-field reads, and driving
+        // them through `&mut FseBitReader` puts the 64-bit container and the
+        // consumed-bit count in memory, paying a store and a dependent load
+        // for each one.
+        let reader = FseBitReader::new(data)?;
+        let bits = reader.data();
+        let mut cur = reader.detach();
 
-        let mut ll_state = reader.read_bits(ll_table.accuracy_log()) as usize;
-        let mut of_state = reader.read_bits(of_table.accuracy_log()) as usize;
-        let mut ml_state = reader.read_bits(ml_table.accuracy_log()) as usize;
-        if reader.is_overflowed() {
+        let mut ll_state = read_field(&mut cur, ll_table.accuracy_log()) as usize;
+        let mut of_state = read_field(&mut cur, of_table.accuracy_log()) as usize;
+        let mut ml_state = read_field(&mut cur, ml_table.accuracy_log()) as usize;
+        if cur.bits_remaining() < 0 {
             return Err(OxiArcError::corrupted(
                 0,
                 "sequence bitstream too short for initial FSE states",
@@ -375,6 +385,11 @@ impl SequencesDecoder {
         out.reserve(count.min(data.len().saturating_mul(8)));
 
         for i in 0..count {
+            // Reload point 1: the offset and match-length extra bits that
+            // follow are at most 31 + 16 = 47, which fits a container reloaded
+            // to at most 7 consumed bits.
+            cur.refill(bits);
+
             let ll_entry = *ll_table.get(ll_state)?;
             let of_entry = *of_table.get(of_state)?;
             let ml_entry = *ml_table.get(ml_state)?;
@@ -385,10 +400,14 @@ impl SequencesDecoder {
                 of_entry.symbol,
                 ll_entry.symbol,
                 &mut self.repeat_offsets,
-                &mut reader,
+                &mut cur,
             )?;
-            let ml_value = decode_ml_value(ml_entry.symbol, &mut reader)?;
-            let ll_value = decode_ll_value(ll_entry.symbol, &mut reader)?;
+            let ml_value = decode_ml_value(ml_entry.symbol, &mut cur)?;
+
+            // Reload point 2: the literal-length extra bits plus the three
+            // state updates that follow are at most 16 + 9 + 9 + 8 = 42.
+            cur.refill(bits);
+            let ll_value = decode_ll_value(ll_entry.symbol, &mut cur)?;
 
             out.push(Sequence {
                 literal_length: ll_value,
@@ -399,14 +418,14 @@ impl SequencesDecoder {
             // Update states (skipped after the last sequence).
             if i + 1 < count {
                 ll_state =
-                    ll_entry.baseline as usize + reader.read_bits(ll_entry.num_bits) as usize;
+                    ll_entry.baseline as usize + read_field(&mut cur, ll_entry.num_bits) as usize;
                 ml_state =
-                    ml_entry.baseline as usize + reader.read_bits(ml_entry.num_bits) as usize;
+                    ml_entry.baseline as usize + read_field(&mut cur, ml_entry.num_bits) as usize;
                 of_state =
-                    of_entry.baseline as usize + reader.read_bits(of_entry.num_bits) as usize;
+                    of_entry.baseline as usize + read_field(&mut cur, of_entry.num_bits) as usize;
             }
 
-            if reader.is_overflowed() {
+            if cur.bits_remaining() < 0 {
                 return Err(OxiArcError::corrupted(
                     0,
                     "sequence bitstream exhausted early",
@@ -416,12 +435,12 @@ impl SequencesDecoder {
 
         // A well-formed stream is consumed exactly (reference checks
         // `BIT_endOfDStream` after the last sequence).
-        if !reader.is_finished() {
+        if !cur.is_finished() {
             return Err(OxiArcError::corrupted(
                 0,
                 format!(
                     "sequence bitstream not fully consumed ({} bits left)",
-                    reader.bits_remaining()
+                    cur.bits_remaining()
                 ),
             ));
         }
@@ -446,6 +465,21 @@ impl SequencesDecoder {
     }
 }
 
+/// Read `n` bits from a detached cursor with no reload.
+///
+/// The sequence loop reloads the 64-bit container at two *fixed* points per
+/// sequence instead of testing after every field: the widths are all bounded
+/// by the format (offset code <= 31, length extras <= 16, FSE state updates
+/// <= 9), so the schedule is provably sufficient and the loop carries no
+/// data-dependent branch for bit management. Testing after each of the six to
+/// nine reads per sequence put six mispredictable branches in the loop.
+#[inline(always)]
+fn read_field(cur: &mut BitCursor, n: u8) -> u32 {
+    let value = cur.peek(n);
+    cur.advance(n);
+    value
+}
+
 /// Decode offset with repeat offset handling (RFC 8878 §3.1.1.5).
 ///
 /// The offset code and extra bits produce an `Offset_Value`:
@@ -460,7 +494,7 @@ fn decode_offset(
     code: u8,
     ll_code: u8,
     repeat_offsets: &mut [usize; 3],
-    reader: &mut FseBitReader,
+    cur: &mut BitCursor,
 ) -> Result<usize> {
     if code > MAX_OFFSET_CODE {
         return Err(OxiArcError::corrupted(
@@ -470,7 +504,7 @@ fn decode_offset(
     }
 
     // Read extra bits (always `code` bits for offset).
-    let extra = reader.read_bits(code);
+    let extra = read_field(cur, code);
     let offset_value = (1usize << code) + extra as usize;
 
     if offset_value > 3 {
@@ -526,7 +560,7 @@ impl Default for SequencesDecoder {
 }
 
 /// Decode literal length value from code and extra bits.
-fn decode_ll_value(code: u8, reader: &mut FseBitReader) -> Result<usize> {
+fn decode_ll_value(code: u8, cur: &mut BitCursor) -> Result<usize> {
     // Literal length baseline and extra bits table
     const LL_BASELINE: [u32; 36] = [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
@@ -545,12 +579,12 @@ fn decode_ll_value(code: u8, reader: &mut FseBitReader) -> Result<usize> {
         });
     }
 
-    let extra = reader.read_bits(LL_EXTRA[idx]);
+    let extra = read_field(cur, LL_EXTRA[idx]);
     Ok(LL_BASELINE[idx] as usize + extra as usize)
 }
 
 /// Decode match length value from code and extra bits.
-fn decode_ml_value(code: u8, reader: &mut FseBitReader) -> Result<usize> {
+fn decode_ml_value(code: u8, cur: &mut BitCursor) -> Result<usize> {
     // Match length baseline and extra bits table
     const ML_BASELINE: [u32; 53] = [
         3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
@@ -570,7 +604,7 @@ fn decode_ml_value(code: u8, reader: &mut FseBitReader) -> Result<usize> {
         });
     }
 
-    let extra = reader.read_bits(ML_EXTRA[idx]);
+    let extra = read_field(cur, ML_EXTRA[idx]);
     Ok(ML_BASELINE[idx] as usize + extra as usize)
 }
 

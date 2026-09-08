@@ -90,12 +90,27 @@ use oxiarc_core::error::Result;
 use oxiarc_core::traits::FlushMode;
 
 use crate::inflate_core::{ActiveTrees, InflateCore, InflateState, Trees, drive};
-use crate::sink::{BoundedSink, GrowSink, History, InflateSink};
-use crate::window::InflateWindow;
+use crate::sink::{BoundedSink, History, InflateSink};
 use crate::zlib::Adler32;
 
 /// Default growable-output capacity, matching `Inflater::new`.
 const DEFAULT_OUTPUT_CAPACITY: usize = 65536;
+
+/// Expansion factor [`InflateStream::inflate_to_vec`] guesses when sizing
+/// its first output buffer.
+const INITIAL_EXPANSION_GUESS: usize = 4;
+
+/// Ceiling on that guess, so a large compressed input does not turn into a
+/// large speculative allocation.
+const MAX_INITIAL_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// Room [`InflateStream::inflate_to_vec`] keeps ahead of the cursor.
+///
+/// The fast symbol loop needs 258 bytes of slack to run at all (the longest
+/// match), so growing only when less than a whole window is left keeps it
+/// on the fast path across the whole decode instead of dropping into the
+/// careful path at the end of every chunk.
+const MIN_GROW_ROOM: usize = 32768;
 
 // ---------------------------------------------------------------------------
 // Public result types
@@ -421,15 +436,76 @@ impl InflateStream {
     /// assert_eq!(stream.inflate_to_vec(&compressed).expect("inflate"), b"grow me");
     /// ```
     pub fn inflate_to_vec(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut window = InflateWindow::with_capacity(DEFAULT_OUTPUT_CAPACITY);
-        if self.history.len() > 0 {
-            window.preload_dictionary(self.history.as_slice());
+        // The buffer being filled *is* the window: back-references resolve
+        // inside it, so no byte is written twice and no history copy is
+        // taken. Only the dictionary (bytes that precede the buffer) is a
+        // separate slice.
+        let dictionary = if self.history.len() > 0 {
+            Some(&self.history)
+        } else {
+            None
+        };
+        // Seed from the input: DEFLATE rarely expands by less than 2x, so a
+        // 4x guess usually decodes in one pass. Growth is still geometric,
+        // and the guess is bounded so a small input cannot ask for a large
+        // buffer.
+        let seed = input
+            .len()
+            .saturating_mul(INITIAL_EXPANSION_GUESS)
+            .clamp(DEFAULT_OUTPUT_CAPACITY, MAX_INITIAL_OUTPUT);
+        let mut out = vec![0u8; seed];
+        let mut filled = 0usize;
+        let mut consumed = 0usize;
+        loop {
+            if let Some(fault) = &self.core.fault {
+                return Err(fault.to_error());
+            }
+            self.core.sync_flush = false;
+            if self.core.state == InflateState::Done {
+                break;
+            }
+            if out.len() - filled < MIN_GROW_ROOM {
+                // Geometric growth, initialised so the decoder can write
+                // through a plain slice.
+                let target = out.len().saturating_mul(2).max(DEFAULT_OUTPUT_CAPACITY);
+                out.resize(target, 0u8);
+            }
+            let rest = input.get(consumed..).unwrap_or_default();
+            // Field-wise borrows (as in `inflate`), so the dictionary can be
+            // read while the core is driven mutably.
+            let mut in_pos = 0usize;
+            self.core.bits_base = self.core.cache.consumed();
+            let status = {
+                let mut sink = BoundedSink::resumed(&mut out, filled, dictionary);
+                let status = drive(
+                    &mut self.core,
+                    &mut self.trees,
+                    &mut sink,
+                    rest,
+                    &mut in_pos,
+                    FlushMode::Finish,
+                )?;
+                filled = sink.position();
+                status
+            };
+            self.core.bits_used += self.core.cache.consumed() - self.core.bits_base;
+            self.core.bits_base = self.core.cache.consumed();
+            self.core.total_in += in_pos as u64;
+            consumed += in_pos;
+            match status {
+                InflateStatus::StreamEnd => break,
+                InflateStatus::NeedOutput => continue,
+                // `Finish` was requested and the whole remaining stream was
+                // handed over, so `NeedInput` means the decoder is waiting
+                // for a byte that will never come. `inflate_sink` has
+                // already reported truncation as an error in that case; a
+                // sync-flush boundary is the one legitimate way here, and
+                // there is nothing further to decode.
+                InflateStatus::NeedInput => break,
+            }
         }
-        {
-            let mut sink = GrowSink::new(&mut window);
-            self.inflate_sink(input, &mut sink, FlushMode::Finish)?;
-        }
-        Ok(window.into_output())
+        out.truncate(filled);
+        Ok(out)
     }
 
     /// Install a preset dictionary (RFC 1950 `FDICT`, MSZIP, a CAB folder

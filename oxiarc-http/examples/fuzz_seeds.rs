@@ -1,10 +1,29 @@
-//! Seed-corpus generator for the seven `oxiarc-http` fuzz targets.
+//! Seed-corpus generator for `oxiarc-http`'s two fuzz targets,
+//! `fuzz_http_decode` and `fuzz_http_headers`
+//! (`fuzz/fuzz_targets/fuzz_http_{decode,headers}.rs`).
 //!
-//! The targets themselves live in the workspace `fuzz/` crate (added by the
-//! Phase 8 wave-3 workspace track); this is the generator that gives each of
-//! them a corpus that already reaches the interesting states, so the fuzzer
-//! spends its budget past the header parser rather than rediscovering the
-//! two bytes of a gzip magic.
+//! An earlier draft of this file assumed seven targets — one per parser/
+//! decoder entry point — that never materialized: Phase 8 wired exactly two,
+//! each covering what several of the drafted ones would have (`fuzz_http_decode`
+//! drives [`Decoder`](oxiarc_http::Decoder) with *randomly chosen* codings,
+//! limits and chunk granularity picked from the fuzz input's own leading
+//! bytes via `arbitrary::Unstructured`, rather than one target per coding;
+//! `fuzz_http_headers` covers every header-parsing/negotiation entry point
+//! in one target). This file, and the seed families below, now match that.
+//!
+//! Both targets consume their *own* leading bytes as picker/limit data
+//! before treating the rest as the real payload (see their own doc
+//! comments for the exact `Unstructured` order) — these seeds are
+//! deliberately **not** pre-encoded for that prefix. A seed corpus only
+//! needs to contain the interesting byte *structures* (a real gzip stream,
+//! an RFC 9110 example header) somewhere in the input for libFuzzer's
+//! coverage-guided mutation to find useful leading-byte combinations
+//! quickly; hand-crafting the exact prefix is the level of engineering the
+//! *differential* targets against `oxiarc-deflate`/`oxiarc-zstd`/
+//! `oxiarc-brotli` need (see `fuzz/README.md`'s "Seeding corpora" section)
+//! because those compare byte-for-byte against a reference decoder — these
+//! two only need to prove the integration never panics or hangs, which does
+//! not depend on the picker prefix landing on any particular coding.
 //!
 //! ```text
 //! # write every corpus under fuzz/corpus/<target>/
@@ -30,17 +49,41 @@ type Seed = (String, Vec<u8>);
 /// One fuzz target's corpus: the target's name and its seeds.
 type Corpus = (&'static str, Vec<Seed>);
 
-/// The seven targets, each with its seed inputs.
+/// The two targets, each with its seed inputs merged from the families
+/// below (prefixed so names stay unique once merged into one directory).
+///
+/// No `compress`/`dcb` shapes here even though both are real codings now
+/// (this track's own `Content-Encoding: compress`/`dcb` work, landed after
+/// `fuzz_http_decode.rs` was written): that target's own `CANDIDATES` array
+/// still hard-codes `[Identity, Deflate, Gzip, Brotli, Zstd]` with a comment
+/// saying `compress`/`dcb` are "permanently unsupported", which is now
+/// stale — but `fuzz/` is a separate crate this track does not own, and
+/// seeding bytes here cannot matter until that array is updated to be able
+/// to pick either coding in the first place. Flagged for whoever updates it
+/// next, alongside the same note in this crate's own `TODO.md`.
 fn corpora() -> Vec<Corpus> {
-    vec![
-        ("fuzz_http_parse_accept_encoding", accept_encoding_seeds()),
-        ("fuzz_http_parse_content_encoding", content_encoding_seeds()),
-        ("fuzz_http_qvalue", qvalue_seeds()),
-        ("fuzz_http_decoder_gzip", gzip_seeds()),
-        ("fuzz_http_decoder_deflate", deflate_seeds()),
-        ("fuzz_http_decoder_chunked", chunked_seeds()),
-        ("fuzz_http_negotiate", negotiate_seeds()),
-    ]
+    let mut decode = Vec::new();
+    decode.extend(prefixed("gzip", gzip_seeds()));
+    decode.extend(prefixed("deflate", deflate_seeds()));
+    decode.extend(prefixed("chunked", chunked_seeds()));
+
+    let mut headers = Vec::new();
+    headers.extend(prefixed("accept_encoding", accept_encoding_seeds()));
+    headers.extend(prefixed("content_encoding", content_encoding_seeds()));
+    headers.extend(prefixed("qvalue", qvalue_seeds()));
+    headers.extend(prefixed("negotiate", negotiate_seeds()));
+
+    vec![("fuzz_http_decode", decode), ("fuzz_http_headers", headers)]
+}
+
+/// Prefix every seed's file name with `family`, so seeds from several
+/// generator functions can share one target's corpus directory without
+/// colliding (each generator numbers its own seeds from 0).
+fn prefixed(family: &str, seeds: Vec<Seed>) -> Vec<Seed> {
+    seeds
+        .into_iter()
+        .map(|(name, bytes)| (format!("{family}_{name}"), bytes))
+        .collect()
 }
 
 /// RFC 9110 §12.5.3's own examples plus the shapes that historically break

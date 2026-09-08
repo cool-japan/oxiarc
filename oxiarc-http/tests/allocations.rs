@@ -9,6 +9,12 @@
 //! 2. **`feed_into` does not allocate in the steady state.** Every buffer it
 //!    needs is allocated once and reused.
 //!
+//! 3. **A `.Z` (`compress`) body is metered too.** `oxiarc_lzw::z::ZReader`
+//!    decodes a whole pull of compressed input into a `Vec` of its own
+//!    before serving the first byte of it, so peak memory would otherwise
+//!    track the *body*; `decode/compress.rs`'s pull meter is what stops it,
+//!    and nothing but a measurement can prove that.
+//!
 //! Everything lives in ONE `#[test]` on purpose: a global allocator is
 //! process-wide, so a second concurrently-running test would pollute the
 //! counters. (`cargo nextest` gives each test its own process and would be
@@ -207,4 +213,73 @@ fn memory_gates() {
         bomb_peak <= bomb_bound,
         "a refused 123 MiB single-block bomb peaked at {bomb_peak} bytes"
     );
+
+    // ── Gate 4: the `compress` (`.Z`) stage is metered the same way ───────
+    //
+    // Unlike every other coding here, `.Z` is decoded through a *pull*
+    // reader (`oxiarc_lzw::z::ZReader`) bridged onto this crate's push seam,
+    // and that reader expands one pull of compressed input to completion,
+    // into a `Vec` of its own, before serving the first byte of it. Left at
+    // its own 16 KiB pull, a body that expands 5000:1 therefore materialises
+    // ~80 MiB inside one `read` call and peak memory tracks the body — which
+    // is exactly what Gate 1 exists to forbid. `decode/compress.rs` meters
+    // the pull instead; this is the measurement that keeps it honest.
+    //
+    // `DecodeLimits::unlimited()` on purpose: with `max_output` in play the
+    // budget would stop the bomb before the meter had to, and the gate would
+    // pass for the wrong reason.
+    #[cfg(feature = "compress")]
+    {
+        let bomb = oxiarc_lzw::z::compress(&vec![0u8; 128 * 1024 * 1024], 16).expect("compress");
+        let expansion = (128 * 1024 * 1024) / bomb.len();
+        assert!(
+            expansion > 1000,
+            "this gate needs a body that really expands; got {expansion}:1"
+        );
+
+        let baseline = live();
+        reset_peak();
+        let mut body = DecodedBody::with_codings(
+            Trickle {
+                data: &bomb,
+                pos: 0,
+                step: 8 * 1024,
+            },
+            &[ContentCoding::Compress],
+            &DecodeLimits::unlimited(),
+        )
+        .expect("decoder");
+        let mut sink = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = body.read(&mut sink).expect("read");
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let z_peak = peak_since_reset(baseline);
+        assert_eq!(total, 128 * 1024 * 1024, "the whole body must be delivered");
+        drop(body);
+
+        // The `.Z` code table at 16 bits is ~192 KiB on its own, one metered
+        // fill targets 64 KiB (which a `Vec` may hold as 128 KiB of
+        // capacity), and the adapter's two 64 KiB staging buffers sit on
+        // top. The bound is deliberately *not* trimmed to the measurement:
+        // this fixture (an all-zeros body) measures 893,668 bytes, but the
+        // meter's headroom depends on the shape of the expansion curve — a
+        // benign prefix followed by a bomb measures 1,475,295 — and one
+        // extra `Vec` doubling either way should not read as a regression.
+        // 2 MiB is still 67x under the 134,605,718 bytes this same fixture
+        // measured before `decode/compress.rs` grew its pull meter, so the
+        // gate keeps all of its teeth without being a tripwire.
+        let z_bound = 2 * 1024 * 1024;
+        eprintln!(".Z streaming peak: {z_peak} bytes (bound {z_bound}) at {expansion}:1");
+        assert!(
+            z_peak <= z_bound,
+            "streaming a {expansion}:1 `.Z` bomb peaked at {z_peak} bytes, over the \
+             {z_bound}-byte bound — the pull meter in decode/compress.rs is not holding \
+             (this fixture measured 893,668 with the meter, 134,605,718 without it)"
+        );
+    }
 }

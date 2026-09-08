@@ -25,7 +25,24 @@
 //!   inherent — a whole block has to fit before the caller drains it — so a
 //!   frame that declares no `Frame_Content_Size` still starts at one block.
 
+use crate::short_copy::{copy_run_within, copy_short, fill_short};
 use oxiarc_core::error::{OxiArcError, Result};
+
+/// Reduce `value` modulo `cap`, given `value < 2 * cap`.
+///
+/// Every ring index in this module is formed as `pos + cap - k` or `pos + run`
+/// with `pos < cap` and `k, run <= cap`, so one conditional subtraction is
+/// exact. It replaces an integer *division*: `cap` is not a power of two (the
+/// ring is clamped to the frame's addressable reach, which is an arbitrary
+/// `Window_Size`), so `%` compiles to a real `udiv` — 20-40 cycles, three of
+/// them per run of an overlapping match copy and two per literal run. On a
+/// 50 MB text corpus that arithmetic alone was a larger cost than the byte
+/// copying it guarded.
+#[inline(always)]
+fn wrap(value: usize, cap: usize) -> usize {
+    debug_assert!(cap > 0 && value < 2 * cap);
+    if value >= cap { value - cap } else { value }
+}
 
 /// A bounded LZ77 history ring.
 #[derive(Debug)]
@@ -184,39 +201,35 @@ impl ZstdWindow {
         self.reallocate(new_cap)
     }
 
-    /// Re-linearise the history into a buffer of exactly `new_cap` bytes.
+    /// Grow the ring to exactly `new_cap` bytes, re-linearising the history.
+    ///
+    /// Grows the existing allocation rather than copying into a fresh one. The
+    /// history is first rotated to the front of the current buffer — which is
+    /// what makes the ring phase correct after `cap` changes — and only the
+    /// *new* tail is zeroed. The obvious alternative (allocate `new_cap`,
+    /// zero all of it, copy the history in) zeroes `2 x final capacity` bytes
+    /// over a doubling growth sequence instead of `final capacity`; on a 50 MB
+    /// frame whose ring grows from one block to 50 MB that difference was 8 %
+    /// of the whole decode, spent in `bzero`.
     fn reallocate(&mut self, new_cap: usize) -> Result<()> {
-        let mut fresh: Vec<u8> = Vec::new();
-        fresh
-            .try_reserve_exact(new_cap)
+        let old_cap = self.buf.len();
+        if new_cap <= old_cap {
+            return Ok(());
+        }
+        if old_cap > 0 {
+            // Move the oldest live byte to index 0; the history then occupies
+            // `[0, filled)` and everything above it is dead.
+            let start = wrap(self.pos + old_cap - self.filled, old_cap);
+            self.buf.rotate_left(start);
+        }
+        self.buf
+            .try_reserve_exact(new_cap - old_cap)
             .map_err(|e| window_alloc_error(new_cap, &e))?;
-        fresh.resize(new_cap, 0);
-        let keep = self.filled.min(new_cap);
-        let (a, b) = self.history_slices(keep);
-        fresh[..a.len()].copy_from_slice(a);
-        fresh[a.len()..a.len() + b.len()].copy_from_slice(b);
-        self.filled = keep;
-        self.pending = self.pending.min(keep);
-        self.pos = keep % new_cap;
-        self.buf = fresh;
+        self.buf.resize(new_cap, 0);
+        self.pending = self.pending.min(self.filled);
+        // `filled <= old_cap < new_cap`, so the write cursor needs no wrap.
+        self.pos = self.filled;
         Ok(())
-    }
-
-    /// The two contiguous runs holding the most recent `n` history bytes,
-    /// oldest run first.
-    fn history_slices(&self, n: usize) -> (&[u8], &[u8]) {
-        let cap = self.buf.len();
-        let n = n.min(self.filled);
-        if cap == 0 || n == 0 {
-            return (&[], &[]);
-        }
-        let start = (self.pos + cap - n) % cap;
-        if start + n <= cap {
-            (&self.buf[start..start + n], &[])
-        } else {
-            let first = cap - start;
-            (&self.buf[start..], &self.buf[..n - first])
-        }
     }
 
     /// Write `data` into the ring, updating `pos`/`filled` but not `pending`.
@@ -230,12 +243,12 @@ impl ZstdWindow {
             data
         };
         let first = (cap - self.pos).min(data.len());
-        self.buf[self.pos..self.pos + first].copy_from_slice(&data[..first]);
+        copy_short(&mut self.buf[self.pos..self.pos + first], &data[..first]);
         if first < data.len() {
             let rest = data.len() - first;
-            self.buf[..rest].copy_from_slice(&data[first..]);
+            copy_short(&mut self.buf[..rest], &data[first..]);
         }
-        self.pos = (self.pos + data.len()) % cap;
+        self.pos = wrap(self.pos + data.len(), cap);
         self.filled = (self.filled + data.len()).min(cap);
     }
 
@@ -262,8 +275,8 @@ impl ZstdWindow {
         let mut written = 0usize;
         while written < len {
             let run = (cap - self.pos).min(len - written);
-            self.buf[self.pos..self.pos + run].fill(byte);
-            self.pos = (self.pos + run) % cap;
+            fill_short(&mut self.buf[self.pos..self.pos + run], byte);
+            self.pos = wrap(self.pos + run, cap);
             written += run;
         }
         self.filled = (self.filled + len).min(cap);
@@ -274,9 +287,23 @@ impl ZstdWindow {
     /// Execute an LZ77 back-reference: append `len` bytes read from `offset`
     /// bytes before the current write position.
     ///
-    /// Overlapping matches (`offset < len`) are handled by copying in runs of
-    /// at most `offset` bytes, which reproduces the byte-by-byte semantics at
-    /// `copy_within` speed.
+    /// # Overlapping matches
+    ///
+    /// An overlapping match (`offset < len`) repeats a period-`offset` pattern,
+    /// so the history behind the write cursor is periodic with *every* multiple
+    /// of `offset` as well. Each round therefore copies from the largest whole
+    /// multiple of `offset` that fits in the pattern written so far — the run
+    /// length doubles (`offset`, `2·offset`, `4·offset`, …) instead of being
+    /// pinned at `offset`, which is what a 64 KiB match at `offset` 1 used to
+    /// cost: 65 536 one-byte `copy_within` calls, each with three `%`
+    /// reductions. It is now 17 calls. A non-overlapping match is still one
+    /// call (two when it straddles the ring boundary).
+    ///
+    /// Copying from a multiple of `offset` is phase-correct because the source
+    /// bytes of a run are all *already written* — `run <= distance` — so no
+    /// byte in a run depends on another byte of the same run, and
+    /// `copy_within`'s move semantics deliver exactly the pre-copy source even
+    /// where source and destination overlap in the ring.
     pub(crate) fn copy_match(&mut self, offset: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -290,15 +317,16 @@ impl ZstdWindow {
         let cap = self.buf.len();
         let mut written = 0usize;
         while written < len {
-            let src = (self.pos + cap - offset) % cap;
+            // Periodic history behind the cursor, clamped to the ring and
+            // rounded down to a whole number of periods.
+            let periodic = (offset + written).min(cap);
+            let distance = periodic - periodic % offset;
+            let src = wrap(self.pos + cap - distance, cap);
             let dst = self.pos;
-            let run = (len - written)
-                .min(cap - src)
-                .min(cap - dst)
-                .min(offset)
-                .max(1);
-            self.buf.copy_within(src..src + run, dst);
-            self.pos = (self.pos + run) % cap;
+            let run = (len - written).min(distance).min(cap - src).min(cap - dst);
+            debug_assert!(run > 0, "offset {offset} distance {distance} cap {cap}");
+            copy_run_within(&mut self.buf, src, dst, run);
+            self.pos = wrap(self.pos + run, cap);
             self.filled = (self.filled + run).min(cap);
             written += run;
         }
@@ -316,13 +344,13 @@ impl ZstdWindow {
             return 0;
         }
         let cap = self.buf.len();
-        let start = (self.pos + cap - self.pending) % cap;
+        let start = wrap(self.pos + cap - self.pending, cap);
         let first = (cap - start).min(n);
-        out[..first].copy_from_slice(&self.buf[start..start + first]);
+        copy_short(&mut out[..first], &self.buf[start..start + first]);
         hash(&out[..first]);
         if first < n {
             let rest = n - first;
-            out[first..n].copy_from_slice(&self.buf[..rest]);
+            copy_short(&mut out[first..n], &self.buf[..rest]);
             hash(&out[first..n]);
         }
         self.pending -= n;
@@ -353,6 +381,55 @@ mod tests {
         let n = w.drain_into(&mut out, |_| {});
         out.truncate(n);
         out
+    }
+
+    /// The ring's match copy must reproduce the byte-at-a-time definition for
+    /// every combination of capacity, prior history, offset and length —
+    /// including the pattern-doubling runs, the ring wrap, and offsets equal
+    /// to the whole reachable history.
+    ///
+    /// The reference here is a plain growing `Vec`: `out.push(out[len - off])`.
+    /// The ring is only allowed to be faster, never different.
+    #[test]
+    fn copy_match_matches_the_byte_at_a_time_definition() {
+        let mut cases = 0usize;
+        for cap in [16usize, 17, 32, 48, 64, 100] {
+            for prime in [1usize, 5, 15, 16, 31, 40] {
+                if prime > cap {
+                    continue;
+                }
+                for offset in 1..=prime {
+                    for len in [1usize, 2, 3, 7, 8, 15, 16, 17, 31, 33, 64] {
+                        if len > cap {
+                            continue;
+                        }
+                        let seed: Vec<u8> =
+                            (0..prime).map(|i| (i as u8).wrapping_mul(29) | 1).collect();
+
+                        let mut w = window(cap);
+                        w.push(&seed).expect("seed fits");
+                        let _ = drained(&mut w);
+                        if w.copy_match(offset, len).is_err() {
+                            continue;
+                        }
+                        let got = drained(&mut w);
+
+                        let mut naive = seed.clone();
+                        for _ in 0..len {
+                            let byte = naive[naive.len() - offset];
+                            naive.push(byte);
+                        }
+                        assert_eq!(
+                            got,
+                            &naive[prime..],
+                            "cap {cap} prime {prime} offset {offset} len {len}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases > 500, "only {cases} combinations exercised");
     }
 
     #[test]

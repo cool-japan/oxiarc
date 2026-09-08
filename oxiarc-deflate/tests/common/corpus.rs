@@ -583,3 +583,217 @@ pub fn all_samples() -> Vec<Sample> {
     v.extend(png_filtered_rows());
     v
 }
+
+// ---------------------------------------------------------------------------
+// Decode-shaped corpora (used by `examples/inflate_ab.rs`)
+// ---------------------------------------------------------------------------
+
+/// Synthetic RGB8 image scanlines: the shape a TIFF strip or an unfiltered
+/// PNG row carries.
+///
+/// Smooth horizontal/vertical gradients with a little per-pixel noise and a
+/// few flat regions. Compresses to a *literal-heavy* dynamic-Huffman stream
+/// with short matches — the shape the image tracks measured our inflate as
+/// slowest on, and the reason this generator exists.
+pub fn rgb8_image_rows(target: usize) -> Vec<u8> {
+    let width = 4096usize;
+    let mut rng = Rng::new(0x5247_4238);
+    let mut out = Vec::with_capacity(target + width * 3);
+    let mut y = 0usize;
+    while out.len() < target {
+        for x in 0..width {
+            let base_r = ((x * 255) / width) as u8;
+            let base_g = ((y * 137) % 256) as u8;
+            let base_b = (((x + y) * 91) % 256) as u8;
+            // A flat band every 64 rows keeps some long matches in the mix.
+            let noise = if (y / 64) % 5 == 0 {
+                0u8
+            } else {
+                (rng.next_u32() & 0x07) as u8
+            };
+            out.push(base_r.wrapping_add(noise));
+            out.push(base_g.wrapping_add(noise >> 1));
+            out.push(base_b.wrapping_add(noise));
+        }
+        y += 1;
+    }
+    out.truncate(target);
+    out
+}
+
+/// The same image as [`rgb8_image_rows`], PNG-filtered per row with the
+/// adaptive (minimum-sum-of-absolute-differences) heuristic real encoders
+/// use — without needing Pillow.
+///
+/// Filtered rows are small-magnitude deltas, so the literal alphabet is
+/// sharply skewed and codes are short: one root-table hit per symbol and
+/// almost no matches. This is the worst case for a per-symbol decode loop.
+pub fn png_filtered_image_rows(target: usize) -> Vec<u8> {
+    let width = 4096usize;
+    let bpp = 3usize;
+    let stride = width * bpp;
+    let raw = rgb8_image_rows(target + stride);
+    let rows = raw.len() / stride;
+    let mut out = Vec::with_capacity(rows * (stride + 1));
+    let zero = vec![0u8; stride];
+    for y in 0..rows {
+        let Some(cur) = raw.get(y * stride..(y + 1) * stride) else {
+            break;
+        };
+        let prev: &[u8] = if y == 0 {
+            &zero
+        } else {
+            raw.get((y - 1) * stride..y * stride).unwrap_or(&zero)
+        };
+        let mut best_filter = 0u8;
+        let mut best_cost = u64::MAX;
+        let mut best_row: Vec<u8> = Vec::new();
+        for filter in 0u8..=4 {
+            let mut row = Vec::with_capacity(stride);
+            for i in 0..stride {
+                let a = if i >= bpp { cur[i - bpp] } else { 0 };
+                let b = prev[i];
+                let c = if i >= bpp { prev[i - bpp] } else { 0 };
+                let pred = match filter {
+                    0 => 0u8,
+                    1 => a,
+                    2 => b,
+                    3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
+                    _ => paeth(a, b, c),
+                };
+                row.push(cur[i].wrapping_sub(pred));
+            }
+            let cost: u64 = row
+                .iter()
+                .map(|&v| u64::from(v.min(v.wrapping_neg())))
+                .sum();
+            if cost < best_cost {
+                best_cost = cost;
+                best_filter = filter;
+                best_row = row;
+            }
+        }
+        out.push(best_filter);
+        out.extend_from_slice(&best_row);
+        if out.len() >= target {
+            break;
+        }
+    }
+    out.truncate(target);
+    out
+}
+
+/// PNG Paeth predictor (RFC 2083 §6.6).
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let p = i32::from(a) + i32::from(b) - i32::from(c);
+    let pa = (p - i32::from(a)).abs();
+    let pb = (p - i32::from(b)).abs();
+    let pc = (p - i32::from(c)).abs();
+    if pa <= pb && pa <= pc {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
+    }
+}
+
+/// Highly repetitive JSON records: the shape the HTTP track measured at
+/// 1.3 GiB/s, i.e. the long-match end of the spectrum.
+pub fn json_records(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(0x4a53_4f4e);
+    let mut out = Vec::with_capacity(target + 512);
+    let mut id = 100_000u32;
+    while out.len() < target {
+        id += 1;
+        out.extend_from_slice(
+            format!(
+                "{{\"id\":{},\"kind\":\"measurement\",\"unit\":\"byte\",\"ok\":true,\
+                 \"tags\":[\"inflate\",\"deflate\",\"throughput\"],\
+                 \"value\":{},\"window\":32768,\"note\":\"steady state\"}},\n",
+                id,
+                rng.below(100_000),
+            )
+            .as_bytes(),
+        );
+    }
+    out.truncate(target);
+    out
+}
+
+/// Time `zlib.decompress` **inside** python (so process spawn never enters
+/// the number) and return the best of `rounds` MB/s figures over the
+/// decompressed size.
+///
+/// `compressed` must be a complete zlib stream. Returns `None` when python3
+/// is unavailable or the script fails.
+pub fn python_zlib_decompress_throughput(compressed: &[u8], rounds: u32) -> Option<f64> {
+    let path = temp_path("infl");
+    std::fs::write(&path, compressed).ok()?;
+    let script = "import sys, zlib, time\n\
+        blob = open(sys.argv[1],'rb').read()\n\
+        rounds = int(sys.argv[2])\n\
+        best = 0.0\n\
+        n = 0\n\
+        for _ in range(rounds):\n\
+        \tt0 = time.perf_counter()\n\
+        \tout = zlib.decompress(blob)\n\
+        \tdt = time.perf_counter() - t0\n\
+        \tn = len(out)\n\
+        \tif dt > 0:\n\
+        \t\tbest = max(best, (n/1048576.0)/dt)\n\
+        print('%.6f' % best)\n";
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&path)
+        .arg(rounds.to_string())
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&path);
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+}
+
+/// Compress with python's `zlib.compressobj`, forcing a `Z_FULL_FLUSH`
+/// every `chunk` input bytes so the stream carries many small blocks.
+///
+/// This is the "many block headers" shape: it makes the per-block Huffman
+/// table build, not the symbol loop, the dominant cost.
+pub fn python_zlib_compress_full_flush(data: &[u8], level: u8, chunk: usize) -> Option<Vec<u8>> {
+    let in_path = temp_path("ffin");
+    let out_path = temp_path("ffout");
+    std::fs::write(&in_path, data).ok()?;
+    let script = "import sys, zlib\n\
+        data = open(sys.argv[1],'rb').read()\n\
+        lvl = int(sys.argv[3])\n\
+        chunk = int(sys.argv[4])\n\
+        co = zlib.compressobj(lvl)\n\
+        parts = []\n\
+        for i in range(0, len(data), chunk):\n\
+        \tparts.append(co.compress(data[i:i+chunk]))\n\
+        \tparts.append(co.flush(zlib.Z_FULL_FLUSH))\n\
+        parts.append(co.flush())\n\
+        open(sys.argv[2],'wb').write(b''.join(parts))\n";
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(&in_path)
+        .arg(&out_path)
+        .arg(level.to_string())
+        .arg(chunk.to_string())
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&in_path);
+    let bytes = std::fs::read(&out_path).ok();
+    let _ = std::fs::remove_file(&out_path);
+    if !out.status.success() {
+        return None;
+    }
+    bytes
+}

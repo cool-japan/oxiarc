@@ -1,12 +1,12 @@
 # oxiarc-http
 
-HTTP content-coding (RFC 9110 `Content-Encoding` / `Accept-Encoding`: gzip, deflate, br, zstd, dcz) for OxiArc — Pure Rust, no `flate2`, no `http` crate dependency.
+HTTP content-coding (RFC 9110 `Content-Encoding` / `Accept-Encoding`: gzip, deflate, br, zstd, compress, plus RFC 9842 Compression Dictionary Transport's `dcb`/`dcz`) for OxiArc — Pure Rust, no `flate2`, no `http` crate dependency.
 
 [![Crates.io](https://img.shields.io/crates/v/oxiarc-http.svg)](https://crates.io/crates/oxiarc-http)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Complete-brightgreen)
 
-**Version: 0.4.2 (unreleased) | 249 tests passing (nextest, all features) + 17 doctests**
+**Version: 0.4.2 (unreleased) | 306 tests passing (nextest, all features) + 17 doctests**
 
 ## Overview
 
@@ -32,7 +32,10 @@ incrementally and bounded (`Decoder`, `DecodedBody`, `AsyncDecodedBody`,
 - **`ContentCoding`** — `Identity`, `Compress`, `Deflate`, `Gzip`, `Brotli`,
   `Zstd`, `Dcb`, `Dcz`, `Unknown(String)`; case-insensitive parsing with the
   `x-gzip`/`x-compress` aliases; declared least-to-most-preferred so the
-  derived `Ord` is a ready-made client-side preference order.
+  derived `Ord` is a ready-made client-side preference order. `is_decodable`/
+  `is_encodable` track *real* capability: `Compress` needs its own feature,
+  `Dcb`/`Dcz` need their feature (`brotli`/`zstd`) **and** a per-response
+  dictionary — see below.
 - **RFC-exact header parsing** — `Content-Encoding` application order
   preserved (decode in reverse, RFC 9110 §8.4); `Accept-Encoding` q-values
   as exact `u16` thousandths (`QValue`), never `f32`/`NaN`; RFC 9110
@@ -51,16 +54,23 @@ incrementally and bounded (`Decoder`, `DecodedBody`, `AsyncDecodedBody`,
   never honouring the client's q-value over the server's fixed order.
   Pinned against the RFC's full negotiation table as tests.
 - **`encode_body` / `Encoder<W: Write>`** — one-shot and streaming
-  server-side response encoding for gzip, deflate, brotli, zstd, and (with
-  a shared dictionary) `dcz` (RFC 9842 Compression Dictionary Transport).
-  `EncodeOptions` is built with `new()` + `with_level`/`with_brotli_quality`/
-  `with_zstd_level`/`with_dictionary`. `Encoder`'s per-coding framing is
-  documented rather than assumed uniform: a `flush()` stays inside one
-  member for gzip/deflate/brotli, but **closes a Zstandard frame** for
-  `zstd`/`dcz` — as does streaming past 128 KiB with no flush at all — so a
-  streamed zstd body needs a multi-frame decoder
+  server-side response encoding for gzip, deflate, brotli, zstd, compress
+  and (with a shared dictionary) `dcz`/`dcb` (RFC 9842 Compression
+  Dictionary Transport — each body opens with a preamble naming the
+  dictionary's SHA-256, verified on the way back in, never silently
+  decoded against the wrong one or falling back to plain `br`/`zstd`).
+  `EncodeOptions` is built with `new()` +
+  `with_level`/`with_brotli_quality`/`with_zstd_level`/
+  `with_compress_max_bits`/`with_dictionary`. `Encoder`'s per-coding
+  framing is documented rather than assumed uniform: a `flush()` stays
+  inside one member for gzip/deflate/brotli, but **closes a Zstandard
+  frame** for `zstd`/`dcz` — as does streaming past 128 KiB with no flush
+  at all — so a streamed zstd body needs a multi-frame decoder
   (`oxiarc_zstd::decompress_multi_frame`), never the single-frame one,
-  which stops after the first frame without erroring.
+  which stops after the first frame without erroring. `dcb` has no
+  streaming `Encoder` at all (`oxiarc-brotli` has no dictionary-aware
+  streaming encoder to wrap) — `encode_body`'s one-shot path is the only
+  way to produce one; the rustdoc on that `Encoder::new` arm explains why.
 - **`DecodeLimits`** — `max_output` (the load-bearing bomb control, default
   64 MiB), `max_ratio` (defense-in-depth, documented with the measurements
   behind the default), `max_codings`.
@@ -69,14 +79,22 @@ incrementally and bounded (`Decoder`, `DecodedBody`, `AsyncDecodedBody`,
   guessed number.
 - **`Decoder` / `decode_body` / `DecodedBody` / `AsyncDecodedBody`** — the
   client-side decode path, driven through the resumable push decoders in
-  `oxiarc-deflate` / `oxiarc-brotli` / `oxiarc-zstd`, never a `read_to_end`.
-  A slice-primary, allocation-free `decode()`; `feed_into` for a push body
-  loop (`reqwest::Response::chunk`, a `hyper` frame loop); `Read` + `BufRead`
-  and `tokio::io::AsyncRead` adapters. `gzip` is multi-member (RFC 1952 §2.2),
-  `deflate` accepts all three spellings servers actually send (zlib, raw, and
-  a whole gzip stream mislabelled `deflate`), `zstd` is multi-frame, and
-  `dcz` decodes against a caller-supplied dictionary
-  (`Decoder::with_dictionary`).
+  `oxiarc-deflate` / `oxiarc-brotli` / `oxiarc-zstd` / `oxiarc-lzw`, never a
+  `read_to_end`. A slice-primary, allocation-free `decode()`; `feed_into`
+  for a push body loop (`reqwest::Response::chunk`, a `hyper` frame loop);
+  `Read` + `BufRead` and `tokio::io::AsyncRead` adapters. `gzip` is
+  multi-member (RFC 1952 §2.2), `deflate` accepts all three spellings
+  servers actually send (zlib, raw, and a whole gzip stream mislabelled
+  `deflate`), `zstd` is multi-frame, `compress` decodes the legacy UNIX
+  `.Z` format (bridged from `oxiarc_lzw::z::ZReader`'s pull shape onto this
+  crate's push seam — see `decode/compress.rs`'s module docs for how), and
+  `dcz`/`dcb` decode against a caller-supplied dictionary
+  (`Decoder::with_dictionary`) after verifying each body's own preamble
+  names that same dictionary.
+  `.Z` has no end-of-information code: a truncated `compress` body decodes
+  to a silently short, valid prefix rather than an error — the one coding
+  here where that is the documented, correct behaviour, not a bug (see
+  `ContentCoding::Compress`'s doc comment).
 - **Truly incremental, measured** — streaming a 16 MiB gzip body peaks at
   **~210 KiB** of live allocation; `feed_into` allocates **nothing** per call
   after warm-up; the decoded bytes are identical however the wire data is
@@ -94,9 +112,9 @@ incrementally and bounded (`Decoder`, `DecodedBody`, `AsyncDecodedBody`,
   `DecodedBody` calls it at EOF, so a truncated response is an `io::Error`
   from the final read, never a silently short body.
 - **Cargo feature matrix** — `default = ["gzip", "deflate"]`; `brotli`,
-  `zstd`, `compress` (plumbing only — see `ContentCoding::Compress`),
-  `async-io` (`AsyncDecodedBody`) and `http-oracle` (differential tests) all
-  opt-in. Every combination, including `--no-default-features`, builds and is
+  `zstd`, `compress` (legacy UNIX `.Z`, both directions), `async-io`
+  (`AsyncDecodedBody`) and `http-oracle` (differential tests) all opt-in.
+  Every combination, including `--no-default-features`, builds and is
   clippy-clean.
 
 ## Quick Start
@@ -149,7 +167,8 @@ decoder.finish_into(&mut out)?;             // REQUIRED: verifies checksums
 
 Runnable integration recipes live in `examples/`:
 `ureq3_manual_gzip`, `reqwest_bytes_stream`, `oxihttp_client`, plus
-`fuzz_seeds` (the seed-corpus generator for the seven fuzz targets).
+`fuzz_seeds` (the seed-corpus generator for this crate's two fuzz targets,
+`fuzz_http_decode` and `fuzz_http_headers`).
 
 See the crate-level rustdoc (`cargo doc -p oxiarc-http --all-features --open`)
 for the full API, the `Transfer-Encoding`-out-of-scope statement, and the
@@ -180,11 +199,11 @@ behaviour:
 | `chunking.rs` | chunk invariance, incl. proptest over arbitrary split points |
 | `framing.rs` | gzip members/flags/FHCRC, the `deflate` sniff, trailing policy, chains |
 | `limits.rs` | the 812 KB -> 123 MiB single-block bomb, ratio, boundaries, windows |
-| `dictionary.rs` | `dcz` against a supplied dictionary; `dcb` refused |
+| `dictionary.rs` | `dcz`/`dcb` against a supplied dictionary; wrong/missing dictionary refused |
 | `async_body.rs` | a `Poll::Pending` source is never an empty body |
 | `allocations.rs` | peak-memory and zero-allocation gates (counting allocator) |
-| `fuzz_seeds.rs` | the invariants the seven fuzz targets assert |
-| `http_oracle.rs` | reference-encoder differential (feature `http-oracle`) |
+| `fuzz_seeds.rs` | the invariants `fuzz_http_decode`/`fuzz_http_headers` assert |
+| `http_oracle.rs` | reference-encoder differential (feature `http-oracle`): gzip/deflate/brotli/zstd both directions, plus `compress` (`compress`/`uncompress`/`gzip -dc`, including the prefix a *truncated* `.Z` decodes to, checked against `uncompress -c` at every third offset) and the `dcz` preamble (`zstd -D <dict> -d`) — the legs that had no external anchor before |
 
 A co-located test is **not** a substitute for external linkage, though, and
 this crate has already been bitten by the difference: code inside the crate

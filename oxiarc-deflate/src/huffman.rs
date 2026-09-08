@@ -330,8 +330,10 @@ impl HuffmanTree {
         // per-block `HLIT` wanders (257..=286 for the literal/length alphabet)
         // reallocates on the first block only and never again.
         let symbol_capacity = code_lengths.len().next_power_of_two();
-        self.symbols
-            .reserve_exact(symbol_capacity.saturating_sub(self.symbols.len()));
+        if self.symbols.capacity() < symbol_capacity {
+            self.symbols
+                .reserve_exact(symbol_capacity - self.symbols.len().min(symbol_capacity));
+        }
         self.symbols.resize(total_codes as usize, 0u16);
         self.symbols.fill(0u16);
         let symbols = &mut self.symbols;
@@ -417,33 +419,38 @@ impl HuffmanTree {
                 }
             }
 
-            // Reserve the decode table once, for the *worst* code this
-            // alphabet admits, so no later block can grow it.
+            // Reserve the decode table once, for the exact size the loop
+            // below will build, so no later block can grow it.
             //
-            // A root slot that is completely filled by its codes needs a
-            // sub-table of `1 << k` entries (`k = max_length - root_bits`) and,
-            // to reach that width, at least `k + 1` codes: one at each of the
-            // lengths `root_bits+1 ..= root_bits+k`, plus a second at the
-            // longest. So the sub-tables together cost at most
-            // `ceil(long_codes * 2^k / (k + 1))` entries, and at most one slot
-            // (the last) can be partially filled and pay a further `2^k`.
-            // Independently, no slot's sub-table exceeds `1 << k` entries, so
-            // the total is also capped at `root_size << k`.
-            // For DEFLATE (k = 5) that is 2582 entries for the 286-symbol
-            // literal/length alphabet and 1216 for the 30-symbol distance
-            // alphabet — 10 KiB and 5 KiB, paid once per tree.
-            let k = usize::from(max_length - root_bits);
-            let widest = 1usize << k;
-            let long_codes: usize = bl_count
-                .iter()
-                .skip(root_bits as usize + 1)
-                .take(max_length as usize - root_bits as usize)
-                .map(|&c| c as usize)
-                .sum();
-            let sub_worst = ((long_codes * widest).div_ceil(k + 1) + widest)
-                .min(root_size.saturating_mul(widest));
-            let worst = (root_size + sub_worst).min(MAX_TABLE_INDEX + 1);
-            table.reserve_exact(worst.saturating_sub(table.len()));
+            // A root slot whose longest code is `root_bits + j` gets a
+            // sub-table of `1 << j` entries, and every such slot contains at
+            // least one code of exactly that length. So the number of slots
+            // whose longest length is `root_bits + j` is at most
+            // `bl_count[root_bits + j]`, and the sub-tables together occupy at
+            // most `sum over j of bl_count[root_bits + j] << j` entries. The
+            // `MAX_TABLE_INDEX` clamp keeps the reservation inside what an
+            // entry's payload field can address; the loop below still returns
+            // `Err` if the real table would exceed it.
+            //
+            // The bound is rounded up to a power of two and the capacity never
+            // shrinks, so a decoder whose blocks get progressively deeper pays
+            // at most `log2(MAX_TABLE_INDEX)` growths over its whole life —
+            // never one per block. Reserving the *alphabet's* absolute worst
+            // case instead (1024 + 286 << 5 entries, 40 KiB for the
+            // literal/length tree alone) would cost more resident memory than
+            // the streaming decoder's whole budget.
+            let mut sub_worst = 0usize;
+            for j in 1..=usize::from(max_length - root_bits) {
+                let count = bl_count.get(root_bits as usize + j).copied().unwrap_or(0) as usize;
+                sub_worst = sub_worst.saturating_add(count << j);
+            }
+            let worst = root_size
+                .saturating_add(sub_worst)
+                .next_power_of_two()
+                .min(MAX_TABLE_INDEX + 1);
+            if table.capacity() < worst {
+                table.reserve_exact(worst - table.len().min(worst));
+            }
 
             // Allocate the sub-tables contiguously after the root table and
             // install the pointer entries.

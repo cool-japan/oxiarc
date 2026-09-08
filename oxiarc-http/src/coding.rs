@@ -31,11 +31,17 @@ pub enum ContentCoding {
     /// `Accept-Encoding`; RFC 9110 §8.4 says it "SHOULD NOT" appear in a
     /// `Content-Encoding` response header.
     Identity,
-    /// `compress` / `x-compress` (RFC 9110 §8.4.1.1) — legacy UNIX LZW.
+    /// `compress` / `x-compress` (RFC 9110 §8.4.1.1) — legacy UNIX LZW,
+    /// the `.Z` container (`oxiarc_lzw::z`). Decodable/encodable exactly
+    /// when the `compress` feature is on — see
+    /// [`is_decodable`](Self::is_decodable).
     ///
-    /// Token recognition only in this build: [`is_decodable`](Self::is_decodable)
-    /// and [`is_encodable`](Self::is_encodable) are unconditionally `false`.
-    /// See the `compress` Cargo feature's doc comment for why.
+    /// `.Z` has no end-of-information code: a body cut short decodes to a
+    /// plausible, silently short prefix rather than an error, the same as
+    /// `gzip -dc`/BSD `uncompress`. See
+    /// [`TrailingData`](crate::TrailingData)'s docs for how the *other*
+    /// codings here detect truncation, and why this one structurally
+    /// cannot.
     Compress,
     /// `deflate` (RFC 9110 §8.4.1.2) — an RFC 1950 zlib wrapper around an
     /// RFC 1951 DEFLATE stream. RFC 9110 itself sanctions accepting a raw
@@ -52,17 +58,24 @@ pub enum ContentCoding {
     Zstd,
     /// `dcb` — Compression Dictionary Transport (RFC 9842), Brotli variant.
     ///
-    /// Always unsupported in this build: `oxiarc-brotli` has no shared-dictionary
-    /// support (Phase 8 owner decision #8). [`is_decodable`](Self::is_decodable)
-    /// and [`is_encodable`](Self::is_encodable) are unconditionally `false`.
+    /// Decodable/encodable when the `brotli` feature is on **and** a
+    /// dictionary is supplied
+    /// ([`Decoder::with_dictionary`](crate::Decoder::with_dictionary),
+    /// [`EncodeOptions::dictionary`](crate::EncodeOptions)) — a body is a
+    /// 36-byte preamble (magic + the dictionary's SHA-256) followed by a
+    /// shared-dictionary Brotli stream (`oxiarc_brotli::dcb`); a wrong or
+    /// absent dictionary is [`HttpCodingError::MissingDictionary`] /
+    /// [`HttpCodingError::Corrupt`], never a silent fallback to plain `br`.
+    /// [`Encoder`](crate::Encoder) (the *streaming* encoder) still refuses
+    /// this one specifically — see its own doc comment.
     Dcb,
     /// `dcz` — Compression Dictionary Transport (RFC 9842), Zstandard variant.
     ///
-    /// Supported when a dictionary is supplied (Phase 8 owner decision #8):
-    /// [`encode_body`](crate::encode_body) accepts `Dcz` when the `zstd`
-    /// feature is on and [`EncodeOptions::dictionary`](crate::EncodeOptions)
-    /// is `Some`, and fails with
-    /// [`HttpCodingError::MissingDictionary`] otherwise.
+    /// Decodable/encodable when the `zstd` feature is on **and** a
+    /// dictionary is supplied — the same shape as [`Dcb`](Self::Dcb), a
+    /// 40-byte preamble (an RFC 8878 skippable frame carrying the
+    /// dictionary's SHA-256) followed by an ordinary dictionary-referencing
+    /// Zstandard frame.
     Dcz,
     /// Any other token, preserved verbatim (lowercased) for round-tripping
     /// and for matching a server's own custom/experimental coding.
@@ -156,10 +169,8 @@ impl ContentCoding {
     /// Whether this build can actually decode this coding.
     ///
     /// Tracks real, implemented capability — not merely "the dependency
-    /// happens to be compiled in" — so [`Compress`](Self::Compress) and
-    /// [`Dcb`](Self::Dcb) are `false` unconditionally (see their doc
-    /// comments) even when their Cargo features are enabled. [`Identity`]
-    /// is always `true`.
+    /// happens to be compiled in". [`Identity`] is always `true`;
+    /// [`Unknown`](Self::Unknown) is always `false`.
     ///
     /// # What this predicate is for
     ///
@@ -171,19 +182,21 @@ impl ContentCoding {
     /// this reports `false` for, with
     /// [`HttpCodingError::UnsupportedCoding`](crate::HttpCodingError::UnsupportedCoding).
     ///
-    /// One caveat: [`Dcz`](Self::Dcz) is decodable only *with* a caller-
-    /// supplied dictionary, so it reports `true` whenever the `zstd`
-    /// feature is on, while `Decoder::new` still directs you to
+    /// One caveat: [`Dcb`](Self::Dcb) and [`Dcz`](Self::Dcz) are decodable
+    /// only *with* a caller-supplied dictionary, so each reports `true`
+    /// whenever its underlying feature (`brotli`, `zstd`) is on, while
+    /// `Decoder::new` still directs you to
     /// [`Decoder::with_dictionary`](crate::Decoder::with_dictionary).
     ///
     /// [`Identity`]: Self::Identity
     pub const fn is_decodable(&self) -> bool {
         match self {
             Self::Identity => true,
-            Self::Compress | Self::Dcb | Self::Unknown(_) => false,
+            Self::Unknown(_) => false,
+            Self::Compress => cfg!(feature = "compress"),
             Self::Deflate => cfg!(feature = "deflate"),
             Self::Gzip => cfg!(feature = "gzip"),
-            Self::Brotli => cfg!(feature = "brotli"),
+            Self::Brotli | Self::Dcb => cfg!(feature = "brotli"),
             Self::Zstd | Self::Dcz => cfg!(feature = "zstd"),
         }
     }
@@ -220,11 +233,10 @@ pub(crate) fn unsupported_reason(coding: &ContentCoding) -> UnsupportedReason {
             // Identity is always supported; callers should not reach this.
             UnsupportedReason::Unknown
         }
-        ContentCoding::Compress => UnsupportedReason::Unknown, // P-4, not a feature flag away
-        ContentCoding::Dcb => UnsupportedReason::Unknown,      // needs upstream brotli work
+        ContentCoding::Compress => UnsupportedReason::FeatureDisabled("compress"),
         ContentCoding::Deflate => UnsupportedReason::FeatureDisabled("deflate"),
         ContentCoding::Gzip => UnsupportedReason::FeatureDisabled("gzip"),
-        ContentCoding::Brotli => UnsupportedReason::FeatureDisabled("brotli"),
+        ContentCoding::Brotli | ContentCoding::Dcb => UnsupportedReason::FeatureDisabled("brotli"),
         ContentCoding::Zstd | ContentCoding::Dcz => UnsupportedReason::FeatureDisabled("zstd"),
         ContentCoding::Unknown(_) => UnsupportedReason::Unknown,
     }
@@ -319,13 +331,43 @@ mod tests {
 
     #[test]
     fn permanently_unsupported_codings_report_false() {
-        // True regardless of which features happen to be on in this build.
-        assert!(!ContentCoding::Compress.is_decodable());
-        assert!(!ContentCoding::Compress.is_encodable());
-        assert!(!ContentCoding::Dcb.is_decodable());
-        assert!(!ContentCoding::Dcb.is_encodable());
+        // True regardless of which features happen to be on in this build —
+        // unlike `Compress`/`Dcb`/`Dcz`, which are conditionally decodable
+        // (see the feature-gated tests elsewhere in this module and in
+        // `tests/dictionary.rs`).
         assert!(!ContentCoding::Unknown("x".to_string()).is_decodable());
         assert!(!ContentCoding::Unknown("x".to_string()).is_encodable());
+    }
+
+    #[cfg(not(feature = "compress"))]
+    #[test]
+    fn compress_is_undecodable_without_its_feature() {
+        assert!(!ContentCoding::Compress.is_decodable());
+        assert!(!ContentCoding::Compress.is_encodable());
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn compress_is_decodable_with_its_feature() {
+        assert!(ContentCoding::Compress.is_decodable());
+        assert!(ContentCoding::Compress.is_encodable());
+    }
+
+    #[cfg(not(feature = "brotli"))]
+    #[test]
+    fn dcb_is_undecodable_without_brotli() {
+        assert!(!ContentCoding::Dcb.is_decodable());
+        assert!(!ContentCoding::Dcb.is_encodable());
+    }
+
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn dcb_is_decodable_with_brotli() {
+        // "Decodable" here means "with a dictionary in hand" — see the
+        // type's own doc comment; `Decoder::new` alone still needs
+        // `with_dictionary`.
+        assert!(ContentCoding::Dcb.is_decodable());
+        assert!(ContentCoding::Dcb.is_encodable());
     }
 
     #[test]

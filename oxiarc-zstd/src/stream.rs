@@ -60,6 +60,29 @@
 //! corrupted-data error: a caller has to be able to tell a compression bomb
 //! from a malformed frame.
 //!
+//! # Relationship to the legacy one-shot decoders
+//!
+//! [`ZstdStream`] and [`crate::decompress_multi_frame`] accept and refuse the
+//! same frames, with one deliberate exception: the **declared window**.
+//!
+//! * Format rules are shared code, so neither path can drift from the other: a
+//!   frame naming a `Dictionary_ID` without a dictionary is refused by both,
+//!   and a block regenerating more than `min(Window_Size, 128 KiB)` (further
+//!   bounded by a declared `Frame_Content_Size`) is a format error on both.
+//! * Frame boundaries are classified identically: leading garbage, a truncated
+//!   magic and a truncated skippable frame are errors; a *complete* skippable
+//!   frame is metadata and is walked past, in front of a frame as well as
+//!   between frames; bytes that start no frame end the stream cleanly once at
+//!   least one frame has been decoded; an empty multi-frame stream is empty
+//!   output, an empty single-frame one is an error.
+//! * `Window_Size` is where they differ, because the memory means different
+//!   things: this decoder keeps a real ring and so refuses a declaration above
+//!   [`ZstdStream::with_max_window`] (8 MiB by default), while the legacy
+//!   one-shot path has no ring — its output `Vec` is the window — and accepts
+//!   any declaration. [`decompress_with_limit`] and
+//!   [`decompress_multi_frame_with_limit`] are the bounded one-shot helpers
+//!   that do apply a ceiling.
+//!
 //! # Example
 //!
 //! ```rust
@@ -88,7 +111,10 @@
 //! assert_eq!(out, original);
 //! ```
 
-use crate::frame::{FrameHeader, frame_header_len, parse_frame_header};
+use crate::frame::{
+    FrameHeader, ZSTD_MAGIC_U32, block_rfc_max, charge_block, frame_header_len, parse_frame_header,
+    require_dictionary,
+};
 use crate::literals::LiteralsDecoder;
 use crate::sequences::{Sequence, SequencesDecoder};
 use crate::window::ZstdWindow;
@@ -99,9 +125,6 @@ use oxiarc_core::traits::FlushMode;
 
 /// Largest frame header, magic included (RFC 8878 §3.1.1).
 const MAX_FRAME_HEADER: usize = 18;
-
-/// Zstandard frame magic as a little-endian `u32`.
-const ZSTD_MAGIC_U32: u32 = 0xFD2F_B528;
 
 /// Window ceiling used by the derived, back-compatible entry points.
 ///
@@ -213,6 +236,11 @@ pub struct ZstdStream {
     /// Sliding-window ring holding the LZ77 history.
     window: ZstdWindow,
     /// Reusable literals buffer.
+    /// First ring allocation to make, in bytes.
+    ///
+    /// Zero unless a caller has *already allocated* at least this much itself
+    /// — see [`ZstdStream::with_window_hint`].
+    window_hint: usize,
     lit_buf: Vec<u8>,
     /// Reusable sequence buffer.
     seq_buf: Vec<Sequence>,
@@ -267,6 +295,7 @@ impl ZstdStream {
             literals: LiteralsDecoder::new(),
             sequences: SequencesDecoder::new(),
             window: ZstdWindow::new(),
+            window_hint: 0,
             lit_buf: Vec::new(),
             seq_buf: Vec::new(),
             hasher: None,
@@ -301,6 +330,16 @@ impl ZstdStream {
     /// Checked against the frame header before a single window byte is
     /// allocated. The default is [`MAX_WINDOW_SIZE`] (8 MiB); raise it to
     /// accept `zstd --long` frames, which declare 16-128 MiB.
+    ///
+    /// This is the window knob for *streaming* decoding, and the strictest of
+    /// the three policies this crate applies. The one-shot helpers differ
+    /// because they keep no window ring: [`decompress_with_limit`] and
+    /// [`decompress_multi_frame_with_limit`] refuse only a declaration past the
+    /// reference decoder's own 128 MiB ceiling (raised further by a larger
+    /// output limit — see [`limit_window`]), and the unbounded
+    /// [`crate::decompress`] and [`crate::decompress_multi_frame`] apply none
+    /// at all, since their output `Vec` *is* their window and a declaration
+    /// alone costs no memory there.
     #[must_use]
     pub fn with_max_window(mut self, bytes: usize) -> Self {
         self.max_window = bytes;
@@ -318,6 +357,28 @@ impl ZstdStream {
     #[must_use]
     pub fn with_multi_frame(mut self, yes: bool) -> Self {
         self.multi_frame = yes;
+        self
+    }
+
+    /// Pre-size the sliding window to `bytes`, skipping the growth steps.
+    ///
+    /// The ring normally starts at one block and doubles as bytes arrive,
+    /// because `Window_Size` and `Frame_Content_Size` are attacker-controlled
+    /// and must never drive an allocation. A *caller-supplied output buffer*
+    /// is different: the memory already exists, so starting the ring at its
+    /// size costs nothing that has not been paid, and it skips the doubling
+    /// sequence — each step of which re-linearises the history and zeroes the
+    /// bytes it adds.
+    ///
+    /// Only ever pass memory the caller has itself allocated.
+    /// [`decompress_into`] passes `dst.len()`; the `*_with_limit` helpers pass
+    /// nothing, because their `max_output` is a *ceiling*, not a commitment.
+    /// The hint never raises the frame's addressable reach — it is clamped by
+    /// the same `cap_limit` the lazy path uses — and never lowers the ring
+    /// below one block.
+    #[must_use]
+    pub(crate) fn with_window_hint(mut self, bytes: usize) -> Self {
+        self.window_hint = bytes;
         self
     }
 
@@ -403,7 +464,13 @@ impl ZstdStream {
         self.literals.reset();
         self.sequences.reset();
         self.window.reset_keep_allocation();
-        self.lit_buf.clear();
+        // `lit_buf` is deliberately *not* cleared. It is pure scratch whose
+        // length is its allocation: `LiteralsDecoder::decode_into` grows it to
+        // the block's `Regenerated_Size` and the caller only ever reads
+        // `lit_buf[..produced]` from the block just decoded, so stale bytes are
+        // unreachable — while clearing it would make the next block's
+        // `Vec::resize` zero the whole buffer again. `oxiarc-tiff` calls
+        // `reset()` once per strip, which is exactly the case that would pay.
         self.seq_buf.clear();
         self.hasher = None;
         self.frame_out = 0;
@@ -881,19 +948,9 @@ impl ZstdStream {
         // dictionary: its matches reach into content this decoder does not
         // have, and its first block may reference the dictionary's entropy
         // tables. The reference decoder refuses too, and the Phase 8 contract
-        // makes every new entry point strict, so this is an error rather than
-        // a stream of wrong bytes. (`Dictionary_ID` 0 means "no dictionary",
-        // whatever the header's flag width says.)
-        let required_dict = if self.dict.is_none() {
-            header.dict_id.filter(|id| *id != 0)
-        } else {
-            None
-        };
-        if let Some(id) = required_dict {
-            return Err(OxiArcError::invalid_header(format!(
-                "Zstandard frame requires dictionary ID {id:#010x} but no dictionary was supplied"
-            )));
-        }
+        // makes every entry point strict — legacy one-shot included, which is
+        // why the check lives in `frame.rs` and is shared.
+        require_dictionary(&header, self.dict.is_some())?;
         if header.declared_window_size > self.max_window as u64 {
             return Err(OxiArcError::MemoryBudgetExceeded {
                 budget: self.max_window,
@@ -923,12 +980,9 @@ impl ZstdStream {
         // A frame that declares its content size can never exceed that either.
         // This ceiling is derived from the *format* alone: folding the caller's
         // output budget into it would report a compression bomb as corrupt data
-        // instead of as a budget overrun.
-        let declared = usize::try_from(header.declared_window_size).unwrap_or(usize::MAX);
-        let mut rfc_max = MAX_BLOCK_SIZE.min(declared.max(1));
-        if let Some(cs) = header.content_size {
-            rfc_max = rfc_max.min(usize::try_from(cs).unwrap_or(usize::MAX));
-        }
+        // instead of as a budget overrun. Shared with the legacy one-shot path
+        // so both refuse exactly the same blocks.
+        let rfc_max = block_rfc_max(&header);
         self.block_rfc_max = rfc_max;
         // The budget still bounds how much of a block is worth decoding, and so
         // how large the ring has to be; a block cut short here is reported as a
@@ -947,7 +1001,7 @@ impl ZstdStream {
         // Start at one block (which `block_max` guarantees is enough for any
         // single block) and let `grow_for` double as real bytes arrive, so the
         // ring never exceeds one block plus what the stream actually produced.
-        let initial = cap_limit.min(MAX_BLOCK_SIZE);
+        let initial = cap_limit.min(MAX_BLOCK_SIZE.max(self.window_hint));
         debug_assert!(initial >= block_max);
 
         self.literals.reset();
@@ -1124,7 +1178,7 @@ fn decode_block(
             Ok(block_size)
         }
         BlockType::Compressed => {
-            let literals_size = literals.decode_into(data, lit_buf)?;
+            let (literals_size, literals_len) = literals.decode_into(data, lit_buf)?;
             if literals_size > data.len() {
                 return Err(OxiArcError::corrupted(
                     0,
@@ -1132,7 +1186,7 @@ fn decode_block(
                 ));
             }
             sequences.decode_into(&data[literals_size..], seq_buf)?;
-            execute_sequences(window, lit_buf, seq_buf, limits)
+            execute_sequences(window, &lit_buf[..literals_len], seq_buf, limits)
         }
         BlockType::Reserved => Err(OxiArcError::corrupted(0, "reserved block type")),
     }
@@ -1186,18 +1240,8 @@ fn execute_sequences(
 /// is. Only a block that is *valid* but would take the stream past its output
 /// budget is reported as [`OxiArcError::MemoryBudgetExceeded`].
 fn charge(produced: usize, more: usize, limits: &BlockLimits) -> Result<usize> {
-    let total = produced.checked_add(more).ok_or_else(|| {
-        OxiArcError::corrupted(0, "block regenerated size overflowed".to_string())
-    })?;
-    if total > limits.rfc_max {
-        return Err(OxiArcError::corrupted(
-            0,
-            format!(
-                "block regenerated size {total} exceeds the frame maximum {}",
-                limits.rfc_max
-            ),
-        ));
-    }
+    // The format ceiling is the shared one the legacy path also applies.
+    let total = charge_block(produced, more, limits.rfc_max)?;
     if total > limits.budget_max {
         return Err(OxiArcError::MemoryBudgetExceeded {
             budget: usize::try_from(limits.max_output.unwrap_or(0)).unwrap_or(usize::MAX),
@@ -1214,14 +1258,49 @@ fn charge(produced: usize, more: usize, limits: &BlockLimits) -> Result<usize> {
 
 /// Build a stream configured for a bounded one-shot decode.
 ///
-/// The declared-window ceiling is left unrestricted because `max_output`
-/// already bounds the memory: the window ring never grows past one block plus
-/// the number of bytes actually produced, and the budget caps the latter.
-fn bounded_stream(max_output: u64, multi_frame: bool) -> ZstdStream {
+/// `max_window` is the caller's declared-window policy: the two `*_with_limit`
+/// helpers refuse an over-large declaration up front (see [`limit_window`]),
+/// while [`decompress_into`] leaves it unrestricted because its `dst` already
+/// bounds the memory — the window ring never grows past one block plus the
+/// bytes actually produced, and `dst.len()` caps the latter.
+fn bounded_stream(max_output: u64, multi_frame: bool, max_window: usize) -> ZstdStream {
     ZstdStream::new()
         .with_max_output(max_output)
-        .with_max_window(UNRESTRICTED_MAX_WINDOW)
+        .with_max_window(max_window)
         .with_multi_frame(multi_frame)
+}
+
+/// The reference decoder's default `Window_Size` ceiling, 128 MiB.
+///
+/// `zstd -d` refuses anything larger unless told otherwise
+/// (`ZSTD_WINDOWLOG_MAX_DEFAULT` = 27): a frame declaring 2 GiB is rejected
+/// with *"Window size larger than maximum : 2147483648 > 134217728 — use
+/// --long=31 or --memory=2048MB"*. Matching it costs no interoperability, since
+/// anything refused here the reference decoder refuses too.
+const REFERENCE_MAX_WINDOW: usize = 128 * 1024 * 1024;
+
+/// The declared-window ceiling the bounded one-shot helpers apply: the larger
+/// of the caller's own output limit and [`REFERENCE_MAX_WINDOW`].
+///
+/// # Why not `max_output` itself
+///
+/// A `Window_Size` is not an output size, and tying the two would reject
+/// ordinary reference frames. Measured against `zstd` 1.5.7, a payload
+/// compressed through a pipe (no `pledgedSrcSize`, exactly how an HTTP body or
+/// this crate's own oracle suite is produced) declares a window that has
+/// nothing to do with its length and carries no `Frame_Content_Size` to fall
+/// back on: 2 MiB at `-3` and 16 MiB at `--long=24 -6`, for a one-byte payload
+/// as much as for a large one. `decompress_with_limit(one_byte_frame, 1)` must
+/// still decode those, so the ceiling has to sit above them.
+///
+/// The 11 MB-window frame that motivated this ceiling is byte-for-byte the same
+/// *shape* as those legitimate frames — windowed, no `Frame_Content_Size`, a
+/// large window over a small payload — so no rule phrased purely in terms of
+/// the declaration can refuse one and accept the other. What bounds the memory
+/// here is `max_output`, not the declaration: the ring never exceeds one block
+/// plus the bytes actually produced.
+fn limit_window(max_output: usize) -> usize {
+    max_output.max(REFERENCE_MAX_WINDOW)
 }
 
 /// Drive `stream` over the whole of `src`, appending to `out`.
@@ -1267,6 +1346,13 @@ fn run_to_end(stream: &mut ZstdStream, src: &[u8], out: &mut Vec<u8>, cap: usize
 /// Bytes after the first frame are ignored — TIFF and other containers pad
 /// their per-strip payloads, and a padded strip must not become an error.
 ///
+/// # Declared window
+///
+/// Deliberately unrestricted: a container's chunk bounds the memory here, and
+/// a strip written by a `zstd --long` encoder must still decode into a small
+/// `dst`. The `*_with_limit` helpers do apply a ceiling; see
+/// [`decompress_with_limit`].
+///
 /// # Errors
 ///
 /// Returns [`OxiArcError::MemoryBudgetExceeded`] when the frame regenerates
@@ -1284,7 +1370,10 @@ fn run_to_end(stream: &mut ZstdStream, src: &[u8], out: &mut Vec<u8>, cap: usize
 /// assert_eq!(&out[..n], b"tiff strip payload");
 /// ```
 pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
-    let mut stream = bounded_stream(dst.len() as u64, false);
+    // `dst` is memory the caller already holds, so the ring may start at its
+    // size instead of doubling up to it — see `ZstdStream::with_window_hint`.
+    let mut stream = bounded_stream(dst.len() as u64, false, UNRESTRICTED_MAX_WINDOW)
+        .with_window_hint(dst.len());
     let mut written = 0usize;
     let mut pos = 0usize;
     loop {
@@ -1313,10 +1402,31 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 /// The cap is enforced *while* decoding, so a compression bomb is rejected
 /// after at most one extra block rather than after it has exhausted memory.
 ///
+/// # What is bounded, and what is not
+///
+/// `max_output` bounds the memory: the decoder's ring never exceeds one block
+/// plus the bytes actually produced, and a declared `Frame_Content_Size` larger
+/// than `max_output` is refused *before* anything is decoded.
+///
+/// The declared `Window_Size` is bounded only against
+/// [`limit_window`]`(max_output)` — the larger of `max_output` and the
+/// reference decoder's own 128 MiB default. It is deliberately not tied to
+/// `max_output`: a piped `zstd -3` frame declares a 2 MiB window whatever its
+/// payload, so that rule would reject ordinary input (see [`limit_window`]).
+///
+/// The unbounded [`crate::decompress`] and [`crate::decompress_multi_frame`]
+/// apply no window ceiling at all: their output `Vec` is their window, so a
+/// declaration costs nothing there. On the streaming decoder the knob is
+/// [`ZstdStream::with_max_window`], whose 8 MiB default is stricter than this
+/// helper's because that decoder keeps a real window ring. Pick a bounded
+/// entry point for untrusted input; pick which one by whether you can afford
+/// the output, the declaration, or both.
+///
 /// # Errors
 ///
 /// [`OxiArcError::MemoryBudgetExceeded`] when the frame would produce more than
-/// `max_output` bytes; otherwise the usual corrupted-data errors.
+/// `max_output` bytes, or declares a window past the ceiling above; otherwise
+/// the usual corrupted-data errors.
 ///
 /// # Example
 ///
@@ -1329,7 +1439,7 @@ pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 /// assert_eq!(out.len(), 1 << 20);
 /// ```
 pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    let mut stream = bounded_stream(max_output as u64, false);
+    let mut stream = bounded_stream(max_output as u64, false, limit_window(max_output));
     let mut out = Vec::new();
     run_to_end(&mut stream, data, &mut out, max_output)?;
     Ok(out)
@@ -1338,13 +1448,16 @@ pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
 /// Decompress one or more concatenated Zstandard frames with a hard output cap.
 ///
 /// Behaves like [`crate::decompress_multi_frame`] — skippable frames are
-/// dropped and trailing non-Zstandard bytes end the stream gracefully — but the
-/// total output is bounded by `max_output`.
+/// dropped, trailing bytes that start no frame end the stream gracefully once
+/// at least one frame has been decoded, and garbage *before* any frame is an
+/// error — but the total output is bounded by `max_output`, and the declared
+/// window against [`limit_window`], exactly as in [`decompress_with_limit`].
 ///
 /// # Errors
 ///
 /// [`OxiArcError::MemoryBudgetExceeded`] when the frames would produce more
-/// than `max_output` bytes in total; otherwise the usual corrupted-data errors.
+/// than `max_output` bytes in total, or one declares a window past
+/// [`limit_window`]`(max_output)`; otherwise the usual corrupted-data errors.
 ///
 /// # Example
 ///
@@ -1357,7 +1470,7 @@ pub fn decompress_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> 
 /// assert_eq!(out, b"one two");
 /// ```
 pub fn decompress_multi_frame_with_limit(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    let mut stream = bounded_stream(max_output as u64, true);
+    let mut stream = bounded_stream(max_output as u64, true, limit_window(max_output));
     let mut out = Vec::new();
     run_to_end(&mut stream, data, &mut out, max_output)?;
     Ok(out)

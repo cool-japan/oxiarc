@@ -144,6 +144,12 @@ struct Dialect {
     byte_align: bool,
     /// Row padding for the RLE dialects.
     alignment: RowAlignment,
+    /// Whether the option tag permits uncompressed mode (T.4 §4.2.1.3.2).
+    ///
+    /// Read side: ignored, because the entrance code is unambiguous and a
+    /// file that carries the mode without declaring it is still readable.
+    /// Write side: load-bearing — the mode is written only when this is set.
+    uncompressed: bool,
 }
 
 impl Dialect {
@@ -156,6 +162,10 @@ impl Dialect {
                 always_two_dimensional: false,
                 byte_align: false,
                 alignment: RowAlignment::Byte,
+                // T.4's uncompressed mode is an extension of the *Group 3*
+                // coding scheme; the bare RLE dialects have no option tag and
+                // no reader expects it there.
+                uncompressed: false,
             },
             CompressionMethod::CcittRleWord => Self {
                 end_of_line: false,
@@ -163,6 +173,7 @@ impl Dialect {
                 always_two_dimensional: false,
                 byte_align: false,
                 alignment: RowAlignment::Word,
+                uncompressed: false,
             },
             CompressionMethod::CcittFax3 => Self {
                 end_of_line: true,
@@ -170,6 +181,7 @@ impl Dialect {
                 always_two_dimensional: false,
                 byte_align: cx.t4_options.byte_aligned_eol(),
                 alignment: RowAlignment::None,
+                uncompressed: cx.t4_options.uncompressed(),
             },
             CompressionMethod::CcittFax4 => Self {
                 end_of_line: false,
@@ -177,6 +189,7 @@ impl Dialect {
                 always_two_dimensional: true,
                 byte_align: false,
                 alignment: RowAlignment::None,
+                uncompressed: cx.t6_options.uncompressed(),
             },
             other => {
                 return Err(TiffError::Unsupported(UnsupportedError::Compression(
@@ -217,10 +230,6 @@ fn fault_error(method: CompressionMethod, row: u32, fault: RowFault) -> TiffErro
         RowFault::ShortRow { missing } => {
             format!("row {row}: an end-of-line code arrived {missing} pixels early")
         }
-        RowFault::UncompressedMode => format!(
-            "row {row}: uncompressed mode (T.4 §4.2.1.3) is not decodable; \
-             libtiff 4.7.1 reports the same data as \"Uncompressed data (not supported)\""
-        ),
         RowFault::UnknownExtension { code } => {
             format!("row {row}: extension code {code:03b} is not defined")
         }
@@ -310,10 +319,14 @@ fn run(
             || (decoder.bits.remaining() < 64 && decoder.bits.rest_is_padding())
         {
             // Out of data, or only fill bits are left: the caller decides
-            // whether a short chunk is fatal. The bound has to be *zero*
-            // bits, not "too few to be interesting": a two-dimensional row
-            // that repeats the row above is a single `V0` bit, so a strip can
-            // legitimately end with one bit of data left to read.
+            // whether a short chunk is fatal. The test is "no bits" or "every
+            // remaining bit is zero", never "too few bits to be interesting":
+            // a two-dimensional row that repeats the row above is a single
+            // `V0` bit, so a strip can legitimately end with one bit of data
+            // left to read, and no code word of any dialect is all zeros. The
+            // `< 64` is only there to keep `rest_is_padding` from walking a
+            // long over-declared tail; past that bound the row decoder
+            // reports the truncation itself.
             break;
         }
         if dialect.always_two_dimensional && decoder.consume_eol_here() {
@@ -387,6 +400,7 @@ pub fn encode(src: &[u8], cx: &CodecContext<'_>) -> Result<Vec<u8>> {
     let mut writer = BitWriter::new();
     let mut changes: Vec<u32> = Vec::with_capacity(64);
     let mut reference: Vec<u32> = Vec::with_capacity(64);
+    let mut scratch = encode::RowScratch::default();
     reference.clear();
 
     for row in 0..height {
@@ -406,11 +420,15 @@ pub fn encode(src: &[u8], cx: &CodecContext<'_>) -> Result<Vec<u8>> {
             RowAlignment::Byte => writer.align_to_byte(),
             RowAlignment::Word => writer.align_to_word(),
         }
-        if two_dimensional {
-            encode::encode_2d_row(&mut writer, &changes, &reference, width);
-        } else {
-            encode::encode_1d_row(&mut writer, &changes, width);
-        }
+        encode::encode_row(
+            &mut writer,
+            &changes,
+            &reference,
+            width,
+            two_dimensional,
+            dialect.uncompressed,
+            &mut scratch,
+        );
         core::mem::swap(&mut reference, &mut changes);
     }
     if dialect.always_two_dimensional {
@@ -725,16 +743,43 @@ mod tests {
     }
 
     #[test]
-    fn uncompressed_mode_is_named_the_way_libtiff_names_it() {
+    fn a_hand_built_uncompressed_segment_decodes_where_libtiff_refuses() {
+        // libtiff 4.7.1 answers this exact stream with "Uncompressed data
+        // (not supported)"; this crate decodes it. Every bit is spelled from
+        // Table 5/T.4 rather than produced by the encoder.
+        let bits = [1u16];
+        let cx = context(CompressionMethod::CcittFax4, 8, 1, &bits);
+        let mut writer = BitWriter::new();
+        // Entrance from a two-dimensionally coded line.
+        writer.write(0b00_0000_1111, 10);
+        // `1` `1` `01` `001` `0001` spells black black white black
+        // white white black white white white black — eight pixels:
+        // B B W B W W B W.
+        writer.write(0b1, 1);
+        writer.write(0b1, 1);
+        writer.write(0b01, 2);
+        writer.write(0b001, 3);
+        // Exit with one trailing white pixel and a white run next:
+        // `00000001` + `T = 0`.
+        writer.write(0b0_0000_0010, 9);
+        let coded = writer.finish(false);
+        let mut out = vec![0u8; 1];
+        assert_eq!(decode_into(&coded, &mut out, &cx).expect("decode"), 1);
+        // `BlackIsZero`-style painting: white is 0, black is 1.
+        assert_eq!(out[0], 0b1101_0010, "got {:08b}", out[0]);
+    }
+
+    #[test]
+    fn an_undefined_extension_code_is_still_named() {
         let bits = [1u16];
         let cx = context(CompressionMethod::CcittFax4, 32, 1, &bits);
-        // `0000001111` is the uncompressed-mode extension code.
+        // `0000001` + `000`: an extension T.4 leaves for further study.
         let mut writer = BitWriter::new();
-        writer.write(0b00_0000_1111, 10);
+        writer.write(0b00_0000_1000, 10);
         let coded = writer.finish(false);
         let mut out = vec![0u8; 4];
         let err = decode_into(&coded, &mut out, &cx).expect_err("named error");
-        assert!(err.to_string().contains("uncompressed mode"), "{err}");
+        assert!(err.to_string().contains("extension code"), "{err}");
     }
 
     #[test]

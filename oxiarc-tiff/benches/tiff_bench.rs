@@ -446,20 +446,21 @@ fn bench_lzw_strip(c: &mut Criterion) {
 /// parallel arm adds: an interleaved A/B puts parallel PackBits decode
 /// somewhere around 0.9x-1.1x of serial depending on how compressible the
 /// pixels are, and uncompressed at ~0.66x, while LZW tiles come out 2.6x-3.6x
-/// *faster*. Quote the README's by-codec table, not a single number from this
-/// group. The encode half has no such caveat -- every codec parallelises
-/// there.
+/// *faster* and Deflate and the fax codecs at 2.0x-3.0x. Quote the README's
+/// by-codec table, not a single number from this group. The encode half has no
+/// such caveat -- every codec parallelises there.
 ///
 /// tiff-design.md P7 asks for this pair specifically. The other numeric gate
 /// -- critique.md section 7's "whole-image decode within 1.25x of `tiffcp`" --
 /// is *not* measured here, because it needs an external binary rather than a
 /// Rust benchmark; the crate README's "Benchmarks" section carries the
-/// measured table. Read it before quoting the gate as met: the uncompressed
-/// and PackBits paths clear it by an order of magnitude, but LZW, Deflate and
-/// ZSTD land at roughly 1.2x-2.8x of `tiffcp`'s wall clock even though
-/// `tiffcp` is charged with an encode and a file write we do not do. That
-/// shortfall is in the shared codec crates, not in this one: the same image
-/// decodes in a few milliseconds with no codec at all.
+/// measured table. Read it before quoting the gate as met: the uncompressed,
+/// PackBits and LZMA paths clear it, but LZW, Deflate, ZSTD and JPEG land at
+/// roughly 1.4x-6x of `tiffcp`'s wall clock even though `tiffcp` is charged
+/// with an encode and a file write we do not do. That shortfall is in the
+/// shared codec crates, not in this one: the same image decodes in a few
+/// milliseconds with no codec at all, and a codec-only strip measurement puts
+/// the throughput squarely inside `oxiarc-lzw` / `oxiarc-zstd`.
 #[cfg(feature = "rayon")]
 fn bench_rayon(c: &mut Criterion) {
     let (width, height) = (4096u32, 4096u32);

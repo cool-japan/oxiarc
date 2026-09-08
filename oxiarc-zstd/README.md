@@ -169,6 +169,44 @@ let decompressed = decoder.decode_frame(&compressed)?;
 `ZstdDecoder::decode_frame` needs the whole frame in memory and has no output
 cap; prefer the bounded APIs above for untrusted input.
 
+### What every decoding path refuses
+
+The one-shot decoders and `ZstdStream` enforce the same **format** rules, from
+shared code, so neither can drift from the other:
+
+| input | `decompress` / `decompress_multi_frame` | `ZstdStream` |
+|---|---|---|
+| frame naming a `Dictionary_ID`, no dictionary supplied | error | error |
+| block regenerating more than `min(Window_Size, 128 KiB)` (further bounded by a declared `Frame_Content_Size`) | error | error |
+| garbage *before* any frame (short magic, unknown magic, truncated skippable frame) | error | error |
+| a *complete* skippable frame in front of a Zstandard frame | metadata, walked past | metadata, walked past |
+| bytes that start no frame *after* at least one complete frame | tolerated, stream ends | tolerated, stream ends |
+| empty input (multi-frame) | empty output | empty output |
+| declared `Window_Size` of 11 MB | accepted | refused above `with_max_window` (8 MiB default) |
+
+The block ceiling is the RFC's, not the reference decoder's: RFC 8878
+§3.1.1.2.3 caps a block at `min(Window_Size, 128 KiB)`, while `zstd -d` lets a
+frame past that cap when it also declares a larger `Frame_Content_Size`. No
+encoder emits such a frame — a `--zstd=wlog=10` frame declares a 1 KiB window
+next to a content size hundreds of times larger and still keeps its blocks
+within 1 KiB — so this crate keeps the RFC rule and is, in that one corner,
+stricter than `zstd -d`. Both are pinned by
+`tests/legacy_verify.rs::oracle`.
+
+The last row is the one deliberate split, and it is about memory, not
+conformance: `ZstdStream` keeps a real window ring, so an over-large
+declaration is refused before it is allocated; the one-shot decoders keep no
+ring at all — their output `Vec` *is* the window — so a declaration costs them
+nothing. The bounded helpers `decompress_with_limit` /
+`decompress_multi_frame_with_limit` bound the *output*, and refuse a
+declaration only above the reference decoder's own 128 MiB ceiling (raised
+further by a larger limit). Tying that ceiling to the output limit is not
+possible: a payload piped through `zstd -3` declares a 2 MiB window whatever
+its length, and `zstd --long=24 -6` declares 16 MiB, neither carrying a
+`Frame_Content_Size` — so `Window_Size > limit` would reject ordinary
+reference frames. Use `with_max_window` when the declaration itself is what
+you need to bound.
+
 ### Dictionary Compression
 
 Training a dictionary from representative samples improves the ratio for
@@ -282,28 +320,70 @@ Zstandard uses a sophisticated multi-stage approach:
 
 ## Performance
 
+### Decode throughput vs the reference decoder
+
+Measured by `examples/decode_throughput.rs`: the same `.zst` frames decoded
+three ways here and by `zstd -b -d` (libzstd's own in-memory benchmark), one
+round of each arm in turn so machine load moves them together. Run it with
+
+```text
+cargo run --release -p oxiarc-zstd --example decode_throughput
+```
+
+| shape (level) | frame bytes | `decompress_into` | `decompress` | `ZstdStream` 64 KiB | `zstd -b -d` | best ratio |
+|---|---|---|---|---|---|---|
+| RGB8 TIFF strip 288 KiB (1) | 281 KiB | 871 | 940 | 911 | 1314 | **0.72x** |
+| RGB8 TIFF strip 288 KiB (3) | 263 KiB | 804 | 874 | 830 | 1657 | 0.53x |
+| RGB8 TIFF strip 288 KiB (9) | 263 KiB | 752 | 879 | 842 | 1685 | 0.52x |
+| RGB8 TIFF strip 288 KiB (19) | 176 KiB | 182 | 199 | 185 | 345 | 0.58x |
+| RGB8 TIFF strip 1 MiB (1) | 977 KiB | 876 | 907 | 885 | 1264 | **0.72x** |
+| RGB8 TIFF strip 1 MiB (3) | 880 KiB | 511 | 572 | 522 | 1000 | 0.57x |
+| RGB8 TIFF strip 1 MiB (9) | 911 KiB | 578 | 665 | 589 | 1148 | 0.58x |
+| RGB8 TIFF strip 1 MiB (19) | 629 KiB | 164 | 177 | 161 | 249 | **0.71x** |
+| text corpus 50 MB (3) | 9.2 MB | 555 | 594 | 668 | 1207 | 0.55x |
+| text corpus 50 MB (19) | 5.9 MB | 1068 | 1079 | 1144 | 2050 | 0.56x |
+| incompressible 8 MiB (3) | 8 MiB | 9462 | 7126 | 8280 | 10238 | **0.92x** |
+| highly repetitive 8 MiB (3) | 801 B | 10012 | 7483 | 9291 | 2670 | **3.75x** |
+
+MB/s of *output* (1 MB = 1e6 B), best of 13 interleaved rounds, Apple Silicon,
+`zstd` 1.5.7, machine shared with other builds at load averages 45-57 on 8
+cores. "best ratio" is the fastest of our three arms over `zstd -b -d`.
+
+**Read the ratios, not the absolute numbers**, and read the *best-of* column on
+a shared machine: contention can only slow a round down, so the fastest round is
+the least contaminated. The example prints medians and best-of side by side, plus
+the load average, precisely so a reader can tell the two apart.
+
+Where the remaining gap is: on literal-dense frames (a photographic TIFF strip
+compresses to ~1.1x, so nearly every output byte is a Huffman-coded literal) the
+decode is one four-way-interleaved symbol loop and little else, and libzstd's
+double-symbol (`HUF_DECOMPRESS_X2`) tables decode two literals per lookup where
+this crate decodes one. On `Raw`-block and highly repetitive data — where the
+work is copying, not decoding — this decoder is at or ahead of the reference.
+
 ### Incremental decode vs one-shot
 
-1 MiB payloads, Apple Silicon, level 3. Measured as an **interleaved A/B**
-(alternating rounds, best of 40 each), which is what the target ratio needs: on a
-loaded machine the absolute numbers move a long way but the ratio does not.
+The same interleaved measurement, read as `ZstdStream` (64 KiB chunks) over the
+legacy one-shot `decompress`. The audit gate is *incremental >= 85 % of
+one-shot*:
 
-| Path | structured 1 MiB | vs one-shot | random 1 MiB | vs one-shot |
-|------|-----------------|-------------|--------------|-------------|
-| one-shot `decompress` (baseline) | 471 MiB/s | 1.00x | 4009 MiB/s | 1.00x |
-| `ZstdStream`, 64 KiB chunks | 434 MiB/s | **0.92x** | 8433 MiB/s | **2.10x** |
-| `decompress_into` | 432 MiB/s | 0.92x | 7333 MiB/s | 1.83x |
-| `decompress_with_limit` | 430 MiB/s | 0.91x | 5633 MiB/s | 1.41x |
-| `ZstdStreamDecoder::read_to_end` | 426 MiB/s | 0.90x | 4823 MiB/s | 1.20x |
+| shape (level) | one-shot | `ZstdStream` | vs one-shot |
+|---|---|---|---|
+| RGB8 TIFF strip 288 KiB (3) | 874 | 830 | 0.95x |
+| RGB8 TIFF strip 1 MiB (9) | 665 | 589 | 0.89x |
+| text corpus 50 MB (3) | 594 | 668 | **1.12x** |
+| text corpus 50 MB (19) | 1079 | 1144 | 1.06x |
+| incompressible 8 MiB (3) | 7126 | 8280 | **1.16x** |
+| highly repetitive 8 MiB (3) | 7483 | 9291 | **1.24x** |
 
-The target is *incremental >= 85 % of one-shot*, and every path clears it. On
-entropy-coded data the ~8 % gap is the one extra copy that bounded memory costs:
-the one-shot decoder pushes each byte into a growing `Vec` once and hands the
-`Vec` over, while a windowed decoder writes each byte into the ring and then
-copies it out to the caller. On data that is mostly `Raw` blocks the push decoder
-is 2.1x *faster*, because it writes into a pre-sized ring instead of reallocating
-a `Vec` and executes matches with chunked `copy_within` runs rather than a
-per-byte modulo loop.
+Every shape clears the gate. Where the push decoder is *slower* the gap is the
+one extra copy that bounded memory costs: the one-shot decoder writes each byte
+into a growing `Vec` and hands the `Vec` over, while a windowed decoder writes
+it into the ring and then copies it out to the caller. Where it is faster, the
+one-shot path is paying for the owned `Vec` it returns — a fresh allocation and
+its first-touch page faults on every call, which `decompress_into` avoids
+entirely (see the table above, where `decompress_into` is 33 % ahead of
+`decompress` on incompressible data).
 
 Steady-state allocations after warm-up are **zero** over `Raw`/`RLE` blocks, and
 for compressed blocks the allocation count is a function of the frame (a few

@@ -54,6 +54,7 @@
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub(crate) mod decode_table;
 pub mod deflate;
 mod encoder;
 pub mod gzip;

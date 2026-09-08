@@ -31,9 +31,6 @@ pub(super) enum RowFault {
         /// Pixels the row was missing.
         missing: u32,
     },
-    /// The extension code selected uncompressed mode, but the segment that
-    /// followed was not decodable.
-    UncompressedMode,
     /// The extension code selected something T.4 does not define.
     UnknownExtension {
         /// The three extension bits.
@@ -70,9 +67,18 @@ pub(super) struct FaxDecoder<'a> {
     /// non-decreasing, and [`FaxDecoder::decode_2d_row`] rejects a stream that
     /// says otherwise), so the search in [`FaxDecoder::locate`] can resume
     /// where the last one stopped instead of restarting at element zero. That
-    /// turns a row with `n` changing elements from `O(n^2)` into `O(n)`, which
-    /// on a 4096-pixel fax page with a few hundred runs per row is the
-    /// difference between 353 ms and 84 ms for the whole image.
+    /// turns a row with `n` changing elements from `O(n^2)` into `O(n)`.
+    ///
+    /// What that is worth depends entirely on `n`, so the row engine was
+    /// timed against the restarting search directly, interleaved, medians of
+    /// five, on three 4096x4096 Group 4 pages (release build, shared machine
+    /// at load 22 -- the ratios are the meaningful part, not the times):
+    ///
+    /// | page | resumable | restarting | ratio |
+    /// |---|---|---|---|
+    /// | a few long runs per row (a scan of text) | 9.0 ms | 9.2 ms | 1.03x |
+    /// | the benches' bilevel fixture | 7.9 ms | 37.8 ms | 4.8x |
+    /// | hundreds of runs per row (halftone) | 55.4 ms | 1360 ms | 24.6x |
     ref_cursor: usize,
 }
 
@@ -248,7 +254,17 @@ impl<'a> FaxDecoder<'a> {
             return;
         }
         if position < self.width {
-            self.current.push(position);
+            if self.current.last() == Some(&position) {
+                // Two changes at one position cancel: the run between them is
+                // empty, and the colour this call opens is the one that was
+                // open before the change already recorded there. Reachable
+                // only when a segment is entered exactly where the preceding
+                // code word left a changing element, which is what keeps the
+                // list identical to `encode::row_changes`'s.
+                self.current.pop();
+            } else {
+                self.current.push(position);
+            }
         }
         *open = black;
     }
@@ -666,16 +682,149 @@ mod tests {
     }
 
     #[test]
-    fn an_uncompressed_mode_extension_is_named() {
+    fn an_uncompressed_mode_extension_with_no_segment_after_it_is_truncated() {
+        // The entrance code alone: uncompressed mode is entered and the
+        // chunk then ends, which is a truncation, not an unknown extension.
         let mut writer = BitWriter::new();
         writer.write(0b00_0000_1111, 10);
         let bytes = writer.finish(false);
         let mut decoder = FaxDecoder::new(&bytes, 40, false);
-        assert_eq!(
-            decoder.decode_2d_row(),
-            Err(RowFault::UncompressedMode),
-            "the extension code must be named, never mistaken for a run"
-        );
+        assert_eq!(decoder.decode_2d_row(), Err(RowFault::Truncated));
+    }
+
+    #[test]
+    fn a_two_dimensional_uncompressed_segment_decodes_and_resumes() {
+        // Entrance, four pixels (`1` `01` `1`: black, white, black, black),
+        // then an exit whose tag bit says the next run is white — after which
+        // ordinary vertical-mode coding takes the row to its end.
+        let mut writer = BitWriter::new();
+        writer.write(0b00_0000_1111, 10);
+        writer.write(0b1, 1);
+        writer.write(0b01, 2);
+        writer.write(0b1, 1);
+        // `0000001` + `T = 0`: exit with no trailing pixels, white next.
+        writer.write(0b0000_0010, 8);
+        // `V(0)`: the next changing element sits under `b1`, which is the
+        // row width because the reference line is all white.
+        writer.write(0b1, 1);
+        let bytes = writer.finish(false);
+        let mut decoder = FaxDecoder::new(&bytes, 16, false);
+        decoder.decode_2d_row().expect("uncompressed then vertical");
+        let mut row = [0u8; 2];
+        decoder.paint(&mut row, 0);
+        assert_eq!(row, [0b1011_0000, 0], "got {row:?}");
+    }
+
+    #[test]
+    fn a_segment_entered_mid_row_starts_at_the_right_pixel_and_colour() {
+        // Every fixture the encoder produces enters uncompressed mode at the
+        // start of a row, so nothing else reaches `decode_uncompressed` with
+        // `a0 >= 0` — the one place a sign or parity mistake could hide.
+        // Hand-built: horizontal mode with a three-pixel white run and a
+        // two-pixel black run leaves `a0 = 5` with the run there still white,
+        // and the segment continues from exactly that pixel.
+        let mut writer = BitWriter::new();
+        // `001`: horizontal mode.
+        writer.write(0b001, 3);
+        super::super::tables::encode_run(3, true, |code, bits| writer.write(code, bits));
+        super::super::tables::encode_run(2, false, |code, bits| writer.write(code, bits));
+        // Entrance, then `1` `01` `001`: B, WB, WWB from pixel five.
+        writer.write(0b00_0000_1111, 10);
+        writer.write(0b1, 1);
+        writer.write(0b01, 2);
+        writer.write(0b001, 3);
+        // Exit with no trailing pixels and a white run next.
+        writer.write(0b0000_0010, 8);
+        // `V(0)`: the next change is under `b1`, which is the row width.
+        writer.write(0b1, 1);
+        let bytes = writer.finish(false);
+        let mut decoder = FaxDecoder::new(&bytes, 16, false);
+        decoder
+            .decode_2d_row()
+            .expect("horizontal then uncompressed");
+        let mut row = [0u8; 2];
+        decoder.paint(&mut row, 0);
+        // W W W | B B (horizontal) | B W B W W B (segment) | W W W W W
+        assert_eq!(row, [0b0001_1101, 0b0010_0000], "got {row:?}");
+    }
+
+    #[test]
+    fn a_change_at_the_entry_pixel_cancels_rather_than_repeating() {
+        // The changing-element list must stay in `encode::row_changes`'s
+        // shape, so a segment that opens a black run exactly where the code
+        // before it recorded a change to white removes that change instead of
+        // recording a zero-length run. Same stream as above; this looks at
+        // the representation rather than the pixels.
+        let mut writer = BitWriter::new();
+        writer.write(0b001, 3);
+        super::super::tables::encode_run(3, true, |code, bits| writer.write(code, bits));
+        super::super::tables::encode_run(2, false, |code, bits| writer.write(code, bits));
+        writer.write(0b00_0000_1111, 10);
+        writer.write(0b1, 1);
+        writer.write(0b0000_0010, 8);
+        writer.write(0b1, 1);
+        let bytes = writer.finish(false);
+        let mut decoder = FaxDecoder::new(&bytes, 16, false);
+        decoder.decode_2d_row().expect("decode");
+        // W W W then black from 3 to 6, then white: two changes, not four.
+        assert_eq!(decoder.current, vec![3, 6]);
+    }
+
+    #[test]
+    fn a_segment_entered_after_a_pass_code_pushes_rather_than_cancels() {
+        // The complement of the test above, and the one arm the encoder can
+        // never reach: after `Pass`, `a0 = b2` is *not* a changing element, so
+        // `current.last()` is not `a0` and `open_run` has to **push**. It also
+        // pins the invariant `locate`'s resumable `ref_cursor` rests on --
+        // that `a0` never moves backwards across the uncompressed arm -- by
+        // running a vertical code against the same reference line afterwards.
+        //
+        // Reference line: white 0..4, black 4..20, white 20..32.
+        // Stream: Pass (a0 := b2 = 20), entrance, `1` `001`, exit carrying one
+        // trailing white pixel and a white run next, then V(0) to the edge.
+        let mut writer = BitWriter::new();
+        writer.write(0b0001, 4);
+        writer.write(0b00_0000_1111, 10);
+        writer.write(0b1, 1);
+        writer.write(0b001, 3);
+        // `00000001` + `T = 0`: one trailing white pixel, white run next.
+        writer.write(0b0_0000_0010, 9);
+        writer.write(0b1, 1);
+        let bytes = writer.finish(false);
+        let mut decoder = FaxDecoder::new(&bytes, 32, false);
+        decoder.set_reference(&[4, 20]);
+        decoder.decode_2d_row().expect("pass then uncompressed");
+        // 0..20 white (the pass), 20 black, 21..23 white, 23 black, 24..32
+        // white. Four changes, every one of them pushed rather than cancelled.
+        assert_eq!(decoder.current, vec![20, 21, 23, 24]);
+        let mut row = [0u8; 4];
+        decoder.paint(&mut row, 0);
+        assert_eq!(row, [0, 0, 0b0000_1001, 0], "got {row:?}");
+        // The painted row reads back as the same changing elements, which is
+        // what the next row's reference line depends on: a segment that left
+        // a duplicate or a stale element would show up here as a mismatch.
+        let mut again = Vec::new();
+        super::super::encode::row_changes(&row, 32, 0, &mut again);
+        assert_eq!(again, decoder.current, "painting and re-reading must agree");
+    }
+
+    #[test]
+    fn a_one_dimensional_uncompressed_segment_decodes_and_resumes() {
+        // The 1D entrance code is `000000001` + `111`; the segment then
+        // spells two black pixels and exits saying white follows, and a
+        // Modified Huffman run of fourteen white pixels finishes the row.
+        let mut writer = BitWriter::new();
+        writer.write(0b0000_0000_1111, 12);
+        writer.write(0b1, 1);
+        writer.write(0b1, 1);
+        writer.write(0b0000_0010, 8);
+        super::super::tables::encode_run(14, true, |code, bits| writer.write(code, bits));
+        let bytes = writer.finish(false);
+        let mut decoder = FaxDecoder::new(&bytes, 16, false);
+        decoder.decode_1d_row().expect("uncompressed then runs");
+        let mut row = [0u8; 2];
+        decoder.paint(&mut row, 0);
+        assert_eq!(row, [0b1100_0000, 0], "got {row:?}");
     }
 
     #[test]

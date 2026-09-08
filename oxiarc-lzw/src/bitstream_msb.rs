@@ -1,82 +1,11 @@
-//! MSB-first bit stream operations for TIFF LZW.
+//! MSB-first bit writing for TIFF LZW.
 //!
-//! TIFF LZW uses MSB-first (Most Significant Bit first) bit ordering,
-//! which differs from DEFLATE/LZH that use LSB-first.
+//! TIFF LZW packs codes MSB-first (Most Significant Bit first), which
+//! differs from DEFLATE/LZH's LSB-first packing. The *read* side lives in
+//! [`crate::bits`], which extracts a code from a four-byte window without
+//! keeping any state.
 
 use crate::error::{LzwError, Result};
-
-/// MSB-first bit reader for LZW decompression.
-#[derive(Debug)]
-pub struct MsbBitReader<'a> {
-    /// Input data.
-    data: &'a [u8],
-    /// Current byte position.
-    byte_pos: usize,
-    /// Bit buffer (MSB-first).
-    buffer: u32,
-    /// Number of valid bits in buffer (from MSB).
-    bits_in_buffer: u8,
-    /// Total bits read (for error reporting).
-    total_bits_read: u64,
-}
-
-impl<'a> MsbBitReader<'a> {
-    /// Create a new MSB bit reader.
-    pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_pos: 0,
-            buffer: 0,
-            bits_in_buffer: 0,
-            total_bits_read: 0,
-        }
-    }
-
-    /// Fill buffer with at least `count` bits.
-    #[inline]
-    fn fill_buffer(&mut self, count: u8) -> Result<()> {
-        while self.bits_in_buffer < count && self.byte_pos < self.data.len() {
-            let byte = self.data[self.byte_pos];
-            self.byte_pos += 1;
-
-            // Add byte to buffer (MSB-first)
-            self.buffer = (self.buffer << 8) | (byte as u32);
-            self.bits_in_buffer += 8;
-        }
-
-        if self.bits_in_buffer < count {
-            return Err(LzwError::UnexpectedEof {
-                position: self.total_bits_read,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Read up to 16 bits from the stream (MSB-first).
-    pub fn read_bits(&mut self, count: u8) -> Result<u16> {
-        if count == 0 || count > 16 {
-            return Err(LzwError::InvalidBitWidth(count));
-        }
-
-        self.fill_buffer(count)?;
-
-        // Extract bits from MSB side of buffer
-        let shift = self.bits_in_buffer - count;
-        let mask = (1u32 << count) - 1;
-        let value = (self.buffer >> shift) & mask;
-
-        self.bits_in_buffer -= count;
-        self.total_bits_read += count as u64;
-
-        Ok(value as u16)
-    }
-
-    /// Get total bits read.
-    pub fn bits_read(&self) -> u64 {
-        self.total_bits_read
-    }
-}
 
 /// MSB-first bit writer for LZW compression.
 #[derive(Debug)]
@@ -151,21 +80,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_msb_roundtrip() {
+    fn test_msb_writer_packs_bits_high_first() {
         let mut writer = MsbBitWriter::new();
 
-        // Write some bits
         writer.write_bits(0b101, 3).expect("write 3 msb bits");
         writer.write_bits(0b1100, 4).expect("write 4 msb bits");
         writer.write_bits(0b11111111, 8).expect("write 8 msb bits");
 
         let data = writer.into_vec().expect("flush msb writer to vec");
-
-        // Read them back
-        let mut reader = MsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(3).expect("read 3 msb bits"), 0b101);
-        assert_eq!(reader.read_bits(4).expect("read 4 msb bits"), 0b1100);
-        assert_eq!(reader.read_bits(8).expect("read 8 msb bits"), 0b11111111);
+        // 15 bits, 101 1100 11111111, packed high-first and zero-padded:
+        // 1011_1001 1111_111|0
+        assert_eq!(data, vec![0b1011_1001, 0b1111_1110]);
     }
 
     #[test]
@@ -177,9 +102,5 @@ mod tests {
 
         let data = writer.into_vec().expect("flush msb writer byte boundary");
         assert_eq!(data, vec![0xAB]);
-
-        // Read it back
-        let mut reader = MsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(8).expect("read byte 0xAB msb"), 0xAB);
     }
 }

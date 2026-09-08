@@ -65,6 +65,9 @@ enum Conversion {
 fn conversion_for(input: InputColor, color: ColorSpace) -> Result<Conversion> {
     Ok(match (input, color) {
         (InputColor::Luma | InputColor::LumaAlpha, ColorSpace::Luma) => Conversion::Luma,
+        // The alpha channel survives here instead of being dropped: it
+        // becomes the frame's second, untransformed component.
+        (InputColor::LumaAlpha, ColorSpace::Unknown(2)) => Conversion::Passthrough(2),
         (InputColor::Ycbcr, ColorSpace::Luma) => Conversion::Luma,
         (
             InputColor::Rgb | InputColor::Rgba | InputColor::Bgr | InputColor::Bgra,
@@ -148,6 +151,31 @@ fn convert_rows_three<T: Copy + Into<i64>>(
                 c[x] = Into::<i64>::into(source[base + 2]) as u16;
             }
         }
+    }
+}
+
+/// Run one row of a two-plane passthrough conversion.
+///
+/// The only caller is `Conversion::Passthrough(2)`
+/// ([`InputColor::LumaAlpha`] into [`ColorSpace::Unknown`]'s two-component
+/// case), so there is no reordering or matrix to select between — every
+/// source channel copies straight into the plane of the same index.
+fn convert_rows_two<T: Copy + Into<i64>>(
+    source: &[T],
+    planes: &mut [Plane],
+    y: usize,
+    context: &RowContext,
+) {
+    let RowContext {
+        width, channels, ..
+    } = *context;
+    let (first, second) = planes.split_at_mut(1);
+    let a = first[0].row_mut(y);
+    let b = second[0].row_mut(y);
+    for x in 0..width {
+        let base = x * channels;
+        a[x] = Into::<i64>::into(source[base]) as u16;
+        b[x] = Into::<i64>::into(source[base + 1]) as u16;
     }
 }
 
@@ -263,6 +291,7 @@ fn convert_typed<T: Copy + Into<i64>>(pixels: &[T], planes: &mut [Plane], contex
             Conversion::RgbToYcbcr | Conversion::RgbPassthrough | Conversion::Passthrough(3) => {
                 convert_rows_three(source, planes, y, context);
             }
+            Conversion::Passthrough(2) => convert_rows_two(source, planes, y, context),
             _ => convert_rows_four(source, planes, y, context),
         }
     }
@@ -487,6 +516,21 @@ mod tests {
         let options = EncodeOptions::default();
         let planes = build(&options, 1, 1, InputColor::LumaAlpha, &[77, 255]);
         assert_eq!(planes[0].row(0)[0], 77);
+    }
+
+    /// The paired case: asking for `ColorSpace::Unknown(2)` instead of the
+    /// default keeps the alpha channel as a second, untransformed component
+    /// rather than dropping it.
+    #[test]
+    fn alpha_is_kept_as_a_second_component_when_asked() {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            ..Default::default()
+        };
+        let planes = build(&options, 2, 1, InputColor::LumaAlpha, &[77, 255, 12, 34]);
+        assert_eq!(planes.len(), 2);
+        assert_eq!(planes[0].row(0)[..2], [77, 12], "luma column untouched");
+        assert_eq!(planes[1].row(0)[..2], [255, 34], "alpha column preserved");
     }
 
     #[test]

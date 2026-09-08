@@ -35,7 +35,7 @@
 //! all declare that region's full length costs `chunk_count x count` resident
 //! bytes while the file itself stays small. The per-chunk
 //! `check_intermediate` guard cannot see that, because it only ever looks at
-//! one chunk. [`batch_end`] therefore closes a batch as soon as the *declared*
+//! one chunk. `batch_end` therefore closes a batch as soon as the *declared*
 //! compressed bytes in it would exceed `intermediate_buffer_size`, so the
 //! resident compressed bytes never exceed that cap (a single chunk larger
 //! than the cap is already rejected by `check_intermediate`, so the
@@ -61,10 +61,11 @@
 //! implementation of what a chunk decodes or encodes to, never a second copy
 //! that can drift from the serial one.
 //!
-//! [`crate::compression::CodecState`] (shared, read-only, across every
-//! worker of one call) serialises the handful of codecs whose scratch is a
-//! `Mutex` (the Deflate window, the CCITT changing-element buffers); the LZW
-//! code-width rule is a lock-free `AtomicU8`.
+//! [`crate::compression::CodecState`] is shared across every worker of one
+//! call, and every codec that keeps scratch holds it in a *pool*: a worker
+//! takes a decoder out for the length of its chunk and puts it back after, so
+//! the lock is held only around the hand-off and no two workers ever touch
+//! one decoder. The LZW code-width rule is a lock-free `AtomicU8`.
 //!
 //! # When parallel decode is worth it (measured, not assumed)
 //!
@@ -75,28 +76,40 @@
 //! is nearly a byte copy, while the same codec over long literal runs has
 //! real expansion work to do.
 //!
-//! Interleaved A/B (serial and parallel timed in the same loop), 4096x4096
-//! Gray8, medians of nine rounds, release build, 8 cores at load average
-//! 6-10:
+//! Interleaved A/B (serial and parallel timed in the same loop), 4096x4096,
+//! medians of nine rounds, release build, 8 cores. The first block was
+//! measured at load average 6-10, the second at 33-46 (this machine is
+//! shared), so the two are not directly comparable with each other -- only
+//! each arm with the other arm of its own row, which is what interleaving is
+//! for.
 //!
 //! | Fixture | Serial | Parallel | Ratio |
 //! |---|---|---|---|
 //! | LZW, 256x256 tiles, incompressible | 114 ms | 32 ms | **3.6x faster** |
 //! | LZW, 256x256 tiles, compressible | 26.6 ms | 10.4 ms | **2.6x faster** |
-//! | Deflate, 64-row strips | 60 ms | 62 ms | 0.98x |
 //! | PackBits, 256x256 tiles, compressible | 2.6 ms | 2.4 ms | 1.09x |
 //! | PackBits, 256x256 tiles, incompressible | 3.8 ms | 4.2 ms | 0.90x |
 //! | uncompressed, 64-row strips | 2.1 ms | 3.1 ms | **0.66x, slower** |
 //!
-//! Read that as three groups rather than six numbers:
+//! The four codecs that keep pooled scratch, 32-row strips, remeasured after
+//! the pools replaced the single-slot caches:
 //!
-//! * **Worth it**: codecs whose per-chunk decompress is real CPU work -- LZW
-//!   measured here, and ZSTD, LZMA and JPEG by the same argument. LZW came out
-//!   faster in every run, including a repeat at load average 30 on 8 cores
-//!   where it still managed 1.3x.
-//! * **No gain**: Deflate and CCITT, whose scratch lives behind
-//!   [`crate::compression::CodecState`]'s `Mutex`, so the workers serialise on
-//!   the codec anyway.
+//! | Fixture | Serial | Parallel | Ratio |
+//! |---|---|---|---|
+//! | Deflate, Gray8 | 77.7 ms | 34.6 ms | **2.24x faster** |
+//! | LZW, Gray8 | 166.4 ms | 78.2 ms | **2.13x faster** |
+//! | Group 4, bilevel | 81.9 ms | 27.0 ms | **3.04x faster** |
+//! | Group 3 2D, bilevel | 69.0 ms | 34.0 ms | **2.03x faster** |
+//!
+//! Read that as two groups rather than nine numbers:
+//!
+//! * **Worth it**: every codec whose per-chunk decompress is real CPU work --
+//!   Deflate, LZW, both fax codecs measured here, and ZSTD, LZMA and JPEG by
+//!   the same argument. Deflate used to sit at 0.98x, and the fax codecs had
+//!   no gain at all, because a single cached decoder behind a `Mutex` made
+//!   the workers queue for the codec; pooling the decoders is what turned
+//!   those rows into 2-3x. LZW came out faster in every run, including a
+//!   repeat at load average 30 on 8 cores where it still managed 1.3x.
 //! * **No reliable gain, sometimes a loss**: uncompressed, and PackBits.
 //!   These are `memcpy`-bound, so the overhead is a large fraction of the
 //!   total; repeated runs straddled 1.0 (0.32x to 1.12x for PackBits,

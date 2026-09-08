@@ -40,12 +40,19 @@
 //!
 //! Every coding is driven through a resumable push decoder
 //! (`oxiarc_deflate::WrappedInflate`, `oxiarc_brotli::BrotliStream`,
-//! `oxiarc_zstd::ZstdStream`), never through a `read_to_end`. Concretely,
-//! measured in `tests/allocations.rs`:
+//! `oxiarc_zstd::ZstdStream`; `compress` bridges `oxiarc_lzw::z::ZReader`'s
+//! pull shape onto the same push seam — see `decode/compress.rs`'s module
+//! docs), never through a `read_to_end`. Concretely, measured in
+//! `tests/allocations.rs`:
 //!
 //! * streaming a 16 MiB gzip body through [`DecodedBody`] with 4 KiB reads
-//!   peaks at **~210 KiB** of live allocation — two 64 KiB staging buffers,
+//!   peaks at **~174 KiB** of live allocation — two 64 KiB staging buffers,
 //!   the 32 KiB DEFLATE window and its tables;
+//! * streaming a 128 MiB `compress` (`.Z`) body that expands **4992:1**,
+//!   with no output budget at all
+//!   ([`DecodeLimits::unlimited`](crate::DecodeLimits::unlimited)), peaks at
+//!   **~873 KiB** — the 192 KiB `.Z` code table and one metered decode fill
+//!   on top of the same staging buffers;
 //! * [`Decoder::feed_into`] performs **zero allocations** per call once warm;
 //! * a decompression bomb is refused having materialised the budget, not the
 //!   bomb.
@@ -57,8 +64,12 @@
 //! # `finish` is not optional
 //!
 //! [`Decoder::finish`] / [`Decoder::close`] is what verifies gzip's CRC-32
-//! and `ISIZE`, zlib's Adler-32, zstd's XXH64 and every codec's truncation
-//! check. Skipping it silently accepts a corrupted or truncated body.
+//! and `ISIZE`, zlib's Adler-32, zstd's XXH64 and every other codec's
+//! truncation check. Skipping it silently accepts a corrupted or truncated
+//! body — for every coding but one: `compress` (`.Z`) has no checksum and
+//! no end-of-information code at all, so a truncated `.Z` body decodes to a
+//! plausible, valid-looking short prefix whatever `finish` does or does not
+//! check (see [`ContentCoding::Compress`]'s own doc comment).
 #![cfg_attr(
     feature = "async-io",
     doc = "[`DecodedBody`] and [`AsyncDecodedBody`] call it for you at EOF and"
@@ -165,9 +176,9 @@
 //! |---|---|---|
 //! | `gzip` | on | [`ContentCoding::Gzip`] via `oxiarc-deflate` |
 //! | `deflate` | on | [`ContentCoding::Deflate`] via `oxiarc-deflate` |
-//! | `brotli` | off | [`ContentCoding::Brotli`] via `oxiarc-brotli` |
+//! | `brotli` | off | [`ContentCoding::Brotli`] and, with a dictionary, [`ContentCoding::Dcb`], via `oxiarc-brotli` |
 //! | `zstd` | off | [`ContentCoding::Zstd`] and, with a dictionary, [`ContentCoding::Dcz`], via `oxiarc-zstd` |
-//! | `compress` | off | Plumbing only — see [`ContentCoding::Compress`] |
+//! | `compress` | off | [`ContentCoding::Compress`] (legacy UNIX `.Z`) via `oxiarc-lzw` |
 #![cfg_attr(
     feature = "async-io",
     doc = "| `async-io` | off | [`AsyncDecodedBody`], the `tokio::io::AsyncRead` adapter |"

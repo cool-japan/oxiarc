@@ -7,6 +7,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.2] - Unreleased
 
+### Added
+
+- **`oxiarc-tiff`: CCITT Group 3/4 uncompressed mode (ITU-T T.4 §4.2.1.3.2,
+  Table 5/T.4), both directions.** The mode transmits pixels at about one bit
+  each instead of Huffman-coding runs, which is the difference between shrinking
+  and *expanding* a dithered or halftoned bilevel page. Decode is unconditional
+  — the entrance code (`0000001111` on a two-dimensionally coded line,
+  `000000001111` on a one-dimensionally coded one) is unambiguous, so a file
+  that carries the mode without setting `T4Options` bit 1 / `T6Options` bit 1
+  still decodes, where before it was a named error. Encode is opt-in through the
+  new `ImageSpec::with_ccitt_uncompressed(bool)`, which also writes the option
+  bit into whichever of tags 292/293 the codec owns; the encoder prices the
+  Huffman coding and the uncompressed coding of every row exactly and takes the
+  mode only where it is strictly smaller, so enabling it can only shrink a page.
+  A 512x64 dithered page more than halves in all three dialects, and a page of
+  long runs comes out byte-identical to one written with the mode off.
+  **Interoperability**: libtiff 4.7.1 *parses* these files (`tiffinfo` prints
+  "Group 4 Options: uncompressed data") but cannot decode them
+  (`Fax4Decode: Uncompressed data (not supported)`), which is why the mode is
+  never written unless asked for.
+- **`oxiarc-tiff`: `ImageSpec::with_jpeg_restart_rows(u16)` and
+  `CodecContext::jpeg_restart_rows`**, writing a `DRI` segment and `RSTn`
+  markers every *n* MCU rows (`cjpeg -restart n`). `0`, the default, writes
+  none, which is what libtiff writes. libtiff reads the result.
+- **`oxiarc-jpeg`: two-component frames (`ColorSpace::Unknown(2)`), libjpeg's
+  `JCS_UNKNOWN` layout.** Sequential identifiers `1`/`2`, one shared
+  quantisation and Huffman slot, no subsampling, no colour transform, and
+  neither a `JFIF` nor an Adobe marker (libjpeg writes neither for
+  `JCS_UNKNOWN`). `InputColor::LumaAlpha` reaches it by asking for it
+  explicitly — its default target is still one-component `Luma`, which
+  keeps dropping the alpha channel exactly as before. The decoder already
+  handled any component count outside `1..=4` generically; only the
+  encoder's `component_template` needed the one new row. No external
+  libjpeg tool can *decode* a two-component stream (none has an output path
+  for a colour space it cannot map to grayscale or RGB — checked against
+  `djpeg`, `tjbench` and Pillow), so this is verified by decomposing a
+  two-component source into its two channels and checking each alone
+  against real `cjpeg`/`djpeg`, by `djpeg -verbose`'s frame/scan header
+  trace, and — closing the remaining gap — by embedding one in a TIFF page
+  and confirming libtiff's *own* embedded libjpeg decodes the interleaved
+  scan byte-identically to this crate's decoder (`tiffcp -c none`; see the
+  `oxiarc-tiff` entry below). This is what
+  `oxiarc-tiff`'s two-channel chunky JPEG refusal, added earlier in this
+  same unreleased version, was waiting on.
+
+### Changed
+
+- **`oxiarc-zstd`: decode throughput rebuilt around the reference decoder's
+  data layout.** The speed-up is strongly shape-dependent — it is large exactly
+  where the decoder was doing per-byte work, and small where it was already
+  bound by `memcpy` (see the table below). The motivating
+  measurement came from the TIFF track: on a 4096x4096 RGB8 page in 16-row
+  strips, our ZSTD strip decode delivered ~110 MB/s where `libzstd` inside
+  `tiffcp` was an order of magnitude ahead, the largest gap in the whole codec
+  matrix. Profiling found the cost was almost never in the entropy decoding
+  itself but in how the decoder reached the bits and moved the bytes:
+  `FseBitReader` gathered up to five bounds-checked byte loads *per bit-field
+  read* (a Huffman literals stream calls it once per output byte, a sequence
+  stream six to nine times per sequence); an overlapping match copied
+  `out[i % offset]` one byte at a time, an integer division per output byte;
+  the window ring reduced every index with `% cap`, and `cap` is not a power of
+  two, so each was a real `udiv`; short literal and match runs went through
+  `memcpy`/`memmove` **calls** whose overhead dwarfed the 3-20 bytes they moved
+  (`_platform_memmove` was **51 %** of a 50 MB text decode); the window
+  re-allocated and re-zeroed on every growth step (`2x` the final capacity in
+  `bzero` over a doubling sequence); `xxhash`'s `read_u64_le` was eight
+  bounds-checked byte loads and was not being inlined; and the legacy
+  `ZstdDecoder` allocated a fresh literals and sequences `Vec` for **every
+  block**. All of that is gone. What replaces it: a 64-bit bit container with
+  bulk refills (`src/backward_bits.rs`, modelled on the reference
+  `BIT_DStream_t`), split into a register-resident `BitCursor` a decode loop
+  keeps out of memory; **reloads on a fixed schedule instead of a
+  data-dependent test** (four Huffman symbols per stream per reload; two
+  reloads per sequence), because that test is a mispredicting branch; the four
+  Huffman literal streams decoded **in lockstep**, which is what RFC 8878's
+  four-stream layout exists for — four independent `peek -> table load -> skip`
+  chains instead of one; pattern-doubling overlapping-match copies on both
+  decode paths (`offset`, `2*offset`, `4*offset`, ...); a new `src/short_copy.rs`
+  of call-free fixed-width copies for short runs; one conditional subtraction
+  in place of every ring `%`; in-place ring growth that zeroes only the new
+  tail; and scratch buffers reused across blocks on the legacy path too.
+  **No output changed**: the `zstd-oracle` differential suite (reference `zstd`
+  1.5.7, both directions), the embedded OxiGDAL corpus, the mutation and
+  truncation sweeps and every ZSTD4 accept/refuse test are unchanged and green,
+  and two new differentials pin the fast paths against the implementations they
+  replace — `literals::tests::the_interleaved_pass_agrees_with_the_checked_decoder`
+  (interleaved vs checked, over real encoder-produced four-stream sections) and
+  `frame`/`window`'s `..._matches_the_byte_at_a_time_definition` (pattern
+  doubling vs `out.push(out[len - offset])`, every offset x length combination),
+  plus a differential oracle in `backward_bits` that replays the byte-gathering
+  reader's exact `peek`/`bits_remaining`/`is_overflowed`/`is_finished` at every
+  step. Public API unchanged. New `examples/decode_throughput.rs` measures the
+  whole matrix against `zstd -b -d` in interleaved rounds; `benches/stream_bench.rs`
+  gained a `zstd_shape/*` group over the same shapes.
+
+- **`oxiarc-zstd`: `decompress_multi_frame` no longer tolerates *leading*
+  garbage, and a recognised-but-truncated frame is an error wherever it sits.**
+  Trailing tolerance is unchanged and now stated exactly in the doc comment:
+  bytes that start no recognisable frame end the stream gracefully **after at
+  least one complete frame has been decoded**; the same bytes before any frame
+  are an error. A truncated skippable frame (magic with no size field, or a
+  payload that runs off the end) is an error on both paths — a recognised frame
+  start is never trailing garbage. A complete skippable frame still does not
+  count as a decoded frame, so `[skippable]` alone remains an empty stream
+  while `[skippable][2 stray bytes]` is now an error. Callers that relied on
+  `Ok(vec![])` for non-zstd input must check the error instead.
+- **`oxiarc-zstd`: the declared-`Window_Size` policy is now explicit, and
+  differs by entry point on purpose.** `ZstdStream` keeps a real sliding-window
+  ring, so it refuses a declaration above `with_max_window` (8 MiB by default)
+  before allocating; the unbounded `decompress` / `decompress_multi_frame` keep
+  no ring — their output `Vec` *is* the window — so they accept any declaration,
+  as they always have; and `decompress_with_limit` /
+  `decompress_multi_frame_with_limit` now refuse a declaration above
+  `max(max_output, 128 MiB)`, 128 MiB being the reference decoder's own
+  `ZSTD_WINDOWLOG_MAX_DEFAULT` (`zstd -d` rejects a 2 GiB-window frame with
+  "Window size larger than maximum : 2147483648 > 134217728"). The ceiling is
+  deliberately **not** the caller's output limit: measured against `zstd` 1.5.7,
+  a payload piped through `-3` declares a 2 MiB window and one piped through
+  `--long=24 -6` declares 16 MiB — whatever the payload's length, and with no
+  `Frame_Content_Size` — so `Window_Size > limit` would reject ordinary
+  reference frames. A declared `Frame_Content_Size` past the limit is still
+  refused before anything is decoded. `decompress_into` stays unrestricted: a
+  container's chunk already bounds it.
+- **`oxiarc-tiff` now encodes `Compression = 7` (JPEG) through
+  `oxiarc_jpeg::Encoder`** instead of the baseline encoder it carried while
+  `oxiarc-jpeg` had none. `compression/jpeg/encode.rs` went from 659 lines of
+  DCT, Huffman and downsampling code to 334 lines that map a TIFF
+  `CodecContext` onto `oxiarc_jpeg::EncodeOptions` and drive
+  `write_tables_only` / `encode_scan_only` / `encode`. `JPEGTables` (tag 347)
+  is unchanged — verified byte-identical to the old encoder's for gray, YCbCr
+  4:2:2, RGB and CMYK at qualities 1, 10, 25, 50, 75, 95 and 100 before the
+  swap, and now checked byte-identical to `tiffcp -c jpeg`'s in the
+  `tiff-oracle` suite. The strips' marker order follows libjpeg's
+  (`SOI DQT SOF DHT SOS`) rather than the old `SOI DQT DHT SOF SOS`; both are
+  conformant abbreviated datastreams and libtiff, Pillow and `tifffile` read
+  either. A chunk with exactly two channels was a named error for part of this
+  same unreleased version and never in a published one — the swap's local
+  encoder had produced a two-component frame that `oxiarc-jpeg` could not —
+  and is fixed below, in the same version, rather than shipped and documented
+  as a regression: see the `oxiarc-jpeg` two-component entry above.
+  `ImageSpec::validate`'s refusal (and the `plan()` arm that produced it) are
+  both gone; a greyscale-plus-alpha *chunky* JPEG page now round-trips
+  (`tests/roundtrip.rs::a_two_channel_jpeg_page_round_trips_chunky_through_
+  jcs_unknown`), and so does `PlanarConfiguration::Planar` (each channel its
+  own single-component frame), which remains a legitimate way to write the
+  same page. Verified against real libtiff: `tiffinfo` parses the chunky
+  file cleanly, and `tiffcp -c none` makes libtiff's own embedded libjpeg
+  decode the two-component scan byte-identically to this crate's decoder.
+- **`oxiarc-tiff` per-image codec scratch is now pooled rather than held in a
+  single slot.** The reusable `WrappedInflate`, `ZstdStream`, `XzDecoder` and
+  CCITT changing-element buffers used to live behind one `Mutex` each, held for
+  the length of a chunk's decode — correct, but it made a `rayon` decode of a
+  Deflate, CCITT, ZSTD or LZMA page serialise every worker behind the codec. A
+  pool hands each worker a decoder of its own and locks only around the
+  hand-off. Measured, interleaved, 4096x4096, medians of nine rounds: Deflate
+  went from 0.98x to **2.24x**, Group 4 from no gain to **3.04x**, Group 3 2D
+  to **2.03x**, LZW to 2.13x. Serial decode is unchanged (the pool holds
+  exactly one entry) and output is byte-identical either way, which
+  `tests/codec_reuse.rs` now asserts for all four codecs, including eight
+  threads decoding one page through one shared `CodecState`.
+
+### Fixed
+
+- **`oxiarc-zstd`: the legacy one-shot decoders accepted three classes of frame
+  the RFC forbids.** Differential fuzzing of `decompress_multi_frame` against
+  the new `ZstdStream` (`fuzz/fuzz_targets/fuzz_zstd_stream.rs`) found four
+  independently-rooted inputs, in about ten cumulative minutes, that the legacy
+  `ZstdDecoder::decode_frame` core accepted and the hardened push decoder
+  refused. Three were real defects, now fixed *in shared code* so the two paths
+  cannot drift again:
+  1. **`Dictionary_ID` was never validated.** A frame naming a dictionary the
+     caller never supplied (RFC 8878 §3.1.1.1.1.6) decoded to silently wrong
+     bytes — its matches reach into content the decoder does not have. Every
+     entry point (`decompress`, `decompress_frame`, `decompress_multi_frame`,
+     `ZstdDecoder::decode_frame`, `decompress_with_limit`) now refuses it with
+     the same `InvalidHeader` the streaming decoder already used;
+     `Dictionary_ID` 0 still means "no dictionary", and the `*_with_dict`
+     entries are unaffected.
+  2. **`Block_Maximum_Decompressed_Size` was never enforced.** A block may not
+     regenerate more than `min(Window_Size, 128 KiB)`, further bounded by a
+     declared `Frame_Content_Size`. `Raw`/`RLE` blocks are now charged from the
+     block header — before an RLE block expands — and `Compressed` blocks
+     inside the sequence executor, so an over-large block is refused without
+     first materialising it.
+  3. **Leading garbage was tolerated.** `decompress_multi_frame`'s loop stopped
+     and returned `Ok(accumulated)` on fewer than four bytes, an unknown magic,
+     or a truncated skippable frame *at any position, including the very
+     first* — so `decompress_multi_frame(b"not zstd at all")` was `Ok(vec![])`.
+     Those are now errors before any frame has been decoded, matching
+     `ZstdStream` byte for byte.
+  The fourth finding, an ~11 MB declared `Window_Size`, is a deliberate split
+  and is now documented as one (see *Changed*). Pinned by
+  `oxiarc-zstd/tests/legacy_hardening.rs` — 16 tests that drive **both** paths
+  over every case, including the fuzzer's own minimised artifacts, and assert
+  identical accept/refuse plus identical bytes whenever both accept, and by
+  `oxiarc-zstd/tests/legacy_verify.rs` (below).
+
+- **`oxiarc-zstd`: a reused `ZstdDecoder` carried a failed frame's partial
+  output into the next one.** `ZstdDecoder::decode_frame` took its output
+  buffer only on success, so after a truncated or corrupt frame the buffer
+  still held whatever that frame had already regenerated, and the *next*
+  `decode_frame` on the same decoder returned it prepended to the new frame's
+  content. With a checksum on the following frame the symptom was a bogus
+  `CrcMismatch`; with neither a checksum nor a `Frame_Content_Size` — what
+  `zstd --no-check` writes from a pipe — it was silent: 131 076 bytes returned
+  as `Ok` where 4 were expected. `decode_frame` now resets the per-frame state
+  (output buffer plus the literals Huffman table and the three sequence FSE
+  tables, so a `Treeless`/`Repeat` block at the start of a new frame is
+  rejected rather than decoded with the previous frame's tables) at the start
+  of every call, exactly as `ZstdStream::begin_frame` does; a configured
+  dictionary survives. `ZstdDecoder::reset` stays public and is no longer
+  something a caller has to remember. The one-shot free functions were never
+  affected — they build a fresh decoder per frame.
+
+- **`oxiarc-zstd`: the legacy one-shot decoders refused a skippable frame
+  placed in front of a Zstandard frame.** `zstd -d` decodes
+  `[skippable][frame]` exactly like `[frame]`, and so do `ZstdStream`,
+  `decompress_into` and `decompress_with_limit` — but `decompress`,
+  `decompress_frame` and `ZstdDecoder::decode_frame` stopped at the skippable
+  magic with `InvalidMagic`, so a container that prefixes its payload with
+  metadata decoded on one path and failed on the other. All of them now walk
+  past a complete skippable-frame prefix (RFC 8878 §3.1.2); `decompress_frame`
+  reports it in the byte count it returns, so walking a concatenated stream
+  still lands on the next frame. A *truncated* skippable frame remains an
+  error wherever it sits, and leading bytes that are not a recognised frame
+  start remain an error. Found by the adversarial sweep in
+  `oxiarc-zstd/tests/legacy_verify.rs`, which now pins the whole matrix: 8000+
+  crafted frames over every `Window_Descriptor` byte and 5500+ truncated,
+  mutated and spliced inputs, asserting the legacy and streaming families
+  reach the same verdict with no carve-out beyond the documented
+  declared-window split.
+
+- **`oxiarc-tiff`: CCITT Group 4 decode was quadratic in the number of runs
+  per row.** The two-dimensional row decoder re-scanned the reference line's
+  changing elements from element zero for every code word. Since `a0` never
+  moves backwards inside a row, the search can resume where the previous one
+  stopped. Timed against the restarting search directly, interleaved, medians
+  of five, on three 4096x4096 Group 4 pages: **1.03x** on a page with a few
+  long runs per row, **4.8x** on the benches' bilevel fixture and **24.6x** on
+  a halftone page with hundreds of runs per row — free where fax coding is at
+  home, decisive where it is not. `tests/tiff_oracle_codecs.rs`'s byte-identity
+  checks against `tiffcp -c g3` and `-c g4` are unchanged. `BitReader::peek` was also a byte-at-a-time loop and
+  is now one shift-and-mask over a three-byte window.
+- **`oxiarc-tiff`: `cargo nextest run --no-default-features` passes again.**
+  Eight tests in `tests/corrupt_no_panic.rs` and `tests/proptest_roundtrip.rs`
+  built their fixtures with `Compression::Lzw` / `CcittGroup4` / `Deflate`
+  unconditionally and panicked on `FeatureNotCompiled` before testing anything.
+  Each fixture is now gated on the feature that compiles its codec, with
+  `PackBits` (which needs no feature) keeping the corpus non-empty. The default
+  and `--all-features` corpora are unchanged.
+
 ## [0.4.1] - 2026-08-06
 
 **Security hardening (ZIP CSPRNG, constant-time AES, x86 CRC-32, 7z

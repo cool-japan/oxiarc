@@ -2,10 +2,10 @@
 
 use oxiarc_jpeg::{
     CodingProcess, ColorSpace, ComponentIds, DecodeOptions, Decoder, Downsampling, EncodeOptions,
-    EncodeProcess, Encoder, InputColor, JpegError, MarkerPolicy, QuantTable, QuantTableSource,
-    RestartInterval, ScanSpec, Subsampling, TableSet, TablesMode, decode_abbreviated_into,
-    decode_abbreviated_into_u16, encode_to_vec, encode_to_vec_with_options,
-    encode_u16_to_vec_with_options, table_set,
+    EncodeProcess, Encoder, EntropyCoding, InputColor, JpegError, MarkerPolicy, QuantTable,
+    QuantTableSource, RestartInterval, ScanSpec, Subsampling, TableSet, TablesMode,
+    decode_abbreviated_into, decode_abbreviated_into_u16, encode_to_vec,
+    encode_to_vec_with_options, encode_u16_to_vec_with_options, table_set,
 };
 use proptest::prelude::*;
 
@@ -95,6 +95,225 @@ fn every_shape_and_process_survives_a_round_trip() {
             }
         }
     }
+}
+
+/// A two-component frame ([`ColorSpace::Unknown(2)`], libjpeg's `JCS_UNKNOWN`
+/// shape) round-trips through this crate's own decoder, keeping both
+/// channels rather than dropping the second as the default `Luma` target
+/// does for [`InputColor::LumaAlpha`].
+#[test]
+fn two_component_frames_round_trip_and_keep_both_channels() {
+    for &(width, height) in &AWKWARD {
+        let pixels = source(usize::from(width), usize::from(height), 2);
+        let options = EncodeOptions {
+            quality: 90,
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            ..Default::default()
+        };
+        let jpeg =
+            encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+                .unwrap_or_else(|e| panic!("{width}x{height}: {e}"));
+        let mut decoder = Decoder::new(&jpeg[..]);
+        let info = decoder.read_info().expect("info");
+        assert_eq!(info.num_components, 2);
+        assert_eq!(info.output_color_space, ColorSpace::Unknown(2));
+        let decoded = decoder.decode().expect("decode");
+        assert_eq!(decoded.len(), pixels.len());
+        let error = mean_squared_error(&decoded, &pixels);
+        assert!(
+            error < 80.0,
+            "{width}x{height}: MSE {error} too high for quality 90"
+        );
+    }
+}
+
+/// The default decode and an explicit [`DecodeOptions::raw`] decode must
+/// agree byte for byte: a two-component frame's `output_color_space` is
+/// already the same as its `input_color_space` (nothing to transform), so
+/// asking for raw components changes nothing.
+#[test]
+fn two_component_default_decode_matches_raw_components_decode() {
+    let pixels = source(9, 7, 2);
+    let options = EncodeOptions {
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg =
+        encode_to_vec_with_options(&pixels, 9, 7, InputColor::LumaAlpha, &options).expect("encode");
+
+    let mut default_decoder = Decoder::new(&jpeg[..]);
+    default_decoder.read_info().expect("info");
+    let default_decoded = default_decoder.decode().expect("decode");
+
+    let mut raw_decoder = Decoder::with_options(&jpeg[..], DecodeOptions::raw());
+    raw_decoder.read_info().expect("info");
+    let raw_decoded = raw_decoder.decode().expect("decode");
+
+    assert_eq!(default_decoded, raw_decoded);
+}
+
+/// libjpeg writes no `JFIF` or Adobe marker for `JCS_UNKNOWN`, every
+/// component sits on quantisation and Huffman slot 0, and the identifiers are
+/// sequential (`1`, `2`) rather than letters — the whole shape TIFF's
+/// `Compression = 7` strips need for a greyscale-plus-alpha page.
+#[test]
+fn two_component_frames_write_no_metadata_and_share_one_table_slot() {
+    let pixels = source(6, 5, 2);
+    let options = EncodeOptions {
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg =
+        encode_to_vec_with_options(&pixels, 6, 5, InputColor::LumaAlpha, &options).expect("encode");
+
+    let mut decoder = Decoder::new(&jpeg[..]);
+    let info = decoder.read_info().expect("info");
+    assert!(!info.has_jfif, "no JFIF marker for JCS_UNKNOWN");
+    assert!(!info.has_adobe, "no Adobe marker for JCS_UNKNOWN");
+    let frame = decoder.frame_header().expect("frame header");
+    let ids: Vec<u8> = frame.components.iter().map(|c| c.id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert!(frame.components.iter().all(|c| (c.h, c.v) == (1, 1)));
+    assert!(frame.components.iter().all(|c| c.quant_table == 0));
+
+    let tables = table_set(&options, InputColor::LumaAlpha).expect("table_set");
+    assert!(tables.quant[0].is_some(), "slot 0 must be referenced");
+    assert!(
+        tables.quant[1..].iter().all(Option::is_none),
+        "only one quantisation table"
+    );
+    assert!(
+        tables.dc_huffman[1..].iter().all(Option::is_none),
+        "only one DC Huffman table"
+    );
+    assert!(
+        tables.ac_huffman[1..].iter().all(Option::is_none),
+        "only one AC Huffman table"
+    );
+}
+
+/// Only exactly two components reach `ColorSpace::Unknown`; every other
+/// count is a named error, both through the public encode entry point and
+/// regardless of which `InputColor` claims to supply it.
+#[test]
+fn unknown_colour_space_is_refused_except_at_two_components() {
+    for count in [0u8, 1, 3, 4, 5, 6, 255] {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(count)),
+            ..Default::default()
+        };
+        let error = encode_to_vec_with_options(&[0u8; 32], 4, 4, InputColor::LumaAlpha, &options)
+            .expect_err(&format!("Unknown({count}) should be refused"));
+        assert!(
+            matches!(error, JpegError::InvalidEncodeParameter { .. }),
+            "Unknown({count}): unexpected error {error}"
+        );
+    }
+    // Even at the one accepted count, only `LumaAlpha` can reach it: `Luma`
+    // has one channel and nothing to put in the second component.
+    let options = EncodeOptions {
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    assert!(encode_to_vec_with_options(&[0u8; 16], 4, 4, InputColor::Luma, &options).is_err());
+}
+
+/// `component_template` is the only place that used to reject
+/// `ColorSpace::Unknown` outright; nothing downstream of it — the
+/// progressive scan-script builder, the lossless predictor, arithmetic
+/// coding — special-cases component count the way it did. All three
+/// processes, in both entropy codings, must therefore already accept a
+/// two-component frame with no further change: lossless exactly (no
+/// quantisation), the two lossy processes within ordinary JPEG error.
+#[test]
+fn two_component_frames_survive_every_process_and_entropy_coding() {
+    let width = 17u16;
+    let height = 19u16;
+    let pixels = source(usize::from(width), usize::from(height), 2);
+    let processes = [
+        EncodeProcess::Sequential,
+        EncodeProcess::Progressive,
+        EncodeProcess::Lossless {
+            predictor: 1,
+            point_transform: 0,
+        },
+    ];
+    let entropies: &[EntropyCoding] = &[
+        EntropyCoding::Huffman,
+        #[cfg(feature = "arithmetic")]
+        EntropyCoding::Arithmetic,
+    ];
+    for &process in &processes {
+        for &entropy in entropies {
+            let options = EncodeOptions {
+                process,
+                entropy,
+                jpeg_color_space: Some(ColorSpace::Unknown(2)),
+                ..Default::default()
+            };
+            let jpeg =
+                encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+                    .unwrap_or_else(|e| panic!("{process:?}/{entropy:?}: {e}"));
+            let mut decoder = Decoder::new(&jpeg[..]);
+            let info = decoder.read_info().expect("info");
+            assert_eq!(info.num_components, 2);
+            let decoded = decoder.decode().expect("decode");
+            assert_eq!(decoded.len(), pixels.len());
+            let max_diff = decoded
+                .iter()
+                .zip(pixels.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(255);
+            if matches!(process, EncodeProcess::Lossless { .. }) {
+                assert_eq!(
+                    max_diff, 0,
+                    "{process:?}/{entropy:?}: lossless must be exact"
+                );
+            } else {
+                assert!(
+                    max_diff < 64,
+                    "{process:?}/{entropy:?}: max_diff {max_diff} too high"
+                );
+            }
+        }
+    }
+}
+
+/// [`Encoder::encode_planar`] interleaves its planes into the same buffer
+/// shape [`encode_to_vec_with_options`] takes, so it must reach
+/// `ColorSpace::Unknown(2)` exactly as the chunky entry point does — the two
+/// paths are compared byte for byte, the same way `planar_input_matches_interleaved_input`
+/// already checks it for RGB.
+#[test]
+fn two_component_frames_via_encode_planar_match_the_interleaved_path() {
+    let width = 12u16;
+    let height = 9u16;
+    let count = usize::from(width) * usize::from(height);
+    let gray: Vec<u8> = (0..count).map(|i| (i % 251) as u8).collect();
+    let alpha: Vec<u8> = (0..count).map(|i| (i % 97) as u8).collect();
+    let mut interleaved = Vec::with_capacity(count * 2);
+    for index in 0..count {
+        interleaved.extend_from_slice(&[gray[index], alpha[index]]);
+    }
+
+    let options = EncodeOptions {
+        quality: 80,
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let expected =
+        encode_to_vec_with_options(&interleaved, width, height, InputColor::LumaAlpha, &options)
+            .expect("chunky encode");
+
+    let mut out = Vec::new();
+    let mut encoder = Encoder::with_options(&mut out, options);
+    encoder
+        .encode_planar(&[&gray, &alpha], width, height, InputColor::LumaAlpha)
+        .expect("planar encode");
+    encoder.finish().expect("finish");
+
+    assert_eq!(out, expected);
 }
 
 /// Every subsampling ratio must survive every awkward size.
@@ -781,5 +1000,269 @@ fn abbreviated_scans_refuse_every_process_that_generates_tables() {
             !strip.windows(2).any(|pair| pair == [0xFF, 0xC4]),
             "{name}: no DHT may reach an abbreviated stream"
         );
+    }
+}
+
+/// `Subsampling::Custom` is the only way a two-component frame ever leaves
+/// `1x1`, and it reaches it through the same `build_plan` arm every other
+/// colour space uses. The plan-level check lives in `encoder/plan.rs`; this
+/// is the end-to-end half — the frame really codes, the decoder really
+/// upsamples the decimated component back to full resolution, and a smooth
+/// source survives the round trip within the decimation's own error.
+#[test]
+fn two_component_frames_survive_custom_subsampling_end_to_end() {
+    let (width, height) = (32usize, 24usize);
+    let mut gradient = Vec::with_capacity(width * height * 2);
+    for y in 0..height {
+        for x in 0..width {
+            gradient.push((x * 4) as u8);
+            gradient.push((y * 4) as u8);
+        }
+    }
+    for factors in [
+        [(1u8, 1u8), (1, 1), (1, 1), (1, 1)],
+        [(2, 1), (1, 1), (1, 1), (1, 1)],
+        [(1, 2), (1, 1), (1, 1), (1, 1)],
+        [(2, 2), (1, 1), (1, 1), (1, 1)],
+        // Both components decimated equally is not decimation at all: hmax
+        // and vmax rise with them, so every component stays full size.
+        [(2, 2), (2, 2), (1, 1), (1, 1)],
+        // The *second* component full-rate and the first decimated is just
+        // as legal here as the other way round, since neither is "luma".
+        [(1, 1), (2, 2), (1, 1), (1, 1)],
+    ] {
+        let options = EncodeOptions {
+            quality: 95,
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            subsampling: Subsampling::Custom(factors),
+            ..Default::default()
+        };
+        let jpeg = encode_to_vec_with_options(
+            &gradient,
+            width as u16,
+            height as u16,
+            InputColor::LumaAlpha,
+            &options,
+        )
+        .unwrap_or_else(|e| panic!("{factors:?}: {e}"));
+
+        let mut decoder = Decoder::new(&jpeg[..]);
+        let info = decoder.read_info().expect("info");
+        assert_eq!(info.num_components, 2, "{factors:?}");
+        let frame = decoder.frame_header().expect("frame header");
+        let coded: Vec<(u8, u8)> = frame.components.iter().map(|c| (c.h, c.v)).collect();
+        assert_eq!(coded, vec![factors[0], factors[1]], "{factors:?}");
+
+        let decoded = decoder.decode().expect("decode");
+        assert_eq!(decoded.len(), gradient.len(), "{factors:?}");
+        let max_diff = decoded
+            .iter()
+            .zip(gradient.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(255);
+        assert!(
+            max_diff <= 8,
+            "{factors:?}: a linear ramp came back with max_diff {max_diff}, which is \
+             more than decimating and re-interpolating it can explain"
+        );
+    }
+}
+
+/// Restart intervals at two components, including a frame large enough for
+/// the `rayon` feature's parallel scan splitter to engage (it needs at least
+/// 256 MCUs and a non-zero interval, which no other two-component test
+/// reaches). The split is byte-identical to the serial coder's by
+/// construction, so the check here is that the frame codes and decodes at
+/// all — verified separately to be bit-identical with and without the
+/// feature.
+#[test]
+fn two_component_frames_survive_every_restart_interval() {
+    let cases: [(u16, u16, RestartInterval); 8] = [
+        (37, 23, RestartInterval::None),
+        (37, 23, RestartInterval::Mcus(1)),
+        (37, 23, RestartInterval::Mcus(3)),
+        (37, 23, RestartInterval::McuRows(1)),
+        (37, 23, RestartInterval::McuRows(2)),
+        (37, 23, RestartInterval::Mcus(u16::MAX)),
+        // 32x16 = 512 MCUs: past the parallel splitter's threshold.
+        (256, 128, RestartInterval::Mcus(8)),
+        (256, 128, RestartInterval::McuRows(1)),
+    ];
+    for (width, height, restart) in cases {
+        for process in [EncodeProcess::Sequential, EncodeProcess::Progressive] {
+            let pixels = source(usize::from(width), usize::from(height), 2);
+            let options = EncodeOptions {
+                quality: 90,
+                process,
+                restart_interval: restart,
+                jpeg_color_space: Some(ColorSpace::Unknown(2)),
+                ..Default::default()
+            };
+            let jpeg =
+                encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+                    .unwrap_or_else(|e| panic!("{restart:?}/{process:?}: {e}"));
+            let mut decoder = Decoder::new(&jpeg[..]);
+            let info = decoder.read_info().expect("info");
+            assert_eq!(info.num_components, 2);
+            let decoded = decoder.decode().expect("decode");
+            assert_eq!(decoded.len(), pixels.len());
+            let max_diff = decoded
+                .iter()
+                .zip(pixels.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(255);
+            assert!(
+                max_diff < 64,
+                "{width}x{height} {restart:?}/{process:?}: max_diff {max_diff}"
+            );
+        }
+    }
+}
+
+/// Twelve-bit two-component frames: `SOF1` with a two-component template,
+/// generated Huffman tables (Annex K's stop short of the categories a
+/// twelve-bit sample reaches) and the `u16` sample path through
+/// `convert_rows_two`.
+#[test]
+fn two_component_frames_round_trip_at_twelve_bits() {
+    let (width, height) = (17u16, 19u16);
+    let count = usize::from(width) * usize::from(height) * 2;
+    let pixels: Vec<u16> = (0..count).map(|i| ((i * 53) % 4096) as u16).collect();
+    let options = EncodeOptions {
+        precision: 12,
+        quality: 95,
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg =
+        encode_u16_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+            .expect("twelve-bit encode");
+    let mut decoder = Decoder::new(&jpeg[..]);
+    let info = decoder.read_info().expect("info");
+    assert_eq!(info.num_components, 2);
+    assert_eq!(info.precision, 12);
+    assert_eq!(info.output_color_space, ColorSpace::Unknown(2));
+    let decoded = decoder.decode_u16().expect("decode");
+    assert_eq!(decoded.len(), pixels.len());
+}
+
+/// [`Encoder::encode_planar`] takes one slice per *component*, and a
+/// two-component frame needs exactly two. Handing it one, three or none must
+/// be a named error rather than a panic or a frame built from whatever the
+/// slice list happened to contain.
+#[test]
+fn encode_planar_refuses_a_wrong_plane_count_at_two_components() {
+    let gray = [7u8; 12 * 9];
+    let alpha = [9u8; 12 * 9];
+    let wrong: [Vec<&[u8]>; 3] = [
+        vec![&gray[..]],
+        vec![&gray[..], &alpha[..], &gray[..]],
+        Vec::new(),
+    ];
+    for planes in wrong {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let mut encoder = Encoder::with_options(&mut out, options);
+        let error = encoder
+            .encode_planar(&planes, 12, 9, InputColor::LumaAlpha)
+            .expect_err("a wrong plane count must be refused");
+        assert!(
+            matches!(
+                error,
+                JpegError::InvalidEncodeParameter { .. } | JpegError::BufferTooSmall { .. }
+            ),
+            "{} planes: unexpected error {error}",
+            planes.len()
+        );
+    }
+}
+
+/// Now that a two-component frame can be *written*, a decode of one can also
+/// be asked for an `output_color_space` this crate has no transform for.
+/// Every such request must come back as a named error: never a panic, and
+/// never a short or over-long output buffer that a caller sized from
+/// [`ImageInfo::output_components`].
+#[test]
+fn two_component_decode_refuses_transforms_it_cannot_perform() {
+    let (width, height) = (24u16, 16u16);
+    let pixels = source(usize::from(width), usize::from(height), 2);
+    let options = EncodeOptions {
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg = encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+        .expect("encode");
+
+    for target in [
+        ColorSpace::Luma,
+        ColorSpace::Ycbcr,
+        ColorSpace::Rgb,
+        ColorSpace::Cmyk,
+        ColorSpace::Ycck,
+        ColorSpace::Unknown(0),
+        ColorSpace::Unknown(3),
+        ColorSpace::Unknown(255),
+    ] {
+        let decode_options = DecodeOptions {
+            output_color_space: Some(target),
+            ..Default::default()
+        };
+        let mut decoder = Decoder::with_options(&jpeg[..], decode_options);
+        decoder.read_info().expect("info");
+        let error = decoder
+            .decode()
+            .expect_err("no transform exists out of a two-component frame");
+        assert!(
+            matches!(error, JpegError::Unsupported(_)),
+            "{target:?}: unexpected error {error}"
+        );
+    }
+
+    // The identity is the one that works, and it produces exactly two
+    // samples per pixel.
+    let decode_options = DecodeOptions {
+        output_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let mut decoder = Decoder::with_options(&jpeg[..], decode_options);
+    let info = decoder.read_info().expect("info");
+    assert_eq!(info.output_components(), 2);
+    assert_eq!(decoder.decode().expect("decode").len(), pixels.len());
+}
+
+/// A truncated or corrupted two-component stream must always come back as an
+/// error, never a panic. Every prefix of a real frame, and every single-bit
+/// and high-bit flip across its header region, is tried.
+#[test]
+fn two_component_streams_never_panic_when_damaged() {
+    let (width, height) = (24u16, 20u16);
+    let pixels = source(usize::from(width), usize::from(height), 2);
+    let options = EncodeOptions {
+        jpeg_color_space: Some(ColorSpace::Unknown(2)),
+        ..Default::default()
+    };
+    let jpeg = encode_to_vec_with_options(&pixels, width, height, InputColor::LumaAlpha, &options)
+        .expect("encode");
+
+    for cut in 0..jpeg.len() {
+        let mut decoder = Decoder::new(&jpeg[..cut]);
+        if decoder.read_info().is_ok() {
+            let _ = decoder.decode();
+        }
+    }
+    for offset in 0..jpeg.len().min(256) {
+        for delta in [1u8, 0x80, 0xff] {
+            let mut corrupt = jpeg.clone();
+            corrupt[offset] ^= delta;
+            let mut decoder = Decoder::new(&corrupt[..]);
+            if decoder.read_info().is_ok() {
+                let _ = decoder.decode();
+            }
+        }
     }
 }

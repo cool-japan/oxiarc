@@ -152,6 +152,57 @@
       tool), `tests/common/blocks.rs` (independent block walker),
       `examples/zlib_ab.rs` (criterion-free ratio/throughput/per-call table)
 
+## Completed Features (Phase 8 — inflate throughput, 0.4.2)
+
+### Packed decode tables and a rewritten fast loop (W3-INFLATEPERF)
+- [x] `src/decode_table.rs` — a crate-private, decode-only two-level table
+      whose `u32` entries carry the symbol *kind* (literal / end-of-block /
+      sub-table / invalid), the code length, the extra-bit count and the
+      payload (literal byte, length base, distance base, sub-table offset).
+      Removes two `*_EXTRA_BITS` lookups, two `decode_*` base lookups and the
+      `<256 / ==256 / >285` comparison chain from every symbol. `HuffmanTree`
+      is untouched — it stays the crate's public Huffman type, the encoder's,
+      and the bit-at-a-time fallback's; the 19-symbol code-length alphabet
+      still decodes through it.
+- [x] Built by **zlib's `inflate_table` algorithm**: symbols counting-sorted
+      into canonical order and the table filled in one pass with the reversed
+      code maintained by a backwards increment, instead of reversing every
+      symbol's code with a per-bit loop twice. Sub-tables are created on
+      demand and sized from the code space still unaccounted for.
+- [x] Proven equal to `HuffmanTree` for **every bit pattern** of every shape
+      it is built from (`decode_table_agrees_with_huffman_tree`, plus a
+      48-shape pseudorandom sweep and an in-place-rebuild differential)
+- [x] Fixed tables built once per process (`OnceLock`), never per block
+- [x] Steady-state allocation-free: scratch reuse plus a power-of-two
+      sub-table reservation. Resident scratch *fell* — the two per-tree
+      root-sized scratch vectors (5 KiB) are gone, replaced by one
+      alphabet-sized `Vec<u16>`; `oxiarc-http`'s streaming peak went from
+      ~216 KiB to 178 KiB against its 224 KiB budget.
+- [x] `fast_symbols` rewritten: one bulk refill per iteration (>= 56 bits,
+      checked once as a single invariant so no inner step needs an
+      availability test), one table lookup per symbol, up to three literals
+      per 32-bit peek with a single `consume`, and the bit accumulator, the
+      output cursor and the input cursor all in locals. `#[inline(never)]`,
+      so the loop does not share a register allocation with the careful path
+      (before: a store of the input cursor per refill and a stack reload of
+      the input pointer per iteration).
+- [x] Match copies in machine words: short non-overlapping matches inline in
+      8-byte chunks (never `memmove`, whose call costs more than the copy at
+      DEFLATE's average match length), byte fill for distance 1, word tiling
+      with pattern doubling for distances 2-7, and `copy_within` above 32
+      bytes where the vector `memmove` wins. **No write ever goes past the
+      reported output** — the caller's buffer tail is untouched, as before.
+- [x] The growable path (`inflate()` / `InflateStream::inflate_to_vec`)
+      decodes into the tail of the buffer it is filling through
+      `BoundedSink::resumed`, so the window is written once and
+      back-references resolve in place; the first buffer is sized from the
+      input instead of always starting at 64 KiB
+- [x] `examples/inflate_ab.rs` — interleaved A/B of all four decode entry
+      points against CPython `zlib.decompress` over six data shapes x three
+      sizes x levels 1/6/9, every arm's output checked before it is timed
+- [x] `benches/deflate_bench.rs::inflate_shapes` — per-shape decode
+      throughput (image rows, PNG-filtered rows, text, long matches, stored)
+
 ## Future Enhancements
 
 ### Advanced LZ77
@@ -255,33 +306,36 @@ async_reader 2.
 
 ## Code Statistics
 
-Lines per file (`wc -l oxiarc-deflate/src/*.rs`, verified 2026-09-07; every
-file is under the 2000-line policy limit, and under the 1500-line target):
+Lines per file (`wc -l oxiarc-deflate/src/*.rs oxiarc-deflate/src/inflate_core/*.rs`,
+verified 2026-09-08; every file is under the 2000-line policy limit and
+under the 1500-line target):
 
 | File | Lines |
 |------|-------|
-| deflate.rs | 1,372 |
+| wrapper.rs | 1,396 |
 | streaming.rs | 1,346 |
-| lz77.rs | 1,236 |
-| inflate_core.rs | 1,164 |
-| wrapper.rs | 1,138 |
-| inflate.rs | 1,127 |
-| zlib.rs | 1,097 |
-| huffman.rs | 1,050 |
-| stream.rs | 717 |
-| reader.rs | 595 |
+| huffman.rs | 1,216 |
+| zlib.rs | 1,199 |
+| inflate.rs | 1,166 |
+| inflate_core.rs | 1,054 |
+| stream.rs | 887 |
+| sink.rs | 726 |
+| decode_table.rs | 719 |
+| reader.rs | 717 |
+| lz77.rs | 642 |
 | window.rs | 578 |
-| sink.rs | 577 |
 | parallel.rs | 562 |
 | pool.rs | 534 |
-| optimal.rs | 521 |
-| tables.rs | 343 |
-| async_reader.rs | 316 |
-| async_deflate.rs | 312 |
+| deflate.rs | 513 |
+| inflate_core/fast.rs | 503 |
+| tables.rs | 345 |
+| async_reader.rs | 330 |
+| async_deflate.rs | 322 |
 | raw_stream.rs | 274 |
 | gzip.rs | 268 |
-| lib.rs | 113 |
-| **Total** | **15,240** |
+| optimal.rs | 261 |
+| lib.rs | 116 |
+| **Total** | **15,674** |
 
 ## Known Limitations
 

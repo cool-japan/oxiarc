@@ -11,6 +11,9 @@
 //! - The resumable push decoder (`InflateStream` / `WrappedInflate`) at
 //!   several feed granularities, next to the one-shot `inflate()` it shares
 //!   a core with
+//! - Decode throughput per data shape (`inflate_shapes`): image rows,
+//!   PNG-filtered rows, text, long matches and stored blocks, which is what
+//!   the fast symbol loop is tuned against
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxiarc_core::traits::FlushMode;
@@ -138,6 +141,56 @@ mod test_data {
             data.extend_from_slice(&html[..chunk_size]);
         }
         data
+    }
+
+    /// Synthetic RGB8 image scanlines: the shape a TIFF strip or an
+    /// unfiltered PNG row carries, and the *literal-heavy* worst case for
+    /// the decoder's symbol loop.
+    pub fn image_rows(size: usize) -> Vec<u8> {
+        let width = 1024usize;
+        let mut state = 0x5247_4238u64;
+        let mut out = Vec::with_capacity(size + width * 3);
+        let mut y = 0usize;
+        while out.len() < size {
+            for x in 0..width {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let noise = if (y / 64) % 5 == 0 {
+                    0u8
+                } else {
+                    (state & 0x07) as u8
+                };
+                out.push((((x * 255) / width) as u8).wrapping_add(noise));
+                out.push((((y * 137) % 256) as u8).wrapping_add(noise >> 1));
+                out.push(((((x + y) * 91) % 256) as u8).wrapping_add(noise));
+            }
+            y += 1;
+        }
+        out.truncate(size);
+        out
+    }
+
+    /// The same image, PNG-`Sub`-filtered per row: small-magnitude deltas,
+    /// so the literal alphabet is sharply skewed and the codes are short.
+    pub fn filtered_rows(size: usize) -> Vec<u8> {
+        let stride = 1024 * 3;
+        let raw = image_rows(size + stride);
+        let mut out = Vec::with_capacity(size + stride);
+        let mut row = 0usize;
+        while out.len() < size {
+            let Some(cur) = raw.get(row * stride..(row + 1) * stride) else {
+                break;
+            };
+            out.push(1u8);
+            for i in 0..stride {
+                let left = if i >= 3 { cur[i - 3] } else { 0 };
+                out.push(cur[i].wrapping_sub(left));
+            }
+            row += 1;
+        }
+        out.truncate(size);
+        out
     }
 }
 
@@ -505,6 +558,59 @@ fn bench_inflate_into(c: &mut Criterion) {
     group.finish();
 }
 
+/// Decode throughput per *data shape*, which is what the inflate fast loop
+/// is tuned against.
+///
+/// `image-rows` is nearly all literals (one table lookup per output byte),
+/// `filtered-rows` is short literals plus short matches, `repetitive` is
+/// long matches, `random` is stored blocks, and `text` is the mixed case.
+/// A change that helps one and hurts another shows up here; the A/B table
+/// against CPython's `zlib` lives in `examples/inflate_ab.rs`.
+fn bench_inflate_shapes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_shapes");
+
+    let patterns: [(&str, PatternGenerator); 5] = [
+        (
+            "filtered-rows",
+            test_data::filtered_rows as PatternGenerator,
+        ),
+        ("image-rows", test_data::image_rows as PatternGenerator),
+        ("text", test_data::text_like as PatternGenerator),
+        ("repetitive", test_data::repetitive as PatternGenerator),
+        ("random", test_data::random as PatternGenerator),
+    ];
+    let size = data_sizes::LARGE;
+
+    for (pattern_name, generator) in patterns {
+        let original = generator(size);
+        let compressed = deflate(&original, 6).unwrap();
+        group.throughput(Throughput::Bytes(original.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("inflate", pattern_name),
+            &compressed,
+            |b, compressed| {
+                b.iter(|| {
+                    let out = inflate(black_box(compressed)).unwrap();
+                    black_box(out.len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("inflate_into", pattern_name),
+            &compressed,
+            |b, compressed| {
+                let mut dst = vec![0u8; original.len()];
+                b.iter(|| {
+                    let written = inflate_into(black_box(compressed), &mut dst).unwrap();
+                    black_box(written);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Streaming decode through the `Read` adapters.
 ///
 /// The `read_*` parameters are the size of the *caller's* buffer, which is
@@ -817,6 +923,7 @@ criterion_group!(
     bench_inflate_stream,
     bench_wrapped_inflate,
     bench_inflate_into,
+    bench_inflate_shapes,
     bench_gzip_stream_decoder,
     bench_inflate_reader,
     bench_zlib_decompression,

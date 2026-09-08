@@ -8,11 +8,12 @@ use crate::error::Result;
 // Kept imported (rather than named through a full path at each use site) so
 // the rustdoc intra-doc links throughout this file resolve, and the
 // per-codec-feature `cfg` blocks below that construct it read naturally.
-// It is genuinely unused only when every one of `gzip`/`deflate`/`brotli`/
-// `zstd` is off, in which case every arm falls through to
-// `unsupported_coding_error` instead.
+// Genuinely unused only when every one of `gzip`/`deflate`/`brotli`/`zstd`/
+// `compress` is off, in which case every arm falls through to
+// `unsupported_coding_error` instead. `UnsupportedReason` is used only by
+// the `dcb` arm of `Encoder::new` (`brotli` feature).
 #[allow(unused_imports)]
-use crate::error::HttpCodingError;
+use crate::error::{HttpCodingError, UnsupportedReason};
 
 /// Options for encoding a response body.
 ///
@@ -39,11 +40,13 @@ use crate::error::HttpCodingError;
 ///     .with_level(9)
 ///     .with_brotli_quality(5)
 ///     .with_zstd_level(10)
+///     .with_compress_max_bits(12)
 ///     .with_dictionary(Some(dictionary));
 ///
 /// assert_eq!(opts.level, 9);
 /// assert_eq!(opts.brotli_quality, 5);
 /// assert_eq!(opts.zstd_level, 10);
+/// assert_eq!(opts.compress_max_bits, 12);
 /// assert_eq!(opts.dictionary, Some(&dictionary[..]));
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -73,12 +76,30 @@ pub struct EncodeOptions<'a> {
     /// so, as with [`level`](Self::level), an out-of-range value never
     /// fails.
     pub zstd_level: i32,
-    /// Shared dictionary for [`ContentCoding::Dcz`] (RFC 9842 Compression
-    /// Dictionary Transport, zstd variant). Ignored by every other coding.
-    /// `None` makes `Dcz` fail with
-    /// [`HttpCodingError::MissingDictionary`] — see that coding's docs for
-    /// why `Dcz`, unlike `Dcb`, is implemented at all.
+    /// Shared dictionary for [`ContentCoding::Dcz`] and
+    /// [`ContentCoding::Dcb`] (RFC 9842 Compression Dictionary Transport).
+    /// Ignored by every other coding. `None` makes either fail with
+    /// [`HttpCodingError::MissingDictionary`].
+    ///
+    /// This is the *only* RFC 9842 machinery this crate implements: naming,
+    /// fetching, and advertising a dictionary by content address — the
+    /// `Available-Dictionary` / `Use-As-Dictionary` / `Dictionary-ID`
+    /// request and response headers — is entirely the caller's business.
+    /// This field takes the dictionary's bytes directly, once the caller
+    /// already has them from wherever it keeps them.
     pub dictionary: Option<&'a [u8]>,
+    /// Code-width ceiling for [`ContentCoding::Compress`] (legacy UNIX
+    /// `.Z`), `9..=16`. Default **16** — the maximum this crate's own
+    /// decoder (and `gzip -dc`/BSD `uncompress`) will read, and therefore
+    /// the best ratio available without narrowing compatibility: nothing
+    /// still in service reads a *narrower* `.Z` any more happily than a
+    /// 16-bit one (`gzip`/`uncompress` on this project's own test machine
+    /// in fact *refuse* anything narrower than 12 bits — see
+    /// `oxiarc-lzw`'s `z` module docs), so there is no real-world reason to
+    /// pick anything else. An out-of-range value is
+    /// [`HttpCodingError::Corrupt`] naming it, the same "not silently
+    /// clamped" choice as [`brotli_quality`](Self::brotli_quality).
+    pub compress_max_bits: u8,
 }
 
 impl Default for EncodeOptions<'_> {
@@ -88,13 +109,14 @@ impl Default for EncodeOptions<'_> {
             brotli_quality: 4,
             zstd_level: 3,
             dictionary: None,
+            compress_max_bits: 16,
         }
     }
 }
 
 impl<'a> EncodeOptions<'a> {
     /// The default options: `level: 6`, `brotli_quality: 4`,
-    /// `zstd_level: 3`, no dictionary. Identical to
+    /// `zstd_level: 3`, `compress_max_bits: 16`, no dictionary. Identical to
     /// [`Default::default`], spelled as a constructor so the `with_*`
     /// builders read as one chain.
     pub fn new() -> Self {
@@ -116,6 +138,13 @@ impl<'a> EncodeOptions<'a> {
         self
     }
 
+    /// Set [`compress_max_bits`](Self::compress_max_bits).
+    #[must_use]
+    pub fn with_compress_max_bits(mut self, max_bits: u8) -> Self {
+        self.compress_max_bits = max_bits;
+        self
+    }
+
     /// Set [`zstd_level`](Self::zstd_level).
     #[must_use]
     pub fn with_zstd_level(mut self, level: i32) -> Self {
@@ -124,7 +153,7 @@ impl<'a> EncodeOptions<'a> {
     }
 
     /// Set (or, with `None`, clear) the [`dictionary`](Self::dictionary)
-    /// used by [`ContentCoding::Dcz`].
+    /// used by [`ContentCoding::Dcz`] and [`ContentCoding::Dcb`].
     ///
     /// Takes an `Option` rather than a bare slice so the dictionary can be
     /// cleared again, mirroring
@@ -155,13 +184,14 @@ impl<'a> EncodeOptions<'a> {
 /// docs).
 ///
 /// Only referenced by the codec-specific match arms below, each gated on
-/// its own Cargo feature; with every one of `gzip`/`deflate`/`brotli`/`zstd`
-/// off, nothing calls it, hence the matching `cfg`.
+/// its own Cargo feature; with every one of `gzip`/`deflate`/`brotli`/`zstd`/
+/// `compress` off, nothing calls it, hence the matching `cfg`.
 #[cfg(any(
     feature = "gzip",
     feature = "deflate",
     feature = "brotli",
-    feature = "zstd"
+    feature = "zstd",
+    feature = "compress"
 ))]
 fn wrap_codec_error(
     coding: &ContentCoding,
@@ -176,10 +206,8 @@ fn wrap_codec_error(
 /// Encode a response body with one content coding.
 ///
 /// [`ContentCoding::Identity`] is a trivial copy (no transformation). Every
-/// coding this build cannot produce — including
-/// [`Compress`](ContentCoding::Compress), [`Dcb`](ContentCoding::Dcb), and
-/// [`Unknown`](ContentCoding::Unknown) unconditionally, and any coding whose
-/// Cargo feature is off — fails with
+/// coding this build cannot produce — [`Unknown`](ContentCoding::Unknown)
+/// unconditionally, and any coding whose Cargo feature is off — fails with
 /// [`HttpCodingError::UnsupportedCoding`]; check
 /// [`ContentCoding::is_encodable`] first if you need to decide that ahead of
 /// time.
@@ -197,7 +225,7 @@ fn wrap_codec_error(
 /// # Errors
 /// [`HttpCodingError::UnsupportedCoding`] if this build cannot produce
 /// `coding`; [`HttpCodingError::MissingDictionary`] for
-/// [`ContentCoding::Dcz`] without `opts.dictionary`;
+/// [`ContentCoding::Dcz`]/[`ContentCoding::Dcb`] without `opts.dictionary`;
 /// [`HttpCodingError::Corrupt`] if the underlying codec itself reports an
 /// error (out-of-range parameters aside, this should not normally happen for
 /// well-formed input).
@@ -250,6 +278,10 @@ pub fn encode_body(
         #[cfg(not(feature = "zstd"))]
         ContentCoding::Zstd => Err(unsupported_coding_error(coding)),
 
+        // The RFC 9842 preamble (`decode::zstd::dcz_header`) goes on the
+        // wire *before* the frame it names, so the decoder side
+        // (`DczCodingDecoder`) has something to verify before a single
+        // frame byte reaches `ZstdStream`.
         #[cfg(feature = "zstd")]
         ContentCoding::Dcz => {
             let Some(dictionary) = opts.dictionary else {
@@ -260,16 +292,41 @@ pub fn encode_body(
             let mut encoder = oxiarc_zstd::ZstdEncoder::new();
             encoder.set_level(opts.zstd_level);
             encoder.set_dictionary(dictionary);
-            encoder
-                .compress(body)
-                .map_err(|e| wrap_codec_error(coding, e))
+            let mut out = crate::decode::zstd::dcz_header(dictionary);
+            out.extend_from_slice(
+                &encoder
+                    .compress(body)
+                    .map_err(|e| wrap_codec_error(coding, e))?,
+            );
+            Ok(out)
         }
         #[cfg(not(feature = "zstd"))]
         ContentCoding::Dcz => Err(unsupported_coding_error(coding)),
 
-        ContentCoding::Compress | ContentCoding::Dcb | ContentCoding::Unknown(_) => {
-            Err(unsupported_coding_error(coding))
+        #[cfg(feature = "compress")]
+        ContentCoding::Compress => oxiarc_lzw::z::compress(body, opts.compress_max_bits)
+            .map_err(|e| wrap_codec_error(coding, e)),
+        #[cfg(not(feature = "compress"))]
+        ContentCoding::Compress => Err(unsupported_coding_error(coding)),
+
+        #[cfg(feature = "brotli")]
+        ContentCoding::Dcb => {
+            let Some(dictionary) = opts.dictionary else {
+                return Err(HttpCodingError::MissingDictionary {
+                    coding: coding.clone(),
+                });
+            };
+            let params = oxiarc_brotli::BrotliParams {
+                quality: opts.brotli_quality,
+                ..oxiarc_brotli::BrotliParams::default()
+            };
+            oxiarc_brotli::compress_dcb(body, dictionary, &params)
+                .map_err(|e| wrap_codec_error(coding, e))
         }
+        #[cfg(not(feature = "brotli"))]
+        ContentCoding::Dcb => Err(unsupported_coding_error(coding)),
+
+        ContentCoding::Unknown(_) => Err(unsupported_coding_error(coding)),
     }
 }
 
@@ -301,6 +358,13 @@ pub fn encode_body(
 /// | `deflate` | a DEFLATE sync flush inside the **same** zlib stream | one zlib stream |
 /// | `br` | every complete meta-block; a ≤7-bit residue can stay buffered until the next block or `finish` | one brotli stream |
 /// | `zstd` / `dcz` | a **complete Zstandard frame** | a *sequence* of frames |
+/// | `compress` | nothing extra; `ZWriter` batches internally (~32 KiB) regardless of `flush()` | one `.Z` stream |
+/// | `dcb` | — | **not buildable**: [`Encoder::new`] refuses it (see that arm's doc comment); use [`encode_body`] |
+///
+/// `dcz`'s row covers only the frame *after* [`new`](Self::new)'s one-time,
+/// synchronous 40-byte write of the RFC 9842 preamble — that part is neither
+/// buffered nor affected by `flush()`, since it goes to `writer` before this
+/// `Encoder` exists at all.
 ///
 /// So for gzip, deflate and brotli, `flush()` is cheap and invisible to the
 /// peer — the output is still one member/stream, and a plain one-shot
@@ -317,8 +381,9 @@ pub fn encode_body(
 /// stops after the first frame: `oxiarc_zstd::decompress` on such a body
 /// returns `Ok` with only the first frame's bytes — a *silent truncation*,
 /// not an error. Decode with `oxiarc_zstd::decompress_multi_frame` (or
-/// `decompress_multi_frame_with_dict` for `dcz`, or this crate's future
-/// `Decoder`, which will handle it), never with the single-frame one.
+/// `decompress_multi_frame_with_dict` for the frame after a `dcz` preamble),
+/// or, in this crate, [`Decoder`](crate::Decoder) — which is multi-frame
+/// aware by construction — never with the single-frame one.
 ///
 /// [`encode_body`] does **not** have this property: it compresses in one
 /// shot and always emits exactly one frame. If a single-frame body matters
@@ -345,18 +410,26 @@ pub enum Encoder<W: Write> {
     /// [`ContentCoding::Zstd`] and, with a dictionary, [`ContentCoding::Dcz`].
     #[cfg(feature = "zstd")]
     Zstd(Box<oxiarc_zstd::ZstdStreamEncoder<W>>),
+    /// [`ContentCoding::Compress`]. [`ContentCoding::Dcb`] has no entry here
+    /// — see [`Encoder::new`]'s doc comment on that arm.
+    #[cfg(feature = "compress")]
+    Compress(Box<oxiarc_lzw::z::ZWriter<W>>),
 }
 
 impl<W: Write> Encoder<W> {
     /// Start a new streaming encoder over `writer` for `coding`.
     ///
-    /// Same coverage and errors as [`encode_body`], with one addition:
-    /// [`ContentCoding::Dcz`] streams through `oxiarc_zstd`'s own
-    /// dictionary-aware streaming encoder (`ZstdStreamEncoder::with_dictionary`)
-    /// rather than the one-shot API `encode_body` uses, so a dictionary
-    /// passed here is copied once up front (the streaming encoder must hold
-    /// it for the writer's whole lifetime) rather than merely borrowed for
-    /// one call.
+    /// Same coverage and errors as [`encode_body`], with two differences:
+    ///
+    /// * [`ContentCoding::Dcz`] writes its 40-byte RFC 9842 preamble to
+    ///   `writer` immediately, then streams through `oxiarc_zstd`'s own
+    ///   dictionary-aware streaming encoder
+    ///   (`ZstdStreamEncoder::with_dictionary`) rather than the one-shot API
+    ///   `encode_body` uses, so a dictionary passed here is copied once up
+    ///   front (the streaming encoder must hold it for the writer's whole
+    ///   lifetime) rather than merely borrowed for one call.
+    /// * [`ContentCoding::Dcb`] is refused here even when `encode_body`
+    ///   would succeed — see that arm's own doc comment for why.
     pub fn new(writer: W, coding: &ContentCoding, opts: EncodeOptions<'_>) -> Result<Self> {
         // See the matching comment in `encode_body`.
         let _ = &opts;
@@ -398,6 +471,11 @@ impl<W: Write> Encoder<W> {
             #[cfg(not(feature = "zstd"))]
             ContentCoding::Zstd => Err(unsupported_coding_error(coding)),
 
+            // The RFC 9842 preamble is written to `writer` immediately, up
+            // front — a plain, synchronous `write_all` of 40 bytes, before
+            // a single byte of the (dictionary-aware, streaming) Zstandard
+            // frame that follows it. `finish`'s framing table below records
+            // this as a one-line addition to the `dcz` row.
             #[cfg(feature = "zstd")]
             ContentCoding::Dcz => {
                 let Some(dictionary) = opts.dictionary else {
@@ -405,6 +483,10 @@ impl<W: Write> Encoder<W> {
                         coding: coding.clone(),
                     });
                 };
+                let mut writer = writer;
+                writer
+                    .write_all(&crate::decode::zstd::dcz_header(dictionary))
+                    .map_err(|e| wrap_codec_error(coding, e))?;
                 Ok(Self::Zstd(Box::new(
                     oxiarc_zstd::ZstdStreamEncoder::with_dictionary(
                         writer,
@@ -416,9 +498,33 @@ impl<W: Write> Encoder<W> {
             #[cfg(not(feature = "zstd"))]
             ContentCoding::Dcz => Err(unsupported_coding_error(coding)),
 
-            ContentCoding::Compress | ContentCoding::Dcb | ContentCoding::Unknown(_) => {
-                Err(unsupported_coding_error(coding))
-            }
+            // `oxiarc_lzw::z::ZWriter` is a real, bounded streaming `Write`
+            // adapter (see its own docs), unlike `dcb` below.
+            #[cfg(feature = "compress")]
+            ContentCoding::Compress => Ok(Self::Compress(Box::new(
+                oxiarc_lzw::z::ZWriter::new(writer, opts.compress_max_bits)
+                    .map_err(|e| wrap_codec_error(coding, e))?,
+            ))),
+            #[cfg(not(feature = "compress"))]
+            ContentCoding::Compress => Err(unsupported_coding_error(coding)),
+
+            // Unlike `encode_body` (one-shot: `oxiarc_brotli::compress_dcb`
+            // exists and works fine), there is no *streaming* dictionary-
+            // aware Brotli encoder to wrap here: `oxiarc_brotli::BrotliCompressor`
+            // has no `with_dictionary` — only its `Read`-side counterpart,
+            // `BrotliDecompressor`, does — so a `dcb` `Encoder` cannot be
+            // built without either buffering the whole body internally
+            // (defeating what this type is *for*) or a new upstream API.
+            // Named, documented refusal rather than either of those.
+            #[cfg(feature = "brotli")]
+            ContentCoding::Dcb => Err(HttpCodingError::UnsupportedCoding {
+                token: coding.as_str().to_string(),
+                reason: UnsupportedReason::StreamingUnsupported,
+            }),
+            #[cfg(not(feature = "brotli"))]
+            ContentCoding::Dcb => Err(unsupported_coding_error(coding)),
+
+            ContentCoding::Unknown(_) => Err(unsupported_coding_error(coding)),
         }
     }
 
@@ -438,6 +544,8 @@ impl<W: Write> Encoder<W> {
             Self::Brotli(e) => e.finish(),
             #[cfg(feature = "zstd")]
             Self::Zstd(e) => e.finish(),
+            #[cfg(feature = "compress")]
+            Self::Compress(e) => e.finish(),
         }
     }
 }
@@ -454,6 +562,8 @@ impl<W: Write> Write for Encoder<W> {
             Self::Brotli(e) => e.write(buf),
             #[cfg(feature = "zstd")]
             Self::Zstd(e) => e.write(buf),
+            #[cfg(feature = "compress")]
+            Self::Compress(e) => e.write(buf),
         }
     }
 
@@ -468,6 +578,8 @@ impl<W: Write> Write for Encoder<W> {
             Self::Brotli(e) => e.flush(),
             #[cfg(feature = "zstd")]
             Self::Zstd(e) => e.flush(),
+            #[cfg(feature = "compress")]
+            Self::Compress(e) => e.flush(),
         }
     }
 }
@@ -632,14 +744,17 @@ mod tests {
     #[test]
     fn negotiate_and_encode_reports_a_coding_this_build_cannot_produce() {
         // `available` deliberately unfiltered, which is the mistake the
-        // rustdoc warns about.
+        // rustdoc warns about. `Unknown` is used here rather than
+        // `Compress`/`Dcb` specifically because it is the one coding this
+        // build genuinely never produces, whatever features are on.
+        let unknown = ContentCoding::Unknown("shrink-o-matic".to_string());
         let error = negotiate_and_encode(
-            Some("compress"),
-            &[ContentCoding::Compress],
+            Some("shrink-o-matic"),
+            &[unknown],
             b"body",
             EncodeOptions::default(),
         )
-        .expect_err("compress cannot be produced");
+        .expect_err("an unknown coding cannot be produced");
         assert!(matches!(error, NegotiateEncodeError::Coding(_)));
     }
 
@@ -653,15 +768,61 @@ mod tests {
 
     #[test]
     fn always_unsupported_codings_error() {
-        for coding in [
-            ContentCoding::Compress,
-            ContentCoding::Dcb,
-            ContentCoding::Unknown("x".to_string()),
-        ] {
-            let err = encode_body(&coding, b"x", EncodeOptions::default())
-                .expect_err("must be unsupported");
-            assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
-        }
+        // `Compress` and `Dcb` used to be permanently unsupported here too;
+        // both are now real, feature-gated codings — see
+        // `compress_encodes_a_real_dot_z_body` and `dcb_encodes_and_decodes`
+        // below, and `tests/dictionary.rs` at the crate level. `Unknown` is
+        // the one coding this build genuinely never produces.
+        let err = encode_body(
+            &ContentCoding::Unknown("x".to_string()),
+            b"x",
+            EncodeOptions::default(),
+        )
+        .expect_err("must be unsupported");
+        assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
+    }
+
+    #[cfg(not(feature = "compress"))]
+    #[test]
+    fn compress_is_unsupported_without_its_feature() {
+        let err = encode_body(&ContentCoding::Compress, b"x", EncodeOptions::default())
+            .expect_err("compress needs the `compress` feature");
+        assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn compress_encodes_a_real_dot_z_body() {
+        let plain = b"compress, wired all the way through encode_body".repeat(4);
+        let wire = encode_body(&ContentCoding::Compress, &plain, EncodeOptions::default())
+            .expect("compress now encodes for real");
+        assert_eq!(
+            oxiarc_lzw::z::decompress(&wire).expect("decode what we just encoded"),
+            plain
+        );
+    }
+
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn dcb_encodes_and_decodes() {
+        let dictionary = b"a shared dictionary both ends already have".repeat(8);
+        let plain = b"dcb, wired all the way through encode_body".repeat(4);
+        let opts = EncodeOptions::new().with_dictionary(Some(&dictionary));
+        let wire =
+            encode_body(&ContentCoding::Dcb, &plain, opts).expect("dcb now encodes for real");
+        assert_eq!(&wire[..4], &oxiarc_brotli::DCB_MAGIC);
+        assert_eq!(
+            oxiarc_brotli::decompress_dcb(&wire, &dictionary).expect("decode what we just encoded"),
+            plain
+        );
+    }
+
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn dcb_without_a_dictionary_is_missing_dictionary() {
+        let err = encode_body(&ContentCoding::Dcb, b"x", EncodeOptions::default())
+            .expect_err("dcb needs a dictionary");
+        assert!(matches!(err, HttpCodingError::MissingDictionary { .. }));
     }
 
     #[cfg(feature = "gzip")]
@@ -1118,11 +1279,44 @@ mod tests {
         // here — match manually instead.
         match Encoder::new(
             Vec::new(),
-            &ContentCoding::Compress,
+            &ContentCoding::Unknown("x".to_string()),
             EncodeOptions::default(),
         ) {
             Err(e) => assert!(matches!(e, HttpCodingError::UnsupportedCoding { .. })),
             Ok(_) => panic!("must be unsupported"),
+        }
+    }
+
+    // `Compress` streams for real now (`oxiarc_lzw::z::ZWriter`); `Dcb`
+    // still cannot — see `Encoder::new`'s own doc comment on that arm.
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn streaming_compress_round_trips() {
+        let body = b"streaming compress through Encoder<W>, one write call".repeat(4);
+        let mut encoder = Encoder::new(
+            Vec::new(),
+            &ContentCoding::Compress,
+            EncodeOptions::default(),
+        )
+        .expect("compress streams");
+        encoder.write_all(&body).expect("write");
+        let wire = encoder.finish().expect("finish");
+        assert_eq!(
+            oxiarc_lzw::z::decompress(&wire).expect("decode what we just streamed"),
+            body
+        );
+    }
+
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn streaming_dcb_is_refused_with_a_named_reason() {
+        match Encoder::new(Vec::new(), &ContentCoding::Dcb, EncodeOptions::default()) {
+            Err(HttpCodingError::UnsupportedCoding { reason, .. }) => {
+                assert!(matches!(reason, UnsupportedReason::StreamingUnsupported));
+            }
+            Err(other) => panic!("dcb must be refused with StreamingUnsupported, got {other:?}"),
+            Ok(_) => panic!("dcb must not build a streaming Encoder"),
         }
     }
 }

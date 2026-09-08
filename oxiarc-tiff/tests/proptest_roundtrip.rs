@@ -245,12 +245,17 @@ proptest! {
 }
 
 /// The lossless codecs, chosen by index so the strategy stays a plain `usize`.
+///
+/// Every entry that needs a feature returns `None` without it, so a build with
+/// a reduced codec set exercises the codecs it has rather than failing while
+/// writing a fixture. `None` and `PackBits` need no feature, so the strategy
+/// always has something to run.
 fn lossless_codec(index: usize, level: u8) -> Option<Compression> {
     Some(match index {
         0 => Compression::None,
         1 => Compression::PackBits,
-        2 => Compression::Lzw,
-        3 => Compression::Deflate { level: level % 10 },
+        2 if cfg!(feature = "lzw") => Compression::Lzw,
+        3 if cfg!(feature = "deflate") => Compression::Deflate { level: level % 10 },
         4 if cfg!(feature = "zstd") => Compression::Zstd {
             level: i32::from(level % 19) + 1,
         },
@@ -260,8 +265,15 @@ fn lossless_codec(index: usize, level: u8) -> Option<Compression> {
 }
 
 /// The fax codecs, which are defined for bilevel data only.
-fn fax_codec(index: usize) -> Compression {
-    match index {
+///
+/// `None` without the `ccitt` feature, for the reason [`lossless_codec`]
+/// gives; the fax property then has nothing to check and says so by returning
+/// early rather than by failing.
+fn fax_codec(index: usize) -> Option<Compression> {
+    if !cfg!(feature = "ccitt") {
+        return None;
+    }
+    Some(match index {
         0 => Compression::CcittRle,
         1 => Compression::CcittGroup3 {
             two_dimensional: false,
@@ -276,7 +288,7 @@ fn fax_codec(index: usize) -> Compression {
             byte_align_eol: true,
         },
         _ => Compression::CcittGroup4,
-    }
+    })
 }
 
 proptest! {
@@ -351,7 +363,9 @@ proptest! {
         lsb_first in any::<bool>(),
         seed in any::<u64>(),
     ) {
-        let compression = fax_codec(codec_index);
+        let Some(compression) = fax_codec(codec_index) else {
+            return Ok(());
+        };
         let mut state = seed | 1;
         let data: Vec<u8> = (0..(width * height) as usize)
             .map(|_| {
@@ -381,5 +395,36 @@ proptest! {
         let mut decoder = Decoder::new(Cursor::new(buffer.into_inner())).expect("decoder");
         let samples = decoder.read_image().expect("read");
         prop_assert_eq!(samples.to_native_bytes(), data);
+    }
+}
+
+/// The feature gates in [`lossless_codec`] and [`fax_codec`] exist so a build
+/// with a reduced codec set exercises what it has instead of failing on
+/// `FeatureNotCompiled` while writing a fixture. They must only ever
+/// *subtract*: in a build that has the feature, every index the strategy
+/// draws has to yield a codec, or the property above would report `PASS`
+/// while testing nothing.
+#[test]
+fn the_property_strategies_are_not_vacuous_in_this_build() {
+    for index in 0usize..6 {
+        let wanted = match index {
+            0 | 1 => true,
+            2 => cfg!(feature = "lzw"),
+            3 => cfg!(feature = "deflate"),
+            4 => cfg!(feature = "zstd"),
+            _ => cfg!(feature = "lzma"),
+        };
+        assert_eq!(
+            lossless_codec(index, 6).is_some(),
+            wanted,
+            "lossless codec {index} disappeared in a build that compiles it"
+        );
+    }
+    for index in 0usize..5 {
+        assert_eq!(
+            fax_codec(index).is_some(),
+            cfg!(feature = "ccitt"),
+            "fax codec {index} disappeared in a build that compiles it"
+        );
     }
 }

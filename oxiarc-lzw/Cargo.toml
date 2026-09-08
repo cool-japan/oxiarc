@@ -25,6 +25,13 @@ all-features = true
 # Mirrors the `lha-oracle` feature pattern in `oxiarc-lzhuf`.
 tiff-oracle = []
 
+# GIF-LZW differential oracle tests (tests/gif_oracle.rs) that shell out to
+# `python3` + Pillow, whose GIF plugin is an independent LZW implementation.
+# Both directions: Pillow-written GIFs must decode byte-identically here, and
+# GIFs built around `gif_compress` output must read back byte-identically in
+# Pillow. Tests self-skip when the tools are absent.
+gif-oracle = []
+
 # UNIX `compress(1)` / `.Z` differential oracle tests (tests/z_oracle.rs) that
 # shell out to the system `compress`, `uncompress` and `gzip -dc`. They check
 # BOTH directions: real `compress -b N` output must decode byte-identically

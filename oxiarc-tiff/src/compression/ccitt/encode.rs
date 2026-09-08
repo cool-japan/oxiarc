@@ -7,6 +7,7 @@
 
 use super::bits::BitWriter;
 use super::tables::{EOL_BITS, EOL_CODE, Mode, encode_run, mode_bits};
+use super::uncompressed;
 
 /// The changing element of `changes` that follows `a0` for a run of `white`.
 ///
@@ -85,6 +86,132 @@ pub(super) fn encode_2d_row(
             writer.write(code, bits);
         });
         a0 = i64::from(a2);
+    }
+}
+
+/// The pixels of one row, `true` for black, from its changing elements.
+fn row_pixels(changes: &[u32], width: u32, out: &mut Vec<bool>) {
+    out.clear();
+    out.resize(width as usize, false);
+    let mut black = false;
+    let mut position = 0u32;
+    for change in changes {
+        let end = (*change).min(width);
+        if black {
+            if let Some(run) = out.get_mut(position as usize..end as usize) {
+                run.fill(true);
+            }
+        }
+        position = end;
+        black = !black;
+    }
+    if black {
+        if let Some(run) = out.get_mut(position as usize..) {
+            run.fill(true);
+        }
+    }
+}
+
+/// Whether a whole row is cheaper in uncompressed mode than in `coded_bits`.
+///
+/// The comparison is exact rather than heuristic — both sides are counted in
+/// bits — because uncompressed mode is a *loss* on ordinary fax content and a
+/// win only on dithered or halftoned regions, and guessing wrong makes files
+/// bigger with no compensating benefit.
+fn uncompressed_is_cheaper(pixels: &[bool], coded_bits: usize, entrance_bits: u8) -> bool {
+    usize::from(entrance_bits) + uncompressed::encoded_bits(pixels) < coded_bits
+}
+
+/// Writes one row in uncompressed mode: the entrance code, the pixels, and
+/// the exit code whose tag bit opens the next line's first (white) run.
+///
+/// The mode is entered only at the *start* of a row, which is what makes
+/// T.4's NOTE 4 hazard structurally impossible: the note warns that a
+/// one-dimensional coder must not switch into uncompressed mode after a code
+/// word ending in `000`, because those three zeros plus the entrance code's
+/// eight would spell the twelve-bit end-of-line code. At a row start the
+/// preceding bit is the `1` that ends the previous end-of-line code, or its
+/// tag bit, or (in Group 4, which has no end-of-line codes at all) the last
+/// bit of the previous row — and no T.4 code word ends in more than three
+/// zeros, so a Group 4 row can contribute at most three, giving nine before
+/// the two-dimensional entrance code's terminating one. Eleven are needed to
+/// look like an end-of-line.
+fn write_uncompressed_row(writer: &mut BitWriter, pixels: &[bool], two_dimensional: bool) {
+    if two_dimensional {
+        writer.write(uncompressed::ENTER_2D_CODE, uncompressed::ENTER_2D_BITS);
+    } else {
+        writer.write(uncompressed::ENTER_1D_CODE, uncompressed::ENTER_1D_BITS);
+    }
+    // The row ends here, so the "next run" the tag bit names is the one after
+    // the row's last pixel: white, because every line starts white.
+    uncompressed::write_pixels(writer, pixels, false);
+}
+
+/// Writes one row, choosing uncompressed mode when it is smaller.
+///
+/// `allowed` is the option-tag bit (`T4Options` bit 1 / `T6Options` bit 1):
+/// without it the mode is never written at all, because libtiff refuses to
+/// read it and a file that used it uninvited would be unreadable there.
+pub(super) fn encode_row(
+    writer: &mut BitWriter,
+    changes: &[u32],
+    reference: &[u32],
+    width: u32,
+    two_dimensional: bool,
+    allowed: bool,
+    scratch: &mut RowScratch,
+) {
+    if !allowed {
+        encode_coded_row(writer, changes, reference, width, two_dimensional);
+        return;
+    }
+    // Code the row into the scratch writer to price it, rather than
+    // estimating: an estimate that guessed wrong would make the file bigger.
+    // No `Vec` is allocated per row — the scratch writer keeps its buffer.
+    scratch.probe.clear();
+    encode_coded_row(
+        &mut scratch.probe,
+        changes,
+        reference,
+        width,
+        two_dimensional,
+    );
+    let coded_bits = scratch.probe.bit_len();
+    row_pixels(changes, width, &mut scratch.pixels);
+    let entrance_bits = if two_dimensional {
+        uncompressed::ENTER_2D_BITS
+    } else {
+        uncompressed::ENTER_1D_BITS
+    };
+    if uncompressed_is_cheaper(&scratch.pixels, coded_bits, entrance_bits) {
+        write_uncompressed_row(writer, &scratch.pixels, two_dimensional);
+    } else {
+        encode_coded_row(writer, changes, reference, width, two_dimensional);
+    }
+}
+
+/// Reusable buffers for [`encode_row`], so the choice costs no allocation
+/// per row.
+#[derive(Debug, Default)]
+pub(super) struct RowScratch {
+    /// One entry per pixel, `true` for black.
+    pixels: Vec<bool>,
+    /// The writer the Huffman coding of a row is priced in.
+    probe: BitWriter,
+}
+
+/// Writes one row with the ordinary Huffman coding of its dialect.
+fn encode_coded_row(
+    writer: &mut BitWriter,
+    changes: &[u32],
+    reference: &[u32],
+    width: u32,
+    two_dimensional: bool,
+) {
+    if two_dimensional {
+        encode_2d_row(writer, changes, reference, width);
+    } else {
+        encode_1d_row(writer, changes, width);
     }
 }
 
@@ -184,6 +311,104 @@ mod tests {
         writer.write(0b101, 3);
         write_eol(&mut writer, false);
         assert_eq!(writer.bit_len(), 15);
+    }
+
+    #[test]
+    fn row_pixels_inverts_row_changes() {
+        for row in [
+            vec![0b0000_0000u8],
+            vec![0b1111_1111],
+            vec![0b1010_1010],
+            vec![0b1100_0011],
+            vec![0b0000_0001, 0b1000_0000],
+        ] {
+            let width = (row.len() * 8) as u32;
+            let mut changes = Vec::new();
+            row_changes(&row, width, 0, &mut changes);
+            let mut pixels = Vec::new();
+            row_pixels(&changes, width, &mut pixels);
+            for (index, black) in pixels.iter().enumerate() {
+                let bit = (row[index / 8] >> (7 - index % 8)) & 1;
+                assert_eq!(bit == 1, *black, "pixel {index} of {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn uncompressed_mode_is_chosen_only_where_it_wins() {
+        let mut scratch = RowScratch::default();
+        // A dithered row: every other pixel black, so Modified Huffman spends
+        // a whole code word per pixel and uncompressed mode spends one bit.
+        let dithered: Vec<u32> = (0..256).collect();
+        let mut writer = BitWriter::new();
+        encode_row(&mut writer, &dithered, &[], 256, false, true, &mut scratch);
+        let with_mode = writer.bit_len();
+        let mut writer = BitWriter::new();
+        encode_row(&mut writer, &dithered, &[], 256, false, false, &mut scratch);
+        let without = writer.bit_len();
+        assert!(
+            with_mode < without,
+            "uncompressed mode must win on dithered data: {with_mode} vs {without}"
+        );
+
+        // A long-run row: uncompressed mode would cost a bit per pixel, so
+        // it must not be chosen even when it is allowed.
+        let plain = [128u32];
+        let mut writer = BitWriter::new();
+        encode_row(&mut writer, &plain, &[], 256, false, true, &mut scratch);
+        let with_mode = writer.bit_len();
+        let mut writer = BitWriter::new();
+        encode_row(&mut writer, &plain, &[], 256, false, false, &mut scratch);
+        let without = writer.bit_len();
+        assert_eq!(
+            with_mode, without,
+            "long runs must stay Huffman-coded even when the mode is allowed"
+        );
+    }
+
+    #[test]
+    fn a_row_written_in_uncompressed_mode_decodes_back_to_itself() {
+        let mut scratch = RowScratch::default();
+        for width in [1u32, 7, 8, 9, 64, 251] {
+            for seed in [1u32, 3, 7] {
+                let pixels: Vec<bool> = (0..width).map(|x| (x * seed / 2) % 3 == 0).collect();
+                let mut changes = Vec::new();
+                let mut black = false;
+                for (index, is_black) in pixels.iter().enumerate() {
+                    if *is_black != black {
+                        changes.push(index as u32);
+                        black = *is_black;
+                    }
+                }
+                for two_dimensional in [false, true] {
+                    let mut writer = BitWriter::new();
+                    write_uncompressed_row(&mut writer, &pixels, two_dimensional);
+                    let bytes = writer.finish(false);
+                    let mut decoder = FaxDecoder::new(&bytes, width, false);
+                    let outcome = if two_dimensional {
+                        decoder.decode_2d_row()
+                    } else {
+                        decoder.decode_1d_row()
+                    };
+                    outcome.expect("decode an uncompressed row");
+                    let mut row = vec![0u8; (width as usize).div_ceil(8)];
+                    decoder.paint(&mut row, 0);
+                    for (index, want) in pixels.iter().enumerate() {
+                        let bit = (row[index / 8] >> (7 - index % 8)) & 1;
+                        assert_eq!(
+                            bit == 1,
+                            *want,
+                            "width {width} seed {seed} 2d {two_dimensional} pixel {index}"
+                        );
+                    }
+                }
+            }
+        }
+        // The scratch must be usable afterwards, which is what the encoder
+        // relies on.
+        let mut writer = BitWriter::new();
+        encode_row(&mut writer, &[1], &[], 8, false, true, &mut scratch);
+        assert!(writer.bit_len() > 0);
     }
 
     #[test]

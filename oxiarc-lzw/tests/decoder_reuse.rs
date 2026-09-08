@@ -1,20 +1,16 @@
-//! Reusing one [`LzwDecoder`] across strips (track D-verify).
+//! Reusing one [`LzwDecoder`] across strips (tracks D-verify, LZWPERF).
 //!
-//! The 0.4.2 decoder caches, per learned code, the offset in the *current*
-//! output at which that code's string was last written, and copies the
-//! bytes back from there instead of walking the prefix chain
-//! (`decoder.rs::copy_from_output`). Those offsets are only valid for the
-//! buffer they were recorded against, so a decoder reused for a second
-//! strip must not read one recorded during the first.
-//!
-//! The invariant that makes this safe is that every decode starts with a
-//! table reset, after which no learned code is reachable until it has been
-//! re-stored (which re-arms its offset). Nothing in the type system
-//! enforces it, and getting it wrong is either a panic (`copy_within` /
-//! `extend_from_within` with an out-of-range source) or, worse, silently
-//! wrong bytes. So it is pinned here: every shape below decodes through a
-//! reused decoder and through a freshly constructed one, and the two must
-//! agree byte for byte.
+//! A decoder owns its code table, so reusing one across the strips of an
+//! image is the cheap way to decode a whole page: `decompress_tiff_into`
+//! builds a table per call, while `LzwDecoder::decode_into` resets one in
+//! O(1). That only works because a reset leaves nothing readable behind:
+//! the root entries are immutable, every learned slot is rewritten before
+//! it can be reached again, and the allocation cursor and code width are
+//! rolled back. Nothing in the type system enforces it, and getting it
+//! wrong would be silently wrong bytes rather than a failure, so it is
+//! pinned here: every shape below decodes through a reused decoder and
+//! through a freshly constructed one, and the two must agree byte for
+//! byte.
 //!
 //! `LzwEncoder` shares the same table type, so it is exercised the same
 //! way.
@@ -24,10 +20,10 @@ use oxiarc_lzw::{
 };
 
 /// Deterministic strip shapes that between them drive every decode path:
-/// long runs (the copy-back fast path), a growing KwKwK run (the
-/// parent-plus-suffix path), noise (chain walk), and a strip long enough to
-/// cross the 9->10->11->12 bit-width boundaries and a mid-stream table
-/// reset.
+/// long runs (the `repeated` fill), a growing KwKwK run, noise (one code
+/// per byte, so the one-byte path), text (the chain walk), and a strip long
+/// enough to cross the 9->10->11->12 bit-width boundaries and a mid-stream
+/// table reset.
 fn strips() -> Vec<Vec<u8>> {
     let mut out = vec![
         Vec::new(),

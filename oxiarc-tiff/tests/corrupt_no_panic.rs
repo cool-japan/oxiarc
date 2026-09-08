@@ -142,26 +142,34 @@ fn corpus() -> Vec<(&'static str, Vec<u8>)> {
 
 /// One page per compressed codec this build supports.
 fn codec_specs() -> Vec<(&'static str, ImageSpec)> {
-    let mut out: Vec<(&'static str, ImageSpec)> = vec![
-        (
+    // Every entry is gated on the feature that compiles its codec: a build
+    // without `lzw` or `ccitt` must exercise the codecs it *does* have rather
+    // than fail on `FeatureNotCompiled` while writing a fixture.
+    let mut out: Vec<(&'static str, ImageSpec)> = Vec::new();
+    if cfg!(feature = "lzw") {
+        out.push((
             "gray8_lzw",
             ImageSpec::new(24, 20, ColorType::Gray(8))
                 .with_compression(Compression::Lzw)
                 .with_layout(Layout::Strips { rows_per_strip: 5 }),
-        ),
-        (
+        ));
+    }
+    if cfg!(feature = "deflate") {
+        out.push((
             "gray8_deflate",
             ImageSpec::new(24, 20, ColorType::Gray(8))
                 .with_compression(Compression::Deflate { level: 6 })
                 .with_layout(Layout::Strips { rows_per_strip: 5 }),
-        ),
-        (
+        ));
+    }
+    if cfg!(feature = "ccitt") {
+        out.push((
             "bilevel_g4",
             ImageSpec::new(24, 20, ColorType::Gray(1))
                 .with_compression(Compression::CcittGroup4)
                 .with_layout(Layout::Strips { rows_per_strip: 5 }),
-        ),
-        (
+        ));
+        out.push((
             "bilevel_g3_2d",
             ImageSpec::new(24, 20, ColorType::Gray(1))
                 .with_compression(Compression::CcittGroup3 {
@@ -169,14 +177,22 @@ fn codec_specs() -> Vec<(&'static str, ImageSpec)> {
                     byte_align_eol: true,
                 })
                 .with_layout(Layout::Strips { rows_per_strip: 5 }),
-        ),
-        (
+        ));
+        out.push((
             "bilevel_rle",
             ImageSpec::new(24, 20, ColorType::Gray(1))
                 .with_compression(Compression::CcittRle)
                 .with_layout(Layout::Strips { rows_per_strip: 5 }),
-        ),
-    ];
+        ));
+    }
+    // PackBits needs no feature, so the list is never empty and the corpus
+    // still has a compressed codec to damage under `--no-default-features`.
+    out.push((
+        "gray8_packbits",
+        ImageSpec::new(24, 20, ColorType::Gray(8))
+            .with_compression(Compression::PackBits)
+            .with_layout(Layout::Strips { rows_per_strip: 5 }),
+    ));
     if cfg!(feature = "zstd") {
         out.push((
             "gray8_zstd",
@@ -509,4 +525,33 @@ fn the_parallel_decoder_survives_the_same_corruption_as_the_serial_one() {
         agreed_images >= corpus().len(),
         "the sweep decoded only {agreed_images} images successfully; it is not comparing anything"
     );
+}
+
+/// The feature gates in [`codec_specs`] must only ever *subtract*: a build
+/// that compiles a codec has to damage a page written with it. Without this,
+/// a mis-typed `cfg!` would quietly shrink the corpus to PackBits and every
+/// sweep below would still report `PASS`.
+#[test]
+fn the_corruption_corpus_covers_every_codec_this_build_compiles() {
+    let names: Vec<&str> = codec_specs().into_iter().map(|(name, _)| name).collect();
+    for (name, present) in [
+        ("gray8_lzw", cfg!(feature = "lzw")),
+        ("gray8_deflate", cfg!(feature = "deflate")),
+        ("bilevel_g4", cfg!(feature = "ccitt")),
+        ("bilevel_g3_2d", cfg!(feature = "ccitt")),
+        ("bilevel_rle", cfg!(feature = "ccitt")),
+        ("gray8_zstd", cfg!(feature = "zstd")),
+        ("gray8_lzma", cfg!(feature = "lzma")),
+        ("gray8_jpeg", cfg!(feature = "jpeg")),
+        ("ycbcr_jpeg", cfg!(feature = "jpeg")),
+        ("gray8_packbits", true),
+    ] {
+        assert_eq!(
+            names.contains(&name),
+            present,
+            "{name} is missing from the corpus of a build that compiles it"
+        );
+    }
+    // And the corpus itself is never empty, whatever is switched off.
+    assert!(!corpus().is_empty(), "the corruption corpus is empty");
 }

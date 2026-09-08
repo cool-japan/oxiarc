@@ -27,6 +27,8 @@ pub enum HttpCodingError {
             UnsupportedReason::FeatureDisabled(f) =>
                 format!(" (rebuild oxiarc-http with the `{f}` feature)"),
             UnsupportedReason::Unknown => String::new(),
+            UnsupportedReason::StreamingUnsupported =>
+                " (encode_body's one-shot path works)".to_string(),
         }
     )]
     UnsupportedCoding {
@@ -91,8 +93,8 @@ pub enum HttpCodingError {
         message: String,
     },
 
-    /// [`ContentCoding::Dcz`] (or, once supported, [`ContentCoding::Dcb`])
-    /// was requested without supplying the shared dictionary it requires.
+    /// [`ContentCoding::Dcz`] or [`ContentCoding::Dcb`] was requested
+    /// without supplying the shared dictionary it requires.
     #[error("{coding} requires a shared dictionary, but none was supplied")]
     MissingDictionary {
         /// The coding that needed a dictionary.
@@ -108,10 +110,20 @@ pub enum HttpCodingError {
 pub enum UnsupportedReason {
     /// The coding is implemented, but its Cargo feature is off.
     FeatureDisabled(&'static str),
-    /// This crate has no implementation for the coding at all (an unknown
-    /// token, or a coding permanently blocked on upstream work — see
-    /// [`ContentCoding::Compress`] and [`ContentCoding::Dcb`]).
+    /// This crate has no implementation for the coding at all — an unknown
+    /// token, or (for [`ContentCoding::Unknown`]) any coding this crate does
+    /// not recognize.
     Unknown,
+    /// [`Encoder::new`](crate::Encoder::new) specifically has no *streaming*
+    /// encoder for this coding, even though
+    /// [`encode_body`](crate::encode_body) can produce it. Currently only
+    /// [`ContentCoding::Dcb`]: `oxiarc-brotli` exposes shared-dictionary
+    /// compression as a one-shot function
+    /// (`compress_with_dictionary`/`dcb::compress`) only, with no
+    /// dictionary-aware counterpart to its streaming `BrotliCompressor` —
+    /// see [`Encoder`](crate::Encoder)'s own docs. Use
+    /// [`encode_body`](crate::encode_body) instead.
+    StreamingUnsupported,
 }
 
 impl fmt::Display for UnsupportedReason {
@@ -119,6 +131,9 @@ impl fmt::Display for UnsupportedReason {
         match self {
             Self::FeatureDisabled(feature) => write!(f, "feature `{feature}` disabled"),
             Self::Unknown => f.write_str("no implementation in this build"),
+            Self::StreamingUnsupported => f.write_str(
+                "no streaming encoder in this build (encode_body's one-shot path works)",
+            ),
         }
     }
 }

@@ -14,12 +14,22 @@
 //! the same bytes as the current decoder before it is timed, so the
 //! comparison is between two implementations that agree.
 //!
-//! `oxiarc_vec` is today's `decompress_tiff` (prefix/suffix table, growable
-//! `Vec` sink) and `oxiarc_into` is `decompress_tiff_into` (prefix/suffix
+//! `oxiarc_vec` is today's `decompress_tiff` (packed prefix/suffix table,
+//! growable `Vec` sink) and `oxiarc_into` is `decompress_tiff_into` (same
 //! table, caller-supplied slice, zero allocation).
+//!
+//! `gif_decode` compares `gif_decompress` with the same `Vec<Vec<u8>>`
+//! baseline shape it used before 0.4.2 (one `clone()` per emitted code); it
+//! now runs on the shared decode loop.
+//!
+//! For the comparison that actually matters — this decoder against
+//! libtiff's `LZWDecode` on strips libtiff produced — see
+//! `examples/lzw_vs_libtiff.rs`.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use oxiarc_lzw::{compress_tiff, decompress_tiff, decompress_tiff_into};
+use oxiarc_lzw::{
+    compress_tiff, decompress_tiff, decompress_tiff_into, gif_compress, gif_decompress,
+};
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -27,7 +37,10 @@ use std::hint::black_box;
 // Legacy baseline: per-code `Vec<u8>` dictionary (pre-0.4.2 algorithm)
 // ---------------------------------------------------------------------------
 
-/// MSB-first bit reader (copy of the crate-private `bitstream_msb` reader).
+/// MSB-first bit reader: the byte-at-a-time accumulator this crate used
+/// before 0.4.2, kept here as part of the legacy baseline. The current
+/// decoder extracts each code from a four-byte window instead and keeps no
+/// reader state at all (`bits::CodeOrder`).
 struct LegacyBitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
@@ -281,5 +294,41 @@ fn bench_strip_encode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_strip_decode, bench_strip_encode);
+/// GIF image data: the codec that used to allocate a `Vec<u8>` per emitted
+/// code and now shares the strip decoder's loop.
+fn bench_gif_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gif_decode");
+    let patterns: [(&str, PatternGenerator); 4] = [
+        ("image", image_like as PatternGenerator),
+        ("text", text_like as PatternGenerator),
+        ("uniform", uniform as PatternGenerator),
+        ("random", random as PatternGenerator),
+    ];
+    for (pattern_name, generator) in patterns {
+        let size = 1024 * 1024;
+        let raw = generator(size);
+        let stream = gif_compress(&raw, 8).expect("gif compress benchmark payload");
+        assert_eq!(
+            gif_decompress(&stream, 8).expect("gif decompress"),
+            raw,
+            "gif round trip disagrees on {pattern_name}"
+        );
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(
+            BenchmarkId::new("gif_decompress", pattern_name),
+            &stream,
+            |b, stream| {
+                b.iter(|| black_box(gif_decompress(black_box(stream), 8)));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_strip_decode,
+    bench_strip_encode,
+    bench_gif_decode
+);
 criterion_main!(benches);

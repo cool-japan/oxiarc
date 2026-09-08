@@ -1,7 +1,9 @@
-//! LSB-first bit stream operations for GIF LZW.
+//! LSB-first bit writing for GIF LZW.
 //!
-//! GIF LZW uses LSB-first (Least Significant Bit first) bit ordering,
-//! which differs from TIFF LZW that uses MSB-first.
+//! GIF LZW packs codes LSB-first (Least Significant Bit first), which
+//! differs from TIFF LZW's MSB-first packing. The *read* side lives in
+//! [`crate::bits`], which extracts a code from a four-byte window without
+//! keeping any state.
 
 /// LSB-first bit writer for GIF LZW compression.
 #[derive(Debug)]
@@ -63,89 +65,20 @@ impl Default for LsbBitWriter {
     }
 }
 
-/// LSB-first bit reader for GIF LZW decompression.
-#[derive(Debug)]
-pub struct LsbBitReader<'a> {
-    /// Input data.
-    data: &'a [u8],
-    /// Current byte position in `data`.
-    pos: usize,
-    /// Internal accumulation buffer.
-    buffer: u64,
-    /// Number of valid bits currently in `buffer`.
-    bits_in_buffer: usize,
-    /// Total bits handed out by [`LsbBitReader::read_bits`] so far.
-    total_bits_read: u64,
-}
-
-impl<'a> LsbBitReader<'a> {
-    /// Create a new LSB bit reader over the given byte slice.
-    pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            buffer: 0,
-            bits_in_buffer: 0,
-            total_bits_read: 0,
-        }
-    }
-
-    /// Read `bits` bits from the stream, LSB-first.
-    ///
-    /// Returns `None` if the stream is exhausted before `bits` bits are
-    /// available.
-    pub fn read_bits(&mut self, bits: usize) -> Option<u16> {
-        // Refill the buffer until we have enough bits.
-        while self.bits_in_buffer < bits {
-            if self.pos >= self.data.len() {
-                return None;
-            }
-            // Pack the next byte into the buffer at the current top position.
-            self.buffer |= (self.data[self.pos] as u64) << self.bits_in_buffer;
-            self.bits_in_buffer += 8;
-            self.pos += 1;
-        }
-
-        // Extract the lowest `bits` bits.
-        let mask = (1u64 << bits) - 1;
-        let code = (self.buffer & mask) as u16;
-        self.buffer >>= bits;
-        self.bits_in_buffer -= bits;
-        self.total_bits_read += bits as u64;
-
-        Some(code)
-    }
-
-    /// Total number of bits consumed by successful [`Self::read_bits`] calls.
-    pub fn bits_read(&self) -> u64 {
-        self.total_bits_read
-    }
-
-    /// Return `true` if all input bytes have been consumed and the internal
-    /// buffer is empty (no bits remain).
-    #[allow(dead_code)]
-    pub fn is_exhausted(&self) -> bool {
-        self.pos >= self.data.len() && self.bits_in_buffer == 0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_lsb_write_read_roundtrip() {
+    fn test_lsb_writer_packs_bits_low_first() {
         let mut writer = LsbBitWriter::new();
         writer.write_bits(0b101, 3);
         writer.write_bits(0b1100, 4);
         writer.write_bits(0b11111111, 8);
 
         let data = writer.into_bytes();
-
-        let mut reader = LsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(3), Some(0b101));
-        assert_eq!(reader.read_bits(4), Some(0b1100));
-        assert_eq!(reader.read_bits(8), Some(0b11111111));
+        // 15 bits: 0b101 | 0b1100 << 3 | 0xFF << 7 = 0x7FE5, low byte first
+        assert_eq!(data, vec![0xE5, 0x7F]);
     }
 
     #[test]
@@ -155,32 +88,17 @@ mod tests {
 
         let data = writer.into_bytes();
         assert_eq!(data, vec![0xAB]);
-
-        let mut reader = LsbBitReader::new(&data);
-        assert_eq!(reader.read_bits(8), Some(0xAB));
     }
 
     #[test]
     fn test_lsb_variable_widths() {
-        // Simulate GIF-style codes of width 9
+        // GIF-style codes of width 9 pack three bytes per two codes.
         let codes: &[u16] = &[256, 84, 79, 66, 69, 257];
         let mut writer = LsbBitWriter::new();
         for &c in codes {
             writer.write_bits(c, 9);
         }
         let data = writer.into_bytes();
-
-        let mut reader = LsbBitReader::new(&data);
-        for &expected in codes {
-            assert_eq!(reader.read_bits(9), Some(expected));
-        }
-    }
-
-    #[test]
-    fn test_lsb_exhausted() {
-        let data = vec![0xFFu8];
-        let mut reader = LsbBitReader::new(&data);
-        let _ = reader.read_bits(8);
-        assert!(reader.is_exhausted());
+        assert_eq!(data.len(), (codes.len() * 9).div_ceil(8));
     }
 }

@@ -69,8 +69,11 @@ pub(crate) fn lz77_compress_pooled(
 /// the match finder but produce no commands, and matches into it may reach
 /// farther back than `params.window_size`, because a shared dictionary sits
 /// beyond the declared window in Brotli's distance space. A match that starts
-/// in the prefix is capped at the prefix's end, so no command ever straddles
-/// the boundary — which keeps the emitted distance a single well-defined value.
+/// in the prefix is capped at the prefix's end, so no command ever runs past
+/// the dictionary. That is not merely convenient — a copy that overruns the
+/// dictionary is a format error, which the reference decoder enforces (see
+/// [`crate::shared_dict`]), so capping is what keeps the encoder's output
+/// decodable at all.
 ///
 /// `prefix_len == 0` reproduces [`lz77_compress_pooled`] exactly, bit for bit;
 /// that is what keeps the dictionary-free encoder's output frozen.

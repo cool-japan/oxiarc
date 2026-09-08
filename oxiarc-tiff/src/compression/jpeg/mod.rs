@@ -288,7 +288,7 @@ fn quality(level: CodecLevel) -> u8 {
 /// # Errors
 /// [`UnsupportedError::BitsPerSample`] for anything but 8-bit samples and
 /// [`UnsupportedError::Conversion`] for a channel count JPEG has no colour
-/// space for (two, or more than four).
+/// space for (more than four).
 pub fn encode(src: &[u8], cx: &CodecContext<'_>, level: CodecLevel) -> Result<Vec<u8>> {
     let plan = encode::plan(cx, quality(level))?;
     encode::encode_chunk(src, &plan, cx.jpeg_tables.is_some())

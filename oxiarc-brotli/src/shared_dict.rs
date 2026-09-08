@@ -10,8 +10,8 @@
 //! It is **not** the RFC 7932 Appendix A static dictionary, which is built into
 //! every Brotli implementation and stays available whether or not a shared
 //! dictionary is attached (see [`crate::dictionary`]). The two live in adjacent
-//! ranges of the same distance space, and [`classify_distance`] is the single
-//! place that splits them.
+//! ranges of the same distance space, and `classify_distance` below (crate-
+//! internal) is the single place that splits them.
 //!
 //! # Distance space
 //!
@@ -43,6 +43,29 @@
 //! `max_backward = 1008`, `dict_len = 1,100,000`, `offset = 22`), not
 //! `produced + dict_len - offset`. The same stream still reaches the dictionary
 //! after 200,000 bytes of output.
+//!
+//! # A copy may not leave the dictionary
+//!
+//! A shared-dictionary reference may take at most the bytes from its source to
+//! the *end* of the dictionary. A copy longer than that is a format error, not
+//! a copy that continues in the produced output: the dictionary is a compound
+//! history block, not a prefix glued in front of the sliding window.
+//!
+//! That too is measured rather than assumed. Two hand-built streams differing
+//! in exactly one field — the copy length of a single command reading the
+//! dictionary's last four bytes — go to `brotli 1.1.0 -d -D`: the one that
+//! stops at the dictionary's end is accepted and reproduces this crate's bytes,
+//! and the ones that would run 1, 6 or 18 bytes past it are all rejected as
+//! "corrupt input", at both a 1008-byte and a 65520-byte declared window. The
+//! pair is re-run as `brotli_oracle.rs::
+//! test_oracle_reference_rejects_a_copy_past_the_dictionary_end`, so the rule
+//! is re-derived from the reference on every oracle run rather than frozen into
+//! a comment.
+//!
+//! Both of this crate's decoders enforce it at the point the distance is
+//! resolved, before a byte of the copy is produced, so the one-shot and the
+//! incremental decoder reject the same streams with the same error whatever
+//! output-buffer size the caller supplies.
 //!
 //! The literal context bytes `p1`/`p2` are **not** seeded from the dictionary:
 //! at output position 0 they are zero even with a dictionary attached. That too

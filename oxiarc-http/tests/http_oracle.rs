@@ -25,6 +25,8 @@ mod common;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(any(feature = "compress", feature = "zstd"))]
+use oxiarc_http::{ContentCoding, EncodeOptions, encode_body};
 use oxiarc_http::{DecodeLimits, Decoder, decode_body_from_header};
 
 /// A unique scratch path under the process/thread-specific temp directory.
@@ -241,6 +243,142 @@ fn a_cpython_zlib_stream_with_a_preset_dictionary_is_refused_cleanly() {
         .expect_err("FDICT cannot be satisfied over HTTP");
 }
 
+#[cfg(feature = "compress")]
+#[test]
+fn reference_compress_streams_decode() {
+    // BSD `compress`/`uncompress` (this machine) do not support `--version`
+    // (`illegal option --`, exit 1), so `tool_available` — which the other
+    // reference-CLI tests above use as a first-layer check — cannot be
+    // reused here; this relies purely on `cli_transform`'s own `None`
+    // fallback, exactly as `reference_zstd_streams_decode`'s inner loop
+    // already does as a second layer.
+    let plain = payload();
+    for bits in [12u8, 16] {
+        let flag = format!("-b{bits}");
+        let wire = match cli_transform("compress", "compress", &["-c", &flag], &plain) {
+            Some(wire) => wire,
+            None => {
+                eprintln!("skipping: `compress -c {flag}` is unavailable");
+                return;
+            }
+        };
+        assert_eq!(
+            decode_both_ways("compress", &wire),
+            plain,
+            "compress {flag}"
+        );
+    }
+}
+
+#[cfg(feature = "compress")]
+#[test]
+fn a_truncated_compress_body_matches_the_reference_prefix() {
+    // `.Z` has no end-of-information code, so a truncated body is not an
+    // error for any decoder — reference or otherwise — which makes "how much
+    // of it comes out" a genuine interop question that only a reference
+    // decoder can settle. Both `uncompress -c` and this crate stop at the
+    // last code the arriving bytes complete, but *which* code that is
+    // depends on how the final partial eight-code group is handled, and the
+    // two implementations do not have to agree byte-count for byte-count
+    // (this crate stops one group earlier at most offsets). What must hold
+    // is the containment: everything this crate emits is a prefix of what
+    // the reference emits, and of the original body. A decoder that
+    // resynchronised onto garbage after the cut, or speculated one code too
+    // far, would break that.
+    //
+    // A deliberately small fixture, and the reference is consulted at every
+    // third offset rather than every one: this is the only test here that
+    // spawns a process *per offset*, and `payload()`'s 300 KB would cost
+    // six minutes of process startup. The cheap half of the invariant —
+    // "a prefix of the original" — is still checked at every single offset.
+    let plain = common::text(4_000);
+    const REFERENCE_STRIDE: usize = 3;
+    let Some(wire) = cli_transform("trunc_z", "compress", &["-c", "-b16"], &plain) else {
+        eprintln!("skipping: `compress -c -b16` is unavailable");
+        return;
+    };
+    let mut compared = 0usize;
+    for cut in 1..wire.len() {
+        let short = &wire[..cut];
+        let Ok(ours) = decode_body_from_header(
+            "compress",
+            short,
+            &DecodeLimits::default().with_max_ratio(None),
+        ) else {
+            continue;
+        };
+        assert!(
+            plain.starts_with(&ours),
+            "cut at {cut}: {} decoded bytes are not a prefix of the original body",
+            ours.len()
+        );
+        if cut % REFERENCE_STRIDE != 0 {
+            continue;
+        }
+        let Some(theirs) = cli_transform("trunc_unz", "uncompress", &["-c"], short) else {
+            continue; // The reference refuses some cuts outright.
+        };
+        assert!(
+            theirs.starts_with(&ours),
+            "cut at {cut}: this crate decoded {} bytes that are not a prefix of \
+             `uncompress -c`'s {} bytes",
+            ours.len(),
+            theirs.len()
+        );
+        compared += 1;
+    }
+    assert!(
+        compared > wire.len() / (2 * REFERENCE_STRIDE),
+        "only {compared} of {} cuts reached the reference — the oracle leg did not really run",
+        wire.len()
+    );
+}
+
+#[cfg(feature = "compress")]
+#[test]
+fn oxiarc_compress_output_is_accepted_by_uncompress() {
+    // The reverse direction from the test above: this crate's own
+    // HTTP-level `encode_body` (not `oxiarc_lzw::z::compress` called
+    // directly, which LZW3.md already validated against the same tool) fed
+    // to the real decoder.
+    let plain = payload();
+    let wire = encode_body(&ContentCoding::Compress, &plain, EncodeOptions::default())
+        .expect("encode_body(compress)");
+    let decoded = match cli_transform("uncompress", "uncompress", &["-c"], &wire) {
+        Some(decoded) => decoded,
+        None => {
+            eprintln!("skipping: `uncompress -c` is unavailable");
+            return;
+        }
+    };
+    assert_eq!(
+        decoded, plain,
+        "uncompress -c must reproduce encode_body's output"
+    );
+}
+
+#[cfg(feature = "compress")]
+#[test]
+fn oxiarc_compress_output_is_accepted_by_gzip_dc() {
+    // `gzip -dc` reads `.Z` as well as `.gz` (confirmed present on this
+    // machine by LZW3.md); a second, independent reference decoder for the
+    // same body the test above checks against `uncompress`.
+    let plain = payload();
+    let wire = encode_body(&ContentCoding::Compress, &plain, EncodeOptions::default())
+        .expect("encode_body(compress)");
+    let decoded = match cli_transform("gzip_dc", "gzip", &["-dc"], &wire) {
+        Some(decoded) => decoded,
+        None => {
+            eprintln!("skipping: `gzip -dc` on a `.Z` body is unavailable");
+            return;
+        }
+    };
+    assert_eq!(
+        decoded, plain,
+        "gzip -dc must reproduce encode_body's output"
+    );
+}
+
 #[cfg(feature = "brotli")]
 #[test]
 fn reference_brotli_streams_decode() {
@@ -309,6 +447,65 @@ fn concatenated_reference_zstd_frames_decode() {
     let mut expected = first;
     expected.extend_from_slice(&second);
     assert_eq!(decode_both_ways("zstd", &wire), expected);
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn reference_zstd_skips_the_dcz_preamble_and_decodes_the_frame() {
+    // `dcz`'s 40-byte preamble is entirely this crate's own construction —
+    // unlike `dcb`'s (BROTLI3 probed that framing against real
+    // `brotli -D`), nothing outside this crate has ever fed a real `dcz`
+    // body to a reference decoder. Verify it really is the RFC 8878
+    // §3.1.2 skippable frame it claims to be: a genuine
+    // `encode_body`-produced `dcz` body, fed straight to the reference
+    // decoder, must have its preamble silently skipped and the
+    // dictionary-referencing frame after it decoded byte-identically. That
+    // the frame itself round-trips against a raw-content dictionary is
+    // already proven independently by oxiarc-zstd's own
+    // `zstd_oracle::oracle_dictionary_both_directions`; what this test adds
+    // is the preamble in front of it, which is new with this track.
+    if !tool_available("zstd") {
+        eprintln!("skipping: the `zstd` CLI is unavailable");
+        return;
+    }
+    let dictionary = common::json(64 * 1024);
+    let mut plain = common::json(32 * 1024);
+    plain.extend_from_slice(&dictionary[..8 * 1024]);
+
+    let wire = encode_body(
+        &ContentCoding::Dcz,
+        &plain,
+        EncodeOptions::new().with_dictionary(Some(&dictionary)),
+    )
+    .expect("dcz encode");
+
+    let dict_path = temp_path("dcz_reference_dict");
+    std::fs::write(&dict_path, &dictionary).expect("write scratch dictionary file");
+    let dict_path_str = dict_path
+        .to_str()
+        .expect("scratch temp path should be valid UTF-8")
+        .to_string();
+
+    let decoded = cli_transform(
+        "dcz_reference",
+        "zstd",
+        &["-d", "-q", "-c", "-D", &dict_path_str],
+        &wire,
+    );
+    let _ = std::fs::remove_file(&dict_path);
+
+    let decoded = match decoded {
+        Some(decoded) => decoded,
+        None => {
+            eprintln!("skipping: `zstd -D <dict> -d` failed on this dcz body");
+            return;
+        }
+    };
+    assert_eq!(
+        decoded, plain,
+        "the reference decoder must silently skip the dcz preamble and decode \
+         the frame after it byte-identically"
+    );
 }
 
 #[cfg(all(feature = "brotli", feature = "gzip"))]

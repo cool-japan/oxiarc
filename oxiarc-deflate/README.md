@@ -15,9 +15,9 @@ Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
 **Also new in 0.4.2**: **the encoder is a faithful port of zlib's `deflate.c`/`trees.c`.** `Deflater` now uses a persistent 32 KiB window with slid (not rebuilt) hash chains, zlib's per-level `configuration_table`, `deflate_fast` at levels 1-3 and `deflate_slow` lazy matching at 4-9 (with the `TOO_FAR` rule), blocks cut at 16 383 symbols, and a per-block stored/fixed/dynamic choice made on real bit costs. The result is **byte-identical to CPython's `zlib.compress(data, level)` at every level 1-9** on every corpus tested (source text, HTML, log lines, binary records, runs, random, and four PNG-filtered scanline fixtures) — verified as a gate, not as a claim (`tests/zlib_encoder_oracle.rs`). Before this, output was up to **179 % larger** than zlib's on the same bytes.
 
-All encoder state now persists across calls, so **the call size no longer changes anything**: feeding a 2 MiB stream as 1 KiB calls costs the same as one 2 MiB call (34.4 ms vs 33.0 ms) and produces the *same bytes*. Previously a small-call stream cost 13x more, because every call restarted the match finder and emitted its own block and Huffman tree. Level-6 throughput is now 0.77x-1.53x of CPython `zlib` (same miniz-class algorithm) depending on the corpus, against 0.10x-0.40x before.
+All encoder state now persists across calls, so **the call size no longer changes anything**: feeding a 2 MiB stream as 1 KiB calls costs the same as one 2 MiB call (32.3 ms vs 30.8 ms) and produces the *same bytes*. Previously a small-call stream cost 13x more, because every call restarted the match finder and emitted its own block and Huffman tree. Level-6 throughput is now 0.77x-1.40x of CPython `zlib` (same miniz-class algorithm) depending on the corpus, against 0.10x-0.40x before.
 
-`Deflater::with_optimal_parsing(level)` (the graph-based DP parser) is now **never larger than the default ladder** at the same level — it was up to 2 % *larger* on noisy image rows, because its candidate set ignored zlib's `TOO_FAR` rule and bought rare long-distance codes for 3-byte matches. Measured gains over level 9 on a 96 KiB slice of each corpus: -1.3 % to -9.9 % (0 % on random). New `Deflater::with_strategy` exposes zlib's `Z_FILTERED` / `Z_HUFFMAN_ONLY` / `Z_RLE` / `Z_FIXED`.
+`Deflater::with_optimal_parsing(level)` (the graph-based DP parser) is now **never larger than the default ladder** at the same level — it was up to 2 % *larger* on noisy image rows, because its candidate set ignored zlib's `TOO_FAR` rule and bought rare long-distance codes for 3-byte matches. Measured gains over level 9 on a 96 KiB slice of each corpus: -1.3 % to -9.9 % (0 % on random). It is also call-size invariant now: it waits for a whole parse span instead of running one as soon as 262 bytes are buffered, which used to make a byte-at-a-time caller run a 259-position candidate collection per emitted byte (measured on 200 KB of log lines at level 9: 4.17 s and 20 277 bytes in 1-byte calls, against 0.31 s and 19 920 bytes in one call; now 0.36 s and 19 920 bytes at every call size). New `Deflater::with_strategy` exposes zlib's `Z_FILTERED` / `Z_HUFFMAN_ONLY` / `Z_RLE` / `Z_FIXED`, byte-identical to CPython under each.
 
 **What's new in 0.4.0**: DEFLATE/zlib decoder performance rewrite — no wire-format change, no public API removed. New `inflate_into(src, dst) -> Result<usize>` decompresses a raw DEFLATE stream directly into a caller-supplied buffer with no intermediate `Vec` and no output-size guessing (`BufferTooSmall` if the stream would overflow `dst`, never silently truncated; `InvalidDistance` if a back-reference reaches before the start of `dst` — use `Inflater::with_dictionary` when history before `dst` is needed instead). `zlib::zlib_decompress_into` is the zlib-wrapper equivalent — validates the header, decodes via `inflate_into`, and verifies the trailing Adler-32. New `Inflater::with_output_capacity(size_hint)` pre-sizes the output buffer from a size hint (clamped to the new `MAX_OUTPUT_CAPACITY_HINT` = 64 MiB, since the hint is untrusted); GZIP decoding now seeds this automatically from the trailing ISIZE field. Internally (no API change): `HuffmanTree` now decodes through a two-level root+sub-table (root widened from a 9-bit to a 10-bit table, zlib/libdeflate style); the LZ77 history is now the output buffer itself (`InflateWindow`, via `Vec::extend_from_within`) rather than a separate ring buffer that wrote every decoded byte twice; `Adler32::update` now folds 32-byte groups through a closed-form reduction instead of one add-pair per byte so the compiler can auto-vectorize it. These decoders build on `oxiarc-core`'s new buffered `BitReader`/`BitCache`. New differential test suite `tests/inflate_differential.rs` proves the buffered fast path, the exact-mode path, and `inflate_into`/`zlib_decompress_into` all agree byte-for-byte, including hostile/truncated/corrupted input, plus a new `fuzz_inflate_into` fuzz target.
 
@@ -457,8 +457,9 @@ println!("window_hits={} window_allocations={}", stats.window_hits, stats.window
 
 ## Performance
 
-Reproduce every number below with `cargo run --release --example zlib_ab`
-(criterion-free; the reference columns need `python3`).
+Reproduce the *encoder* numbers below with `cargo run --release --example
+zlib_ab` and the *decoder* numbers with `cargo run --release --example
+inflate_ab` (both criterion-free; the reference columns need `python3`).
 
 ### Compressed size
 
@@ -488,7 +489,7 @@ It costs encode time, never ratio: each span is parsed twice (shortest path and
 a zlib-equivalent lazy parse over the same candidates) and the cheaper one wins
 on the *real* block cost, tree description included.
 
-### Throughput
+### Encode throughput
 
 Interleaved A/B against CPython `zlib` (the same miniz-class algorithm), best
 of 3, timed inside python with `time.perf_counter()` so process spawn never
@@ -497,7 +498,7 @@ enters the number. macOS aarch64, release:
 | Level | oxiarc / python |
 |-------|-----------------|
 | 1 | 0.76x - 1.99x |
-| 6 | 0.77x - 1.53x |
+| 6 | 0.77x - 1.40x |
 | 9 | 0.83x - 1.42x |
 
 The low end is incompressible data (where both encoders are memcpy-bound) and
@@ -511,15 +512,40 @@ byte-identical at every call size:
 
 | Call size | Calls | Time | Output |
 |-----------|------:|-----:|-------:|
-| 1 KiB | 2048 | 34.4 ms | 476 016 B |
-| 4 KiB | 512 | 33.2 ms | 476 016 B |
-| 32 KiB | 64 | 33.1 ms | 476 016 B |
-| 1 MiB | 2 | 33.0 ms | 476 016 B |
+| 1 KiB | 2048 | 32.3 ms | 476 492 B |
+| 4 KiB | 512 | 32.3 ms | 476 492 B |
+| 32 KiB | 64 | 31.0 ms | 476 492 B |
+| 1 MiB | 2 | 30.8 ms | 476 492 B |
+
+(Best of three `cargo run --release --example zlib_ab` runs; single-run wall
+times vary by ~20 %, so the load-bearing column is the output size, which is
+identical at every call size. The absolute byte count drifts between commits
+because the "source text" corpus is built from this workspace's own `.rs`
+files — see `tests/common/corpus.rs`.)
+
+The opt-in optimal parser holds to the same rule. 200 KB of log lines at
+level 9, `Deflater::with_optimal_parsing(9)`:
+
+| Call size | Time | Output |
+|-----------|-----:|-------:|
+| 1 B | 357 ms | 19 920 B |
+| 16 B | 475 ms | 19 920 B |
+| 258 B | 317 ms | 19 920 B |
+| 4 KiB | 328 ms | 19 920 B |
+| 1 MiB | 330 ms | 19 920 B |
+
+Level 0 is the documented exception to byte-identity across call sizes: stored
+blocks are cut from whatever is buffered when a call arrives (zlib's
+`deflate_stored` cuts on `avail_out` for the same reason), so small calls can
+carry more 5-byte block headers. The decoded bytes are of course identical, no
+block ever exceeds the format's 65 535-byte maximum, and one-shot output stays
+the tightest layout — all asserted by
+`tests/encoder_behaviour.rs::level_0_streaming_stays_stored_and_bounded_at_every_call_size`.
 
 ## Test Coverage
 
-469 tests (417 via `cargo nextest run -p oxiarc-deflate --all-features` + 52
-doctests; 351 with `--no-default-features`), zero clippy warnings with
+484 tests (432 via `cargo nextest run -p oxiarc-deflate --all-features` + 52
+doctests; 364 with `--no-default-features`), zero clippy warnings with
 `--all-features --all-targets` and with `--no-default-features`.
 
 | Suite | Covers |
@@ -531,7 +557,9 @@ doctests; 351 with `--no-default-features`), zero clippy warnings with
 | `tests/compliance.rs`, `tests/edge_cases.rs`, `tests/proptest_roundtrip.rs` | RFC 1951 block types, spec-inflater cross-checks, round-trip properties |
 | `tests/zlib_oracle.rs` (`zlib-oracle` feature) | Live differential tests against CPython `zlib`/`gzip` and the system `gzip` CLI, in both directions and through both `Read` adapters. Self-skips when the tools are absent |
 | `tests/zlib_encoder_oracle.rs` (`zlib-oracle` feature) | Encoder byte-identity with `zlib.compress` at every level 1-9 over ten corpora, plus raw DEFLATE, level-0 stored blocks, tiny/degenerate inputs, window-spanning input, multi-call streams, preset dictionaries and `Z_SYNC_FLUSH` streams |
-| `tests/encoder_behaviour.rs` | The mechanisms identity is made of, with no external tool: the `configuration_table`, lazy-vs-greedy decisions on crafted inputs, `max_lazy` suppression, the strictly-longer rule, `TOO_FAR`, run shortcuts, block-type selection (via an independent block walker in `tests/common/blocks.rs`), call-size invariance, cross-call matching, the level ladder, and the optimal parser over every corpus |
+| `tests/encoder_behaviour.rs` | The mechanisms identity is made of, with no external tool: the `configuration_table`, lazy-vs-greedy decisions on crafted inputs, `max_lazy` suppression, the strictly-longer rule, `TOO_FAR`, run shortcuts, block-type selection (via an independent block walker in `tests/common/blocks.rs`), call-size invariance (default ladder and optimal parser), the level-0 stored-block bound, cross-call matching, the level ladder, and the optimal parser over every corpus |
+| `tests/encoder_adversarial.rs` | Every encoder boundary size (`MIN_MATCH`, `MAX_MATCH`, `MIN_LOOKAHEAD`, `SYM_END`, `W_SIZE`, `MAX_STORED`, `2 * W_SIZE`, the window-slide trigger) crossed with hostile shapes (zero head/tail at the window edge, periods 1/2/3/257/258/259, a single far 3-byte repeat) crossed with every level, strategy, flush mode, dictionary size and the optimal parser; plus `reset()` returning the encoder to a pristine state |
+| `tests/allocation_steady_state.rs` | A counting global allocator over a many-dynamic-block stream: `InflateStream::inflate` must allocate **zero** times in the steady state, at four (chunk, output-buffer) shapes including 1-byte chunks and a 1-byte output buffer, on both a uniform and a shape-shifting fixture |
 
 ## Performance Notes
 

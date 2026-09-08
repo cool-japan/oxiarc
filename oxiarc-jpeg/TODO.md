@@ -5,7 +5,10 @@ Program context: root `TODO.md`, "Phase 8", items **W1-F1** (decoder),
 seeds, benches). All three have landed in this crate. Reduced-/enlarged-scale
 decode and the `zune_jpeg`/`jpeg-decoder` compat facades (design report
 §7.4/§8, tracked as **JPEGSCALE**, not a numbered Phase 8 wave item) have
-landed as follow-on work in the same cycle — see below.
+landed as follow-on work in the same cycle — see below. Two-component
+(`JCS_UNKNOWN`) frames (tracked as **JPEG2C**, likewise not a numbered wave
+item — it closed a gap `oxiarc-tiff`'s TIFFPOLISH track found) have landed
+too.
 
 ## Completed (W1-F1, decoder)
 
@@ -430,6 +433,98 @@ fail on the pre-fix code.
       inter-row padding untouched and refuses a buffer one sample short; and
       `decode_abbreviated_into` (the TIFF `JPEGTables` entry point) threads
       `scale` through and reports it back.
+
+## Completed (JPEG2C: two-component `JCS_UNKNOWN` frames)
+
+`oxiarc-tiff`'s TIFFPOLISH track (2026-09-08) found that a greyscale-plus-
+alpha *chunky* JPEG-compressed TIFF page had no way to be written: JPEG
+defines colour spaces for one, three and four components, and libjpeg
+reaches a two-component frame only through `JCS_UNKNOWN`, which this crate
+did not encode. The decoder already handled it generically (any component
+count outside `1..=4` decodes as `ColorSpace::Unknown(n)`, untransformed
+`Mode::Passthrough`, `PixelFormat::Raw8`/`Raw16`) — only the encoder side
+was missing.
+
+- [x] `ColorSpace::Unknown(2)` is now encodable. Deliberately narrower than
+      libjpeg's own `JCS_UNKNOWN`, which is generic over any component
+      count via a `SET_COMP(ci, ci, 1,1, 0,0,0)` loop: this crate accepts
+      it only at exactly two, because `1`, `3` and `4` already have named
+      colour spaces and nothing supplies raw passthrough data at those
+      counts, so a row for them would sit unreachable behind
+      `conversion_is_supported`/`conversion_for`'s gates. `component_template`
+      (`encoder/plan.rs`) gained the one row the original TIFFPOLISH note
+      predicted: ids `1`/`2`, quantisation and Huffman slot `0` for both
+      (matching libjpeg's own `SET_COMP` call), neither ever subsampled by
+      default (`Subsampling::Custom` can still move them, per-component,
+      like any other colour space).
+- [x] `InputColor::LumaAlpha` is the input path: its default target is
+      still one-component `Luma` (alpha dropped, unchanged, pinned by the
+      pre-existing `alpha_is_dropped` test), and asking for
+      `ColorSpace::Unknown(2)` explicitly keeps the alpha channel as a
+      second, untransformed component instead
+      (`alpha_is_kept_as_a_second_component_when_asked`). No new
+      `InputColor` variant, no new `Conversion` enum variant beyond
+      `Passthrough(2)` — `Passthrough(usize)` already existed for 3 and 4.
+- [x] Every `EncodeProcess` (`Sequential`/`Progressive`/`Lossless`) and both
+      `EntropyCoding`s reach `Unknown(2)` correctly with no further code
+      change: `component_template` was the only gate on colour space, and
+      nothing downstream (the progressive scan-script builder, the lossless
+      predictor, the arithmetic coder) special-cases component count —
+      lossless is bit-exact, the two lossy processes stay bounded
+      (`two_component_frames_survive_every_process_and_entropy_coding`).
+      `Encoder::encode_planar` also reaches `Unknown(2)`, byte-identical to
+      the chunky path (`two_component_frames_via_encode_planar_match_the_
+      interleaved_path`) — both added after a post-implementation review
+      flagged them as reachable but unexercised.
+- [x] No `JFIF`/Adobe marker: `write_jfif`'s `Auto` rule only fires for
+      `Luma`/`Ycbcr`, and `write_adobe`'s only for `Rgb`/`Cmyk`/`Ycck` —
+      `Unknown` was already outside both, so this needed no code change,
+      only a test confirming it (`two_component_frames_write_no_metadata_
+      and_share_one_table_slot`, `tests/encode_api.rs`).
+- [x] **Verification, and exactly what is and is not external.** No tool on
+      this machine can *decode pixels* from a bare two-component JPEG
+      stream: `djpeg`'s PPM/BMP/GIF/Targa/RLE writers all refuse anything
+      but grayscale or RGB output before a scanline is produced, `-rgb`/
+      `-grayscale` refuse the conversion outright ("Unsupported color
+      conversion request"), TurboJPEG's `tj3DecompressHeader` cannot name
+      the colour space, and Pillow's `Image.open` raises
+      `UnidentifiedImageError` before returning an image object — checked
+      by hand, libjpeg-turbo 3.1.4.1. What `djpeg -verbose` *can* do, because
+      it prints markers during `jpeg_read_header`, before any output module
+      is selected: parse the frame and scan header completely, correctly
+      naming `Nf = 2`, ids `1`/`2`, `1x1` sampling for both, quantisation
+      table `0` for both, DC/AC table `0` for both — pinned by
+      `tests/encode_oracle.rs::djpeg_verbose_parses_our_two_component_frame_
+      and_scan_header`, which also asserts djpeg's failure is exactly the
+      expected *output-format* one, not an earlier parse rejection.
+      Beyond that: `ColorSpace::Unknown(2)`'s template puts both components
+      on table slot `0`, the same slot a plain one-component `Luma` frame
+      uses, and per-component state (MCU grid, DC prediction, dummy-block
+      copy) is blind to how many *other* components share the frame — so
+      splitting a two-component source into its two channels, encoding
+      *each alone* as a standalone grayscale frame with real `cjpeg -dct
+      int`, decoding *that* with real `djpeg -dct int`, and comparing
+      against this crate's own two-component encode/decode, one channel at
+      a time, is a genuine (if decomposed) external check of the
+      entropy-coded values — `two_component_channels_decompose_to_cjpeg_
+      djpeg_reference_pixels`. What that still cannot prove: that libjpeg
+      would decode the real *interleaved* two-component bitstream to those
+      values — no tool can run that entropy decoder at all. `oxiarc-tiff`
+      closed that last gap from its own side: a two-channel JPEG page
+      embedded in a TIFF, recoded with `tiffcp -c none`, makes libtiff's
+      *own* embedded libjpeg actually decode the two-component scan, and
+      the result is byte-identical to this crate's decode of the same
+      file — see `oxiarc-tiff`'s own TODO.md and
+      `tests/roundtrip.rs::a_two_channel_jpeg_page_round_trips_chunky_
+      through_jcs_unknown`.
+- [x] Gates: `oxiarc-jpeg` 585 tests (`--all-features`, was 571), 469
+      (`--no-default-features`, was 457), 28 doctests (was 27); zero clippy
+      warnings across `--all-features`, `--no-default-features`, and
+      `--no-default-features` with `arithmetic`/`rayon`/`arithmetic,rayon`/
+      `jpeg-oracle` individually; `cargo deny check bans` clean; no
+      `unwrap()`, no let-chains, every file under the 1500-line target
+      (largest touched file `encoder/plan.rs` at 905 lines, `tests/
+      encode_oracle.rs` at 1467).
 
 ## Not in W1-F1 / W1-F2 / W1-F3 (owned by other items)
 

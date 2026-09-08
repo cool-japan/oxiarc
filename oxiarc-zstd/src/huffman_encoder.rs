@@ -536,9 +536,7 @@ mod tests {
             assert!(len <= MAX_CODE_LENGTH);
             // Verify the decoder can decode this code back to the same symbol
             let padded_code = code << (decoder_table.max_bits() - len);
-            let entry = decoder_table
-                .entry(padded_code as usize)
-                .expect("prefix within table");
+            let entry = decoder_table.entries()[padded_code as usize];
             assert_eq!(
                 entry.symbol, sym,
                 "decoder should map code back to symbol {:?}",

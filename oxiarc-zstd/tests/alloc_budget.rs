@@ -304,6 +304,50 @@ fn lying_sequence_count_allocates_nothing() {
     );
 }
 
+/// A frame declaring a huge `Window_Size` allocates from what it *produces*,
+/// not from what it declares.
+///
+/// This is what makes the bounded helpers' declared-window ceiling
+/// (`max(max_output, 128 MiB)`, the reference decoder's own default) a
+/// documentation matter rather than a memory one: `decompress_with_limit` on a
+/// frame declaring an 11 MB window, and `decompress_into` on one declaring
+/// 2 GiB, both allocate on the order of one block. Were the ring sized from
+/// the declaration instead, these numbers would be 11 MB and 2 GB.
+fn a_declared_window_never_drives_the_allocation() {
+    /// A one-block `Raw` frame with an explicit `Window_Descriptor`.
+    fn windowed_raw_frame(window_descriptor: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x28u8, 0xB5, 0x2F, 0xFD, 0x00, window_descriptor];
+        let header = 1u32 | (payload.len() as u32) << 3;
+        f.extend_from_slice(&header.to_le_bytes()[..3]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    // Window_Descriptor 0x6b: exponent 13, mantissa 3 -> 11,534,336 bytes.
+    let eleven_mb = windowed_raw_frame(0x6B, b"a small payload behind a huge declaration");
+    let (_allocs, bytes, out) = measure(|| oxiarc_zstd::decompress_with_limit(&eleven_mb, 1 << 20));
+    let out = out.expect("an 11 MB declared window is accepted by the bounded helper");
+    assert_eq!(out, b"a small payload behind a huge declaration");
+    assert!(
+        bytes < 1 << 20,
+        "an 11 MB declared window allocated {bytes} bytes; the ring must follow \
+         what the frame produces, not what it declares"
+    );
+
+    // Window_Descriptor 0xA8: exponent 21, mantissa 0 -> 2,147,483,648 bytes.
+    // `decompress_into` applies no declared-window ceiling at all, so this is
+    // where the lazy ring has to carry the whole weight.
+    let two_gb = windowed_raw_frame(0xA8, b"strip payload");
+    let mut dst = [0u8; 64];
+    let (_allocs, bytes, n) = measure(|| oxiarc_zstd::decompress_into(&two_gb, &mut dst));
+    let n = n.expect("decompress_into accepts any declared window");
+    assert_eq!(&dst[..n], b"strip payload");
+    assert!(
+        bytes < 1 << 20,
+        "a 2 GiB declared window allocated {bytes} bytes in decompress_into"
+    );
+}
+
 /// The whole allocation budget, run sequentially in one test so that no other
 /// test's allocations can be charged to an armed measurement.
 #[test]
@@ -313,4 +357,5 @@ fn allocation_budget() {
     rejected_bomb_stays_within_its_budget();
     oversized_literals_header_allocates_nothing();
     lying_sequence_count_allocates_nothing();
+    a_declared_window_never_drives_the_allocation();
 }

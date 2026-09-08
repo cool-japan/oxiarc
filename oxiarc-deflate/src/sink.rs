@@ -20,6 +20,7 @@
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::ringbuffer::MAX_COPY_LENGTH;
 
+#[cfg(test)]
 use crate::window::{DecodeSink, InflateWindow};
 
 /// DEFLATE sliding-window size (RFC 1951 §3.2.1).
@@ -39,6 +40,23 @@ pub(crate) trait InflateSink {
     /// guard fold away entirely.
     fn space(&self) -> usize;
 
+    /// Direct access to the writable slice, for the fast loop.
+    ///
+    /// A slice-backed sink hands out its buffer, its cursor and the history
+    /// that precedes the buffer, so the fast loop can keep the cursor in a
+    /// register and write literals and matches without a method call per
+    /// symbol. `None` asks the caller to use the per-symbol methods
+    /// instead.
+    fn fast_region(&mut self) -> Option<FastRegion<'_>> {
+        None
+    }
+
+    /// Publish a cursor the fast loop advanced.
+    ///
+    /// Only ever called with a value a [`InflateSink::fast_region`] loop
+    /// produced from this sink's own buffer.
+    fn commit(&mut self, _position: usize) {}
+
     /// Bytes of history a back-reference may address.
     fn history_len(&self) -> usize;
 
@@ -53,6 +71,22 @@ pub(crate) trait InflateSink {
 
     /// Bytes written to this sink since it was created.
     fn written(&self) -> usize;
+}
+
+/// The writable slice of a slice-backed [`InflateSink`], its cursor, and
+/// the history that precedes it.
+///
+/// `dst[..pos]` is already-decoded output a back-reference may address;
+/// `history` is the window that precedes `dst[0]` (a preset dictionary, or
+/// output already handed to the caller). Together they are exactly what
+/// `copy_match` resolves distances against.
+pub(crate) struct FastRegion<'a> {
+    /// The whole writable buffer.
+    pub(crate) dst: &'a mut [u8],
+    /// Bytes of `dst` already written.
+    pub(crate) pos: usize,
+    /// History preceding `dst[0]`.
+    pub(crate) history: &'a [u8],
 }
 
 // ---------------------------------------------------------------------------
@@ -153,15 +187,23 @@ impl History {
 
 /// Growable sink over the crate's existing [`InflateWindow`].
 ///
-/// `space()` is `usize::MAX`, so a decoder monomorphised over this type has
-/// no output-space checks in its fast loop at all — the same instruction
-/// sequence the one-shot decoder runs today.
+/// `space()` is `usize::MAX` and [`InflateSink::fast_region`] is `None`, so
+/// a decoder driven through this sink writes one symbol at a time through
+/// the trait.
+///
+/// Test-only since 0.4.2: every production front end decodes into a slice
+/// (the growable one into the tail of the buffer it is filling), which is
+/// what lets the fast loop hold the output cursor in a register. `GrowSink`
+/// is retained as the independent reference the copy-semantics differential
+/// in this module's tests compares [`BoundedSink`] against.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct GrowSink<'a> {
     window: &'a mut InflateWindow,
     start_len: usize,
 }
 
+#[cfg(test)]
 impl<'a> GrowSink<'a> {
     /// Wrap a window. `written()` counts from zero, not from the window's
     /// current length, and is derived from the window rather than tracked
@@ -172,6 +214,7 @@ impl<'a> GrowSink<'a> {
     }
 }
 
+#[cfg(test)]
 impl InflateSink for GrowSink<'_> {
     #[inline(always)]
     fn space(&self) -> usize {
@@ -229,6 +272,22 @@ impl<'a, 'h> BoundedSink<'a, 'h> {
             pos: 0,
             history,
         }
+    }
+
+    /// Wrap a destination buffer whose first `position` bytes are already
+    /// decoded output.
+    ///
+    /// This is what lets the growable front end decode into the tail of the
+    /// buffer it is filling: the earlier bytes of the same buffer serve as
+    /// the LZ77 window, so no byte is ever written twice and no separate
+    /// history copy is kept.
+    pub(crate) fn resumed(
+        dst: &'a mut [u8],
+        position: usize,
+        history: Option<&'h History>,
+    ) -> Self {
+        let pos = position.min(dst.len());
+        Self { dst, pos, history }
     }
 
     #[inline]
@@ -313,6 +372,22 @@ impl InflateSink for BoundedSink<'_, '_> {
     #[inline(always)]
     fn space(&self) -> usize {
         self.dst.len() - self.pos
+    }
+
+    #[inline(always)]
+    fn fast_region(&mut self) -> Option<FastRegion<'_>> {
+        let history = self.history.map_or(&[][..], History::as_slice);
+        Some(FastRegion {
+            pos: self.pos,
+            dst: self.dst,
+            history,
+        })
+    }
+
+    #[inline(always)]
+    fn commit(&mut self, position: usize) {
+        debug_assert!(position <= self.dst.len());
+        self.pos = position.min(self.dst.len());
     }
 
     #[inline(always)]
@@ -434,6 +509,61 @@ mod tests {
         assert_eq!(h.as_slice(), b"cdefghij");
         h.append(&[b'z'; 40]);
         assert_eq!(h.as_slice(), &[b'z'; 8]);
+    }
+
+    /// `append` must retain exactly the newest `capacity` bytes for every
+    /// combination of prior fill and appended length, and must never let the
+    /// buffer grow past `capacity` — the transient overshoot is what made the
+    /// history reallocate in the steady state (measured: one `realloc` to
+    /// 125 068 bytes against a 32 KiB window, on a 16 MiB gzip body fed in
+    /// 4 KiB chunks through a 64 KiB output buffer).
+    #[test]
+    fn history_never_exceeds_its_capacity_and_matches_a_reference() {
+        for capacity in [1usize, 2, 7, 8, 9, 64, 1000] {
+            for schedule in [
+                vec![1usize, 1, 1, 1, 1],
+                vec![3, 5, 7, 11],
+                vec![capacity, capacity, 1],
+                vec![capacity - 1, 2, capacity + 1],
+                vec![capacity + 5, 1, capacity * 3],
+                vec![0, capacity / 2 + 1, 0, capacity / 2 + 1],
+            ] {
+                let mut h = History::with_capacity(capacity);
+                let mut reference: Vec<u8> = Vec::new();
+                let mut next = 0u8;
+                for len in schedule {
+                    let chunk: Vec<u8> = (0..len)
+                        .map(|_| {
+                            next = next.wrapping_add(1);
+                            next
+                        })
+                        .collect();
+                    h.append(&chunk);
+                    reference.extend_from_slice(&chunk);
+                    let keep = reference.len().min(capacity);
+                    assert_eq!(
+                        h.as_slice(),
+                        &reference[reference.len() - keep..],
+                        "capacity {capacity}: retained bytes differ"
+                    );
+                    assert!(
+                        h.len() <= capacity,
+                        "capacity {capacity}: history holds {} bytes",
+                        h.len()
+                    );
+                    // The allocation, not just the length. Appending before
+                    // evicting leaves `len` correct but grows the *buffer* to
+                    // `capacity + produced.len()`, which is invisible to the
+                    // assertion above and is what reallocated in the steady
+                    // state.
+                    assert!(
+                        h.buf.capacity() <= capacity,
+                        "capacity {capacity}: history buffer grew to {} bytes",
+                        h.buf.capacity()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

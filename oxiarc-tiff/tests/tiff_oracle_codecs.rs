@@ -280,6 +280,106 @@ fn jpeg_recodings_decode_close_to_the_reference() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// libtiff must at least *parse* a file that uses T.4 uncompressed mode.
+///
+/// It cannot decode one — `Fax3Decode2D` answers `Uncompressed data (not
+/// supported)`, which is exactly why this crate never writes the mode unless
+/// asked — so the requirement here is weaker than for every other codec and
+/// is spelled out rather than assumed: `tiffinfo` reads the directory, agrees
+/// with the geometry, and reports the option bit that says the mode may be
+/// present. `tiffcp` is then expected to *fail*, and the test asserts that
+/// too, so the day libtiff learns the mode this test says so instead of
+/// quietly passing.
+#[test]
+fn libtiff_parses_but_cannot_decode_our_uncompressed_mode_files() {
+    #[cfg(not(feature = "ccitt"))]
+    {
+        eprintln!("skipping: built without the `ccitt` feature");
+    }
+    #[cfg(feature = "ccitt")]
+    {
+        let (Some(tiffinfo), Some(tiffcp)) = (find_tool("tiffinfo"), find_tool("tiffcp")) else {
+            eprintln!("skipping: libtiff's tiffinfo/tiffcp are not on PATH");
+            return;
+        };
+        let dir = scratch_dir("faxuncompressed");
+        let (width, height) = (256u32, 32u32);
+        // Dithered: every row is cheaper in uncompressed mode, so the file is
+        // certain to use it rather than merely be allowed to.
+        let pixels: Vec<u8> = (0..width * height)
+            .map(|index| u8::from((index % 2 == 0) ^ ((index / width) % 2 == 0)))
+            .collect();
+        for (label, compression, option_tag) in [
+            (
+                "g3",
+                Compression::CcittGroup3 {
+                    two_dimensional: true,
+                    byte_align_eol: false,
+                },
+                "T4Options",
+            ),
+            ("g4", Compression::CcittGroup4, "T6Options"),
+        ] {
+            let path = dir.join(format!("uncompressed_{label}.tif"));
+            let file = fs::File::create(&path).expect("create");
+            let mut encoder = Encoder::new(std::io::BufWriter::new(file)).expect("encoder");
+            let spec = ImageSpec::new(width, height, ColorType::Gray(1))
+                .with_photometric(oxiarc_tiff::PhotometricInterpretation::WhiteIsZero)
+                .with_compression(compression)
+                .with_layout(Layout::Strips {
+                    rows_per_strip: height,
+                })
+                .with_ccitt_uncompressed(true);
+            encoder.write_image(&spec, &pixels).expect("write");
+            encoder.finish().expect("finish");
+
+            // Our own decode is the correctness check; libtiff's is the
+            // interoperability one.
+            let bytes = fs::read(&path).expect("read");
+            let mut decoder = Decoder::new(Cursor::new(bytes)).expect("decoder");
+            let mut ours = vec![0u8; pixels.len()];
+            decoder.read_image_bytes(&mut ours).expect("decode");
+            assert_eq!(ours, pixels, "{label}: our own decode");
+
+            let info = Command::new(&tiffinfo)
+                .arg(&path)
+                .output()
+                .expect("spawn tiffinfo");
+            assert!(
+                info.status.success(),
+                "{label}: tiffinfo could not parse the file: {}",
+                String::from_utf8_lossy(&info.stderr)
+            );
+            let text = String::from_utf8_lossy(&info.stdout);
+            assert!(
+                text.contains(&format!("{width} Image Length: {height}")),
+                "{label}: tiffinfo read a different geometry:\n{text}"
+            );
+            assert!(
+                text.to_lowercase().contains("uncompressed"),
+                "{label}: tiffinfo did not report the {option_tag} uncompressed \
+                 bit; it printed:\n{text}"
+            );
+
+            // And the documented limit: libtiff cannot get the pixels out.
+            let plain = dir.join(format!("uncompressed_{label}_none.tif"));
+            let recode = Command::new(&tiffcp)
+                .args(["-c", "none"])
+                .arg(&path)
+                .arg(&plain)
+                .output()
+                .expect("spawn tiffcp");
+            let stderr = String::from_utf8_lossy(&recode.stderr).to_lowercase();
+            assert!(
+                !recode.status.success() || stderr.contains("uncompressed data"),
+                "{label}: libtiff 4.7.1 is documented as unable to decode \
+                 uncompressed mode, but tiffcp succeeded silently — if it has \
+                 learned the mode, compare the pixels here instead"
+            );
+        }
+    }
+}
+
 /// The `JPEGTables` (347) blob of a file on disk, or `None` when it has none.
 #[cfg(feature = "jpeg")]
 fn tables_tag(path: &Path) -> Option<Vec<u8>> {

@@ -216,6 +216,16 @@ encoder produces with a dictionary is accepted by `brotli -d -D dict`
 (`--features brotli-oracle`; the tests self-skip when the binary is absent or
 too old for `--dictionary`).
 
+A shared dictionary is a *compound history block*, not a prefix glued in front
+of the sliding window: a copy may not run past the dictionary's end, and one
+that would is rejected as corrupt rather than continued in the produced output.
+That is the reference decoder's rule — an oracle test hands `brotli -d -D` two
+hand-built streams differing only in one copy length and requires it to accept
+the one that stops at the dictionary's end and reject the ones that do not — and
+both decoders here enforce it before a byte of the copy is produced, so the
+one-shot and the incremental decoder reject the same streams whatever
+output-buffer size the caller supplies.
+
 ## API Overview
 
 | Item | Kind | Description |
@@ -292,10 +302,11 @@ Brotli (RFC 7932) combines three techniques:
 
 Quality levels map to LZ77 search depth (quality 0 emits stored
 meta-blocks). Compression-ratio expectations, honestly stated: this encoder
-emits one prefix code per category per meta-block and does not yet perform
-block splitting, context modeling, or dictionary-reference emission, so its
-output is larger than the reference encoder's at the same quality — close
-(within a few percent) on typical text at q5–9, further behind at q10–11 and
+splits the literal, insert-and-copy and distance streams into block types with
+per-context prefix codes at quality 10–11, references an attached shared
+dictionary at every quality, and emits no Appendix A static-dictionary
+references, so its output is larger than the reference encoder's at the same
+quality — close (within a few percent) on typical text at q5–9, further behind
 on structured binary data. The decoder, in contrast, handles everything the
 reference encoder produces.
 
@@ -305,27 +316,38 @@ Decode throughput, interleaved A/B, Apple Silicon, release build
 (`cargo run --release --example decode_profile`). "one-shot" is `decompress`
 over the complete slice; the streaming column is the API's own shape — a caller
 that owns a fixed 64 KiB buffer and consumes each chunk, which is what an HTTP
-body reader does. Every figure below is the **median of five runs of 25
+body reader does. Every time below is the **median of five runs of 25
 interleaved repetitions**, taken on a machine carrying other work (load average
-~35); the harness reports the median of the *paired* per-repetition ratios,
-which is what stays put when the machine does not.
+~35), and each ratio is the quotient of the two medians beside it, so the table
+divides. (The harness itself also prints the median of the *paired*
+per-repetition ratios, which is the more robust estimator under load and is what
+the sub-20 µs rows should be read from; it agrees with the quotient to within
+5 % on every row except `single_byte`, whose one-shot column is the noisiest
+thing here.)
 
 | Payload (q5) | window | one-shot | `BrotliStream`, 64 KiB buffer | ratio |
 |---|---|---|---|---|
-| 1.08 MB repetitive text | lgwin 22 | 606 µs | 62 µs | **9.5×** |
-| 1.08 MB repetitive text | lgwin 10 | 609 µs | 23 µs | **24.9×** |
-| 1.05 MB single repeated byte | lgwin 22 | 517 µs | 35 µs | **19.7×** |
-| 1.05 MB single repeated byte | lgwin 10 | 524 µs | 18 µs | **29.6×** |
-| 2.94 MB hex dump, literal-dominated stream | lgwin 10 | 14.29 ms | 12.74 ms | **1.21×** |
-| 2.94 MB hex dump, copy-dense stream | lgwin 22 | 15.55 ms | 20.92 ms | 0.76× |
-| 1.05 MB incompressible (stored meta-blocks) | lgwin 10 | 14.1 µs | 14.3 µs | 1.01× (floor 1.01×) |
-| 1.05 MB incompressible (stored meta-blocks) | lgwin 22 | 13.7 µs | 41.0 µs | 0.33× (floor 0.34×) |
+| 1.08 MB repetitive text | lgwin 22 | 606 µs | 62.2 µs | **9.7×** |
+| 1.08 MB repetitive text | lgwin 10 | 609 µs | 22.5 µs | **27.1×** |
+| 1.05 MB single repeated byte | lgwin 22 | 517 µs | 35.0 µs | **14.8×** |
+| 1.05 MB single repeated byte | lgwin 10 | 524 µs | 17.7 µs | **29.6×** |
+| 2.94 MB hex dump, literal-dominated stream | lgwin 10 | 14.29 ms | 12.74 ms | **1.12×** |
+| 2.94 MB hex dump, copy-dense stream | lgwin 22 | 14.8 ms | 17.8 ms | 0.80× |
+| 1.05 MB incompressible (stored meta-blocks) | lgwin 10 | 14.5 µs | 16.6 µs | 0.96× |
+| 1.05 MB incompressible (stored meta-blocks) | lgwin 22 | 14.5 µs | 42.6 µs | 0.34× |
+
+The copy-dense row was re-measured after the shared-dictionary overrun fix
+(three runs of 41 interleaved repetitions at load average ~19; paired medians
+0.77×, 0.80×, 0.88×). That fix removed the `distance`/`tail` fields from the
+command loop's resumable state, which took `CmdState` from 40 bytes to 24 —
+one store per command on the hottest path — and moved this row from 0.72× to
+0.80×. Every other row was unaffected or slightly faster.
 
 **Where the push decoder wins, it wins by a lot.** It resolves matches with bulk
 runs and tiles short-distance (periodic) matches, whereas the one-shot decoder
 appends backward references one byte at a time; repetitive content — which is
-most real web content — is 9–28× faster, and the advantage grows as the declared
-window shrinks.
+most real web content — is 10–30× faster, and the advantage grows as the
+declared window shrinks.
 
 **The window is not the cost, and that is measured.** An earlier edition of this
 section blamed the second write per byte: a bounded decoder puts every byte in
@@ -345,17 +367,20 @@ model that does exactly the irreducible work of a bounded push decoder — copy
 every byte into the caller's fixed buffer, and copy the part still reachable
 afterwards (the last `1 << WBITS` bytes) into a freshly allocated ring. It is
 timed against the same one-shot decode as every row above, so its ratio and the
-decoder's are directly comparable. The decoder sits **on** that floor: 0.33×
-against a 0.34× floor at lgwin 22, and 1.01× against a 1.01× floor at lgwin 10
-— 97-100 % of the achievable figure. A bounded push decoder cannot do better
-without holding the whole body in memory, which is the thing it exists not to
-do.
+decoder's are directly comparable — but the cleanest reading is the two bounded
+implementations' own times, which need no denominator at all: **42.6 µs for the
+decoder against 41.5 µs for the model** at lgwin 22, and **16.6 µs against
+15.4 µs** at lgwin 10 — medians of three runs of 41 interleaved repetitions,
+both halves of each comparison taken from the same runs. The decoder is within
+2.5 % of the irreducible work at a 4 MiB window and indistinguishable from it at
+a 1 KiB one. A bounded push decoder cannot do better without holding the whole
+body in memory, which is the thing it exists not to do.
 
 **What is still open** is the copy-dense row, and its shape is worth naming
 precisely, because the payload's name is misleading. The 2.94 MB hex dump is
 literal-dominated only at small windows: at lgwin 10 its stream carries 95,605
 copy commands (73 % of the output is literals) and decodes *faster* than the
-one-shot decoder, at 1.21×. At lgwin 22 the encoder finds a match nearly
+one-shot decoder, at 1.12×. At lgwin 22 the encoder finds a match nearly
 everywhere, and the same payload becomes
 **570,440 copy commands of a mean 5.0 bytes at a mean distance of 116,525** —
 97 % of the output — of which 65 % must read their source out of the ring,

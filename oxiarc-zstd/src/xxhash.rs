@@ -301,16 +301,34 @@ fn merge_round64(mut acc: u64, val: u64) -> u64 {
     acc.wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4)
 }
 
-#[inline]
+/// Read the first eight bytes of `data` as a little-endian `u64`.
+///
+/// Spelled with one fixed-width `copy_from_slice` rather than eight indexed
+/// byte loads: the indexed form carries eight bounds checks, was large enough
+/// that the compiler declined to inline it, and showed up as 6 % of a
+/// literal-heavy frame's decode time all on its own.
+///
+/// # Panics
+///
+/// Panics if `data` is shorter than eight bytes; every caller slices a
+/// 32-byte stripe first.
+#[inline(always)]
 fn read_u64_le(data: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ])
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[..8]);
+    u64::from_le_bytes(bytes)
 }
 
-#[inline]
+/// Read the first four bytes of `data` as a little-endian `u32`.
+///
+/// # Panics
+///
+/// Panics if `data` is shorter than four bytes.
+#[inline(always)]
 fn read_u32_le(data: &[u8]) -> u32 {
-    u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&data[..4]);
+    u32::from_le_bytes(bytes)
 }
 
 #[cfg(test)]

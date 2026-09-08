@@ -177,25 +177,57 @@ otherwise.
 
 ## Deliberately deferred (with reasons)
 
-- **Group 3/4 uncompressed mode is reported, not decoded.** The extension code
-  `0000001 111` is detected and named. libtiff 4.7.1 answers the same data with
-  "Uncompressed data (not supported)" (the string is in the shipped dylib),
-  nothing on this machine can *write* it, and the T.4 Table 3 code words could
-  not be checked against a primary source offline — implementing them from
-  memory would have been a guess no test could verify. The option bits are
-  parsed, reported and never written.
+- ~~**Group 3/4 uncompressed mode is reported, not decoded.**~~ **Done
+  2026-09-08 (TIFFPOLISH).** The code table was checked against the primary
+  source — ITU-T T.4 (07/2003) Table 5/T.4, not Table 3, which is the black
+  run-length table — and both directions are implemented in
+  `compression/ccitt/uncompressed.rs`. Decode is unconditional (the entrance
+  code is unambiguous); encode is opt-in through
+  `ImageSpec::with_ccitt_uncompressed`, sets `T4Options` bit 1 for Group 3 and
+  `T6Options` bit 1 for Group 4, and is taken per row only when it is strictly
+  smaller than the Huffman coding of the same row. libtiff parses the files
+  (`tiffinfo` reports "Group 4 Options: uncompressed data") and, as documented,
+  still cannot decode them.
 - **The compressed codecs miss the "whole-image decode <= 1.25x `tiffcp`"
-  gate** (LZW 1.32x, Deflate 1.25x, ZSTD 2.13x, LZMA 1.54x on a 36 MB image);
-  uncompressed and PackBits are at 0.06x and 0.10x. The TIFF layer is ~4 ms of
-  those 75-722 ms — the time is inside `oxiarc-lzw` / `oxiarc-zstd` /
-  `oxiarc-lzma`, which this crate only calls. Follow-up belongs to those crates.
-- **The JPEG *encoder* lives in this crate** (`compression/jpeg/encode.rs`)
-  rather than in `oxiarc-jpeg`, whose encoder (item W1-F2) has not landed. It
-  is the profile libtiff writes — baseline sequential, 8-bit, Huffman — and it
-  shares `oxiarc-jpeg`'s Annex K tables, `QuantTable::scaled_for_quality` and
-  `TableSet::emit`, so tag 347 comes from their emitter. Swap it for
-  `oxiarc_jpeg::Encoder` when F2 lands; `compression::jpeg::{encode,
-  shared_tables}` is the seam.
+  gate.** Re-measured 2026-09-08 on 4096x4096, medians of nine interleaved
+  rounds: LZMA passes (1.15x RGB8, 1.16x Gray16), Deflate is 1.39x-1.58x, LZW
+  2.13x-2.41x, JPEG 2.37x and ZSTD 5.07x-6.24x; uncompressed and PackBits clear
+  it by an order of magnitude (0.11x, 0.20x). The TIFF layer is ~8 ms of those
+  figures — a codec-only strip measurement puts LZW at 122-144 MB/s, Deflate at
+  293-298 MB/s, ZSTD at 104-118 MB/s and LZMA at 23-24 MB/s, so the gap is
+  inside `oxiarc-lzw` / `oxiarc-zstd` / `oxiarc-lzma`, which this crate only
+  calls. **ZSTD is the outlier and the first place to look.** Follow-up belongs
+  to those crates.
+- **The bilevel rows of that table compare unlike work.** `tiffcp -c none`
+  copies 2 MB of packed bits; this crate expands them to 16 MB of
+  one-byte-per-pixel samples, which is 28.7 ms of a 65-86 ms figure. Net of
+  that the fax codecs run at roughly 1.5-2x. A packed-output decode path would
+  close it, and is not in any track's scope yet.
+- ~~**The JPEG *encoder* lives in this crate**~~ **Done 2026-09-08
+  (TIFFPOLISH).** `compression/jpeg/encode.rs` now maps a TIFF `CodecContext`
+  onto `oxiarc_jpeg::EncodeOptions` and calls `oxiarc_jpeg::Encoder`; see the
+  "Deferred" note below for the details and for the behaviour change it
+  introduced (a two-channel JPEG chunk was a named `Unsupported` error for
+  part of this same unreleased version, never in a published one, until the
+  item directly below closed it).
+- ~~**A two-component JPEG frame (libjpeg's `JCS_UNKNOWN` layout) cannot be
+  written**~~ **Done 2026-09-08 (JPEG2C).** `oxiarc-jpeg` gained
+  `ColorSpace::Unknown(2)` — sequential ids `1`/`2`, one shared quantisation
+  and Huffman slot, no subsampling, no colour transform, no `JFIF`/Adobe
+  marker — exactly as the fix was scoped below. A greyscale-plus-alpha
+  *chunky* JPEG page now round-trips; the `ImageSpec::validate` refusal and
+  the `plan()` arm that produced it are both gone.
+  `tests/roundtrip.rs::a_two_channel_jpeg_page_round_trips_chunky_through_jcs_unknown`
+  is the regression test, and checks `PlanarConfiguration::Planar` still
+  works too. Verified against real libtiff, not merely against this crate's
+  own decoder: `tiffinfo` reports the page cleanly, and `tiffcp -c none`
+  makes libtiff's own libjpeg actually decode the two-component scan —
+  byte-identical to this crate's decode of the same file. Original scoping,
+  left here for the record: *"the fix belongs in `oxiarc-jpeg` — one
+  `component_template` row and one `ColorSpace` variant for two
+  components — and there is no correct workaround inside `oxiarc-tiff`,
+  because the component count comes from the colour space and the entropy
+  coding cannot be spliced after the fact."*
 - **2-, 4-, 12- and 24-bit external fixtures.** `tifffile` needs `imagecodecs`
   to *write* non-byte-aligned depths and Pillow cannot write them at all.
   Covered internally by `e12`/`e13` and, in the encode direction, by
@@ -294,10 +326,15 @@ because libtiff, GDAL and `tifffile` all write the Adobe registration.
 
 ## Deferred (out of this track's scope, recorded so it is not re-discovered)
 
-- **Move the JPEG encoder to `oxiarc-jpeg`** once item W1-F2 lands (it has;
-  the swap itself was not part of this track — `compression/jpeg/encode.rs`
-  and `compression::jpeg::{encode, shared_tables}` remain the seam per
-  TIFF1's handoff).
+- ~~**Move the JPEG encoder to `oxiarc-jpeg`**~~ **Done 2026-09-08
+  (TIFFPOLISH).** `compression/jpeg/encode.rs` is now a 334-line mapping from a
+  TIFF `CodecContext` onto `oxiarc_jpeg::EncodeOptions`, driving
+  `Encoder::{write_tables_only, encode_scan_only, encode}`; the 659-line local
+  baseline encoder is gone. Tag 347 was checked byte-identical against the old
+  encoder at qualities 1/10/25/50/75/95/100 for gray, YCbCr 4:2:2, RGB and CMYK
+  *before* the swap, and is now checked byte-identical against `tiffcp -c jpeg`
+  in `tiff_oracle_codecs.rs`. `compression::jpeg::{encode, shared_tables}`
+  is unchanged as the seam.
 - **`compat::decoder::IfdDecoder` / `compat::decoder::ifd::{Value, Entry}`**
   (critique.md section 2.11's export list) were not built as separate types:
   `compat::tags::ValueBuffer` (`= crate::Value`) and `Decoder::tag_iter`

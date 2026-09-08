@@ -33,8 +33,16 @@ mod deflate;
 #[cfg(feature = "brotli")]
 mod brotli;
 
+#[cfg(feature = "brotli")]
+mod dcb;
+
+// `pub(crate)`, not private: `encode.rs` calls `zstd::dcz_header` to write
+// the same RFC 9842 preamble this module's `DczCodingDecoder` verifies.
 #[cfg(feature = "zstd")]
-mod zstd;
+pub(crate) mod zstd;
+
+#[cfg(feature = "compress")]
+mod compress;
 
 use oxiarc_core::traits::FlushMode;
 
@@ -880,10 +888,18 @@ fn build_stage(
         #[cfg(feature = "zstd")]
         ContentCoding::Zstd => Ok(Box::new(zstd::ZstdCodingDecoder::new(limits))),
 
+        // `compress` / `x-compress`: legacy UNIX `.Z`, bridged from
+        // `oxiarc_lzw::z::ZReader`'s pull shape onto this push seam; see
+        // `decode/compress.rs`.
+        #[cfg(feature = "compress")]
+        ContentCoding::Compress => Ok(Box::new(compress::CompressCodingDecoder::new(limits))),
+
+        // `dcz` verifies the RFC 9842 preamble (a zstd skippable frame
+        // carrying the dictionary's SHA-256) before a single frame byte
+        // reaches `ZstdStream`; see `decode/zstd.rs`'s `DczCodingDecoder`.
         #[cfg(feature = "zstd")]
         ContentCoding::Dcz => match dictionary {
-            Some(dictionary) => Ok(Box::new(zstd::ZstdCodingDecoder::with_dictionary(
-                ContentCoding::Dcz,
+            Some(dictionary) => Ok(Box::new(zstd::DczCodingDecoder::new(
                 limits,
                 dictionary.to_vec(),
             ))),
@@ -892,12 +908,15 @@ fn build_stage(
             }),
         },
 
-        // `dcb` needs shared-dictionary Brotli, which `oxiarc-brotli` does
-        // not implement (Phase 8 owner decision #8). Report the dictionary
-        // requirement when one was offered — that is the actionable answer
-        // — and plain "unsupported" otherwise.
+        // `dcb` verifies `oxiarc_brotli::dcb`'s 36-byte preamble (magic +
+        // the dictionary's SHA-256) before a single Brotli byte is decoded;
+        // see `decode/dcb.rs`.
+        #[cfg(feature = "brotli")]
         ContentCoding::Dcb => match dictionary {
-            Some(_) => Err(unsupported_coding_error(coding)),
+            Some(dictionary) => Ok(Box::new(dcb::DcbCodingDecoder::new(
+                limits,
+                dictionary.to_vec(),
+            ))),
             None => Err(HttpCodingError::MissingDictionary {
                 coding: ContentCoding::Dcb,
             }),
@@ -1032,21 +1051,30 @@ mod tests {
         )
         .expect_err("unknown codings must be refused");
         assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
+    }
 
+    // `compress` and `dcb` used to be permanently unsupported; both are now
+    // real, feature-gated codings — see `tests/dictionary.rs` for `dcb`'s
+    // "with/without a dictionary, with/without the feature" coverage
+    // (mirroring `dcz`'s own pattern there) and `decode::compress::tests`
+    // for `compress`'s. This crate's own DoD runs `--features compress`
+    // alone, so both branches below are exercised by CI either way.
+    #[cfg(not(feature = "compress"))]
+    #[test]
+    fn compress_is_unsupported_without_its_feature() {
         let err = Decoder::new(&[ContentCoding::Compress], &DecodeLimits::default())
-            .expect_err("compress is not implementable yet");
+            .expect_err("compress needs the `compress` feature");
         assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
     }
 
+    #[cfg(feature = "compress")]
     #[test]
-    fn dcb_reports_the_dictionary_requirement() {
-        let err = Decoder::new(&[ContentCoding::Dcb], &DecodeLimits::default())
-            .expect_err("dcb needs a dictionary");
-        assert!(matches!(err, HttpCodingError::MissingDictionary { .. }));
-
-        let err = Decoder::with_dictionary(&[ContentCoding::Dcb], &DecodeLimits::default(), b"d")
-            .expect_err("dcb is unsupported even with a dictionary");
-        assert!(matches!(err, HttpCodingError::UnsupportedCoding { .. }));
+    fn compress_decodes_a_real_dot_z_body() {
+        let plain = b"compress, wired all the way through Decoder::new".repeat(8);
+        let wire = oxiarc_lzw::z::compress(&plain, 16).expect("compress");
+        let out = decode_body(&[ContentCoding::Compress], &wire, &DecodeLimits::default())
+            .expect("compress now decodes for real");
+        assert_eq!(out, plain);
     }
 
     #[test]

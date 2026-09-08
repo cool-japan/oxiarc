@@ -153,6 +153,16 @@ const HUFFMAN_LITERALS_MIN: usize = 64;
 ///
 /// Chooses the smallest valid representation among RLE (all bytes equal),
 /// Huffman-compressed (when it wins and self-verifies), and Raw.
+/// [`encode_literals_section`] for the literals decoder's own tests.
+///
+/// The four-stream Huffman sections this produces are the only realistic
+/// input for the differential between the interleaved and checked decoders,
+/// and hand-writing one would test the hand-written bits, not the format.
+#[cfg(test)]
+pub(crate) fn encode_literals_section_for_test(literals: &[u8]) -> Result<Vec<u8>> {
+    encode_literals_section(literals)
+}
+
 fn encode_literals_section(literals: &[u8]) -> Result<Vec<u8>> {
     if literals.is_empty() {
         // Raw literals with 0 size: single header byte.

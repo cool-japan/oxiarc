@@ -217,7 +217,16 @@ type TemplateRow = (u8, u8, u8, u8, bool);
 
 /// Component identifiers, sampling factors and table slots per colour space.
 ///
-/// Transcribed from libjpeg's `jpeg_set_colorspace` `SET_COMP` calls.
+/// Transcribed from libjpeg's `jpeg_set_colorspace` `SET_COMP` calls. The
+/// `Unknown(2)` row is this crate's own addition — real libjpeg's own
+/// `JCS_UNKNOWN` branch is a loop (`for (ci = 0; ci < num_components; ci++)
+/// SET_COMP(ci, ci, 1,1, 0,0,0);`), so it exists for any component count;
+/// this crate accepts it only at exactly two, because that is the one count
+/// [`conversion_is_supported`] and [`super::prepare::conversion_for`] wire an
+/// [`InputColor`] to ([`InputColor::LumaAlpha`], preserving the alpha channel
+/// a decode would otherwise drop). A row for one, three or four components
+/// would sit unreachable behind those two gates — this crate's other colour
+/// spaces already cover those counts — so it is deliberately not added.
 fn component_template(color: ColorSpace) -> Result<Vec<TemplateRow>> {
     Ok(match color {
         ColorSpace::Luma => vec![(1, 0, 0, 0, true)],
@@ -239,10 +248,21 @@ fn component_template(color: ColorSpace) -> Result<Vec<TemplateRow>> {
             (3, 1, 1, 1, false),
             (4, 0, 0, 0, true),
         ],
+        // libjpeg's `JCS_UNKNOWN`, restricted to the two-component case: ids
+        // `1`, `2`, both on quantisation and Huffman slot 0, neither ever
+        // subsampled (no chroma to decimate, and `luma_sampled = false`
+        // exempts both from `Subsampling`'s named ratios — only
+        // `Subsampling::Custom` can move them off `1x1`). No JFIF or Adobe
+        // marker is written for it either: `color` is neither `Luma` nor
+        // `Ycbcr` (the `write_jfif` `Auto` rule) nor `Rgb`/`Cmyk`/`Ycck` (the
+        // `write_adobe` one), so both fall through to their `_` arm in
+        // `build_plan` with no code change needed there.
+        ColorSpace::Unknown(2) => vec![(1, 0, 0, 0, false), (2, 0, 0, 0, false)],
         ColorSpace::Unknown(_) => {
             return Err(JpegError::InvalidEncodeParameter {
                 parameter: "jpeg_color_space",
-                reason: "an unknown colour space has no component layout",
+                reason: "only a two-component Unknown colour space can be encoded; JPEG's \
+                         named colour spaces already cover one, three and four components",
             });
         }
     })
@@ -252,7 +272,12 @@ fn component_template(color: ColorSpace) -> Result<Vec<TemplateRow>> {
 fn conversion_is_supported(input: InputColor, color: ColorSpace) -> bool {
     use ColorSpace::{Cmyk, Luma, Rgb, Ycbcr, Ycck};
     match input {
-        InputColor::Luma | InputColor::LumaAlpha => color == Luma,
+        InputColor::Luma => color == Luma,
+        // Dropping the alpha channel into a one-component `Luma` frame is
+        // still the default (`InputColor::default_jpeg_color_space`); asking
+        // for `Unknown(2)` instead keeps it, as a second, untransformed
+        // component (see `conversion_for` in `super::prepare`).
+        InputColor::LumaAlpha => matches!(color, Luma | ColorSpace::Unknown(2)),
         InputColor::Rgb | InputColor::Rgba | InputColor::Bgr | InputColor::Bgra => {
             matches!(color, Luma | Ycbcr | Rgb)
         }
@@ -596,6 +621,108 @@ mod tests {
         assert!(!plan.write_jfif);
         assert_eq!(plan.write_adobe, Some(0));
         assert!(plan.quant[1].is_none(), "only one DQT is referenced");
+    }
+
+    /// libjpeg's `JCS_UNKNOWN` shape, restricted to two components: `1`, `2`,
+    /// no subsampling, one shared table slot, no metadata markers.
+    #[test]
+    fn unknown_two_component_layout_is_sequential_unsubsampled_and_unmarked() {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            ..Default::default()
+        };
+        let plan = make(&options, 17, 19, InputColor::LumaAlpha);
+        let ids: Vec<u8> = plan.components.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(
+            plan.components.iter().all(|c| (c.h, c.v) == (1, 1)),
+            "neither component is subsampled by default"
+        );
+        assert!(plan.components.iter().all(|c| c.quant_slot == 0));
+        assert!(plan.components.iter().all(|c| c.dc_slot == 0));
+        assert!(plan.components.iter().all(|c| c.ac_slot == 0));
+        assert!(plan.quant[1].is_none(), "only one DQT is referenced");
+        assert!(
+            !plan.write_jfif,
+            "libjpeg writes no JFIF marker for JCS_UNKNOWN"
+        );
+        assert_eq!(
+            plan.write_adobe, None,
+            "libjpeg writes no Adobe marker for JCS_UNKNOWN"
+        );
+    }
+
+    /// `Subsampling::Custom` can still move a two-component frame off `1x1`,
+    /// even though nothing chooses that automatically.
+    #[test]
+    fn unknown_two_component_layout_honours_an_explicit_custom_subsampling() {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            subsampling: Subsampling::Custom([(2, 1), (1, 1), (1, 1), (1, 1)]),
+            ..Default::default()
+        };
+        let plan = make(&options, 17, 19, InputColor::LumaAlpha);
+        let factors: Vec<(u8, u8)> = plan.components.iter().map(|c| (c.h, c.v)).collect();
+        assert_eq!(factors, vec![(2, 1), (1, 1)]);
+    }
+
+    /// Only the exact count `2` is accepted; every other `Unknown` count is a
+    /// named error, not a panic or a guess.
+    #[test]
+    fn component_template_accepts_only_unknown_two() {
+        assert!(component_template(ColorSpace::Unknown(2)).is_ok());
+        for other in [0u8, 1, 3, 4, 5, 6, 255] {
+            assert!(
+                component_template(ColorSpace::Unknown(other)).is_err(),
+                "Unknown({other}) should be refused"
+            );
+        }
+    }
+
+    /// [`InputColor::Luma`] alone has only one channel, so it cannot fill a
+    /// two-component frame; only [`InputColor::LumaAlpha`] can.
+    #[test]
+    fn only_luma_alpha_reaches_the_two_component_colour_space() {
+        assert!(conversion_is_supported(
+            InputColor::LumaAlpha,
+            ColorSpace::Unknown(2)
+        ));
+        assert!(!conversion_is_supported(
+            InputColor::Luma,
+            ColorSpace::Unknown(2)
+        ));
+        for other in [
+            InputColor::Rgb,
+            InputColor::Rgba,
+            InputColor::Bgr,
+            InputColor::Bgra,
+            InputColor::Ycbcr,
+            InputColor::Cmyk,
+            InputColor::Ycck,
+        ] {
+            assert!(!conversion_is_supported(other, ColorSpace::Unknown(2)));
+        }
+        // `LumaAlpha` still defaults to dropping the alpha channel: asking
+        // for the two-component space is opt-in, not automatic.
+        assert!(!conversion_is_supported(
+            InputColor::LumaAlpha,
+            ColorSpace::Unknown(3)
+        ));
+        assert_eq!(
+            InputColor::LumaAlpha.default_jpeg_color_space(),
+            ColorSpace::Luma
+        );
+    }
+
+    /// A one-channel buffer cannot feed a two-component frame, at the
+    /// `build_plan` level rather than the private helpers directly.
+    #[test]
+    fn luma_alone_cannot_fill_an_unknown_two_frame() {
+        let options = EncodeOptions {
+            jpeg_color_space: Some(ColorSpace::Unknown(2)),
+            ..Default::default()
+        };
+        assert!(build_plan(&options, 8, 8, InputColor::Luma).is_err());
     }
 
     #[test]

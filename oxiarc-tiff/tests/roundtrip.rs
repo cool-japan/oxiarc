@@ -593,3 +593,293 @@ fn an_empty_encoder_still_produces_a_valid_header() {
         assert!(decoder.info().is_err());
     }
 }
+
+/// A greyscale-plus-alpha JPEG page round-trips **chunky**.
+///
+/// Until `oxiarc-jpeg` 0.4.2 this was refused: JPEG has no *named*
+/// two-component colour space, and libjpeg reaches one only through
+/// `JCS_UNKNOWN`, which `oxiarc-jpeg` did not encode yet. It now does
+/// (`ColorSpace::Unknown(2)`: sequential ids `1`/`2`, no subsampling, no
+/// colour transform, no JFIF/Adobe marker), so `ImageSpec::validate`'s
+/// former guard and the `plan()` arm that produced the refusal are both
+/// gone — this is the regression test that they stay gone.
+/// `PlanarConfiguration::Planar` (each channel its own single-component
+/// frame) still works too, and is checked alongside chunky rather than
+/// dropped, since it is still a legitimate way to write the same page.
+#[cfg(feature = "jpeg")]
+#[test]
+fn a_two_channel_jpeg_page_round_trips_chunky_through_jcs_unknown() {
+    use oxiarc_tiff::PlanarConfiguration;
+
+    let (width, height) = (32u32, 16u32);
+    let pixels: Vec<u8> = (0..width * height * 2).map(|i| (i % 251) as u8).collect();
+    let jpeg = oxiarc_tiff::Compression::Jpeg {
+        quality: 90,
+        shared_tables: true,
+    };
+    let base = oxiarc_tiff::ImageSpec::new(width, height, oxiarc_tiff::ColorType::GrayA(8))
+        .with_compression(jpeg)
+        .with_layout(oxiarc_tiff::Layout::Strips {
+            rows_per_strip: height,
+        });
+    assert_eq!(
+        base.planar,
+        PlanarConfiguration::Chunky,
+        "chunky is the default, and the case that used to be refused"
+    );
+
+    let mut chunky_bytes = Vec::new();
+    let mut encoder =
+        oxiarc_tiff::Encoder::new(std::io::Cursor::new(&mut chunky_bytes)).expect("encoder");
+    encoder.write_image(&base, &pixels).expect("chunky write");
+    encoder.finish().expect("finish");
+
+    let mut decoder =
+        oxiarc_tiff::Decoder::new(std::io::Cursor::new(&chunky_bytes)).expect("decoder");
+    let mut chunky_decoded = vec![0u8; pixels.len()];
+    decoder
+        .read_image_bytes(&mut chunky_decoded)
+        .expect("decode");
+    for (index, (a, b)) in chunky_decoded.iter().zip(pixels.iter()).enumerate() {
+        assert!(
+            a.abs_diff(*b) <= 20,
+            "chunky sample {index}: {a} against {b} (JPEG is lossy, but not that lossy)"
+        );
+    }
+
+    // `PlanarConfiguration::Planar` is still a legitimate way to write the
+    // same page, and still works.
+    let mut planar_bytes = Vec::new();
+    let mut encoder =
+        oxiarc_tiff::Encoder::new(std::io::Cursor::new(&mut planar_bytes)).expect("encoder");
+    let planar_spec = base.with_planar(PlanarConfiguration::Planar);
+    encoder
+        .write_image(&planar_spec, &pixels)
+        .expect("planar write");
+    encoder.finish().expect("finish");
+
+    let mut decoder =
+        oxiarc_tiff::Decoder::new(std::io::Cursor::new(&planar_bytes)).expect("decoder");
+    let mut planar_decoded = vec![0u8; pixels.len()];
+    decoder
+        .read_image_bytes(&mut planar_decoded)
+        .expect("decode");
+    for (index, (a, b)) in planar_decoded.iter().zip(pixels.iter()).enumerate() {
+        assert!(
+            a.abs_diff(*b) <= 20,
+            "planar sample {index}: {a} against {b} (JPEG is lossy, but not that lossy)"
+        );
+    }
+
+    // `tiffinfo` parses the chunky file: `Compression Scheme: JPEG`,
+    // `Samples/Pixel: 2`, `Extra Samples: 1<unassoc-alpha>`, the right
+    // geometry, and no warning on stderr. Self-skips when `tiffinfo` is
+    // absent, as every oracle check in this crate does.
+    if let Some(tiffinfo) = which("tiffinfo") {
+        let path = std::env::temp_dir().join(format!(
+            "oxiarc_tiff_two_channel_{}.tif",
+            std::process::id()
+        ));
+        std::fs::write(&path, &chunky_bytes).expect("write scratch file");
+        let output = std::process::Command::new(&tiffinfo)
+            .arg(&path)
+            .output()
+            .expect("spawn tiffinfo");
+        let _ = std::fs::remove_file(&path);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "tiffinfo did not parse the chunky two-channel file cleanly:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for expected in [
+            "Image Width: 32 Image Length: 16",
+            "Compression Scheme: JPEG",
+            "Samples/Pixel: 2",
+            "Extra Samples: 1<unassoc-alpha>",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "tiffinfo output missing {expected:?}:\n{stdout}"
+            );
+        }
+    } else {
+        eprintln!("libtiff's tiffinfo is not on PATH; skipping that half of the check");
+    }
+
+    // Stronger still: `tiffcp -c none` makes libtiff's *own* embedded
+    // libjpeg actually entropy-decode the two-component scan (not merely
+    // parse its headers, which is all a bare `djpeg` can do for this shape —
+    // see `oxiarc-jpeg/tests/encode_oracle.rs` for why) and re-encode
+    // uncompressed. Decoding libtiff's own recoded output through this
+    // crate must be byte-identical to decoding the original file through
+    // this crate: the two are the same pixels through the same JPEG loss,
+    // decoded by two different JPEG decoders written by two different
+    // projects.
+    if let Some(tiffcp) = which("tiffcp") {
+        let source_path = std::env::temp_dir().join(format!(
+            "oxiarc_tiff_two_channel_src_{}.tif",
+            std::process::id()
+        ));
+        let recoded_path = std::env::temp_dir().join(format!(
+            "oxiarc_tiff_two_channel_recoded_{}.tif",
+            std::process::id()
+        ));
+        std::fs::write(&source_path, &chunky_bytes).expect("write scratch file");
+        let recode = std::process::Command::new(&tiffcp)
+            .args(["-c", "none"])
+            .arg(&source_path)
+            .arg(&recoded_path)
+            .output()
+            .expect("spawn tiffcp");
+        assert!(
+            recode.status.success(),
+            "libtiff's tiffcp refused to recode the two-channel JPEG page: {}",
+            String::from_utf8_lossy(&recode.stderr)
+        );
+        let recoded_bytes = std::fs::read(&recoded_path).expect("read recoded file");
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&recoded_path);
+
+        let mut recoded_decoder =
+            oxiarc_tiff::Decoder::new(std::io::Cursor::new(recoded_bytes)).expect("decoder");
+        let mut via_libtiff = vec![0u8; pixels.len()];
+        recoded_decoder
+            .read_image_bytes(&mut via_libtiff)
+            .expect("decode libtiff's recode");
+        assert_eq!(
+            via_libtiff, chunky_decoded,
+            "libtiff's own libjpeg decoded the two-component scan to different \
+             samples than this crate's decoder did"
+        );
+    } else {
+        eprintln!("libtiff's tiffcp is not on PATH; skipping that half of the check");
+    }
+}
+
+/// A tool on `PATH`, found the same way `which` reports it, or `None`.
+///
+/// Only the two-channel JPEG test below uses this, so it is gated the same
+/// way that test is: unused (and a `dead_code` error under `-D warnings`)
+/// when the `jpeg` feature is off.
+#[cfg(feature = "jpeg")]
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// The chunky two-channel JPEG page above is written as a single strip. The
+/// interesting boundaries are the ones a real writer hits: several strips
+/// (each its own abbreviated frame, the last one short), tiles, restart
+/// markers inside the scan, and tables written per chunk instead of into tag
+/// 347. None of these had ever coded a two-component frame — before
+/// `oxiarc-jpeg` gained `ColorSpace::Unknown(2)` the spec was refused
+/// outright — so each one is checked here rather than assumed to follow from
+/// the single-strip case.
+#[cfg(feature = "jpeg")]
+#[test]
+fn two_channel_jpeg_pages_survive_strip_tile_and_restart_boundaries() {
+    use oxiarc_tiff::{Compression, Decoder, Encoder, ImageSpec, Layout};
+
+    fn page(width: u32, height: u32) -> Vec<u8> {
+        (0..width * height * 2).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn round_trip(spec: &ImageSpec, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder::new(std::io::Cursor::new(&mut bytes)).expect("encoder");
+        encoder.write_image(spec, data).expect("write");
+        encoder.finish().expect("finish");
+        let mut decoder = Decoder::new(std::io::Cursor::new(&bytes)).expect("decoder");
+        let mut out = vec![0u8; data.len()];
+        decoder.read_image_bytes(&mut out).expect("decode");
+        out
+    }
+
+    fn check(label: &str, decoded: &[u8], expected: &[u8]) {
+        assert_eq!(decoded.len(), expected.len(), "{label}: wrong length");
+        for (index, (a, b)) in decoded.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                a.abs_diff(*b) <= 20,
+                "{label}: sample {index} is {a} against {b} (JPEG is lossy, but not \
+                 that lossy — a boundary is coding the wrong samples)"
+            );
+        }
+    }
+
+    let jpeg = Compression::Jpeg {
+        quality: 90,
+        shared_tables: true,
+    };
+
+    // Several strips, including a short final one (20 rows in strips of 8)
+    // and a page narrower than one MCU row (17 wide, 8 rows per strip).
+    for (width, height, rows_per_strip) in [
+        (32u32, 20u32, 8u32),
+        (32, 24, 8),
+        (17, 20, 8),
+        (32, 40, 24),
+        (7, 3, 8),
+    ] {
+        let data = page(width, height);
+        let spec = ImageSpec::new(width, height, oxiarc_tiff::ColorType::GrayA(8))
+            .with_compression(jpeg)
+            .with_layout(Layout::Strips { rows_per_strip });
+        let decoded = round_trip(&spec, &data);
+        check(
+            &format!("strips {width}x{height}/{rows_per_strip}"),
+            &decoded,
+            &data,
+        );
+    }
+
+    // Tiles, including a page whose edge tiles are partly padding.
+    for (width, height, tile_width, tile_length) in [
+        (32u32, 32u32, 16u32, 16u32),
+        (40, 24, 16, 16),
+        (17, 19, 32, 16),
+    ] {
+        let data = page(width, height);
+        let spec = ImageSpec::new(width, height, oxiarc_tiff::ColorType::GrayA(8))
+            .with_compression(jpeg)
+            .with_layout(Layout::Tiles {
+                width: tile_width,
+                length: tile_length,
+            });
+        let decoded = round_trip(&spec, &data);
+        check(
+            &format!("tiles {width}x{height}/{tile_width}x{tile_length}"),
+            &decoded,
+            &data,
+        );
+    }
+
+    // Restart markers inside a two-component interleaved scan, with the
+    // tables in tag 347 and again written into every chunk.
+    for shared_tables in [true, false] {
+        for restart_rows in [0u16, 1, 2] {
+            let (width, height) = (32u32, 24u32);
+            let data = page(width, height);
+            let spec = ImageSpec::new(width, height, oxiarc_tiff::ColorType::GrayA(8))
+                .with_compression(Compression::Jpeg {
+                    quality: 85,
+                    shared_tables,
+                })
+                .with_jpeg_restart_rows(restart_rows)
+                .with_layout(Layout::Strips { rows_per_strip: 8 });
+            let decoded = round_trip(&spec, &data);
+            check(
+                &format!("shared={shared_tables} restart_rows={restart_rows}"),
+                &decoded,
+                &data,
+            );
+        }
+    }
+}

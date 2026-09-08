@@ -1,9 +1,14 @@
-//! The invariants the seven fuzz targets assert, run against the committed
-//! seed corpus.
+//! The invariants `oxiarc-http`'s two fuzz targets, `fuzz_http_decode` and
+//! `fuzz_http_headers`, assert — run here directly, against the seed
+//! families `examples/fuzz_seeds.rs` writes for them.
 //!
-//! The targets live in the workspace `fuzz/` crate; the seeds come from
-//! `examples/fuzz_seeds.rs`. This file re-derives the same seed families and
-//! checks the same invariants, so:
+//! The targets themselves live in the workspace `fuzz/` crate
+//! (`fuzz/fuzz_targets/fuzz_http_{decode,headers}.rs`); this file re-derives
+//! the same seed families and checks the same properties those targets
+//! assert (`fuzz_http_decode`'s bounded/no-panic/no-hang decode over
+//! randomly chosen codings, limits and chunk granularity;
+//! `fuzz_http_headers`'s never-panics-on-header-text plus its own
+//! `AcceptEncoding` round-trip check), so:
 //!
 //! * an invariant that stops holding fails here, in `cargo test`, rather
 //!   than only under a fuzzer someone remembers to run;
@@ -13,6 +18,12 @@
 //! The invariants themselves are deliberately weak — no panic, and bounds
 //! that must hold for *any* input — because that is what a fuzz target can
 //! assert. The strong assertions live in the other test files.
+//!
+//! One property this file does *not*, and cannot, mirror: `fuzz_http_decode`
+//! picks its codings, limits, and chunk size from the fuzz input's own
+//! leading bytes via `arbitrary::Unstructured`, rather than from the fixed
+//! shapes below — see that target's own doc comment and
+//! `examples/fuzz_seeds.rs`'s.
 
 #![cfg(all(feature = "gzip", feature = "deflate"))]
 
@@ -88,7 +99,7 @@ const QVALUES: &[&str] = &[
     " q = 0.5 ",
 ];
 
-/// `fuzz_http_parse_accept_encoding`: never panics, and every q value is in
+/// Part of `fuzz_http_headers`: never panics, and every q value is in
 /// range.
 #[test]
 fn accept_encoding_seeds_hold_their_invariants() {
@@ -104,7 +115,7 @@ fn accept_encoding_seeds_hold_their_invariants() {
     parse_accept_encoding(&hostile).expect_err("65 elements must be refused");
 }
 
-/// `fuzz_http_parse_content_encoding`: never panics, and never yields
+/// Part of `fuzz_http_headers`: never panics, and never yields
 /// `identity` (which RFC 9110 §8.4 says must not appear and this crate
 /// drops).
 #[test]
@@ -119,7 +130,7 @@ fn content_encoding_seeds_hold_their_invariants() {
     }
 }
 
-/// `fuzz_http_qvalue`: never panics, result always in `0..=1000`.
+/// Part of `fuzz_http_headers`: never panics, result always in `0..=1000`.
 #[test]
 fn qvalue_seeds_hold_their_invariants() {
     for value in QVALUES {
@@ -155,7 +166,7 @@ fn decode_bounded(coding: ContentCoding, wire: &[u8], cap: u64) {
     assert!(out.len() as u64 <= cap, "output exceeded the cap");
 }
 
-/// `fuzz_http_decoder_gzip`: no panic, no cap violation, on every gzip seed
+/// Part of `fuzz_http_decode`: no panic, no cap violation, on every gzip seed
 /// shape — and the "ok" seeds must still decode, or the corpus has rotted.
 #[test]
 fn gzip_seeds_hold_their_invariants() {
@@ -205,7 +216,7 @@ fn gzip_seeds_hold_their_invariants() {
     }
 }
 
-/// `fuzz_http_decoder_deflate`: the sniffer's three spellings plus the
+/// Part of `fuzz_http_decode`: the sniffer's three spellings plus the
 /// crafted collision, all bounded and panic-free.
 #[test]
 fn deflate_seeds_hold_their_invariants() {
@@ -243,8 +254,9 @@ fn deflate_seeds_hold_their_invariants() {
     }
 }
 
-/// `fuzz_http_decoder_chunked`: the strongest streaming invariant — the
-/// decoded bytes do not depend on how the wire bytes were split.
+/// A stronger, fixed-shape property `fuzz_http_decode` cannot itself pin
+/// (see this file's module docs): the decoded bytes do not depend on how
+/// the wire bytes were split.
 #[test]
 fn chunked_seeds_hold_the_invariance_property() {
     let plain = common::text(6_000);
@@ -287,7 +299,7 @@ fn chunked_seeds_hold_the_invariance_property() {
     }
 }
 
-/// `fuzz_http_negotiate`: the result is always `None` or a member of
+/// Part of `fuzz_http_headers`: the result is always `None` or a member of
 /// `available`, and it never panics.
 #[test]
 fn negotiate_seeds_hold_their_invariants() {

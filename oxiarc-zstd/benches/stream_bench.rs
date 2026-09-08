@@ -129,6 +129,82 @@ fn bench_decode_throughput(c: &mut Criterion) {
     }
 }
 
+/// RGB8 image rows: the TIFF-strip shape, whose bytes are almost all
+/// Huffman-coded literals.
+fn rgb8_rows(width: usize, rows: usize) -> Vec<u8> {
+    let mut x = 0x1234_5678u32;
+    let mut out = Vec::with_capacity(width * rows * 3);
+    for y in 0..rows {
+        for i in 0..width {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let noise = (x & 0x0F) as usize;
+            out.push((((i * 255) / width + noise) & 0xFF) as u8);
+            out.push((((y * 255) / rows.max(1) + noise / 2) & 0xFF) as u8);
+            out.push((((i + y) * 128 / (width + rows) + noise / 4) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// The shape matrix the decode-throughput work is measured against.
+///
+/// Each row is one payload at one compression level, decoded three ways. The
+/// shapes stress different parts of the decoder: the TIFF-strip rows are
+/// literal-bound (the interleaved Huffman loop), `repetitive` is bound by the
+/// overlapping-match copy, and `incompressible` is a `Raw` block memcpy.
+///
+/// For a comparison against the reference decoder rather than against our own
+/// previous self, use `examples/decode_throughput.rs`, which measures the same
+/// shapes against `zstd -b -d` with interleaved rounds.
+fn bench_shape_matrix(c: &mut Criterion) {
+    let strip = rgb8_rows(4096, 24);
+    let shapes: [(&str, &[u8], &[i32]); 3] = [
+        ("tiff_strip_rgb8", &strip, &[1, 3, 9, 19]),
+        ("incompressible", &[], &[3]),
+        ("repetitive", &[], &[3]),
+    ];
+
+    for (name, fixed, levels) in shapes {
+        let data: Vec<u8> = match name {
+            "incompressible" => pseudo_random(1 << 20, 0x5EED),
+            "repetitive" => b"oxiarc-zstd/"
+                .iter()
+                .copied()
+                .cycle()
+                .take(1 << 20)
+                .collect(),
+            _ => fixed.to_vec(),
+        };
+        let mut group = c.benchmark_group(format!("zstd_shape/{name}"));
+        group.throughput(Throughput::Bytes(data.len() as u64));
+
+        for &level in levels {
+            let frame = compress_with_level(&data, level).expect("compress");
+            group.bench_with_input(BenchmarkId::new("oneshot_into", level), &level, |b, _| {
+                let mut dst = vec![0u8; data.len()];
+                b.iter(|| {
+                    black_box(
+                        decompress_into(black_box(&frame), &mut dst).expect("decompress_into"),
+                    )
+                });
+            });
+            group.bench_with_input(BenchmarkId::new("legacy_oneshot", level), &level, |b, _| {
+                b.iter(|| black_box(decompress(black_box(&frame)).expect("decompress")));
+            });
+            let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+            let mut scratch = vec![0u8; 64 * 1024];
+            drive(&mut stream, &frame, 64 * 1024, &mut scratch);
+            group.bench_with_input(BenchmarkId::new("stream_64kib", level), &level, |b, _| {
+                b.iter(|| black_box(drive(&mut stream, &frame, 64 * 1024, &mut scratch)));
+            });
+        }
+
+        group.finish();
+    }
+}
+
 /// How far throughput falls when the caller starves the decoder on both sides.
 fn bench_starved_schedules(c: &mut Criterion) {
     let data = structured(128 * 1024);
@@ -192,6 +268,7 @@ fn bench_read_adapter(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_decode_throughput,
+    bench_shape_matrix,
     bench_starved_schedules,
     bench_read_adapter
 );

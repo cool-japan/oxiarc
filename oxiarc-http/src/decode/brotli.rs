@@ -20,8 +20,24 @@ use crate::decode::coding::{CodingDecoder, CodingProgress, CodingStatus, is_fini
 use crate::error::{HttpCodingError, LimitKind, Result};
 use crate::limits::DecodeLimits;
 
-/// Translate a codec error, keeping resource refusals out of `Corrupt`.
+/// Translate a codec error for the plain `br` stage.
 fn map_error(error: BrotliError) -> HttpCodingError {
+    map_error_for(&ContentCoding::Brotli, error)
+}
+
+/// Translate a codec error, keeping resource refusals out of `Corrupt`.
+///
+/// `pub(crate)` and coding-parameterised, not private and hard-wired to
+/// `br`: [`super::dcb::DcbCodingDecoder`] shares this —
+/// `verify_dcb_header`/`BrotliStream::decode` report the same [`BrotliError`],
+/// so a bad dictionary digest ([`BrotliError::DictionaryError`]) and a bad
+/// meta-block both fall through to the same [`HttpCodingError::Corrupt`] arm
+/// below, exactly as a plain `br` body's corruption does — but the
+/// [`Corrupt::coding`](HttpCodingError::Corrupt) it names has to be the
+/// coding the *response* declared, `dcb` or `br`, since that field is a
+/// public part of the error a caller matches on to say which coding in the
+/// chain failed.
+pub(crate) fn map_error_for(coding: &ContentCoding, error: BrotliError) -> HttpCodingError {
     match error {
         BrotliError::WindowTooLarge { declared, max } => HttpCodingError::LimitExceeded {
             limit: max as f64,
@@ -42,7 +58,7 @@ fn map_error(error: BrotliError) -> HttpCodingError {
             },
         },
         other => HttpCodingError::Corrupt {
-            coding: ContentCoding::Brotli,
+            coding: coding.clone(),
             source: Box::new(other),
         },
     }

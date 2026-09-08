@@ -364,9 +364,25 @@ impl<'a, W: Write + Seek> ImageWriter<'a, W> {
             let (h, v) = spec.ycbcr_subsampling.unwrap_or((1, 1));
             dir.set(Tag::YCbCrSubSampling, Value::Short(vec![h, v]));
         }
-        let t4 = spec.compression.t4_options();
-        if t4 != 0 {
-            dir.set(Tag::T4Options, Value::Long(vec![t4]));
+        // `T4Options` bit 1 and `T6Options` bit 1 both mean "this file may
+        // contain T.4 uncompressed mode"; each belongs to its own codec, so
+        // the flag lands in exactly one of the two tags.
+        let uncompressed = if spec.ccitt_uncompressed {
+            crate::tags::T4Options::UNCOMPRESSED
+        } else {
+            0
+        };
+        match spec.compression.method() {
+            crate::tags::CompressionMethod::CcittFax3 => {
+                let t4 = spec.compression.t4_options() | uncompressed;
+                if t4 != 0 {
+                    dir.set(Tag::T4Options, Value::Long(vec![t4]));
+                }
+            }
+            crate::tags::CompressionMethod::CcittFax4 if uncompressed != 0 => {
+                dir.set(Tag::T6Options, Value::Long(vec![uncompressed]));
+            }
+            _ => {}
         }
 
         let offsets = chunk_table(&self.offsets, big)?;
@@ -661,8 +677,16 @@ pub(crate) fn encode_chunk_pure(
         samples_per_pixel: chunk_spp,
         planar: spec.planar,
         plane,
-        t4_options: crate::tags::T4Options::from_u32(spec.compression.t4_options()),
-        t6_options: crate::tags::T6Options::default(),
+        t4_options: crate::tags::T4Options::from_u32(if spec.ccitt_uncompressed {
+            spec.compression.t4_options() | crate::tags::T4Options::UNCOMPRESSED
+        } else {
+            spec.compression.t4_options()
+        }),
+        t6_options: crate::tags::T6Options::from_u32(if spec.ccitt_uncompressed {
+            crate::tags::T6Options::UNCOMPRESSED
+        } else {
+            0
+        }),
         ycbcr_subsampling: if spec.photometric == crate::tags::PhotometricInterpretation::YCbCr {
             spec.ycbcr_subsampling.unwrap_or((2, 2))
         } else {

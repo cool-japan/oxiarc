@@ -337,6 +337,45 @@ pub fn colour_for(dtype: &str, spp: u16) -> (u16, SampleFormat) {
     }
 }
 
+/// Whether this build compiles the codec the file at `path` was written with.
+///
+/// The Python driver and `tiffcp` write fixtures for every codec *libtiff*
+/// has, which is a superset of what a reduced build of this crate decodes; a
+/// `--features tiff-oracle` build without, say, `zstd` would otherwise fail on
+/// `FeatureNotCompiled` while reading a fixture rather than while testing
+/// anything. The callers count what they skip and assert it is **zero**
+/// whenever every codec feature is on, so this can only ever subtract from a
+/// reduced build.
+///
+/// An unreadable or unrecognised file answers `true`, so a real defect still
+/// reaches the assertion that follows.
+pub fn codec_is_available(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return true;
+    };
+    let Ok(mut decoder) = Decoder::new(Cursor::new(bytes)) else {
+        return true;
+    };
+    match decoder.find_tag(oxiarc_tiff::Tag::Compression) {
+        Ok(Some(oxiarc_tiff::Value::Short(values))) => values
+            .first()
+            .map(|value| oxiarc_tiff::CompressionMethod::from_u16(*value))
+            .is_none_or(oxiarc_tiff::CompressionMethod::is_available),
+        _ => true,
+    }
+}
+
+/// `true` when this build compiles every codec the oracle fixtures use, which
+/// is when [`codec_is_available`] must never skip anything.
+pub fn every_codec_is_available() -> bool {
+    cfg!(feature = "deflate")
+        && cfg!(feature = "lzw")
+        && cfg!(feature = "zstd")
+        && cfg!(feature = "lzma")
+        && cfg!(feature = "jpeg")
+        && cfg!(feature = "ccitt")
+}
+
 pub fn decode_file(path: &Path) -> Vec<u8> {
     let bytes = fs::read(path).expect("read fixture");
     let mut decoder = Decoder::new(Cursor::new(bytes)).expect("decoder");

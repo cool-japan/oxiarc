@@ -18,12 +18,17 @@
 //! sizes 10-24 (see the `brotli-oracle` cargo feature).
 //!
 //! The **encoder** emits RFC-conformant streams accepted by the reference
-//! `brotli -d`. It uses one prefix code per category per meta-block (no
-//! multi-block-type splitting, context modeling, or dictionary-reference
-//! emission yet), so compression ratios trail the reference encoder —
-//! close on typical text at q5-9, further behind at q10-11 on structured
-//! data. Incompressible input falls back to stored (uncompressed)
-//! meta-blocks, bounding worst-case expansion to a few bytes per 16 MiB.
+//! `brotli -d`. Quality 0-9 uses one prefix code per category per meta-block;
+//! quality 10-11 additionally splits the literal, insert-and-copy and distance
+//! streams into up to 8 block types each, with per-context prefix codes bound
+//! through a move-to-front, zero-run-length-coded context map, and keeps a
+//! split only when the fully-written meta-block actually gets smaller. An
+//! attached shared dictionary is referenced at every quality
+//! ([`compress_with_dictionary`]). What it still does not emit is Appendix A
+//! static-dictionary references, so ratios trail the reference encoder — close
+//! on typical text at q5-9, further behind on structured data. Incompressible
+//! input falls back to stored (uncompressed) meta-blocks, bounding worst-case
+//! expansion to a few bytes per 16 MiB.
 //!
 //! ## Strictness
 //!
@@ -79,6 +84,9 @@
 //! - RFC 7932 prefix coding with two-level `O(1)` decode tables
 //! - Static dictionary (RFC 7932 Appendix A, byte-exact) with all 121
 //!   transforms, including UTF-8-aware ferment casing
+//! - Shared (custom LZ77) dictionaries in both directions, interoperable with
+//!   `brotli --dictionary=FILE`, plus the RFC 9842 `Content-Encoding: dcb`
+//!   framing (see [`shared_dict`] and [`dcb`])
 //! - Insert-and-copy command alphabet with implicit distance-code-0 reuse
 //! - Distance ring buffer semantics per Section 4
 //! - Multiple quality levels (0-11); quality 0 = stored meta-blocks
@@ -130,7 +138,6 @@ mod block_split;
 pub mod compress;
 /// Context modeling for prefix code selection.
 pub mod context;
-/// `Content-Encoding: dcb` framing (RFC 9842).
 pub mod dcb;
 /// Brotli decompression.
 pub mod decompress;
@@ -142,8 +149,6 @@ pub mod error;
 pub mod huffman;
 /// LZ77 matching engine.
 pub mod lz77;
-/// Shared (custom LZ77) dictionaries: the `brotli --dictionary` / RFC 9842
-/// `dcb` mechanism.
 pub mod shared_dict;
 /// Bounded, truly incremental Brotli decoding.
 pub mod stream;

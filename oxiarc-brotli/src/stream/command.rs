@@ -65,16 +65,15 @@ pub(crate) enum CmdState {
     },
     /// Emitting a copy out of the attached *shared* dictionary
     /// ([`crate::shared_dict`]).
+    ///
+    /// A shared-dictionary copy never leaves the dictionary — one that would
+    /// run past its end is rejected when the distance is resolved, exactly as
+    /// `brotli 1.1.0` rejects it — so this state needs no continuation.
     SharedCopy {
         /// Offset of the next source byte inside the shared dictionary.
         offset: usize,
         /// Bytes still to take from the dictionary.
         remaining: usize,
-        /// The command's backward distance, needed for the `tail`.
-        distance: usize,
-        /// Bytes of the copy that run past the end of the dictionary and
-        /// continue in the produced output.
-        tail: usize,
     },
 }
 
@@ -569,38 +568,9 @@ fn command_loop(
                 meta.produced += n;
                 meta.cmd = CmdState::DictWord { pos: pos + n };
             }
-            CmdState::SharedCopy {
-                offset,
-                remaining,
-                distance,
-                tail,
-            } => {
+            CmdState::SharedCopy { offset, remaining } => {
                 if remaining == 0 {
-                    // A copy longer than the dictionary tail continues in the
-                    // produced output at the same distance: the dictionary sits
-                    // immediately before the reachable window. The ring holds
-                    // `min(1 << WBITS, produced)` bytes, exactly the reach the
-                    // one-shot decoder has into its output `Vec`, so both
-                    // decoders accept and reject the same straddling copies.
-                    //
-                    // The reachable history is the ring plus everything
-                    // produced during this call and not yet mirrored, hence
-                    // the `+ *written`; that sum does not depend on where the
-                    // call boundary happens to fall.
-                    let reach = ctx.window.filled() + *written;
-                    meta.cmd = if tail == 0 {
-                        CmdState::Begin
-                    } else if distance <= reach {
-                        CmdState::Copy {
-                            distance,
-                            remaining: tail,
-                        }
-                    } else {
-                        return Err(BrotliError::InvalidDistance {
-                            distance,
-                            max_distance: reach,
-                        });
-                    };
+                    meta.cmd = CmdState::Begin;
                     continue;
                 }
                 if *written == out.len() {
@@ -616,8 +586,6 @@ fn command_loop(
                 meta.cmd = CmdState::SharedCopy {
                     offset: offset + n,
                     remaining: remaining - n,
-                    distance,
-                    tail,
                 };
             }
         }
@@ -635,8 +603,17 @@ fn command_loop(
 /// one store per byte, with no ring write at all.
 ///
 /// Deferring the mirror to one bulk `push_slice` per call is what removes the
-/// push decoder's second write per produced byte. The caller must have
-/// validated `distance <= window.filled() + at`.
+/// push decoder's second write per produced byte.
+///
+/// **Precondition**: `distance <= min(window_size, bytes produced so far)`.
+/// `resolve_distance` establishes it for every distance that can reach here —
+/// anything larger is a dictionary reference, not a backward one — and the ring
+/// always holds at least that much history, in this call or any later one. It
+/// is the *later* one that matters: a state that carried a larger distance
+/// across a `decode` boundary would find the ring had moved on under it and
+/// read bytes ahead of the write cursor. (That is not hypothetical; it is the
+/// bug the shared-dictionary overrun rejection removed. See
+/// [`crate::shared_dict`].)
 ///
 /// Returns the number of bytes written, `min(count, out.len() - at)`.
 fn copy_into_pending(
@@ -910,12 +887,16 @@ fn resolve_distance(
                 "copy length exceeds meta-block length".to_string(),
             ));
         }
-        let from_dict = copy_length.min(available);
+        if copy_length > available {
+            return Err(crate::decompress::dictionary_overrun(
+                distance,
+                copy_length,
+                available,
+            ));
+        }
         return Ok(CmdState::SharedCopy {
             offset,
-            remaining: from_dict,
-            distance,
-            tail: copy_length - from_dict,
+            remaining: copy_length,
         });
     }
 

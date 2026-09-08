@@ -165,8 +165,30 @@ Quality 1..100 through libjpeg's scaling formula, `force_baseline`, dynamic
 tables, box and smoothed chroma decimation at 4:4:4 / 4:2:2 / 4:4:0 / 4:2:0 /
 4:1:1 and any exact integer ratio, MCU edge replication, restart intervals in
 MCUs or MCU rows, `JFIF` `APP0` with density, Adobe `APP14`, EXIF / XMP / ICC /
-`COM` passthrough, grayscale / YCbCr / RGB (no transform) / CMYK / YCCK, and
-TIFF's abbreviated tables-only and scan-only halves.
+`COM` passthrough, grayscale / YCbCr / RGB (no transform) / CMYK / YCCK /
+two-component (no transform), and TIFF's abbreviated tables-only and
+scan-only halves.
+
+**Two-component frames** (`ColorSpace::Unknown(2)`) are libjpeg's
+`JCS_UNKNOWN` layout: sequential identifiers `1`/`2`, one shared
+quantisation and Huffman slot, no subsampling, no colour transform, and
+neither a `JFIF` nor an Adobe marker (libjpeg writes neither for
+`JCS_UNKNOWN`). `InputColor::LumaAlpha` reaches it by asking for it
+explicitly — the default target for that input is still one-component
+`Luma`, which drops the alpha channel exactly as before. This is the shape
+a greyscale-plus-alpha TIFF `Compression = 7` page needs, and is verified
+against real libtiff, not only against this crate's own decoder: encoding
+one inside a TIFF page and running `tiffcp -c none` on it makes libtiff's
+own embedded libjpeg actually decode the two-component entropy-coded scan
+— a bare `djpeg`/`cjpeg`/Pillow cannot get that far, because none has an
+output path for a colour space it cannot map to grayscale or RGB, so this
+is the one shape in this crate verified through a *different* JPEG
+container's oracle rather than through `cjpeg`/`djpeg` directly. See
+`oxiarc-jpeg/tests/encode_oracle.rs`'s
+`djpeg_verbose_parses_our_two_component_frame_and_scan_header` and
+`two_component_channels_decompose_to_cjpeg_djpeg_reference_pixels` for what
+*is* checked against libjpeg-turbo directly, and exactly where that
+checking stops.
 
 ## Arithmetic coding
 

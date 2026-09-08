@@ -3,11 +3,11 @@
 Pure Rust TIFF 6.0 / BigTIFF reader and writer, part of the OxiArc ecosystem.
 
 ![Version](https://img.shields.io/badge/version-0.4.2-blue)
-![Tests](https://img.shields.io/badge/tests-434%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-535%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-07) | 434 tests + 36 doctests passing (`--all-features`)**
+**Version: 0.4.2 (2026-09-08) | 535 tests + 38 doctests passing (`--all-features`)**
 
 No C, no FFI, `#![forbid(unsafe_code)]`, no `unwrap()` in library code.
 
@@ -315,10 +315,34 @@ codec beyond uncompressed and PackBits": every other value then reports
   our G3-2D output is smaller, because libtiff re-sends a one-dimensional row
   every K rows for fax error resilience, which TIFF does not require (libtiff
   reads ours back with identical pixels).
-- **Group 3/4 uncompressed mode** (`T4Options` bit 1, `T6Options` bit 1) is
-  detected and reported by name, not decoded — libtiff 4.7.1 answers the same
-  data with "Uncompressed data (not supported)". The option bits are parsed and
-  never written.
+- **Group 3/4 uncompressed mode** (T.4 §4.2.1.3.2, `T4Options` bit 1 /
+  `T6Options` bit 1) is decoded *and* written, which libtiff cannot do:
+  libtiff 4.7.1 answers the same data with "Uncompressed data (not supported)".
+  The mode is read unconditionally — the entrance code is unambiguous, so a
+  file that carries it without declaring it in the option tag still decodes —
+  and written only when
+  [`ImageSpec::with_ccitt_uncompressed(true)`](https://docs.rs/oxiarc-tiff/latest/oxiarc_tiff/struct.ImageSpec.html#method.with_ccitt_uncompressed)
+  asks for it, because a file that used it uninvited would be unreadable in
+  libtiff. The encoder prices both codings of every row exactly and takes the
+  mode only where it is smaller, so turning it on can only shrink a page: a
+  512x64 dithered bilevel page more than halves in all three dialects, while a
+  page of long runs comes out byte-identical to one written with the mode off.
+- **A greyscale-plus-alpha JPEG page round-trips chunky.** JPEG defines no
+  *named* colour space with two components; `oxiarc-jpeg` 0.4.2 added
+  libjpeg's `JCS_UNKNOWN` layout for exactly this case (`ColorSpace::
+  Unknown(2)`: sequential ids `1`/`2`, no subsampling, no colour transform,
+  no `JFIF`/Adobe marker), so the `ImageSpec::validate` refusal and the
+  `plan()` arm that produced it — both present through 0.4.1 — are gone.
+  `PlanarConfiguration::Planar` (each channel its own single-component
+  frame) still works too, if that shape is preferred for some other reason.
+  Interoperability, measured rather than assumed: libtiff's own `tiffinfo`
+  reports the page cleanly (`Samples/Pixel: 2`, `Extra Samples: 1<unassoc-
+  alpha>`), and `tiffcp -c none` makes libtiff's *own* embedded libjpeg
+  actually decode the two-component entropy-coded scan (not merely parse its
+  header, which is as far as a bare `djpeg` can get for this shape — no
+  output module of its own accepts a colour space it cannot map to
+  grayscale or RGB) — the result is byte-identical to this crate's own
+  decode of the same file.
 - `Compression::Deflate` writes tag value **8**, the Adobe registration libtiff,
   GDAL and `tifffile` all use; 32946 is read identically.
 - A JPEG page's `SOF` sampling factors are authoritative over
@@ -389,29 +413,97 @@ Subtracting this crate's own no-codec decode time from each figure leaves
 essentially the whole gap inside the codec crate, so closing it is work for
 `oxiarc-lzw` / `oxiarc-zstd`, not for `oxiarc-tiff`.
 
+A third measurement, 4096x4096, 16-row strips, medians of nine **interleaved**
+rounds on a machine at load average 10-64 (so read the ratios, not the absolute
+times), with the per-image decoder pools in place:
+
+| fixture | codec | `tiffcp -c none` | ours, decode only | ratio |
+|---|---|---|---|---|
+| RGB8 | uncompressed | 69.6 ms | 7.7 ms | **0.11x** |
+| RGB8 | PackBits | 62.2 ms | 12.7 ms | **0.20x** |
+| RGB8 | LZW | 215.8 ms | 519.8 ms | 2.41x |
+| RGB8 | Deflate | 146.7 ms | 232.2 ms | 1.58x |
+| RGB8 | ZSTD | 76.1 ms | 474.9 ms | 6.24x |
+| RGB8 | LZMA | 2026 ms | 2333 ms | **1.15x** |
+| RGB8 | JPEG | 79.9 ms | 189.3 ms | 2.37x |
+| Gray16 | LZW | 139.1 ms | 296.2 ms | 2.13x |
+| Gray16 | Deflate | 99.2 ms | 137.6 ms | 1.39x |
+| Gray16 | ZSTD | 62.8 ms | 318.4 ms | 5.07x |
+| Gray16 | LZMA | 1305 ms | 1519 ms | **1.16x** |
+| bilevel | Group 3 | 21.5 ms | 73.0 ms | 3.40x |
+| bilevel | Group 3 2D | 25.9 ms | 86.2 ms | 3.33x |
+| bilevel | Group 4 | 29.8 ms | 79.8 ms | 2.68x |
+
+Subtracting the no-codec baseline from both arms isolates the codec itself,
+and that is the number worth acting on. For RGB8: `tiffcp` spends 69.6 ms with
+no codec and 76.1 ms with ZSTD, so its ZSTD decode is about **6 ms**; ours goes
+from 7.7 ms to 474.9 ms, so ours is about **467 ms**. LZW is 146 ms against
+512 ms and Deflate 77 ms against 225 ms by the same subtraction. The strip loop
+around them is 8 ms either way.
+
+Two things that table is *not* saying. First, the bilevel rows compare unlike
+work: `tiffcp` copies 2 MB of packed bits and this crate expands them to 16 MB
+of one-byte-per-pixel samples, which is 28.7 ms of the figure on its own
+(measured with `-c none`). Subtract that and the fax codecs run at roughly
+1.5-2x. Second, the codec-only throughput of a single 4096-pixel-wide strip,
+with the pipeline out of the picture, is 122-144 MB/s for LZW, 293-298 MB/s for
+Deflate, 104-118 MB/s for ZSTD and 23-24 MB/s for LZMA — so the ranking of the
+gaps is a property of the codec crates, not of the strip loop above them.
+**ZSTD is the outlier by a wide margin** and is the first place a follow-up
+should look.
+
+Group 4 decode got faster after this round: the 2D row decoder's `b1`/`b2`
+search restarted at changing element zero for every code word, which is
+quadratic in the number of runs per row. Resuming the search where the previous
+one stopped (legitimate, because `a0` never moves backwards inside a row) makes
+it linear. How much that is worth depends entirely on the page — the two
+searches were timed against each other directly, interleaved, medians of five,
+on three 4096x4096 Group 4 pages (release build, shared machine at load 22):
+
+| page | resumable | restarting | ratio |
+|---|---|---|---|
+| a few long runs per row (a scan of text) | 9.0 ms | 9.2 ms | 1.03x |
+| the benches' bilevel fixture | 7.9 ms | 37.8 ms | **4.8x** |
+| hundreds of runs per row (halftone) | 55.4 ms | 1360 ms | **24.6x** |
+
+So it is free on the pages fax coding was designed for and decisive on the ones
+it was not — which is the shape "quadratic in runs per row" predicts.
+
 **`rayon` on/off — parallel decode is not a uniform win; it depends on the
-codec *and* on how compressible the data is.** 4096x4096 Gray8, release build,
-8 cores at load average 6-10; serial and parallel measured *interleaved in the
-same loop*, medians of nine rounds:
+codec *and* on how compressible the data is.** Release build, 8 cores; serial
+and parallel measured *interleaved in the same loop*, medians of nine rounds.
+The first block is 4096x4096 Gray8 at load average 6-10, the second the same
+size at 33-46, so compare each arm with the other arm of its own row, never
+across blocks:
 
 | Fixture | Serial | Parallel | Ratio |
 |---|---|---|---|
 | LZW, 256x256 tiles, incompressible | 114 ms | 32 ms | **3.6x faster** |
 | LZW, 256x256 tiles, compressible | 26.6 ms | 10.4 ms | **2.6x faster** |
-| Deflate, 64-row strips | 60 ms | 62 ms | 0.98x |
 | PackBits, 256x256 tiles, compressible | 2.6 ms | 2.4 ms | 1.09x |
 | PackBits, 256x256 tiles, incompressible | 3.8 ms | 4.2 ms | 0.90x |
 | uncompressed, 64-row strips | 2.1 ms | 3.1 ms | **0.66x (slower)** |
 
+The codecs that keep per-image scratch, 32-row strips, remeasured after the
+single-slot caches became pools:
+
+| Fixture | Serial | Parallel | Ratio |
+|---|---|---|---|
+| Deflate, Gray8 | 77.7 ms | 34.6 ms | **2.24x faster** |
+| LZW, Gray8 | 166.4 ms | 78.2 ms | **2.13x faster** |
+| Group 4, bilevel | 81.9 ms | 27.0 ms | **3.04x faster** |
+| Group 3 2D, bilevel | 69.0 ms | 34.0 ms | **2.03x faster** |
+
 The win is exactly the CPU cost of a chunk's decompress step; the serial fetch
 pass (one `Read + Seek` handle), the `memcpy` placement and the thread-pool
-dispatch are overhead on top of it. In three groups:
+dispatch are overhead on top of it. In two groups:
 
-- **Worth it** — LZW, and by the same argument ZSTD, LZMA and JPEG. LZW came
-  out faster in every run, including a repeat at load average 30 on 8 cores
-  where it still managed 1.3x.
-- **No gain** — Deflate and CCITT: their scratch lives behind `CodecState`'s
-  `Mutex`, so the workers serialise on the codec anyway.
+- **Worth it** — Deflate, LZW and both fax codecs measured above, and by the
+  same argument ZSTD, LZMA and JPEG. Deflate used to sit at 0.98x and the fax
+  codecs had no gain at all, because one cached decoder behind a `Mutex` made
+  every worker queue for the codec; giving each image a *pool* of decoders is
+  what turned those rows into 2-3x. LZW came out faster in every run, including
+  a repeat at load average 30 on 8 cores where it still managed 1.3x.
 - **No reliable gain, sometimes a loss** — uncompressed and PackBits. These are
   `memcpy`-bound, so overhead is a large fraction of the total; repeated runs
   straddled 1.0 (PackBits ranged 0.32x-1.12x with data compressibility and free
@@ -419,7 +511,7 @@ dispatch are overhead on top of it. In three groups:
 
 Absolute times move with machine load — the parallel arm needs free cores and
 the serial arm does not, so a busy box penalises it even in an interleaved
-measurement. Only the LZW direction held under every load tested.
+measurement. The compressed-codec rows above held under every load tested.
 
 Encode is the easier direction: every chunk's compression is independent CPU
 work with no shared lock, so it parallelises for every codec. The

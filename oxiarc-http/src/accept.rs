@@ -57,21 +57,31 @@ impl AcceptEncoding {
         }
     }
 
-    /// Every coding this build can decode, best first, no explicit
-    /// `;q=` values.
+    /// Every coding this build can decode *unconditionally*, best first, no
+    /// explicit `;q=` values.
     ///
     /// With `default` features (`gzip`, `deflate`) this is `"gzip, deflate"`;
-    /// with `brotli` and `zstd` also enabled it is `"zstd, br, gzip, deflate"`
-    /// (`dcz` joins that list once its underlying `zstd` feature is on, but
-    /// only once a dictionary makes it actually usable — see
-    /// [`ContentCoding::Dcz`]; it is therefore **not** included here even
-    /// when `zstd` is on, since advertising it would be the exact footgun
-    /// [`add`](Self::add) exists to avoid).
+    /// with `brotli` and `zstd` also enabled it is `"zstd, br, gzip, deflate"`.
+    ///
+    /// [`Dcb`](ContentCoding::Dcb), [`Dcz`](ContentCoding::Dcz) and
+    /// [`Compress`](ContentCoding::Compress) are deliberately **not**
+    /// included here even when their Cargo feature is on: `dcb`/`dcz` need a
+    /// dictionary the caller must supply per response
+    /// ([`Decoder::with_dictionary`](crate::Decoder::with_dictionary)), so
+    /// advertising them unconditionally would be exactly the footgun
+    /// [`add`](Self::add) exists to avoid — decoding what was just
+    /// advertised needs a call this method has no way to make. `compress`
+    /// has no such per-response requirement, but is a legacy coding no
+    /// client has practical reason to *request*; this crate can still
+    /// decode a body a server sends unprompted under that name (see
+    /// [`ContentCoding::Compress`]). A caller that wants any of the three
+    /// advertised anyway adds it explicitly with [`add`](Self::add) /
+    /// [`with_q`](Self::with_q), which check real decodability the same way
+    /// this method's own list does.
     pub fn all_supported() -> Self {
         // Best-to-worst: mirrors ContentCoding's declared least-to-most-preferred
-        // Ord, reversed. Compress is never decodable in this build (see its
-        // doc comment) so it is not worth listing here; Dcb/Dcz/Unknown are
-        // deliberately excluded too — see the doc comment above.
+        // Ord, reversed. See the doc comment above for why Compress/Dcb/Dcz/
+        // Unknown are excluded from this fixed list even when decodable.
         let mut out = Self::new();
         for coding in [
             ContentCoding::Zstd,
@@ -87,9 +97,10 @@ impl AcceptEncoding {
     /// Add a coding at the default weight (`q=1`), if this build can decode
     /// it.
     ///
-    /// A coding whose feature is off — or, like [`ContentCoding::Compress`],
-    /// not yet implemented at all — is **silently skipped**: advertising a
-    /// coding you cannot decode is the one mistake that turns a working
+    /// A coding whose feature is off, or that this crate has no
+    /// implementation for at all ([`ContentCoding::Unknown`]), is
+    /// **silently skipped**: advertising a coding you cannot decode is the
+    /// one mistake that turns a working
     /// client into one that receives an undecodable body. See the
     /// type-level docs for exactly which "cannot decode" this is: the
     /// feature-gated capability of the finished crate, not of this
@@ -262,8 +273,9 @@ mod tests {
             feature = "zstd"
         ))]
         assert_eq!(rendered, Some("zstd, br, gzip, deflate".to_string()));
-        // Never advertises a coding with no dictionary story (Dcz), a
-        // permanently-unsupported one (Compress/Dcb), or identity.
+        // Never advertises a coding that needs a per-response dictionary
+        // (dcz/dcb), a legacy one with no reason to request it (compress),
+        // or identity — see `all_supported`'s own doc comment.
         for banned in ["dcz", "dcb", "compress", "identity", "*"] {
             assert!(
                 !rendered
@@ -287,10 +299,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "compress"))]
     fn undecodable_coding_is_silently_skipped() {
-        // `compress` is never decodable in this build regardless of features.
+        // Without the `compress` feature, `compress` is not decodable, and
+        // `add` must skip it rather than advertise a lie.
         let ae = AcceptEncoding::new().add(ContentCoding::Compress);
         assert_eq!(ae.to_header_value(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "compress")]
+    fn a_decodable_coding_outside_all_supported_can_still_be_added_explicitly() {
+        // `compress` is real once its feature is on, but deliberately absent
+        // from `all_supported`'s own list (see that method's doc comment) —
+        // `add` still accepts it when a caller explicitly asks, which is the
+        // distinction this test pins now that `compress` is no longer
+        // permanently unsupported.
+        let ae = AcceptEncoding::new().add(ContentCoding::Compress);
+        assert_eq!(ae.to_header_value(), Some("compress".to_string()));
+        assert!(
+            !AcceptEncoding::all_supported()
+                .to_header_value()
+                .unwrap_or_default()
+                .split(", ")
+                .any(|t| t == "compress"),
+            "all_supported must still not advertise compress by default"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ fn encode(coding: &ContentCoding, plain: &[u8]) -> Vec<u8> {
         ContentCoding::Brotli => oxiarc_brotli::compress(plain, 4).expect("brotli"),
         #[cfg(feature = "zstd")]
         ContentCoding::Zstd => oxiarc_zstd::compress(plain).expect("zstd"),
+        #[cfg(feature = "compress")]
+        ContentCoding::Compress => oxiarc_lzw::z::compress(plain, 16).expect("compress"),
         ContentCoding::Identity => plain.to_vec(),
         other => panic!("no encoder wired for {other}"),
     }
@@ -33,6 +35,7 @@ fn codings() -> Vec<ContentCoding> {
         ContentCoding::Deflate,
         ContentCoding::Brotli,
         ContentCoding::Zstd,
+        ContentCoding::Compress,
     ]
     .into_iter()
     .filter(ContentCoding::is_decodable)
@@ -296,6 +299,14 @@ fn trailing_garbage_is_rejected_at_every_read_boundary() {
             // `identity` has no end-of-stream marker: every byte is body.
             continue;
         }
+        if coding == ContentCoding::Compress {
+            // `.Z` has no end-of-stream marker either, and no way to tell
+            // "the stream ended" from "more codes happened to follow" — the
+            // trailing `XXXX` here just decodes as (garbage) input, the same
+            // as any other coding's *body* bytes would. See
+            // `ContentCoding::Compress`'s doc comment.
+            continue;
+        }
         let wire = encode(&coding, &plain);
         let mut one_shot = wire.clone();
         one_shot.extend_from_slice(b"XXXX");
@@ -339,6 +350,17 @@ fn truncation_at_every_offset_is_never_a_short_body() {
         if coding == ContentCoding::Identity {
             continue;
         }
+        if coding == ContentCoding::Compress {
+            // `.Z` has no end-of-information code (see
+            // `ContentCoding::Compress`'s doc comment): a genuinely short
+            // body is the documented, correct outcome here, not the bug
+            // this test hunts for. The *replacement* invariant — a truncated
+            // `.Z` body always decodes to a strict prefix of the whole one,
+            // through both entry points, without panicking or hanging — is
+            // asserted at every offset by
+            // `a_truncated_compress_body_always_decodes_to_a_prefix` below.
+            continue;
+        }
         let wire = encode(&coding, &plain);
         for k in 0..wire.len() {
             let cut = &wire[..k];
@@ -364,6 +386,64 @@ fn truncation_at_every_offset_is_never_a_short_body() {
             }
         }
     }
+}
+
+/// `.Z` has no end-of-information code, so
+/// `truncation_at_every_offset_is_never_a_short_body` cannot ask `compress`
+/// for an error. The invariant that *does* hold, and that this asserts at
+/// every offset through both entry points, is strictly weaker but far from
+/// vacuous: whatever a truncated body decodes to is always a **prefix** of
+/// what the whole body decodes to. A decoder that emitted one extra
+/// speculative code from a partial final group, or that resynchronised onto
+/// garbage, would break it — and so would a panic or a hang, which the
+/// bounded loop below also rules out.
+///
+/// The reference decoders agree, byte for byte, in
+/// `tests/http_oracle.rs::a_truncated_compress_body_matches_the_reference_prefix`.
+#[cfg(feature = "compress")]
+#[test]
+fn a_truncated_compress_body_always_decodes_to_a_prefix() {
+    let plain = common::text(3_000);
+    let coding = ContentCoding::Compress;
+    let wire = encode(&coding, &plain);
+    let whole = decode_body(
+        std::slice::from_ref(&coding),
+        &wire,
+        &DecodeLimits::default(),
+    )
+    .expect("the whole body must decode");
+    assert_eq!(whole, plain);
+
+    let mut short = 0usize;
+    for k in 0..wire.len() {
+        let cut = &wire[..k];
+        if let Ok(bytes) = decode_body(std::slice::from_ref(&coding), cut, &DecodeLimits::default())
+        {
+            assert!(
+                whole.starts_with(&bytes),
+                "truncating at {k} decoded {} bytes that are not a prefix of the whole body",
+                bytes.len()
+            );
+            if bytes.len() < whole.len() {
+                short += 1;
+            }
+        }
+        let mut body =
+            DecodedBody::with_codings(cut, std::slice::from_ref(&coding), &DecodeLimits::default())
+                .expect("decoder");
+        if let Ok(bytes) = body.read_to_vec() {
+            assert!(
+                whole.starts_with(&bytes),
+                "DecodedBody truncated at {k} read {} bytes that are not a prefix",
+                bytes.len()
+            );
+        }
+    }
+    assert!(
+        short > wire.len() / 2,
+        "only {short} of {} cuts decoded short — this test would be vacuous",
+        wire.len()
+    );
 }
 
 proptest! {

@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{InputSchedule, call_budget, drive};
+use common::{InputSchedule, call_budget, drive, hand_built_dictionary_copy};
 use oxiarc_brotli::shared_dict::MAX_SHARED_DICTIONARY;
 use oxiarc_brotli::{
     BrotliDecompressor, BrotliError, BrotliParams, BrotliStream, compress_with_dictionary,
@@ -496,118 +496,36 @@ fn dictionary_ids_are_sha256() {
 // A copy that runs past the end of the dictionary ("straddle")
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hand-build a one-meta-block stream whose single command copies more bytes
-/// than the dictionary can supply, so the copy continues in the produced
-/// output.
+/// A shared-dictionary copy must stay inside the dictionary.
 ///
-/// Neither this crate's encoder nor `brotli 1.1.0 -D` emits such a command —
-/// both stop a dictionary match at the dictionary's end — so the decoders' path
-/// for it can only be reached by a stream written by hand. The stream is legal
-/// RFC 7932: one literal block type, one insert-and-copy type and one distance
-/// type, each with a single-symbol *simple* prefix code (which costs zero bits
-/// per symbol), so the whole meta-block is a handful of header fields plus two
-/// extra-bit fields.
+/// The dictionary is a *compound* history block, not a prefix glued to the
+/// sliding window: a copy that would run past its end is a format error, not a
+/// copy that continues in the produced output. `brotli 1.1.0` rejects such a
+/// stream as "corrupt input" while accepting the byte-identical stream whose
+/// copy stops one byte earlier — that pair is the oracle test
+/// `test_oracle_reference_rejects_a_copy_past_the_dictionary_end`, and this
+/// test is its hermetic half.
 ///
-/// Layout produced below, in bit order:
-///
-/// ```text
-/// WBITS=16                      0
-/// ISLAST=1, ISLASTEMPTY=0       1 0
-/// MNIBBLES=4, MLEN-1=14         00, 14 in 16 bits
-/// NBLTYPES L/I/D = 1            0 0 0
-/// NPOSTFIX=0, NDIRECT=0         00, 0000
-/// context mode LSB6             00
-/// NTREESL=1, NTREESD=1          0 0
-/// literal code: simple, 'A'     01, 00, 8 bits
-/// insert-and-copy code          01, 00, 10 bits
-/// distance code: symbol 19      01, 00, 6 bits
-/// copy extra bit (copy_len 10)  0
-/// distance extra bits (dist 9)  00
-/// padding                       zeros to the byte boundary
-/// ```
-fn hand_built_straddle_stream() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    use oxiarc_brotli::bit_writer::BitWriter;
-    use oxiarc_brotli::huffman::alphabet_bits;
-    use oxiarc_brotli::tables::{COPY_LENGTH_CODES, INSERT_LENGTH_CODES, decompose_command};
-
-    let insert_len = 5u32;
-    let copy_len = 10u32;
-    let distance = 9usize;
-
-    // The insert-and-copy symbol for (insert 5, copy 10) with an explicit
-    // distance. Found by inverting the crate's own decomposition, so the test
-    // cannot drift from the table it is testing against.
-    let mut ic_symbol = None;
-    for sym in 0u16..704 {
-        let (ins_code, cpy_code, implicit) = decompose_command(sym);
-        if implicit {
-            continue;
-        }
-        let (ins_base, ins_extra) = INSERT_LENGTH_CODES[ins_code as usize];
-        let (cpy_base, cpy_extra) = COPY_LENGTH_CODES[cpy_code as usize];
-        if ins_base == insert_len && ins_extra == 0 && cpy_base == copy_len && cpy_extra == 1 {
-            ic_symbol = Some(sym);
-            break;
-        }
-    }
-    let ic_symbol = ic_symbol.expect("an insert-5 copy-10 command symbol must exist");
-
-    let mut w = BitWriter::with_capacity(64);
-    w.write_bit(false).expect("wbits"); // WBITS = 16
-    w.write_bit(true).expect("islast");
-    w.write_bit(false).expect("islastempty");
-    w.write_bits(0, 2).expect("mnibbles"); // 4 nibbles
-    w.write_bits(14, 16).expect("mlen"); // MLEN = 15
-    for _ in 0..3 {
-        w.write_bit(false).expect("nbltypes"); // L, I, D = 1
-    }
-    w.write_bits(0, 2).expect("npostfix");
-    w.write_bits(0, 4).expect("ndirect");
-    w.write_bits(0, 2).expect("context mode"); // LSB6
-    w.write_bit(false).expect("ntreesl");
-    w.write_bit(false).expect("ntreesd");
-    // Three single-symbol simple prefix codes.
-    for (alphabet, symbol) in [
-        (256u32, u32::from(b'A')),
-        (704, u32::from(ic_symbol)),
-        (64, 19),
-    ] {
-        w.write_bits(1, 2).expect("hskip"); // hskip == 1 -> simple
-        w.write_bits(0, 2).expect("nsym-1"); // one symbol
-        w.write_bits(symbol, alphabet_bits(alphabet))
-            .expect("symbol");
-    }
-    // The command: symbols cost no bits, only the extra-bit fields remain.
-    w.write_bits(0, 1).expect("copy extra"); // copy length 10 = base 10 + 0
-    w.write_bits(0, 2).expect("distance extra"); // distance 9 = base 9 + 0
-    w.flush();
-    let stream = w.finish();
-
-    let dict: Vec<u8> = (0..100u32).map(|i| b'a' + (i % 26) as u8).collect();
-    // 5 literals, then 4 bytes from the dictionary's tail (all it can supply),
-    // then 6 more at the same distance, which land back at the start of the
-    // output.
-    let mut expected = vec![b'A'; insert_len as usize];
-    expected.extend_from_slice(&dict[dict.len() - 4..]);
-    for _ in 0..(copy_len as usize - 4) {
-        let src = expected.len() - distance;
-        expected.push(expected[src]);
-    }
-    assert_eq!(expected.len(), 15);
-    (stream, dict, expected)
-}
-
+/// The regression this pins is not the rejection itself but its *uniformity*.
+/// When the two decoders disagreed here, the push decoder resolved the
+/// continuation against its bounded ring and the answer depended on where the
+/// caller's output buffer happened to end: the same stream decoded correctly
+/// at some output sizes, returned an error at others, and at yet others
+/// returned `Ok` with silently wrong bytes.
 #[test]
-fn a_copy_running_past_the_dictionary_continues_in_the_output() {
-    let (stream, dict, expected) = hand_built_straddle_stream();
-
+fn a_copy_running_past_the_dictionary_end_is_refused_at_every_chunking() {
+    // The control: a copy that stops exactly at the dictionary's end is legal,
+    // and both decoders reproduce it.
+    let (stream, dict, expected) = hand_built_dictionary_copy(4);
+    let expected = expected.expect("copy 4 fits inside the dictionary");
     assert_eq!(
-        decompress_with_dictionary(&stream, &dict).expect("one-shot straddle"),
+        decompress_with_dictionary(&stream, &dict).expect("one-shot control"),
         expected
     );
+    // Anti-vacuity: without the dictionary the same distance is an Appendix A
+    // reference, so the stream must not produce these bytes.
+    assert_ne!(decompress(&stream).ok(), Some(expected.clone()));
 
-    // The push decoder must agree, at every chunking — this is the path where
-    // the copy is split across `CmdState::SharedCopy` and `CmdState::Copy`.
     for in_chunk in [1usize, 2, 3, 5, 64] {
         for out_chunk in [1usize, 2, 3, 7, 64] {
             let mut push = BrotliStream::new().with_dictionary(dict.clone());
@@ -618,14 +536,42 @@ fn a_copy_running_past_the_dictionary_continues_in_the_output() {
                 out_chunk,
                 call_budget(&stream),
             )
-            .expect("push straddle");
-            assert_eq!(got, expected, "in {in_chunk} out {out_chunk}");
+            .expect("push control");
+            assert_eq!(got, expected, "control in {in_chunk} out {out_chunk}");
         }
     }
 
-    // Anti-vacuity: without the dictionary the same distance is an Appendix A
-    // reference, so the stream must not produce these bytes.
-    assert_ne!(decompress(&stream).ok(), Some(expected));
+    // The overrun: only the copy length differs.
+    for copy_len in [5u32, 10, 22] {
+        let (stream, dict, expected) = hand_built_dictionary_copy(copy_len);
+        assert!(expected.is_none());
+        let one_shot = decompress_with_dictionary(&stream, &dict);
+        assert!(
+            matches!(one_shot, Err(BrotliError::CorruptedData(_))),
+            "one-shot accepted a copy {copy_len} past the dictionary: {one_shot:?}"
+        );
+
+        // Every chunking must reach the *same* verdict. A decoder that resolved
+        // the overrun against its own history would answer differently at
+        // different output sizes, which is the bug this loop exists to catch.
+        for in_chunk in [1usize, 2, 3, 5, 64] {
+            for out_chunk in [1usize, 2, 3, 4, 5, 7, 9, 13, 64, 4096] {
+                let mut push = BrotliStream::new().with_dictionary(dict.clone());
+                let got = drive(
+                    &mut push,
+                    &stream,
+                    InputSchedule::Fixed(in_chunk),
+                    out_chunk,
+                    call_budget(&stream),
+                );
+                assert!(
+                    matches!(got, Err(BrotliError::CorruptedData(_))),
+                    "push accepted copy {copy_len} past the dictionary \
+                     at in {in_chunk} out {out_chunk}: {got:?}"
+                );
+            }
+        }
+    }
 }
 
 /// The crate-root aliases are the names a downstream `Content-Encoding: dcb`
@@ -665,4 +611,227 @@ fn the_crate_root_dcb_aliases_are_the_same_api() {
     assert_eq!(DCB_MAGIC, dcb::DCB_MAGIC);
     assert_eq!(DCB_HEADER_LEN, dcb::DCB_HEADER_LEN);
     assert_eq!(dictionary_id(&dict), dcb::dictionary_id(&dict));
+}
+
+/// Deterministic pseudo-random bytes: incompressible filler that makes a
+/// dictionary-compressed body long enough to mutate byte by byte.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adversarial: a `dcb` body from the wire is untrusted input
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every mutilation of a `dcb` body must produce an error or, at worst, bytes
+/// that are not the original — never a panic, and never `Ok(original)` from a
+/// body that no longer names or contains it.
+///
+/// The framing is the first thing an HTTP peer touches, so it is walked
+/// exhaustively: truncation at *every* offset, a flip of *every* header byte,
+/// and a flip, a drop and an insert at every offset of the compressed payload.
+#[test]
+fn a_mangled_dcb_body_is_refused_without_panicking() {
+    let dict = dictionary(120);
+    let data = {
+        let mut v = dict[300..4000].to_vec();
+        v.extend_from_slice(&noise(300, 0x51ED));
+        v.extend_from_slice(&dict[100..900]);
+        v
+    };
+    let params = BrotliParams {
+        quality: 9,
+        ..BrotliParams::default()
+    };
+    let body = dcb::compress(&data, &dict, &params).expect("compress");
+    assert!(
+        body.len() > dcb::DCB_HEADER_LEN + 200,
+        "need a payload long enough to sweep: {} bytes",
+        body.len()
+    );
+    assert_eq!(dcb::decompress(&body, &dict).expect("control"), data);
+
+    // 1. Truncation at every offset. Nothing shorter than the whole body can
+    //    reproduce the whole body.
+    for cut in 0..body.len() {
+        let short = &body[..cut];
+        assert!(
+            dcb::decompress(short, &dict).is_err(),
+            "a {cut}-byte prefix of the body decoded"
+        );
+        // The header parse must agree with the framing rules exactly.
+        let parsed = dcb::parse_header(short);
+        if cut < dcb::DCB_HEADER_LEN {
+            assert!(matches!(parsed, Err(BrotliError::CorruptedData(_))));
+        } else {
+            let (id, stream) = parsed.expect("a full header parses");
+            assert_eq!(id, dcb::dictionary_id(&dict));
+            assert_eq!(stream.len(), cut - dcb::DCB_HEADER_LEN);
+        }
+    }
+    // A header with no stream at all is a header, and an empty Brotli stream.
+    assert!(dcb::parse_header(&body[..dcb::DCB_HEADER_LEN]).is_ok());
+    assert!(dcb::decompress(&body[..dcb::DCB_HEADER_LEN], &dict).is_err());
+
+    // 2. Every magic byte matters, and every digest byte is checked.
+    for i in 0..dcb::DCB_HEADER_LEN {
+        let mut bad = body.clone();
+        bad[i] ^= 0x40;
+        let parsed = dcb::parse_header(&bad);
+        if i < 4 {
+            assert!(
+                matches!(parsed, Err(BrotliError::CorruptedData(_))),
+                "magic byte {i} was not checked"
+            );
+        } else {
+            // The digest is framing, not integrity: `parse_header` hands it
+            // back unchecked and `verify_header` is what rejects it.
+            let (id, _) = parsed.expect("parse ignores the digest");
+            assert_ne!(id, dcb::dictionary_id(&dict));
+            assert!(
+                matches!(
+                    dcb::verify_header(&bad, &dict),
+                    Err(BrotliError::DictionaryError(_))
+                ),
+                "digest byte {i} was not checked"
+            );
+        }
+        assert!(dcb::decompress(&bad, &dict).is_err(), "header byte {i}");
+    }
+
+    // 3. The payload: a flipped, a dropped and an inserted byte at every
+    //    offset. Brotli carries no checksum, so a mutation may legitimately
+    //    still decode — even back to the original, if it lands on a bit the
+    //    format does not read. What must hold is that nothing panics and that
+    //    the *two* decoders answer identically: a bounded push decoder that
+    //    resolved anything against its own ring rather than against the format
+    //    would drift from the one-shot decoder here first.
+    let mut agreed = 0usize;
+    for i in dcb::DCB_HEADER_LEN..body.len() {
+        for mutated in [
+            {
+                let mut v = body.clone();
+                v[i] ^= 0x01;
+                v
+            },
+            {
+                let mut v = body.clone();
+                v.remove(i);
+                v
+            },
+            {
+                let mut v = body.clone();
+                v.insert(i, 0x5A);
+                v
+            },
+        ] {
+            let one_shot = dcb::decompress(&mutated, &dict).ok();
+            let stream_bytes = dcb::parse_header(&mutated).expect("header survives").1;
+            let mut push = BrotliStream::new().with_dictionary(dict.clone());
+            let pushed = drive(
+                &mut push,
+                stream_bytes,
+                InputSchedule::Fixed(7),
+                13,
+                call_budget(stream_bytes),
+            )
+            .ok();
+            assert_eq!(
+                one_shot, pushed,
+                "the decoders disagree on a body mutated at {i}"
+            );
+            agreed += 1;
+        }
+    }
+    assert!(
+        agreed > 600,
+        "the mutation sweep did not run ({agreed} cases)"
+    );
+    eprintln!("[dcb] {agreed} mutated bodies, both decoders agreeing");
+}
+
+/// The `dcb` output budget is enforced, and the boundary is exact.
+#[test]
+fn the_dcb_output_budget_is_exact() {
+    let dict = dictionary(120);
+    let data = dict[300..4000].to_vec();
+    let params = BrotliParams {
+        quality: 9,
+        ..BrotliParams::default()
+    };
+    let body = dcb::compress(&data, &dict, &params).expect("compress");
+
+    assert_eq!(
+        dcb::decompress_with_limit(&body, &dict, data.len()).expect("exact budget"),
+        data
+    );
+    for limit in [0usize, 1, data.len() / 2, data.len() - 1] {
+        assert!(
+            dcb::decompress_with_limit(&body, &dict, limit).is_err(),
+            "a {limit}-byte budget accepted {} bytes",
+            data.len()
+        );
+    }
+    // The digest is checked before the budget: a wrong dictionary is a
+    // dictionary error whatever the budget.
+    assert!(matches!(
+        dcb::decompress_with_limit(&body, &dictionary(121), 1 << 20),
+        Err(BrotliError::DictionaryError(_))
+    ));
+}
+
+/// A truncated dictionary stream must stop the push decoder, at every
+/// truncation offset and with a one-byte output slice — no silent short read,
+/// no unbounded call loop.
+#[test]
+fn a_truncated_dictionary_stream_stops_the_push_decoder() {
+    let dict = dictionary(60);
+    let data = {
+        // Half from the dictionary, half novel, so the stream is long enough
+        // for the truncation sweep to have somewhere to cut.
+        let mut v = dict[200..1800].to_vec();
+        v.extend_from_slice(&noise(200, 0xC0FFEE));
+        v
+    };
+    let params = BrotliParams {
+        quality: 9,
+        ..BrotliParams::default()
+    };
+    let compressed = compress_with_dictionary(&data, &dict, &params).expect("compress");
+    assert!(
+        compressed.len() > 64,
+        "stream too short to truncate meaningfully"
+    );
+
+    eprintln!("[dcb] truncation sweep over {} bytes", compressed.len());
+    for cut in 0..compressed.len() {
+        let short = &compressed[..cut];
+        let mut stream = BrotliStream::new().with_dictionary(dict.clone());
+        // `drive` asserts a call budget, so a decoder that never terminates
+        // fails the test instead of hanging it.
+        let got = drive(
+            &mut stream,
+            short,
+            InputSchedule::Fixed(1),
+            1,
+            call_budget(&compressed),
+        );
+        assert!(
+            got.is_err(),
+            "a {cut}-byte prefix decoded to completion: {got:?}"
+        );
+        // The same prefix through the one-shot decoder, for agreement.
+        assert!(
+            decompress_with_dictionary(short, &dict).is_err(),
+            "one-shot {cut}"
+        );
+    }
 }

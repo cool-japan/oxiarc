@@ -5,7 +5,8 @@
 //! deduction mirror the reference `HUF_readStats` / `HUF_readDTableX1`
 //! (RFC 8878 §4.2.1).
 
-use crate::fse::{FseBitReader, FseDecoder, read_fse_table_description};
+use crate::backward_bits::FseBitReader;
+use crate::fse::{FseDecoder, read_fse_table_description};
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Maximum Huffman code length the encoder may use (RFC 8878).
@@ -39,6 +40,8 @@ pub struct HuffmanTable {
     entries: Vec<HuffmanEntry>,
     /// Table log (all lookups peek this many bits).
     max_bits: u8,
+    /// Whether every table slot decodes to a symbol.
+    complete: bool,
 }
 
 impl HuffmanTable {
@@ -151,25 +154,43 @@ impl HuffmanTable {
             rank_start[w as usize] = end;
         }
 
+        // Every slot must carry a code: `num_bits = table_log + 1 - w` with
+        // `1 <= w <= table_log`, and the rank layout was just checked to fill
+        // the table exactly, so a hole is unreachable for a table built here.
+        // It is recorded rather than assumed because the interleaved literals
+        // decoder drops its per-symbol validity test on the strength of it —
+        // see [`HuffmanTable::is_complete`].
+        let complete = entries.iter().all(|entry| entry.num_bits != 0);
+
         Ok(Self {
             entries,
             max_bits: table_log,
+            complete,
         })
     }
 
-    /// Look up the entry for a `max_bits`-bit prefix, bounds-checked.
+    /// The decode table itself, indexed by a `max_bits`-bit prefix.
+    ///
+    /// The length is always `1 << max_bits` — a power of two — so a caller's
+    /// inner loop can index it as `entries[prefix & (entries.len() - 1)]`,
+    /// which is provably in range and costs no bounds check. That matters:
+    /// this lookup runs once per literal byte, and the `Result`-returning
+    /// [`entry`](Self::entry) put an error-formatting closure on that path.
     #[inline]
-    pub fn entry(&self, prefix: usize) -> Result<&HuffmanEntry> {
-        self.entries.get(prefix).ok_or_else(|| {
-            OxiArcError::corrupted(
-                0,
-                format!(
-                    "Huffman prefix {} out of range (table size {})",
-                    prefix,
-                    self.entries.len()
-                ),
-            )
-        })
+    pub fn entries(&self) -> &[HuffmanEntry] {
+        &self.entries
+    }
+
+    /// Whether every `max_bits`-bit prefix decodes to a symbol.
+    ///
+    /// True for every table this module can build (see
+    /// [`from_stored_weights`](Self::from_stored_weights)). Checked once here
+    /// so the per-literal-byte inner loop does not have to test each decoded
+    /// code: a decoder that finds this false must refuse the stream rather
+    /// than trust the lookup.
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Get the table log (bits peeked per lookup) for this table.
@@ -311,8 +332,8 @@ mod tests {
         let table = HuffmanTable::from_stored_weights(&weights).expect("valid huffman table");
         assert_eq!(table.max_bits(), 1);
         // prefix 0 -> symbol 0, prefix 1 -> symbol 1 (implied).
-        assert_eq!(table.entry(0).expect("entry").symbol, 0);
-        assert_eq!(table.entry(1).expect("entry").symbol, 1);
+        assert_eq!(table.entries()[0].symbol, 0);
+        assert_eq!(table.entries()[1].symbol, 1);
     }
 
     #[test]
@@ -323,12 +344,12 @@ mod tests {
         let table = HuffmanTable::from_stored_weights(&weights).expect("valid huffman table");
         assert_eq!(table.max_bits(), 3);
         // Weight-1 symbols occupy the lowest indices, in natural order.
-        assert_eq!(table.entry(0).expect("entry").symbol, 1);
-        assert_eq!(table.entry(0).expect("entry").num_bits, 3);
-        assert_eq!(table.entry(1).expect("entry").symbol, 2);
+        assert_eq!(table.entries()[0].symbol, 1);
+        assert_eq!(table.entries()[0].num_bits, 3);
+        assert_eq!(table.entries()[1].symbol, 2);
         // Implied symbol 3 (weight 2) follows, then symbol 0 (weight 3).
-        assert_eq!(table.entry(2).expect("entry").symbol, 3);
-        assert_eq!(table.entry(7).expect("entry").symbol, 0);
+        assert_eq!(table.entries()[2].symbol, 3);
+        assert_eq!(table.entries()[7].symbol, 0);
     }
 
     #[test]

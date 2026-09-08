@@ -19,8 +19,8 @@
 mod oracle_support;
 
 use oracle_support::{
-    Fixture, colour_for, decode_file, find_python, find_tool, read_manifest, run_driver,
-    scratch_dir, write_driver,
+    Fixture, codec_is_available, colour_for, decode_file, every_codec_is_available, find_python,
+    find_tool, read_manifest, run_driver, scratch_dir, write_driver,
 };
 use oxiarc_tiff::tags::PlanarConfiguration;
 use oxiarc_tiff::{
@@ -62,9 +62,19 @@ fn reference_written_fixtures_decode_byte_identically() {
             "the driver no longer emits the `{required}` fixture"
         );
     }
+    let mut skipped = 0usize;
+    let mut checked = 0usize;
     for fixture in &fixtures {
+        let path = dir.join(format!("{}.tif", fixture.name));
+        // The driver writes fixtures for every codec libtiff has; a build
+        // without one of them skips its fixtures rather than failing on
+        // `FeatureNotCompiled` while reading them.
+        if !codec_is_available(&path) {
+            skipped += 1;
+            continue;
+        }
         let expected = fs::read(dir.join(format!("{}.raw", fixture.name))).expect("raw");
-        let got = decode_file(&dir.join(format!("{}.tif", fixture.name)));
+        let got = decode_file(&path);
         assert_eq!(
             got.len(),
             expected.len(),
@@ -74,6 +84,11 @@ fn reference_written_fixtures_decode_byte_identically() {
             expected.len()
         );
         assert_eq!(got, expected, "{}: pixel mismatch", fixture.name);
+        checked += 1;
+    }
+    assert!(checked > 0, "every fixture was skipped");
+    if every_codec_is_available() {
+        assert_eq!(skipped, 0, "an all-codecs build must skip no fixture");
     }
     let _ = fs::remove_dir_all(&dir);
 }
@@ -153,6 +168,11 @@ fn tiffcp_recoded_fixtures_decode_byte_identically() {
     // would simply have no fill order to get wrong.
     let mut fill_order_depths: Vec<String> = Vec::new();
     let mut labels_seen: Vec<&str> = Vec::new();
+    // Rows `tiffcp` produced but this build cannot decode, so the row-coverage
+    // assertions below can tell "libtiff never wrote it" (a real hole) from
+    // "this build does not compile that codec" (a feature choice). In an
+    // all-codecs build this stays empty and every assertion is unchanged.
+    let mut labels_uncompiled: Vec<&str> = Vec::new();
     let mut codecs_seen: Vec<oxiarc_tiff::CompressionMethod> = Vec::new();
     let mut predictors_seen: Vec<oxiarc_tiff::Predictor> = Vec::new();
     for fixture in &fixtures {
@@ -169,6 +189,13 @@ fn tiffcp_recoded_fixtures_decode_byte_identically() {
             if !status.status.success() {
                 // libtiff refuses some combinations (for example separate
                 // planes for a single-channel image); that is not our failure.
+                continue;
+            }
+            if !codec_is_available(&target) {
+                // libtiff wrote a codec this build does not compile.
+                if !labels_uncompiled.contains(&label) {
+                    labels_uncompiled.push(label);
+                }
                 continue;
             }
             if label.starts_with("fill2") {
@@ -215,11 +242,17 @@ fn tiffcp_recoded_fixtures_decode_byte_identically() {
         }
     }
     assert!(checked > 500, "only {checked} tiffcp variants were checked");
+    if every_codec_is_available() {
+        assert!(
+            labels_uncompiled.is_empty(),
+            "an all-codecs build must skip no variant, skipped {labels_uncompiled:?}"
+        );
+    }
     // Every row must have produced at least one file: a `tiffcp` invocation
     // that always failed would shrink the matrix without failing anything.
     for (label, args) in variants {
         assert!(
-            labels_seen.contains(&label),
+            labels_seen.contains(&label) || labels_uncompiled.contains(&label),
             "`tiffcp {}` never produced a file, so that row proves nothing",
             args.join(" ")
         );
@@ -236,7 +269,7 @@ fn tiffcp_recoded_fixtures_decode_byte_identically() {
         oxiarc_tiff::CompressionMethod::Zstd,
     ] {
         assert!(
-            codecs_seen.contains(&method),
+            codecs_seen.contains(&method) || !method.is_available(),
             "no `tiffcp` variant produced {method}; seen: {codecs_seen:?}"
         );
     }

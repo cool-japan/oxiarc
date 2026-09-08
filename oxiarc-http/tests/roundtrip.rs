@@ -20,6 +20,8 @@ fn encode(coding: &ContentCoding, plain: &[u8]) -> Vec<u8> {
         ContentCoding::Brotli => oxiarc_brotli::compress(plain, 4).expect("brotli"),
         #[cfg(feature = "zstd")]
         ContentCoding::Zstd => oxiarc_zstd::compress(plain).expect("zstd"),
+        #[cfg(feature = "compress")]
+        ContentCoding::Compress => oxiarc_lzw::z::compress(plain, 16).expect("compress"),
         ContentCoding::Identity => plain.to_vec(),
         other => panic!("no encoder wired for {other}"),
     }
@@ -40,7 +42,18 @@ fn codings() -> Vec<ContentCoding> {
     if ContentCoding::Zstd.is_decodable() {
         list.push(ContentCoding::Zstd);
     }
+    if ContentCoding::Compress.is_decodable() {
+        list.push(ContentCoding::Compress);
+    }
     list
+}
+
+/// Whether `coding` carries no checksum/EOI, so corruption or truncation is
+/// not guaranteed to surface as an error — `br` (RFC 7932 has neither) and
+/// `compress` (`.Z` has neither either — see [`ContentCoding::Compress`]'s
+/// own doc comment).
+fn has_no_integrity_check(coding: &ContentCoding) -> bool {
+    matches!(coding, ContentCoding::Brotli | ContentCoding::Compress)
 }
 
 /// Decode through the push `Decoder`, feeding `chunk` bytes at a time.
@@ -153,6 +166,15 @@ fn a_truncated_body_is_an_error_for_every_coding() {
         if coding == ContentCoding::Identity {
             continue; // identity has no framing to truncate
         }
+        if coding == ContentCoding::Compress {
+            // `.Z` has no end-of-information code, by design (see
+            // `ContentCoding::Compress`'s doc comment and
+            // `decode/compress.rs`'s module docs): a truncated body decodes
+            // to a plausible, silently short prefix rather than erroring —
+            // covered instead by
+            // `decode::compress::tests::truncation_is_not_an_error_by_design`.
+            continue;
+        }
         let plain = common::text(20_000);
         let wire = encode(&coding, &plain);
         for cut in [1usize, 3, 8] {
@@ -201,21 +223,21 @@ fn a_corrupted_payload_byte_never_decodes_to_the_original() {
             &DecodeLimits::default(),
         );
         // gzip (CRC-32), deflate (Adler-32) and zstd (XXH64) all carry an
-        // integrity check, so corruption must be an error. `br` carries
-        // none — RFC 7932 has no checksum and no length field — so a flipped
-        // bit legitimately yields a *different, well-formed* body. What must
-        // never happen for any coding is a silent return of the original.
+        // integrity check, so corruption must be an error. `br` and
+        // `compress` carry none — RFC 7932 has no checksum and no length
+        // field, and `.Z` has neither either — so a flipped bit legitimately
+        // yields a *different, well-formed* body for either. What must never
+        // happen for any coding is a silent return of the original.
         match result {
             Err(_) => {}
             Ok(decoded) => {
-                assert_eq!(
-                    coding,
-                    ContentCoding::Brotli,
+                assert!(
+                    has_no_integrity_check(&coding),
                     "{coding}: a flipped payload bit decoded without an error"
                 );
                 assert_ne!(
                     decoded, plain,
-                    "br: a flipped bit reproduced the original body exactly"
+                    "{coding}: a flipped bit reproduced the original body exactly"
                 );
             }
         }

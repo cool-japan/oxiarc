@@ -33,6 +33,15 @@
 //!   it, so neither reads the whole input nor materialises the whole output.
 //!   [`decompress_into`], [`decompress_with_limit`] and
 //!   [`decompress_multi_frame_with_limit`] are the bomb-safe one-shot helpers.
+//! - **One set of format rules for every decoding path.** The dictionary-ID
+//!   requirement, the `Block_Maximum_Decompressed_Size` ceiling and the
+//!   frame-boundary classification (leading garbage is an error; a skippable
+//!   frame in front of a real one is metadata and is walked past; a tail that
+//!   starts no frame ends the stream only after one has been decoded) are
+//!   shared code, so [`decompress_multi_frame`] and [`ZstdStream`] accept and
+//!   refuse exactly the same frames. The declared `Window_Size` is the one
+//!   deliberate exception, because only the streaming decoder keeps a window
+//!   ring — see [`ZstdStream::with_max_window`].
 //! - Streaming `Write` encoder (one frame per 128 KiB block)
 //! - XXH64 checksum verification, one-shot and incremental ([`XxHash64`])
 //! - Optional parallel compression
@@ -75,6 +84,7 @@
 /// Async I/O support (Tokio). Requires the `async-io` feature.
 #[cfg(feature = "async-io")]
 pub mod async_zstd;
+mod backward_bits;
 mod bitwriter;
 mod compressed_block;
 /// Dictionary support for improved compression of small data.
@@ -91,6 +101,7 @@ mod literals;
 mod lz77;
 mod read;
 mod sequences;
+mod short_copy;
 /// Bounded, resumable push decoding ([`ZstdStream`]) and the bomb-safe
 /// one-shot helpers built on it.
 pub mod stream;

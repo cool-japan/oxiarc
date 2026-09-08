@@ -109,6 +109,11 @@ impl BrotliWindow {
     /// reached its declared size, which is exactly the reach the one-shot
     /// decoder has into its output `Vec` — the two decoders therefore accept
     /// and reject the same backward distances.
+    ///
+    /// Only the tests read it: every distance the command loop resolves is
+    /// already bounded by `min(window_size, bytes produced)`, so nothing on the
+    /// decoding path has to ask the ring how much it holds.
+    #[cfg(test)]
     pub(crate) fn filled(&self) -> usize {
         self.filled
     }

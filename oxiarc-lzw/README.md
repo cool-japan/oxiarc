@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-08) | 211 tests passing: 190 via nextest (incl. libtiff/Pillow and `compress(1)` differential oracles) + 21 doctests**
+**Version: 0.4.2 (2026-09-08) | 254 tests passing: 233 via nextest (incl. libtiff/Pillow TIFF, Pillow GIF and `compress(1)` differential oracles, adversarial decode hardening and heap-budget suites) + 21 doctests**
 
 ## Overview
 
@@ -20,14 +20,14 @@ LZW is a dictionary-based compression algorithm used in TIFF images, GIF animati
 - **TIFF support** - MSB-first bit ordering for TIFF images
 - **GIF support** - LSB-first bit ordering for GIF animations via `gif_lzw` module
 - **GIF LZW codec** - Dedicated `gif_compress`/`gif_decompress` functions conforming to GIF spec §22
-- **LSB bitstream** - `bitstream_lsb` module with `LsbBitWriter`/`LsbBitReader` for GIF-compatible bit packing
 - **UNIX `compress` / `.Z`** - Complete container codec in the `z` module: `1F 9D` header, block mode, code widths 9-16, `ZReader`/`ZWriter` adapters. Output is byte-identical to `compress -b N -c` and is accepted by `gzip -dc`/`uncompress -c` (`Content-Encoding: compress`)
 - **Explicit bit order** - `LzwConfig::bit_order` (`LzwBitOrder::{Msb, Lsb}`) drives every generic entry point, so `LzwConfig::GIF` really decodes LSB-first and `LzwConfig::TIFF_COMPAT_LSB` reads libtiff's pre-1993 `LZWDecodeCompat` strips
 - **Configurable** - Adjustable code width (9-16 bits; 12 is the TIFF/GIF ceiling, 16 the `compress` one)
 - **Early change** - Code width increases before table full
-- **Zero-allocation strip decode** - `decompress_tiff_into(src, &mut dst)` expands codes straight into a caller-supplied buffer through a prefix/suffix code table; no allocation per decoded code, and none at all beyond the fixed table (see below)
+- **Zero-allocation strip decode** - `decompress_tiff_into(src, &mut dst)` expands codes straight into a caller-supplied buffer through a packed prefix/suffix code table; no allocation per decoded code, and none at all beyond the fixed table
+- **Within 1.4x of libtiff** - the decoder is measured against libtiff 4.7.1's own `LZWDecode` on strips libtiff produced: **0.73-0.80x of its throughput**, i.e. 1.25x-1.37x of its decode time (see [Performance](#performance) and `examples/lzw_vs_libtiff.rs`)
 - **Old-style LZW** - `LzwConfig::TIFF_OLD_STYLE` decodes streams written with the standard (late) code-width change instead of TIFF's early change, i.e. writers that followed TIFF 6.0's pseudo-code literally
-- **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs`, `tests/tiffcp_strip_decode.rs` and the pinned fixtures in `tests/data/`)
+- **Reference interop** - TIFF-LZW streams are byte-compatible with libtiff/Pillow in both directions (differential-tested; see `tests/tiff_lzw_oracle.rs`, `tests/tiffcp_strip_decode.rs` and the pinned fixtures in `tests/data/`), and GIF image data is checked against Pillow's own GIF decoder in both directions, including every minimum code size 2-8 (`tests/gif_oracle.rs`, feature `gif-oracle`)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing across arbitrary inputs, for the generic codec and for `.Z`
 
 All features are implemented and tested. API is stable. `LzwConfig` implements `Default` (returning the TIFF preset), and `LzwError` is `#[non_exhaustive]` ahead of the crate's 1.0 release, so `match` expressions over it need a wildcard arm.
@@ -150,22 +150,74 @@ let decompressed = gif_decompress(&compressed, 8)?;
 assert_eq!(decompressed.as_slice(), data.as_slice());
 ```
 
-## LSB Bitstream (New in 0.2.4)
+## Performance
 
-The `bitstream_lsb` module provides low-level LSB-first bit packing used internally by `gif_lzw`:
+The decoder is built to libtiff's shape, and measured against it: `tiffcp`
+writes the LZW strips, and the same strips are decoded by both. Three-arm
+interleaved rounds (pre-0.4.2-rewrite decoder, current decoder, libtiff
+4.7.1's `LZWDecode`), 4096x4096 pages, medians of 7 rounds, `decompress_tiff_into`
+into an exactly-sized buffer. Absolute times are machine- and
+load-dependent (this run: load 10 on 8 cores); the ratios are the portable
+part.
 
-```rust
-use oxiarc_lzw::bitstream_lsb::{LsbBitWriter, LsbBitReader};
+| payload | strip | libtiff | before | after | before / libtiff | **after / libtiff** | speedup |
+|---|---|---|---|---|---|---|---|
+| RGB8 rows | 60 KiB - 1 MiB | 117 ms | 233 ms | 156 ms | 1.99x | **1.34x** | 1.49x |
+| Gray16 rows | 64 KiB - 1 MiB | 55 ms | 103 ms | 69 ms | 1.86x | **1.25x** | 1.48x |
+| text | 64 KiB - 1 MiB | 23 ms | 38 ms | 30 ms | 1.62x | **1.28x** | 1.27x |
+| incompressible | 64 KiB - 1 MiB | 30 ms | 107 ms | 41 ms | 3.56x | **1.36x** | 2.62x |
 
-let mut writer = LsbBitWriter::new();
-writer.write_bits(0b101, 3);
-writer.write_bits(0b1100, 4);
-let data = writer.into_bytes();
+An independent sweep at load 7.3 and smaller runs at load 4.5-5.5 give the
+same ratios to within 0.02. On a *busy* box the estimator is what matters:
+a median over a handful of rounds scatters badly (individual fixtures
+anywhere from 1.09x to 2.03x above about load 20, both arms alike), but the
+**minimum** over many interleaved rounds does not, because contention can
+only ever inflate a sample. A 15-round re-measurement at load 26-36 taken
+that way reproduced the whole matrix — RGB8 1.33-1.34x, Gray16 1.25x, text
+1.27-1.28x, incompressible 1.35-1.37x, worst case **1.367x** — so the
+figures above survive a loaded machine when they are read as minima.
 
-let mut reader = LsbBitReader::new(&data);
-assert_eq!(reader.read_bits(3), Some(0b101));
-assert_eq!(reader.read_bits(4), Some(0b1100));
-```
+The figures are flat across the strip-size sweep (60 KiB, 256 KiB, 1 MiB),
+so building one code table per strip costs under 1.3 us. GIF image data
+gained more, because `gif_decompress` used to allocate a `Vec<u8>` per
+emitted code and now shares the strip decoder:
+
+| GIF payload (1 MiB) | before | after | speedup |
+|---|---|---|---|
+| image-like | 14.4 ms | 1.14 ms | 12.6x |
+| text | 4.87 ms | 0.84 ms | 5.8x |
+| one repeated byte | 0.30 ms | 0.03 ms | 10.5x |
+| incompressible | 67.7 ms | 2.80 ms | 24.2x |
+
+What makes it fast, in the order the measurements said it mattered:
+
+* **one packed `u64` per code-table entry** (prefix, length, first byte,
+  last byte, "all bytes equal") - as a five-field struct the optimiser
+  emitted four loads and five stores per code; packed, it is one `ldr` and
+  one `str`,
+* **a stateless code reader**: a code is shifted out of a four-byte window
+  at an absolute bit position the decode loop keeps in a register, instead
+  of a bit accumulator behind `&mut` that had to be written back per code,
+* **libtiff's entry-creation order**, which turns the KwKwK case into a
+  single comparison and knows every string's length before writing a byte,
+* **a `repeated` bit per entry**, so the long single-byte runs of a flat
+  image region are emitted with a fill instead of a chain walk,
+* **a chain walk that stops one step above the root**, because every entry
+  on a chain carries the same first byte: a three-byte string costs one
+  table load, a two-byte string none.
+
+The libtiff arm of the table above is a harness that links `libtiff` and
+times `TIFFReadEncodedStrip` on a TIFF held entirely in memory, so nothing
+but the codec is in the loop; it is not committed, because this workspace is
+C-free. The committed example reproduces the same comparison with PATH tools
+only — `tiffcp -c none lzw.tif out` minus `tiffcp -c none uncompressed.tif out`,
+which differ only by the LZW decode. That subtraction is noisier (the two
+runs also read different numbers of bytes) and needs a quiet machine: it
+agrees with the direct harness to within ~15 % at a load of ~10 and is
+meaningless on a busy box, which is why it prints `uptime` with its results.
+
+Reproduce with `cargo run --release --example lzw_vs_libtiff` (self-skips
+without `tiffcp`) and `cargo bench --bench lzw_into_bench`.
 
 ## Configuration
 
