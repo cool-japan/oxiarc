@@ -30,9 +30,15 @@ use oxiarc_deflate::{Deflater, Strategy, deflate, inflate, zlib_compress};
 /// decision (`Z_FIXED`). The corpora are chosen so those paths actually
 /// diverge from each other: `anchored-random` and `nine-bit-alphabet` are the
 /// shapes where `dynamic < stored + 4 <= static`, which is the *only* place
-/// `Z_FIXED`'s block-type rule is observable — folding `Z_FIXED` into zlib's
-/// `opt_lenb` narrowing (rather than applying it after the stored test, as
-/// zlib does) emits a stored block there where zlib emits a fixed one.
+/// `Z_FIXED`'s block-type rule is observable — zlib folds `Z_FIXED` into the
+/// `opt_lenb` narrowing, so the dynamic cost drops out and both corpora come
+/// back as stored blocks; applying `Z_FIXED` only after the stored test would
+/// emit a fixed block there instead.
+///
+/// That makes this gate version-sensitive: it pins zlib >= 1.2.12 behaviour,
+/// the release that added `|| s->strategy == Z_FIXED` to the narrowing. Linked
+/// against zlib <= 1.2.11 (macOS's system zlib) the reference emits fixed
+/// blocks for these two corpora and the byte comparison fails.
 #[test]
 fn every_strategy_is_byte_identical_to_python() {
     if !corpus::python3_available() {
@@ -83,11 +89,13 @@ fn every_strategy_is_byte_identical_to_python() {
     );
 }
 
-/// `Strategy::Fixed` must never emit a *dynamic* block, and must prefer a
-/// fixed block over a stored one exactly where zlib does.
+/// `Strategy::Fixed` must never emit a *dynamic* block.
 ///
 /// This is the structural half of the gate above: it needs no reference tool,
-/// so it keeps holding on a machine with no `python3`.
+/// so it keeps holding on a machine with no `python3`. It deliberately asserts
+/// nothing about the stored-vs-fixed split — that half is version-sensitive
+/// (see above) and belongs to the byte-identity gate; several of these corpora
+/// come back as stored blocks.
 #[test]
 fn fixed_strategy_never_emits_a_dynamic_block() {
     for s in corpus::strategy_samples() {

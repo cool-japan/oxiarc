@@ -27,11 +27,14 @@
 //!
 //! ```text
 //! # write every corpus under fuzz/corpus/<target>/
-//! cargo run -p oxiarc-http --example fuzz_seeds --all-features -- fuzz/corpus
+//! cargo run -p oxiarc-http --example http_fuzz_seeds --all-features -- fuzz/corpus
 //!
 //! # or into a scratch directory (the default is the system temp dir)
-//! cargo run -p oxiarc-http --example fuzz_seeds --all-features
+//! cargo run -p oxiarc-http --example http_fuzz_seeds --all-features
 //! ```
+//!
+//! The `http_` prefix is there because cargo example target names share
+//! one workspace-global output directory (`target/debug/examples/`).
 //!
 //! `fuzz/corpus/` is git-ignored (root `TODO.md` Known Issue 9), so seeds are
 //! regenerated, never committed — which is why this generator is the durable

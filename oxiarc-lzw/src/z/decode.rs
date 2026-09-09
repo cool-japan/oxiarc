@@ -11,6 +11,13 @@
 //!    on stderr, and
 //! 3. output can be bounded, and the bound is enforced *during* decoding.
 //!
+//! Where the references themselves differ, this follows GNU `gzip`'s
+//! `unlzw.c`, which is the strictest of them and the decoder that
+//! `Content-Encoding: compress` bodies actually meet: its `oldcode == -1`
+//! guard runs *before* the CLEAR handling, so the first code of a stream
+//! must be a literal byte and a leading CLEAR is
+//! [`LzwError::InvalidCode`]`(256)` rather than a table reset.
+//!
 //! The decoder is a *push* core: [`ZDecoder::decode`] consumes as much of a
 //! chunk as it can and keeps back fewer than `max_bits` bytes (one code
 //! group) for the next call, so a `Read` adapter over it holds a bounded
@@ -215,21 +222,36 @@ impl ZDecoder {
             }
 
             if code == CLEAR && self.header.block_mode {
+                if self.old_code.is_none() {
+                    // A CLEAR as the *first* code of a stream is corrupt
+                    // input, not a reset. GNU `gzip`'s `unlzw.c` runs its
+                    // `oldcode == -1` guard *before* the CLEAR handling, so
+                    // the first code must be a literal byte:
+                    //
+                    // ```c
+                    //     if (oldcode == -1) {
+                    //         if (256 <= code) gzip_error("corrupt input.");
+                    //         ...
+                    //     }
+                    //     if (code == CLEAR && block_mode) { ... }
+                    // ```
+                    //
+                    // Verified against gzip 1.14 (GNU/Linux), which answers
+                    // `gzip: <name>.Z: corrupt input.` and writes nothing;
+                    // on GNU systems `uncompress` is `gunzip`, so it agrees.
+                    // No encoder in circulation emits a leading CLEAR, so
+                    // inventing output for one would only ever be decode
+                    // surface for crafted input.
+                    return Err(LzwError::InvalidCode(CLEAR));
+                }
                 self.prefix.fill(0);
-                self.free_ent = if self.old_code.is_some() {
-                    // One lower than the encoder's `FIRST`: the next code
-                    // burns slot 256 (which is the CLEAR code and therefore
-                    // never referenced), after which the two sides are back
-                    // in step.
-                    u32::from(CLEAR)
-                } else {
-                    // A CLEAR before any data code: nothing has been
-                    // decoded, so the next code creates no table entry and
-                    // there is no slot to burn. Starting at `FIRST` puts the
-                    // decoder in exactly its initial state, which is what
-                    // `gzip -dc` does with such a stream.
-                    FIRST
-                };
+                // One lower than the encoder's `FIRST`: the next code burns
+                // slot 256 (which is the CLEAR code and therefore never
+                // referenced), after which the two sides are back in step.
+                self.free_ent = u32::from(CLEAR);
+                // `old_code` is deliberately *not* cleared — the reference
+                // does not clear it either — so back-to-back CLEARs take
+                // this same path rather than the rejection above.
                 self.align_group(base, view);
                 self.n_bits = INIT_BITS;
                 self.max_code = (1u32 << INIT_BITS) - 1;

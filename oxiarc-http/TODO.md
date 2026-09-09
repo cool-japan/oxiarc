@@ -383,8 +383,8 @@ reader does not "fix" them back:
       `zstd -D <dict> -d`, all self-skipping. **All twelve ran for real** on
       the development machine — zero "skipping:" lines under `--nocapture`
 - [x] `examples/` — `ureq3_manual_gzip`, `reqwest_bytes_stream`,
-      `oxihttp_client`, `fuzz_seeds` (129 seeds across the seven wave-3 fuzz
-      targets)
+      `oxihttp_client`, `http_fuzz_seeds` (129 seeds across the seven
+      wave-3 fuzz targets)
 - [x] `benches/decode_bench.rs` — **0.96–0.98x** of
       `oxiarc_deflate::gzip_decompress` (see "Deviations")
 
@@ -445,7 +445,7 @@ predates either blocker.
       (one-shot) and `BrotliDecompressor::with_dictionary` (the *read*
       side). `EncodeOptions` gains `compress_max_bits` (default 16,
       deliberately chosen — see its own doc comment).
-- [x] `examples/fuzz_seeds.rs` / `tests/fuzz_seeds.rs` retargeted from the
+- [x] `examples/http_fuzz_seeds.rs` / `tests/fuzz_seeds.rs` retargeted from the
       seven fuzz targets that never materialized to the two Phase 8 wave 3
       actually wired, `fuzz_http_decode` and `fuzz_http_headers` — same 129
       seeds, now merged two ways instead of split seven; `fuzz_http_decode.rs`'s
@@ -574,7 +574,7 @@ that the track's own tests could not see, and closed four coverage holes.
       are real codings. Seeding this crate's corpus cannot help until that
       array can pick either coding; flagged for whoever owns `fuzz/` next.
 - [ ] `fuzz_http_*` cargo-fuzz targets — the root TODO's Wave 3. The seed
-      generator (`examples/fuzz_seeds.rs`) and the invariants each target
+      generator (`examples/http_fuzz_seeds.rs`) and the invariants each target
       should assert (`tests/fuzz_seeds.rs`) are done here; `fuzz/Cargo.toml`
       needs `oxiarc-http` added to its `[dependencies]`
 - [ ] `Transfer-Encoding` — deliberately out of scope (Phase 8 owner

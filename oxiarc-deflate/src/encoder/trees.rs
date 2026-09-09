@@ -732,16 +732,14 @@ pub(crate) fn flush_block(
         let mut o = trees.heap.opt_len.wrapping_add(3 + 7) >> 3;
         let s = trees.heap.static_len.wrapping_add(3 + 7) >> 3;
         static_lenb = s;
-        // zlib narrows `opt_lenb` to the *cheaper* of dynamic and static only.
-        // `Z_FIXED` deliberately does NOT enter this comparison: it is applied
-        // below, after the stored-block test, so a `Z_FIXED` stream still
-        // stores a block only when a stored block beats the best *coded*
-        // encoding — not merely the static one. Folding `Z_FIXED` in here
-        // would emit stored blocks zlib emits as fixed whenever
-        // `dynamic < stored + 4 <= static` (measured: 40 000 bytes drawn from
-        // the 9-bit half of the fixed literal alphabet — dynamic 34 342,
-        // stored 40 005, static 44 905 — where zlib emits fixed).
-        if s <= o {
+        // zlib 1.3.x: `if (static_lenb <= opt_lenb || s->strategy == Z_FIXED)
+        // opt_lenb = static_lenb;`. `Z_FIXED` narrows `opt_lenb` to the static
+        // cost *before* the stored test below, so a `Z_FIXED` stream stores a
+        // block whenever a stored block beats the *static* encoding — the
+        // dynamic cost never enters the decision. The `|| Z_FIXED` arrived in
+        // zlib 1.2.12; code built against zlib <= 1.2.11 (macOS's system zlib)
+        // emits a fixed block wherever `dynamic < stored + 4 <= static`.
+        if s <= o || strategy == Strategy::Fixed {
             o = s;
         }
         opt_lenb = o;
@@ -752,7 +750,11 @@ pub(crate) fn flush_block(
 
     match stored_buf {
         Some(buf) if stored_len as u64 + 4 <= opt_lenb => stored_block(sink, buf, last),
-        _ if strategy == Strategy::Fixed || static_lenb == opt_lenb => {
+        // zlib 1.3.x tests only `static_lenb == opt_lenb` here: under `Fixed`
+        // both branches above already force `opt_lenb == static_lenb` (the
+        // narrowing when `level > 0`, the assignment when `level == 0`), so an
+        // extra `strategy == Fixed` test would be redundant.
+        _ if static_lenb == opt_lenb => {
             sink.send_bits((1 << 1) + u32::from(last), 3);
             compress_block_static(sink, syms);
         }

@@ -322,8 +322,8 @@ because libtiff, GDAL and `tifffile` all write the Adobe registration.
 - [x] ICC/XMP/IPTC/Photoshop tag *type* preservation asserted directly
       (`Value::Undefined` vs `Value::Byte`), not only the decoded bytes,
       in `tests/roundtrip.rs`.
-- [x] Fuzz seed generator: `examples/fuzz_seeds.rs` (mirrors
-      `oxiarc-http/examples/fuzz_seeds.rs`'s shape) generates and documents
+- [x] Fuzz seed generator: `examples/tiff_fuzz_seeds.rs` (mirrors
+      `oxiarc-http/examples/http_fuzz_seeds.rs`'s shape) generates and documents
       the byte layout for five targets — `tiff_decode`, `tiff_roundtrip`,
       `ccitt_decode`, `packbits_decode`, `lzw_tiff_decode` — with the actual
       `fuzz_targets/*.rs` left to the workspace's Wave 3 track (which owns

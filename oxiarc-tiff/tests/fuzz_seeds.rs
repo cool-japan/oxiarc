@@ -1,9 +1,9 @@
-//! The invariants the five fuzz targets `examples/fuzz_seeds.rs` seeds are
+//! The invariants the five fuzz targets `examples/tiff_fuzz_seeds.rs` seeds are
 //! meant to assert, run against freshly regenerated seeds (never the
 //! git-ignored `fuzz/corpus/` on disk).
 //!
 //! The targets live in the workspace `fuzz/` crate (Wave 3's to add, per
-//! `examples/fuzz_seeds.rs`'s module docs, which fix the exact byte layout
+//! `examples/tiff_fuzz_seeds.rs`'s module docs, which fix the exact byte layout
 //! each one parses); this file re-derives the same seed families and
 //! decodes them the way each target is documented to, so:
 //!

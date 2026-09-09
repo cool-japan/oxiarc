@@ -2,18 +2,21 @@
 //! (tiff-design.md section 5.2 item 8): `tiff_decode`, `tiff_roundtrip`,
 //! `ccitt_decode`, `packbits_decode`, `lzw_tiff_decode`.
 //!
-//! Mirrors `oxiarc-http/examples/fuzz_seeds.rs`'s shape exactly (that crate
+//! Mirrors `oxiarc-http/examples/http_fuzz_seeds.rs`'s shape exactly (that crate
 //! wrote its generator before its own fuzz targets landed too -- Wave 3 owns
 //! `fuzz/`, the seeds are ready for whenever it adds the `[[bin]]` entries
 //! below).
 //!
 //! ```text
 //! # write every corpus under fuzz/corpus/<target>/
-//! cargo run -p oxiarc-tiff --example fuzz_seeds --features all-codecs -- fuzz/corpus
+//! cargo run -p oxiarc-tiff --example tiff_fuzz_seeds --features all-codecs -- fuzz/corpus
 //!
 //! # or into a scratch directory (the default is the system temp dir)
-//! cargo run -p oxiarc-tiff --example fuzz_seeds --features all-codecs
+//! cargo run -p oxiarc-tiff --example tiff_fuzz_seeds --features all-codecs
 //! ```
+//!
+//! The `tiff_` prefix is there because cargo example target names share
+//! one workspace-global output directory (`target/debug/examples/`).
 //!
 //! `fuzz/corpus/` is git-ignored (root `TODO.md` Known Issue 9), so seeds are
 //! regenerated, never committed -- which is why this generator is the

@@ -30,6 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use oxiarc_lzw::LzwError;
 use oxiarc_lzw::z::{ZHeader, compress, compress_with_block_mode, decompress};
 
 /// Locate `tool` on `PATH`, returning `None` when it is not installed.
@@ -363,12 +364,20 @@ fn pack(codes: &[(u16, u8)]) -> Vec<u8> {
     out
 }
 
+/// The hand-built corner streams from `tests/z_roundtrip.rs`, replayed
+/// through the real tools.
+///
+/// That suite is hermetic: it justifies its expectations by quoting what
+/// `gzip -dc` and `uncompress -c` do with these exact bytes. This test is
+/// where the quotation is checked against the tools actually installed, so
+/// a quotation that goes stale fails here rather than rotting in a comment.
+///
+/// Two streams, and the crate agrees with the references on both:
+///
+/// 1. KwKwK — accepted everywhere, `aaaaaa`;
+/// 2. a leading CLEAR — rejected everywhere, including here.
 #[test]
 fn oracle_hand_built_corner_streams_match_the_references() {
-    // The two hand-built streams in `tests/z_roundtrip.rs` justify their
-    // expectations by quoting what `gzip -dc` and `uncompress -c` do. That
-    // suite is hermetic, so this test is where the quotation is checked
-    // against the actual tools.
     let gzip = on_path("gzip");
     let uncompress = on_path("uncompress");
     if gzip.is_none() && uncompress.is_none() {
@@ -398,37 +407,64 @@ fn oracle_hand_built_corner_streams_match_the_references() {
     }
     assert_eq!(decompress(&kwkwk).expect("kwkwk"), b"aaaaaa");
 
-    // 2. A stream whose *first* code is a CLEAR. `compress(1)` never writes
-    //    one, and the two references disagree: `gzip -dc` treats it as a
-    //    reset and decodes the body normally, BSD `uncompress -c` reads the
-    //    group padding as literals and emits garbage. This crate follows
-    //    `gzip` (see `oxiarc_lzw::z`'s module docs); if a future platform's
-    //    `uncompress` starts agreeing, this test says so.
+    // 2. A stream whose *first* code is a CLEAR: a full 9-bit group of
+    //    CLEAR + seven zero-code paddings, then a body ('A', 'B', 257, 257)
+    //    that would read as `ABABAB` from an initial table.
+    //
+    //    `compress(1)` never writes such a stream, and GNU `gzip` refuses to
+    //    read it: `unlzw.c` runs its `oldcode == -1` guard before the CLEAR
+    //    handling, so the first code must be a literal byte. Verified
+    //    against gzip 1.14 on GNU/Linux, where both `gzip -dc` and
+    //    `uncompress -c` (a link to `gunzip` there) answer
+    //    `gzip: stream.Z: corrupt input.`, exit 1 and write nothing. This
+    //    crate matches that — see `oxiarc_lzw::z`'s module docs.
+    //
+    //    So here a *rejection* is the expected outcome and the thing that
+    //    counts as agreement. Nothing is asserted about what a BSD-derived
+    //    `uncompress` would do; if one is on PATH and accepts the stream,
+    //    the acceptance is reported below rather than assumed.
     let mut clear_group = vec![(256u16, 9u8)];
     clear_group.extend(std::iter::repeat_n((0u16, 9u8), 7));
     let body = pack(&[(65, 9), (66, 9), (257, 9), (257, 9)]);
     let mut with_clear = header.to_vec();
     with_clear.extend_from_slice(&pack(&clear_group));
     with_clear.extend_from_slice(&body);
-    assert_eq!(decompress(&with_clear).expect("leading clear"), b"ABABAB");
+    assert!(
+        matches!(
+            decompress(&with_clear).expect_err("leading clear"),
+            LzwError::InvalidCode(256)
+        ),
+        "a leading CLEAR must be rejected, as every reference decoder rejects it"
+    );
 
     fs::write(&path, &with_clear).expect("write stream");
-    if let Some(bin) = gzip.as_deref() {
-        let decoded =
-            reference_decompress(bin, &["-dc"], &path).expect("gzip must accept a leading CLEAR");
-        assert_eq!(
-            decoded, b"ABABAB",
-            "gzip -dc no longer resets on a leading CLEAR; this crate follows gzip, so the              module docs and `z_roundtrip.rs` need revisiting"
-        );
-        agreed += 1;
-    }
-    if let Some(bin) = uncompress.as_deref() {
-        match reference_decompress(bin, &["-c"], &path) {
-            Some(decoded) => assert_ne!(
-                decoded, b"ABABAB",
-                "BSD uncompress now agrees with gzip on a leading CLEAR; the documented                  divergence in `oxiarc_lzw::z` is stale"
-            ),
-            None => println!("note: `uncompress` rejected the leading-CLEAR stream outright"),
+    for (tool, args) in [
+        (gzip.as_deref(), &["-dc"][..]),
+        (uncompress.as_deref(), &["-c"][..]),
+    ] {
+        let Some(tool) = tool else { continue };
+        match reference_decompress(tool, args, &path) {
+            None => {
+                // The expected outcome: the reference refuses the stream,
+                // exactly as this crate does.
+                agreed += 1;
+            }
+            Some(decoded) => {
+                println!(
+                    "note: {} accepted the leading-CLEAR stream, producing {} byte(s)",
+                    tool.display(),
+                    decoded.len()
+                );
+                assert_ne!(
+                    decoded,
+                    b"ABABAB",
+                    "{} decodes a leading CLEAR as a table reset. A reference that \
+                     implements the reset reading means this crate's strictness — and \
+                     the leading-CLEAR rule in `oxiarc_lzw::z`'s module docs, \
+                     `z/decode.rs` and `z_roundtrip.rs` — needs revisiting",
+                    tool.display()
+                );
+            }
         }
     }
 

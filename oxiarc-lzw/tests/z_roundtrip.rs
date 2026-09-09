@@ -468,17 +468,24 @@ fn pack(codes: &[(u16, u8)]) -> Vec<u8> {
 }
 
 #[test]
-fn a_leading_clear_code_resets_to_the_initial_state_like_gzip() {
-    // `compress(1)` never writes a CLEAR as the first code, so the two
-    // reference decoders disagree about this stream: `gzip -dc` treats it as
-    // a reset (and decodes the body exactly as if the CLEAR were absent)
-    // while BSD `uncompress -c` reads the group padding as literals and
-    // emits garbage. This crate follows `gzip`, which is the decoder
-    // `Content-Encoding: compress` bodies meet in practice.
+fn a_leading_clear_code_is_rejected_like_gzip() {
+    // `compress(1)` never writes a CLEAR as the first code, and GNU `gzip`
+    // refuses to read one: its `unlzw.c` runs the `oldcode == -1` guard
+    // (`if (256 <= code) gzip_error("corrupt input.")`) *before* the CLEAR
+    // handling, so the first code of a `.Z` stream must be a literal byte.
+    // Verified against gzip 1.14 on GNU/Linux, where `gzip -dc` on exactly
+    // these bytes prints `gzip: <name>.Z: corrupt input.`, exits 1 and
+    // writes nothing; `uncompress` there is a link to `gunzip`, so it says
+    // the same. `tests/z_oracle.rs` re-checks that against the tools on
+    // PATH. This crate matches gzip: it is the decoder that
+    // `Content-Encoding: compress` bodies actually meet, and the strictest
+    // of the references — inventing plausible output from a stream every
+    // reference rejects would be decode surface for crafted input only.
     //
     // Mid-stream CLEAR handling — the case real `compress` output actually
     // contains — is pinned by `tests/z_fixtures.rs::clear_b10.Z` and by the
-    // `z-oracle` suite.
+    // `z-oracle` suite; it is unaffected, because a mid-stream CLEAR always
+    // has a previous code.
     let header = ZHeader::new(12, true).expect("header");
 
     // One full group of eight 9-bit codes: CLEAR followed by the padding a
@@ -505,14 +512,19 @@ fn a_leading_clear_code_resets_to_the_initial_state_like_gzip() {
         expected,
         "the hand-built body is what it claims to be"
     );
-    assert_eq!(
-        decompress(&with_clear).expect("leading clear"),
-        expected,
-        "a leading CLEAR must leave the decoder in its initial state"
+    assert!(
+        matches!(
+            decompress(&with_clear).expect_err("256 first in block mode"),
+            LzwError::InvalidCode(256)
+        ),
+        "a leading CLEAR is corrupt input, not a reset of an already-initial table"
     );
 
-    // Without block mode 256 is an ordinary code and cannot appear as the
-    // first code of a stream, so the same bytes are rejected.
+    // Without block mode 256 is an ordinary code that no initial table
+    // holds, so the same bytes are rejected there too — for a different
+    // reason, reaching the same place. That both halves now reject is the
+    // point: the rule is uniform, and needs no `block_mode` case analysis.
+    // The first code of a `.Z` stream must be a literal byte, full stop.
     let non_block = ZHeader::new(12, false).expect("header");
     let mut as_non_block = non_block.to_bytes().to_vec();
     as_non_block.extend_from_slice(&clear_group);

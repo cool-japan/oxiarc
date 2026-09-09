@@ -167,7 +167,7 @@ decoder.finish_into(&mut out)?;             // REQUIRED: verifies checksums
 
 Runnable integration recipes live in `examples/`:
 `ureq3_manual_gzip`, `reqwest_bytes_stream`, `oxihttp_client`, plus
-`fuzz_seeds` (the seed-corpus generator for this crate's two fuzz targets,
+`http_fuzz_seeds` (the seed-corpus generator for this crate's two fuzz targets,
 `fuzz_http_decode` and `fuzz_http_headers`).
 
 See the crate-level rustdoc (`cargo doc -p oxiarc-http --all-features --open`)

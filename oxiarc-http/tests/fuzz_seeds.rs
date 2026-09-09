@@ -1,6 +1,6 @@
 //! The invariants `oxiarc-http`'s two fuzz targets, `fuzz_http_decode` and
 //! `fuzz_http_headers`, assert — run here directly, against the seed
-//! families `examples/fuzz_seeds.rs` writes for them.
+//! families `examples/http_fuzz_seeds.rs` writes for them.
 //!
 //! The targets themselves live in the workspace `fuzz/` crate
 //! (`fuzz/fuzz_targets/fuzz_http_{decode,headers}.rs`); this file re-derives
@@ -23,7 +23,7 @@
 //! picks its codings, limits, and chunk size from the fuzz input's own
 //! leading bytes via `arbitrary::Unstructured`, rather than from the fixed
 //! shapes below — see that target's own doc comment and
-//! `examples/fuzz_seeds.rs`'s.
+//! `examples/http_fuzz_seeds.rs`'s.
 
 #![cfg(all(feature = "gzip", feature = "deflate"))]
 

@@ -6,7 +6,7 @@
 //! campaign found across `oxiarc-deflate`'s stream wrappers (silent
 //! truncation past 32 KiB, broken bit-continuity across calls). The
 //! corresponding fuzz target — `fuzz_http_decoder_chunked` — is seeded from
-//! `examples/fuzz_seeds.rs`.
+//! `examples/http_fuzz_seeds.rs`.
 
 mod common;
 

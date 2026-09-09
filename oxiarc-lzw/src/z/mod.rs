@@ -31,6 +31,18 @@
 //!   256 a table reset. The writer restarts allocation at 257; the reader
 //!   restarts at 256 and burns that slot on the next code, which is what
 //!   keeps the two in step. Without block mode, 256 is an ordinary entry.
+//! * **The first code of a stream must be a literal byte**, in either mode.
+//!   A leading CLEAR is [`crate::LzwError::InvalidCode`]`(256)`, not a reset
+//!   of an already-initial table. This matches GNU `gzip`'s `unlzw.c`, whose
+//!   `oldcode == -1` guard (`if (256 <= code) gzip_error("corrupt input.")`)
+//!   runs *before* the CLEAR handling. Verified here against gzip 1.14 on
+//!   GNU/Linux, which answers `gzip: <name>.Z: corrupt input.` and writes no
+//!   output; on GNU systems `uncompress` is a link to `gunzip` and so gives
+//!   the same answer. What a BSD-derived `uncompress` does with such a
+//!   stream is not asserted either way — `tests/z_oracle.rs` reports it if
+//!   one is on `PATH`. No `compress(1)` writes a leading CLEAR, so rejecting
+//!   it costs no real stream and keeps crafted input off a decode path that
+//!   every reference refuses.
 //! * **`max_bits` is a table ceiling, not a code-width ceiling.** The
 //!   reference widens the code as soon as `free_ent > maxcode`, and at
 //!   `max_bits == 9` that check fires once more than it "should", so
