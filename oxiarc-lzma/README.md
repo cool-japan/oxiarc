@@ -3,11 +3,11 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-08) — 277 tests passing (+ 12 doctests, 14 with
+**Version 0.4.3** (2026-09-08) — 277 tests passing (+ 12 doctests, 14 with
 `--all-features`).
 
 **What's new in 0.4.2**:
@@ -350,10 +350,10 @@ assert_eq!(&decompressed, data.as_ref());
 ```toml
 [dependencies]
 # Default (serial only)
-oxiarc-lzma = "0.4.2"
+oxiarc-lzma = "0.4.3"
 
 # With parallel LZMA2 compression
-oxiarc-lzma = { version = "0.4.2", features = ["parallel"] }
+oxiarc-lzma = { version = "0.4.3", features = ["parallel"] }
 ```
 
 ## Usage
@@ -362,7 +362,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.4.2"
+oxiarc-lzma = "0.4.3"
 ```
 
 ## Modules

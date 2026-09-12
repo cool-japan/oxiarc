@@ -2,12 +2,12 @@
 
 Pure Rust PNG (ISO/IEC 15948, W3C PNG 3rd Edition) and APNG codec, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![Tests](https://img.shields.io/badge/tests-303%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Decoder%20%2B%20Encoder%20%2B%20APNG%20complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-12) | 335 tests passing (303 via nextest + 32 doctests, `--all-features`)**
+**Version: 0.4.3 (2026-09-12) | 335 tests passing (303 via nextest + 32 doctests, `--all-features`)**
 
 The decoder, the encoder, and the APNG compositor are complete and validated against
 CPython Pillow in both directions — including Pillow's own APNG writer/reader as an
@@ -61,7 +61,7 @@ not built — the design survey found zero real call sites against it — see `T
 
 ```toml
 [dependencies]
-oxiarc-png = "0.4.2"
+oxiarc-png = "0.4.3"
 ```
 
 ### One-shot decode

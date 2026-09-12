@@ -3,11 +3,11 @@
 Pure Rust JPEG (ITU-T T.81 / ISO/IEC 10918-1) codec for OxiArc. No C, no FFI,
 no `unsafe`.
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-12) | 619 tests passing (591 via nextest + 28 doctests,
+**Version: 0.4.3 (2026-09-12) | 619 tests passing (591 via nextest + 28 doctests,
 `--all-features`)** — the decoder and the encoder are both complete
 and byte-parity verified against libjpeg-turbo, including the arithmetic
 entropy coder, reduced-/enlarged-scale decode and the `zune_jpeg` /

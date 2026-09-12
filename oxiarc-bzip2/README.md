@@ -3,11 +3,11 @@
 
 Pure Rust implementation of BZip2 compression/decompression algorithm.
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-08-06) — 108 tests passing.
+**Version 0.4.3** (2026-08-06) — 108 tests passing.
 
 ## Overview
 
@@ -93,14 +93,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-bzip2 = "0.4.2"
+oxiarc-bzip2 = "0.4.3"
 ```
 
 With parallel compression enabled:
 
 ```toml
 [dependencies]
-oxiarc-bzip2 = { version = "0.4.2", features = ["parallel"] }
+oxiarc-bzip2 = { version = "0.4.3", features = ["parallel"] }
 ```
 
 ## License

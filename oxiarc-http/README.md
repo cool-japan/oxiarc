@@ -6,7 +6,7 @@ HTTP content-coding (RFC 9110 `Content-Encoding` / `Accept-Encoding`: gzip, defl
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-12) | 310 tests passing (nextest, all features) + 17 doctests**
+**Version: 0.4.3 (2026-09-12) | 310 tests passing (nextest, all features) + 17 doctests**
 
 ## Overview
 

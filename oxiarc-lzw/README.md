@@ -7,7 +7,7 @@ Pure Rust implementation of LZW (Lempel-Ziv-Welch) compression for TIFF and GIF 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.2 (2026-09-08) | 254 tests passing: 233 via nextest (incl. libtiff/Pillow TIFF, Pillow GIF and `compress(1)` differential oracles, adversarial decode hardening and heap-budget suites) + 21 doctests**
+**Version: 0.4.3 (2026-09-08) | 254 tests passing: 233 via nextest (incl. libtiff/Pillow TIFF, Pillow GIF and `compress(1)` differential oracles, adversarial decode hardening and heap-budget suites) + 21 doctests**
 
 ## Overview
 
@@ -433,7 +433,7 @@ the header's block-mode flag is set.
 
 ```toml
 [dependencies]
-oxiarc-lzw = "0.4.2"
+oxiarc-lzw = "0.4.3"
 ```
 
 ## Use Cases

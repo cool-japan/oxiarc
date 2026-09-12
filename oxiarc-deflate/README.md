@@ -3,11 +3,11 @@
 
 Pure Rust implementation of the DEFLATE compression algorithm (RFC 1951).
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.2** (2026-09-08) — 507 tests passing (455 via `cargo nextest run --all-features` + 52 doctests).
+**Version 0.4.3** (2026-09-08) — 507 tests passing (455 via `cargo nextest run --all-features` + 52 doctests).
 
 **What's new in 0.4.2**: **Resumable inflate, and every decode path re-based on it.** New `InflateStream` (raw DEFLATE) and `WrappedInflate` (gzip/zlib/raw/auto framing) are push decoders: an arbitrary byte split of the same stream yields byte-identical output, because a half-parsed Huffman header, a partially consumed byte and a half-copied match all survive across calls. New `InflateReader<R: Read>` and `AsyncInflateReader<R: AsyncRead>` (feature `async-io`) drive them from any source, with a mandatory 64 KiB output staging buffer, `Interrupted` retry, `WouldBlock` propagated (never turned into a bogus end-of-stream), and truncation reported as an `io::Error` rather than a short read.
 
@@ -77,21 +77,21 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-deflate = "0.4.2"
+oxiarc-deflate = "0.4.3"
 ```
 
 With async I/O support:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.4.2", features = ["async-io"] }
+oxiarc-deflate = { version = "0.4.3", features = ["async-io"] }
 ```
 
 With parallel GZIP compression:
 
 ```toml
 [dependencies]
-oxiarc-deflate = { version = "0.4.2", features = ["parallel"] }
+oxiarc-deflate = { version = "0.4.3", features = ["parallel"] }
 ```
 
 ## Quick Start

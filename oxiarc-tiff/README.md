@@ -2,12 +2,12 @@
 
 Pure Rust TIFF 6.0 / BigTIFF reader and writer, part of the OxiArc ecosystem.
 
-![Version](https://img.shields.io/badge/version-0.4.2-blue)
+![Version](https://img.shields.io/badge/version-0.4.3-blue)
 ![Tests](https://img.shields.io/badge/tests-535%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-12) | 535 tests + 38 doctests passing (`--all-features`)**
+**Version: 0.4.3 (2026-09-12) | 535 tests + 38 doctests passing (`--all-features`)**
 
 No C, no FFI, `#![forbid(unsafe_code)]`, no `unwrap()` in library code.
 
@@ -71,7 +71,7 @@ if you are moving off `tiff`/`image`.
 
 ```toml
 [dependencies]
-oxiarc-tiff = "0.4.2"
+oxiarc-tiff = "0.4.3"
 ```
 
 ### Reading
@@ -192,7 +192,7 @@ most migrations are an import-path swap:
 ```toml
 [dependencies]
 -tiff = "0.11"
-+oxiarc-tiff = { version = "0.4.2", features = ["compat", "all-codecs"] }
++oxiarc-tiff = { version = "0.4.3", features = ["compat", "all-codecs"] }
 ```
 
 What is frozen, byte-for-byte, because downstream code (`image` 0.25.10's
