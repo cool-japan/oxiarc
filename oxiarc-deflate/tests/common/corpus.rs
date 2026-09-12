@@ -258,6 +258,22 @@ pub fn python3_available() -> bool {
         .unwrap_or(false)
 }
 
+/// `zlib.ZLIB_RUNTIME_VERSION` of the `python3` reference, for diagnostics.
+///
+/// Only ever printed, never branched on: a version string says which release
+/// a zlib claims to be, not which rules the build actually applies.
+pub fn python_zlib_runtime_version() -> Option<String> {
+    let output = Command::new("python3")
+        .args(["-c", "import zlib; print(zlib.ZLIB_RUNTIME_VERSION)"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?;
+    Some(version.trim().to_owned())
+}
+
 /// Whether `python3` has Pillow + numpy (for the PNG-filtered corpora).
 pub fn pillow_available() -> bool {
     Command::new("python3")

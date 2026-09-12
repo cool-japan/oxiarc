@@ -468,7 +468,7 @@ fn pack(codes: &[(u16, u8)]) -> Vec<u8> {
 }
 
 #[test]
-fn a_leading_clear_code_is_rejected_like_gzip() {
+fn a_leading_clear_code_is_rejected_like_gnu_gzip() {
     // `compress(1)` never writes a CLEAR as the first code, and GNU `gzip`
     // refuses to read one: its `unlzw.c` runs the `oldcode == -1` guard
     // (`if (256 <= code) gzip_error("corrupt input.")`) *before* the CLEAR
@@ -476,11 +476,13 @@ fn a_leading_clear_code_is_rejected_like_gzip() {
     // Verified against gzip 1.14 on GNU/Linux, where `gzip -dc` on exactly
     // these bytes prints `gzip: <name>.Z: corrupt input.`, exits 1 and
     // writes nothing; `uncompress` there is a link to `gunzip`, so it says
-    // the same. `tests/z_oracle.rs` re-checks that against the tools on
-    // PATH. This crate matches gzip: it is the decoder that
-    // `Content-Encoding: compress` bodies actually meet, and the strictest
-    // of the references — inventing plausible output from a stream every
-    // reference rejects would be decode surface for crafted input only.
+    // the same. This crate matches GNU gzip, the strictest of the
+    // references. The BSD decoders accept these bytes, each differently:
+    // on macOS, Apple gzip 479 prints `ABABAB` (the CLEAR read as a reset)
+    // and the system `uncompress` prints eight NULs, `AB` and table garbage
+    // (the CLEAR read as a literal). `tests/z_oracle.rs` re-checks all of
+    // this against whichever tools are on PATH; the full split is on
+    // `oxiarc_lzw::z`'s module docs.
     //
     // Mid-stream CLEAR handling — the case real `compress` output actually
     // contains — is pinned by `tests/z_fixtures.rs::clear_b10.Z` and by the

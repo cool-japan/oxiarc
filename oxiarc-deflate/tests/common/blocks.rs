@@ -33,6 +33,14 @@ pub struct Block {
     pub matches: usize,
     /// Number of uncompressed bytes the block expands to.
     pub uncompressed: usize,
+    /// Offset, in bits from the start of the stream, of the block's first
+    /// header bit.
+    pub bit_offset: usize,
+    /// Number of bits the block occupies: from its 3-bit header through its
+    /// end-of-block code, or through its last data byte for a stored block
+    /// (alignment padding included). For a fixed block this is zlib's
+    /// `3 + static_len`, so `bit_len.div_ceil(8)` is zlib's `static_lenb`.
+    pub bit_len: usize,
 }
 
 struct Bits<'a> {
@@ -73,6 +81,11 @@ impl<'a> Bits<'a> {
 
     fn done(&self) -> bool {
         self.pos >= self.data.len()
+    }
+
+    /// The read position, in bits from the start of the data.
+    fn position(&self) -> usize {
+        self.pos * 8 + self.bit as usize
     }
 }
 
@@ -204,6 +217,7 @@ pub fn walk_blocks(data: &[u8]) -> Option<Vec<Block>> {
     let mut bits = Bits::new(data);
     let mut out = Vec::new();
     loop {
+        let bit_offset = bits.position();
         let last = bits.read(1)? == 1;
         let btype = match bits.read(2)? {
             0 => BlockType::Stored,
@@ -216,6 +230,8 @@ pub fn walk_blocks(data: &[u8]) -> Option<Vec<Block>> {
                     literals: 0,
                     matches: 0,
                     uncompressed: 0,
+                    bit_offset,
+                    bit_len: 3,
                 });
                 return Some(out);
             }
@@ -226,6 +242,8 @@ pub fn walk_blocks(data: &[u8]) -> Option<Vec<Block>> {
             literals: 0,
             matches: 0,
             uncompressed: 0,
+            bit_offset,
+            bit_len: 0,
         };
         match btype {
             BlockType::Stored => {
@@ -274,6 +292,7 @@ pub fn walk_blocks(data: &[u8]) -> Option<Vec<Block>> {
             }
             BlockType::Reserved => unreachable!(),
         }
+        block.bit_len = bits.position() - bit_offset;
         out.push(block);
         if last {
             break;

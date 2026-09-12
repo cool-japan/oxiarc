@@ -28,7 +28,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use oxiarc_lzw::LzwError;
 use oxiarc_lzw::z::{ZHeader, compress, compress_with_block_mode, decompress};
@@ -364,23 +364,112 @@ fn pack(codes: &[(u16, u8)]) -> Vec<u8> {
     out
 }
 
+/// Run `bin args… < input` to completion whatever its exit status, retrying
+/// only a failure to *spawn*, so a busy machine cannot pass for a refusal.
+fn run_to_completion(bin: &Path, args: &[&str], input: &Path) -> Option<Output> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let Ok(stdin) = fs::File::open(input) else {
+            continue;
+        };
+        if let Ok(output) = Command::new(bin)
+            .args(args)
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            return Some(output);
+        }
+    }
+    None
+}
+
+/// What `bin --version` prints — on stdout for GNU tools, on stderr for the
+/// FreeBSD-derived `gzip` — or `None` for BSD `compress`/`uncompress`, which
+/// have no `--version` and answer it with a usage error.
+fn version_text(bin: &Path) -> Option<String> {
+    let output = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = if output.stdout.is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    String::from_utf8(text).ok()
+}
+
+/// How a reference decoder reads a `.Z` stream whose first code is a CLEAR.
+///
+/// `compress(1)` never writes one, and the references split three ways on
+/// it — which is why `oxiarc_lzw::z`'s module docs name the one it follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeadingClearReading {
+    /// Refused as corrupt input: GNU `gzip`'s `unlzw.c` and `ncompress`,
+    /// whose `oldcode == -1` guard rejects any first code from 256 up
+    /// before the CLEAR handling ever sees it. This crate's reading.
+    Rejected,
+    /// A reset of the already-initial table, so the body decodes as
+    /// `ABABAB`: the FreeBSD/NetBSD `gzip` family's `zuncompress.c` (Apple's
+    /// `gzip` on macOS), which applies the CLEAR handling to every code,
+    /// the first included.
+    Reset,
+    /// The first code emitted, unchecked, as its low byte, and the group
+    /// padding after it read as literals: 4.4BSD `compress`'s `zopen.c`
+    /// (the `uncompress` of FreeBSD and macOS).
+    FirstCodeAsLiteral,
+}
+
+/// What the leading-CLEAR stream starts with under
+/// [`LeadingClearReading::FirstCodeAsLiteral`]: CLEAR's low byte, the seven
+/// zero paddings, then `A` and `B`. What follows reads table slots that
+/// reading never filled, so it is deliberately not pinned.
+const FIRST_CODE_AS_LITERAL_PREFIX: &[u8] = b"\0\0\0\0\0\0\0\0AB";
+
+/// Sort a reference decoder's run over the leading-CLEAR stream into one of
+/// the known readings, or `None` for a reading nobody has documented.
+fn leading_clear_reading(run: &Output) -> Option<LeadingClearReading> {
+    if !run.status.success() && run.stdout.is_empty() {
+        Some(LeadingClearReading::Rejected)
+    } else if run.stdout == b"ABABAB" {
+        Some(LeadingClearReading::Reset)
+    } else if run.stdout.starts_with(FIRST_CODE_AS_LITERAL_PREFIX) {
+        Some(LeadingClearReading::FirstCodeAsLiteral)
+    } else {
+        None
+    }
+}
+
 /// The hand-built corner streams from `tests/z_roundtrip.rs`, replayed
 /// through the real tools.
 ///
-/// That suite is hermetic: it justifies its expectations by quoting what
-/// `gzip -dc` and `uncompress -c` do with these exact bytes. This test is
-/// where the quotation is checked against the tools actually installed, so
-/// a quotation that goes stale fails here rather than rotting in a comment.
+/// That suite is hermetic: it justifies its expectations by quoting what the
+/// reference decoders do with these exact bytes. This test is where the
+/// quotations are checked against the tools actually installed, so one that
+/// goes stale fails here rather than rotting in a comment.
 ///
-/// Two streams, and the crate agrees with the references on both:
-///
-/// 1. KwKwK — accepted everywhere, `aaaaaa`;
-/// 2. a leading CLEAR — rejected everywhere, including here.
+/// 1. KwKwK — every reference reads it as `aaaaaa`, and so does this crate.
+/// 2. A leading CLEAR — the references split three ways (see
+///    [`LeadingClearReading`]) and this crate rejects it, as GNU `gzip`
+///    does. Every tool on PATH must read it in one of the three documented
+///    ways, and a GNU `gzip` must reject it; a reading outside the three, or
+///    a GNU `gzip` that stops rejecting, fails. What each tool did is printed
+///    as a table, so a run on any platform records its own references.
 #[test]
 fn oracle_hand_built_corner_streams_match_the_references() {
-    let gzip = on_path("gzip");
-    let uncompress = on_path("uncompress");
-    if gzip.is_none() && uncompress.is_none() {
+    let tools: Vec<(PathBuf, &[&str])> = [("gzip", &["-dc"][..]), ("uncompress", &["-c"][..])]
+        .into_iter()
+        .filter_map(|(tool, args)| on_path(tool).map(|bin| (bin, args)))
+        .collect();
+    if tools.is_empty() {
         println!("SKIP: neither `gzip` nor `uncompress` is on PATH");
         return;
     }
@@ -392,37 +481,26 @@ fn oracle_hand_built_corner_streams_match_the_references() {
     let mut kwkwk = header.to_vec();
     kwkwk.extend_from_slice(&pack(&[(97, 9), (257, 9), (258, 9)]));
     assert_eq!(kwkwk, [0x1F, 0x9D, 0x8C, 0x61, 0x02, 0x0A, 0x04]);
-    fs::write(&path, &kwkwk).expect("write stream");
-    let mut agreed = 0usize;
-    for (tool, args) in [
-        (gzip.as_deref(), &["-dc"][..]),
-        (uncompress.as_deref(), &["-c"][..]),
-    ] {
-        let Some(tool) = tool else { continue };
-        let Some(decoded) = reference_decompress(tool, args, &path) else {
-            panic!("{} rejected the KwKwK stream", tool.display());
-        };
-        assert_eq!(decoded, b"aaaaaa", "{}: KwKwK", tool.display());
-        agreed += 1;
-    }
     assert_eq!(decompress(&kwkwk).expect("kwkwk"), b"aaaaaa");
+    fs::write(&path, &kwkwk).expect("write stream");
+    for (bin, args) in &tools {
+        let Some(decoded) = reference_decompress(bin, args, &path) else {
+            panic!("{} rejected the KwKwK stream", bin.display());
+        };
+        assert_eq!(decoded, b"aaaaaa", "{}: KwKwK", bin.display());
+    }
 
     // 2. A stream whose *first* code is a CLEAR: a full 9-bit group of
     //    CLEAR + seven zero-code paddings, then a body ('A', 'B', 257, 257)
     //    that would read as `ABABAB` from an initial table.
     //
-    //    `compress(1)` never writes such a stream, and GNU `gzip` refuses to
-    //    read it: `unlzw.c` runs its `oldcode == -1` guard before the CLEAR
-    //    handling, so the first code must be a literal byte. Verified
-    //    against gzip 1.14 on GNU/Linux, where both `gzip -dc` and
-    //    `uncompress -c` (a link to `gunzip` there) answer
-    //    `gzip: stream.Z: corrupt input.`, exit 1 and write nothing. This
-    //    crate matches that — see `oxiarc_lzw::z`'s module docs.
-    //
-    //    So here a *rejection* is the expected outcome and the thing that
-    //    counts as agreement. Nothing is asserted about what a BSD-derived
-    //    `uncompress` would do; if one is on PATH and accepts the stream,
-    //    the acceptance is reported below rather than assumed.
+    //    `compress(1)` never writes such a stream, and the references
+    //    disagree about it. GNU `gzip` refuses it — verified against gzip
+    //    1.14 on GNU/Linux, where `gzip -dc` and `uncompress -c` (a link to
+    //    `gunzip` there) both answer `gzip: stream.Z: corrupt input.`, exit
+    //    1 and write nothing — and this crate matches that. On macOS the same
+    //    bytes give `ABABAB` from Apple gzip 479 and eight NULs, `AB` and
+    //    table garbage from the system `uncompress`, both exiting 0.
     let mut clear_group = vec![(256u16, 9u8)];
     clear_group.extend(std::iter::repeat_n((0u16, 9u8), 7));
     let body = pack(&[(65, 9), (66, 9), (257, 9), (257, 9)]);
@@ -434,41 +512,57 @@ fn oracle_hand_built_corner_streams_match_the_references() {
             decompress(&with_clear).expect_err("leading clear"),
             LzwError::InvalidCode(256)
         ),
-        "a leading CLEAR must be rejected, as every reference decoder rejects it"
+        "a leading CLEAR must be rejected, as GNU gzip rejects it"
     );
 
     fs::write(&path, &with_clear).expect("write stream");
-    for (tool, args) in [
-        (gzip.as_deref(), &["-dc"][..]),
-        (uncompress.as_deref(), &["-c"][..]),
-    ] {
-        let Some(tool) = tool else { continue };
-        match reference_decompress(tool, args, &path) {
-            None => {
-                // The expected outcome: the reference refuses the stream,
-                // exactly as this crate does.
-                agreed += 1;
-            }
-            Some(decoded) => {
-                println!(
-                    "note: {} accepted the leading-CLEAR stream, producing {} byte(s)",
-                    tool.display(),
-                    decoded.len()
-                );
-                assert_ne!(
-                    decoded,
-                    b"ABABAB",
-                    "{} decodes a leading CLEAR as a table reset. A reference that \
-                     implements the reset reading means this crate's strictness — and \
-                     the leading-CLEAR rule in `oxiarc_lzw::z`'s module docs, \
-                     `z/decode.rs` and `z_roundtrip.rs` — needs revisiting",
-                    tool.display()
-                );
-            }
-        }
+    let mut table = Vec::with_capacity(tools.len());
+    for (bin, args) in &tools {
+        let command = format!("{} {}", bin.display(), args.join(" "));
+        let run = run_to_completion(bin, args, &path)
+            .unwrap_or_else(|| panic!("`{command}` could not be started"));
+        let version = version_text(bin);
+        let Some(reading) = leading_clear_reading(&run) else {
+            panic!(
+                "`{command}` reads the leading-CLEAR stream in none of the three documented \
+                 ways (exit {:?}, stdout {:?}, stderr {:?}). A new reading means this crate's \
+                 strictness — the leading-CLEAR rule in `oxiarc_lzw::z`'s module docs, \
+                 `z/decode.rs` and `z_roundtrip.rs` — needs revisiting",
+                run.status.code(),
+                run.stdout,
+                String::from_utf8_lossy(&run.stderr).trim()
+            );
+        };
+        // GNU `gzip` (and GNU `uncompress`, which runs it) is the reference
+        // this crate follows, so its reading is not merely recorded.
+        let is_gnu = version
+            .as_deref()
+            .is_some_and(|text| text.contains("Free Software Foundation"));
+        assert!(
+            !is_gnu || reading == LeadingClearReading::Rejected,
+            "`{command}` is GNU gzip and read a leading CLEAR as {reading:?}, not a rejection. \
+             This crate rejects it *because* GNU gzip does, so that rule — in \
+             `oxiarc_lzw::z`'s module docs, `z/decode.rs` and `z_roundtrip.rs` — needs \
+             revisiting"
+        );
+        table.push(format!(
+            "  {command:<28} {:<24} exit {:<4} {:>3} byte(s)  {reading:?}",
+            version
+                .as_deref()
+                .and_then(|text| text.lines().next())
+                .unwrap_or("(no --version)"),
+            run.status
+                .code()
+                .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+            run.stdout.len(),
+        ));
     }
 
     let _ = fs::remove_dir_all(&dir);
-    assert!(agreed >= 2, "only {agreed} reference comparisons ran");
-    println!("oracle: {agreed} hand-built corner streams cross-checked against the references");
+    println!(
+        "oracle: KwKwK read as `aaaaaa` by all {} reference(s); the leading-CLEAR stream \
+         (this crate: InvalidCode(256)):\n{}",
+        tools.len(),
+        table.join("\n")
+    );
 }

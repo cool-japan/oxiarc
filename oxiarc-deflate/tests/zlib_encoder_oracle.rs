@@ -20,7 +20,143 @@ mod blocks;
 #[path = "common/corpus.rs"]
 mod corpus;
 
+use blocks::{Block, BlockType};
 use oxiarc_deflate::{Deflater, Strategy, deflate, inflate, zlib_compress};
+
+/// The block-type rule a zlib applies under `Z_FIXED`.
+///
+/// zlib's `_tr_flush_block` changed between the upstream `v1.2.12` and
+/// `v1.2.13` tags of `trees.c`:
+///
+/// ```c
+/// /* zlib <= 1.2.12 */
+/// if (static_lenb <= opt_lenb) opt_lenb = static_lenb;
+/// /* ... stored test ... */
+/// } else if (s->strategy == Z_FIXED || static_lenb == opt_lenb) {
+///
+/// /* zlib >= 1.2.13 */
+/// if (static_lenb <= opt_lenb || s->strategy == Z_FIXED)
+///     opt_lenb = static_lenb;
+/// /* ... stored test ... */
+/// } else if (static_lenb == opt_lenb) {
+/// ```
+///
+/// The stored test between them is `stored_len + 4 <= opt_lenb && buf != NULL`
+/// in both, so the two orders disagree exactly on the blocks where
+/// `dynamic < stored + 4 <= static`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixedRule {
+    /// zlib >= 1.2.13, and this encoder: a block is stored whenever
+    /// `stored + 4 <= static`; the dynamic cost never enters the decision.
+    NarrowsToStatic,
+    /// zlib <= 1.2.12: a block is stored only when
+    /// `stored + 4 <= min(dynamic, static)`, and written fixed otherwise.
+    AfterStoredTest,
+}
+
+/// Which [`FixedRule`] the `python3` reference applies, *observed* on `probe`
+/// rather than read off `zlib.ZLIB_RUNTIME_VERSION`.
+///
+/// `probe` must be `nine-bit-alphabet`, which is built so that every block
+/// satisfies `dynamic < stored + 4 <= static`: the reference's `Z_FIXED`
+/// stream for it is then all stored under one rule and all fixed under the
+/// other. Returns `None` when the reference could not be run.
+fn reference_fixed_rule(probe: &[u8]) -> Option<FixedRule> {
+    let theirs = corpus::python_raw_deflate_strategy(probe, 6, 4)?;
+    let walked =
+        blocks::walk_blocks(&theirs).expect("the reference's Z_FIXED probe must be walkable");
+    let all = |btype: BlockType| walked.iter().all(|b| b.btype == btype);
+    if all(BlockType::Stored) {
+        Some(FixedRule::NarrowsToStatic)
+    } else if all(BlockType::Fixed) {
+        Some(FixedRule::AfterStoredTest)
+    } else {
+        panic!("the reference's Z_FIXED probe fits neither block-type rule: {walked:?}");
+    }
+}
+
+/// A block of at most this many bytes is always storable by zlib.
+///
+/// zlib hands `_tr_flush_block` a `NULL` buffer — no stored block possible —
+/// only once `block_start` has gone negative, i.e. once the block is longer
+/// than the window-relative `strstart`; and after the first window slide
+/// `strstart` never drops below `WSIZE - MIN_LOOKAHEAD` again. A longer block
+/// may legitimately stay fixed because its bytes have left the window.
+const ALWAYS_STORABLE: usize = 32 * 1024 - 262;
+
+/// Whether block `a` of stream `x` and block `b` of stream `y` carry the same
+/// bits, header included. Their offsets may differ: a stored block
+/// byte-aligns everything after it.
+fn same_bits(x: &[u8], a: &Block, y: &[u8], b: &Block) -> bool {
+    let bit = |data: &[u8], at: usize| data.get(at / 8).map(|byte| (byte >> (at % 8)) & 1);
+    a.bit_len == b.bit_len
+        && (0..a.bit_len).all(|k| bit(x, a.bit_offset + k) == bit(y, b.bit_offset + k))
+}
+
+/// Hold a `Strategy::Fixed` stream that differs from a zlib <= 1.2.12
+/// reference's to exactly the difference [`FixedRule`] dictates, and nothing
+/// else.
+///
+/// This stands in for the byte comparison, so it keeps everything that
+/// comparison pinned apart from the one decision that changed: every block
+/// covers the same bytes and carries the same `BFINAL` (the match search and
+/// the flush points agree), every block the rule leaves alone is
+/// bit-identical to the reference's, and every block that differs is a
+/// stored block where the reference wrote a fixed one whose own size —
+/// `static_lenb`, read off its bits — makes `stored + 4 <= static` true. A
+/// block the rule says to store but that stayed fixed is a failure too.
+///
+/// Returns how many blocks the rule turned from fixed into stored.
+fn check_fixed_rule_divergence(ours: &[u8], theirs: &[u8]) -> Result<usize, String> {
+    let our_blocks = blocks::walk_blocks(ours).ok_or("our stream is not walkable")?;
+    let their_blocks = blocks::walk_blocks(theirs).ok_or("the reference stream is not walkable")?;
+    if our_blocks.len() != their_blocks.len() {
+        return Err(format!(
+            "{} blocks against the reference's {}",
+            our_blocks.len(),
+            their_blocks.len()
+        ));
+    }
+    let mut swapped = 0usize;
+    for (i, (o, t)) in our_blocks.iter().zip(&their_blocks).enumerate() {
+        if (o.uncompressed, o.last) != (t.uncompressed, t.last) {
+            return Err(format!(
+                "block {i} covers {} bytes (BFINAL {}) against the reference's {} \
+                 (BFINAL {}): the flush points differ, which no block-type rule explains",
+                o.uncompressed, o.last, t.uncompressed, t.last
+            ));
+        }
+        // zlib's `stored_len + 4` and `static_lenb` for this block, the latter
+        // measured on the reference's own fixed encoding of it.
+        let stored_cost = t.uncompressed + 4;
+        let static_lenb = t.bit_len.div_ceil(8);
+        let rule_stores = t.btype == BlockType::Fixed && stored_cost <= static_lenb;
+        match (o.btype, t.btype) {
+            (BlockType::Stored, BlockType::Stored) => {}
+            (BlockType::Stored, BlockType::Fixed) if rule_stores => swapped += 1,
+            (BlockType::Fixed, BlockType::Fixed) if same_bits(ours, o, theirs, t) => {
+                if rule_stores && t.uncompressed <= ALWAYS_STORABLE {
+                    return Err(format!(
+                        "block {i} stayed fixed, but stored + 4 = {stored_cost} <= static \
+                         {static_lenb}, so zlib >= 1.2.13 stores it"
+                    ));
+                }
+            }
+            (our_type, their_type) => {
+                return Err(format!(
+                    "block {i} is {our_type:?} ({} bits) against the reference's \
+                     {their_type:?} ({} bits; stored + 4 = {stored_cost}, static \
+                     {static_lenb}), which the Z_FIXED rule change cannot produce",
+                    o.bit_len, t.bit_len
+                ));
+            }
+        }
+    }
+    if swapped == 0 {
+        return Err("the streams differ, yet no block changed type".to_owned());
+    }
+    Ok(swapped)
+}
 
 /// Every zlib strategy must reproduce CPython's bytes.
 ///
@@ -30,15 +166,20 @@ use oxiarc_deflate::{Deflater, Strategy, deflate, inflate, zlib_compress};
 /// decision (`Z_FIXED`). The corpora are chosen so those paths actually
 /// diverge from each other: `anchored-random` and `nine-bit-alphabet` are the
 /// shapes where `dynamic < stored + 4 <= static`, which is the *only* place
-/// `Z_FIXED`'s block-type rule is observable — zlib folds `Z_FIXED` into the
-/// `opt_lenb` narrowing, so the dynamic cost drops out and both corpora come
-/// back as stored blocks; applying `Z_FIXED` only after the stored test would
-/// emit a fixed block there instead.
+/// `Z_FIXED`'s block-type rule is observable.
 ///
-/// That makes this gate version-sensitive: it pins zlib >= 1.2.12 behaviour,
-/// the release that added `|| s->strategy == Z_FIXED` to the narrowing. Linked
-/// against zlib <= 1.2.11 (macOS's system zlib) the reference emits fixed
-/// blocks for these two corpora and the byte comparison fails.
+/// That rule changed in zlib 1.2.13 (see [`FixedRule`]) and this encoder
+/// follows the new one, so the `Z_FIXED` half of the gate is
+/// version-sensitive. Against zlib >= 1.2.13 every comparison is byte for
+/// byte. Against an older zlib — CPython on macOS links the system zlib,
+/// which is 1.2.12 — those two corpora come back fixed where this encoder
+/// stores them, so a `Z_FIXED` comparison that differs is held to
+/// [`check_fixed_rule_divergence`] instead, and printed rather than folded
+/// into a pass. Which rule the reference applies is observed on
+/// `nine-bit-alphabet`, never inferred from its version string, so a modern
+/// reference always gets the full byte comparison. The rule itself is pinned
+/// hermetically by `encoder_behaviour.rs`, so a regression to the old order
+/// cannot hide behind an old reference.
 #[test]
 fn every_strategy_is_byte_identical_to_python() {
     if !corpus::python3_available() {
@@ -53,8 +194,17 @@ fn every_strategy_is_byte_identical_to_python() {
         (Strategy::Fixed, 4),
     ];
     let mut samples = corpus::strategy_samples();
+    let probe = samples
+        .iter()
+        .find(|s| s.name == "nine-bit-alphabet")
+        .expect("strategy_samples() provides the Z_FIXED probe");
+    let Some(rule) = reference_fixed_rule(&probe.data) else {
+        skip("python3 reference failed");
+        return;
+    };
     samples.extend(corpus::base_samples());
     let mut mismatches: Vec<String> = Vec::new();
+    let mut rule_checked: Vec<String> = Vec::new();
     for s in &samples {
         for (strategy, id) in mapping {
             for level in [1u8, 4, 6, 9] {
@@ -70,16 +220,43 @@ fn every_strategy_is_byte_identical_to_python() {
                     skip("python3 reference failed");
                     return;
                 };
-                if ours != theirs {
+                if ours == theirs {
+                    continue;
+                }
+                let label = format!("{} {strategy:?} level {level}", s.name);
+                if strategy == Strategy::Fixed && rule == FixedRule::AfterStoredTest {
+                    assert_eq!(
+                        inflate(&theirs).expect("inflate the reference"),
+                        s.data,
+                        "{label}: reference round trip"
+                    );
+                    match check_fixed_rule_divergence(&ours, &theirs) {
+                        Ok(swapped) => rule_checked.push(format!(
+                            "{label}: {swapped} block(s) stored where zlib <= 1.2.12 writes \
+                             fixed ({} bytes vs python {})",
+                            ours.len(),
+                            theirs.len()
+                        )),
+                        Err(why) => mismatches.push(format!("{label}: {why}")),
+                    }
+                } else {
                     mismatches.push(format!(
-                        "{} {strategy:?} level {level}: {} bytes vs python {}",
-                        s.name,
+                        "{label}: {} bytes vs python {}",
                         ours.len(),
                         theirs.len()
                     ));
                 }
             }
         }
+    }
+    if !rule_checked.is_empty() {
+        eprintln!(
+            "note: python3's zlib {} predates zlib 1.2.13's Z_FIXED block-type rule; \
+             {} comparison(s) held to that one rule change instead of byte identity:\n{}",
+            corpus::python_zlib_runtime_version().unwrap_or_else(|| "(version unknown)".to_owned()),
+            rule_checked.len(),
+            rule_checked.join("\n")
+        );
     }
     assert!(
         mismatches.is_empty(),
@@ -92,10 +269,11 @@ fn every_strategy_is_byte_identical_to_python() {
 /// `Strategy::Fixed` must never emit a *dynamic* block.
 ///
 /// This is the structural half of the gate above: it needs no reference tool,
-/// so it keeps holding on a machine with no `python3`. It deliberately asserts
-/// nothing about the stored-vs-fixed split — that half is version-sensitive
-/// (see above) and belongs to the byte-identity gate; several of these corpora
-/// come back as stored blocks.
+/// so it keeps holding on a machine with no `python3`. The stored-vs-fixed
+/// split — the half that is version-sensitive against a reference — is pinned
+/// hermetically by `encoder_behaviour.rs`'s
+/// `fixed_strategy_stores_every_block_the_static_code_cannot_beat`; several of
+/// these corpora come back as stored blocks.
 #[test]
 fn fixed_strategy_never_emits_a_dynamic_block() {
     for s in corpus::strategy_samples() {

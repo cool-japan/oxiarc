@@ -11,12 +11,12 @@
 //!    on stderr, and
 //! 3. output can be bounded, and the bound is enforced *during* decoding.
 //!
-//! Where the references themselves differ, this follows GNU `gzip`'s
-//! `unlzw.c`, which is the strictest of them and the decoder that
-//! `Content-Encoding: compress` bodies actually meet: its `oldcode == -1`
-//! guard runs *before* the CLEAR handling, so the first code of a stream
-//! must be a literal byte and a leading CLEAR is
-//! [`LzwError::InvalidCode`]`(256)` rather than a table reset.
+//! Where the references themselves differ — on a leading CLEAR they split
+//! three ways, listed on [`super`] — this follows GNU `gzip`'s `unlzw.c`,
+//! the strictest of them: its `oldcode == -1` guard runs *before* the CLEAR
+//! handling, so the first code of a stream must be a literal byte and a
+//! leading CLEAR is [`LzwError::InvalidCode`]`(256)` rather than a table
+//! reset.
 //!
 //! The decoder is a *push* core: [`ZDecoder::decode`] consumes as much of a
 //! chunk as it can and keeps back fewer than `max_bits` bytes (one code
@@ -239,9 +239,12 @@ impl ZDecoder {
                     // Verified against gzip 1.14 (GNU/Linux), which answers
                     // `gzip: <name>.Z: corrupt input.` and writes nothing;
                     // on GNU systems `uncompress` is `gunzip`, so it agrees.
-                    // No encoder in circulation emits a leading CLEAR, so
-                    // inventing output for one would only ever be decode
-                    // surface for crafted input.
+                    // The BSD decoders accept the stream, but not even in
+                    // the same way (FreeBSD/Apple `gzip` as a reset, BSD
+                    // `uncompress` as a literal — see the module docs of
+                    // `super`), and no encoder in circulation emits a
+                    // leading CLEAR, so accepting one would only ever be
+                    // decode surface for crafted input.
                     return Err(LzwError::InvalidCode(CLEAR));
                 }
                 self.prefix.fill(0);

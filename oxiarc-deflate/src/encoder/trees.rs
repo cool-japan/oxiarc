@@ -34,6 +34,13 @@ pub enum Strategy {
     /// encoding (zlib `Z_RLE`).
     Rle,
     /// Never use dynamic Huffman trees (zlib `Z_FIXED`).
+    ///
+    /// A block is still stored whenever a stored block beats the fixed
+    /// code, which is zlib 1.2.13's rule. zlib 1.2.12 and older — macOS's
+    /// system zlib among them — also weighed the dynamic code it was not
+    /// going to use, and so write a fixed block wherever the dynamic code
+    /// would beat a stored block but the fixed code would not. This
+    /// encoder's output is byte-identical to zlib >= 1.2.13.
     Fixed,
 }
 
@@ -732,13 +739,15 @@ pub(crate) fn flush_block(
         let mut o = trees.heap.opt_len.wrapping_add(3 + 7) >> 3;
         let s = trees.heap.static_len.wrapping_add(3 + 7) >> 3;
         static_lenb = s;
-        // zlib 1.3.x: `if (static_lenb <= opt_lenb || s->strategy == Z_FIXED)
-        // opt_lenb = static_lenb;`. `Z_FIXED` narrows `opt_lenb` to the static
-        // cost *before* the stored test below, so a `Z_FIXED` stream stores a
-        // block whenever a stored block beats the *static* encoding — the
-        // dynamic cost never enters the decision. The `|| Z_FIXED` arrived in
-        // zlib 1.2.12; code built against zlib <= 1.2.11 (macOS's system zlib)
-        // emits a fixed block wherever `dynamic < stored + 4 <= static`.
+        // zlib >= 1.2.13: `if (static_lenb <= opt_lenb || s->strategy ==
+        // Z_FIXED) opt_lenb = static_lenb;`. `Z_FIXED` narrows `opt_lenb` to
+        // the static cost *before* the stored test below, so a `Z_FIXED`
+        // stream stores a block whenever a stored block beats the *static*
+        // encoding — the dynamic cost never enters the decision. The
+        // `|| Z_FIXED` arrived in zlib 1.2.13 (upstream `v1.2.12`'s `trees.c`
+        // still tests `Z_FIXED` only after the stored test); zlib <= 1.2.12,
+        // macOS's system zlib 1.2.12 included, emits a fixed block wherever
+        // `dynamic < stored + 4 <= static`.
         if s <= o || strategy == Strategy::Fixed {
             o = s;
         }
@@ -750,7 +759,7 @@ pub(crate) fn flush_block(
 
     match stored_buf {
         Some(buf) if stored_len as u64 + 4 <= opt_lenb => stored_block(sink, buf, last),
-        // zlib 1.3.x tests only `static_lenb == opt_lenb` here: under `Fixed`
+        // zlib >= 1.2.13 tests only `static_lenb == opt_lenb` here: under `Fixed`
         // both branches above already force `opt_lenb == static_lenb` (the
         // narrowing when `level > 0`, the assignment when `level == 0`), so an
         // extra `strategy == Fixed` test would be redundant.

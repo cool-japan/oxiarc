@@ -33,16 +33,32 @@
 //!   keeps the two in step. Without block mode, 256 is an ordinary entry.
 //! * **The first code of a stream must be a literal byte**, in either mode.
 //!   A leading CLEAR is [`crate::LzwError::InvalidCode`]`(256)`, not a reset
-//!   of an already-initial table. This matches GNU `gzip`'s `unlzw.c`, whose
-//!   `oldcode == -1` guard (`if (256 <= code) gzip_error("corrupt input.")`)
-//!   runs *before* the CLEAR handling. Verified here against gzip 1.14 on
-//!   GNU/Linux, which answers `gzip: <name>.Z: corrupt input.` and writes no
-//!   output; on GNU systems `uncompress` is a link to `gunzip` and so gives
-//!   the same answer. What a BSD-derived `uncompress` does with such a
-//!   stream is not asserted either way — `tests/z_oracle.rs` reports it if
-//!   one is on `PATH`. No `compress(1)` writes a leading CLEAR, so rejecting
-//!   it costs no real stream and keeps crafted input off a decode path that
-//!   every reference refuses.
+//!   of an already-initial table. No `compress(1)` writes one, and the
+//!   reference decoders split three ways on it:
+//!
+//!   - GNU `gzip`'s `unlzw.c` and `ncompress` refuse it as corrupt input:
+//!     their `oldcode == -1` guard runs *before* the CLEAR handling
+//!     (`if (256 <= code) gzip_error("corrupt input.")` in `gzip`);
+//!   - the FreeBSD/NetBSD `gzip`'s `zuncompress.c` — Apple's `gzip` on
+//!     macOS — applies the CLEAR handling to every code, the first
+//!     included, so it reads a reset of the initial table;
+//!   - 4.4BSD `compress`'s `zopen.c` — the `uncompress` of FreeBSD and
+//!     macOS — outputs the first code unchecked, as its low byte, and then
+//!     reads the group padding after it as literals.
+//!
+//!   This crate follows GNU `gzip`, the strictest of the three. Verified
+//!   against gzip 1.14 on GNU/Linux, which answers
+//!   `gzip: <name>.Z: corrupt input.` and writes no output (`uncompress`
+//!   there is a link to `gunzip`, so it says the same), and on macOS, where
+//!   Apple gzip 479 decodes the body after the CLEAR as if the CLEAR were
+//!   absent, and the system `uncompress` prints the CLEAR and its seven
+//!   padding codes as NUL bytes, the body's literals as themselves and
+//!   table garbage for its first table reference — both exiting 0.
+//!   `tests/z_oracle.rs` re-checks whichever of these tools is on `PATH`.
+//!   The two readings that accept such a stream do not agree with each
+//!   other, so rejecting it costs no real stream and keeps crafted input
+//!   off a decode path whose output would depend on which decoder happened
+//!   to read it.
 //! * **`max_bits` is a table ceiling, not a code-width ceiling.** The
 //!   reference widens the code as soon as `free_ent > maxcode`, and at
 //!   `max_bits == 9` that check fires once more than it "should", so

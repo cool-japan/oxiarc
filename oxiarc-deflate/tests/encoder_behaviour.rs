@@ -10,6 +10,9 @@
 //! * the `TOO_FAR` rule rejects distant length-3 matches,
 //! * the block type is chosen on real bit cost (stored for random, dynamic for
 //!   structured, never fixed for a large structured block, never reserved),
+//! * `Strategy::Fixed` stores every block the static code cannot beat — zlib
+//!   1.2.13's rule, which the oracle can only pin against a zlib at least
+//!   that new,
 //! * the encoder is bit-continuous: the call size never changes the bytes,
 //! * the opt-in optimal parser round-trips every corpus and is never larger
 //!   than the default ladder at the same level.
@@ -21,7 +24,7 @@ mod corpus;
 
 use blocks::{BlockType, walk_blocks};
 use oxiarc_deflate::lz77::{Lz77Encoder, Lz77Params, Lz77Token};
-use oxiarc_deflate::{Deflater, deflate, inflate};
+use oxiarc_deflate::{Deflater, Strategy, deflate, inflate};
 
 /// Cap applied to the shared corpora in the (much slower) optimal-parser
 /// tests so the suite stays fast; every corpus is still represented.
@@ -382,6 +385,49 @@ fn a_single_repeated_byte_uses_the_cheapest_block_type() {
         "100 KB of one byte took {} bytes",
         raw.len()
     );
+}
+
+#[test]
+fn fixed_strategy_stores_every_block_the_static_code_cannot_beat() {
+    // `Strategy::Fixed` follows zlib >= 1.2.13, whose `_tr_flush_block`
+    // narrows `opt_lenb` to the *static* cost under `Z_FIXED` before the
+    // stored test, so a block is stored whenever `stored + 4 <= static` and
+    // the dynamic cost never enters the decision. zlib <= 1.2.12 applied
+    // `Z_FIXED` after the stored test, which still compared against the
+    // cheaper of dynamic and static, so it wrote a fixed block wherever
+    // `dynamic < stored + 4 <= static`.
+    //
+    // `anchored-random` and `nine-bit-alphabet` are built so that every block
+    // lands in that gap: this crate's rule stores all of them. The CPython
+    // oracle can pin that only where CPython links zlib >= 1.2.13 — macOS's
+    // system zlib is 1.2.12, and against it a regression to the old order
+    // would be byte-identical to the reference. This pin needs no reference.
+    let samples: Vec<_> = corpus::strategy_samples()
+        .into_iter()
+        .filter(|s| matches!(s.name, "anchored-random" | "nine-bit-alphabet"))
+        .collect();
+    assert_eq!(samples.len(), 2, "both rule-discriminating corpora exist");
+    for s in &samples {
+        for level in [1u8, 4, 6, 9] {
+            let raw = Deflater::new(level)
+                .with_strategy(Strategy::Fixed)
+                .compress_to_vec(&s.data)
+                .expect("compress_to_vec");
+            let blocks = walk_blocks(&raw).expect("walk");
+            assert!(
+                blocks.iter().all(|b| b.btype == BlockType::Stored),
+                "{} level {level}: a Z_FIXED block that a stored block beats must be \
+                 stored, got {blocks:?}",
+                s.name
+            );
+            assert_eq!(
+                inflate(&raw).expect("inflate"),
+                s.data,
+                "{} level {level}",
+                s.name
+            );
+        }
+    }
 }
 
 #[test]

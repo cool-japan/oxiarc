@@ -815,7 +815,9 @@ Rust lines across 714 files (tokei, workspace-wide including `fuzz/`).
   (`Filtered` suits predictor output such as PNG scanlines and TIFF
   horizontal differencing; `Rle` restricts matching to distance 1); all
   five are now byte-identical to CPython `zlib.compressobj(level,
-  DEFLATED, -15, 8, strategy)`. `Deflater::with_optimal_parsing(level)`
+  DEFLATED, -15, 8, strategy)` — `Z_FIXED` against zlib >= 1.2.13, whose
+  block-type rule it follows (see the `Strategy::Fixed` entry under
+  Fixed). `Deflater::with_optimal_parsing(level)`
   (graph-based DP parsing) is now **never larger than the default ladder
   at the same level** (it used to be up to 2 % *larger* on noisy image
   rows, because its candidate set bought rare long-distance codes for
@@ -1158,13 +1160,23 @@ Rust lines across 714 files (tokei, workspace-wide including `fuzz/`).
   Each fixture is now gated on the feature that compiles its codec, with
   `PackBits` (which needs no feature) keeping the corpus non-empty. The default
   and `--all-features` corpora are unchanged.
-- **`oxiarc-deflate`: `Strategy::Fixed` (zlib's `Z_FIXED`) could emit a
-  stored block where zlib emits a fixed one.** The preference was applied
-  before the stored-block size test instead of after it, so a block with
-  `dynamic < stored + 4 <= static` was written stored. All five strategies
-  are now byte-identical to CPython zlib over ten corpora at four levels;
-  `with_strategy` was new API in this same unreleased cycle with zero
-  committed coverage, which is why it shipped.
+- **`oxiarc-deflate`: `Strategy::Fixed` (zlib's `Z_FIXED`) follows zlib
+  1.2.13's block-type rule.** A block is stored whenever a stored block
+  beats the *static* code (`stored + 4 <= static`), as in zlib >= 1.2.13,
+  whose `_tr_flush_block` narrows `opt_lenb` to the static cost under
+  `Z_FIXED` before the stored test. zlib <= 1.2.12 — including macOS's
+  system zlib 1.2.12, which CPython links there — applies `Z_FIXED` only
+  after that test, still weighing the dynamic cost, and so writes a fixed
+  block wherever `dynamic < stored + 4 <= static`. Within this unreleased
+  cycle the rule briefly followed 1.2.12, because the CPython oracle it
+  was first checked against linked 1.2.12. It is now pinned hermetically
+  (`tests/encoder_behaviour.rs`), and the oracle observes which rule its
+  reference applies: against zlib >= 1.2.13 all five strategies are
+  byte-identical to CPython over ten corpora at four levels; against an
+  older zlib the `Z_FIXED` comparisons that differ are held block by block
+  to exactly that rule change instead. `with_strategy` was new API in this
+  same unreleased cycle with zero committed coverage, which is why the
+  first version shipped untested.
 - **`oxiarc-deflate`: two defects in the new resumable inflate core
   (introduced and fixed within this same unreleased cycle).** A match
   straddling the 32 KiB history window's boundary could, when its tail
