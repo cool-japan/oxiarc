@@ -5,7 +5,7 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.2] - Unreleased
+## [0.4.2] - 2026-09-12
 
 **The P2/P3 program: HTTP `Content-Encoding` decoding and three new image
 container formats, all Pure Rust, closing the two routes (`flate2` via
@@ -46,8 +46,8 @@ gained a dictionary-binding header within this same unreleased cycle, so a
 `dcz` body produced by an *earlier* unreleased build of `oxiarc-http` is
 no longer readable by the version shipping in this release (no published
 consumer is affected either way). Final state,
-measured 2026-09-08 on the full workspace: **5,501 tests passing, 0
-failed, 0 skipped** (5,155 via `cargo nextest run --workspace
+measured 2026-09-12 on the full workspace: **5,505 tests passing, 0
+failed, 0 skipped** (5,159 via `cargo nextest run --workspace
 --all-features` + 346 doctests via `cargo test --doc --workspace
 --all-features`); zero clippy warnings on every crate individually
 (`--all-features --all-targets -D warnings`, also with
@@ -56,10 +56,21 @@ failed, 0 skipped** (5,155 via `cargo nextest run --workspace
 sets, `cargo build --workspace --no-default-features`, `RUSTDOCFLAGS='-D
 warnings' cargo doc --workspace --no-deps --all-features` and a real
 `cargo +1.85.0 check --workspace` MSRV compile all ran green on the
-quiescent tree on 2026-09-08 (GATES, re-run independently by the FINALGATE
-gatekeeper and again after its findings were applied); `cargo deny
-check bans` clean with the new PNG/JPEG/TIFF/`image` bans in place; ~225,700
-Rust lines across 714 files (tokei, workspace-wide including `fuzz/`).
+quiescent tree — first on 2026-09-08 (GATES, re-run independently by the
+FINALGATE gatekeeper and again after its findings were applied) and again
+on 2026-09-12 (`/runall`'s own full re-verification immediately ahead of
+this release, all counts re-derived from a clean `cargo nextest`/doctest
+run rather than reused). The 2026-09-12 pass additionally caught and fixed
+two real defects the 2026-09-08 gates could not have seen: an MSRV
+regression that had crept in between the two dates (`encoding_rs` had
+drifted to 0.8.41, silently requiring rustc 1.88 against every line of
+this workspace's own code staying 1.85-clean), and a latent semver gap in
+the internal `oxiarc-*` dependency requirements themselves (see the
+`encoding_rs` and "Internal `oxiarc-*` dependency requirements tightened"
+entries under Changed for both); `cargo deny check bans` clean with
+the new PNG/JPEG/TIFF/`image` bans in place; 716 files / 227,104 Rust code
+lines (tokei `Code` column, workspace root including `fuzz/` and
+`formal/`, measured 2026-09-12).
 
 ### Added
 
@@ -535,6 +546,27 @@ Rust lines across 714 files (tokei, workspace-wide including `fuzz/`).
 
 ### Changed
 
+- **`encoding_rs` capped to `>=0.8.35, <0.8.40`.** 0.8.40+ pulls in
+  `multiversion` for SIMD dispatch and raises its own MSRV to rustc 1.88,
+  silently breaking this workspace's real `cargo +1.85.0 check --workspace`
+  — the declared `rust-version = "1.85"` is enforced, not aspirational (see
+  `clippy.toml`'s `msrv` gate and the `Strategy::Fixed` entry below, which
+  exists precisely because a past `cargo +1.85.0` catch found a real
+  let-chain regression the same way). `oxiarc-archive` is the only
+  consumer; the cap keeps it on the latest 1.85-compatible release rather
+  than dropping the dependency outright. Raise the cap once the workspace
+  MSRV moves to 1.88+.
+- **Internal `oxiarc-*` dependency requirements tightened from `"0.4"`
+  (`^0.4`) to `"0.4.2"` (`^0.4.2`) across all 17 sibling entries in
+  `[workspace.dependencies]`.** Several of this release's new crates use
+  APIs another sibling only gained in 0.4.2 itself (`oxiarc_core::sha256`,
+  `BitCache::take_byte`/`align_to_byte`, `oxiarc_deflate::WrappedInflate` &
+  co., `oxiarc_lzma::xz`); a caller resolving the old `^0.4` range could
+  legitimately land on an already-published 0.4.0/0.4.1 that lacks them —
+  not a first-publication artifact, a real semver gap for any consumer
+  whose resolver picks an older compatible version. Pure Rust semver
+  hygiene; local builds are unaffected (path dependencies still resolve
+  from source regardless of this version string).
 - **gzip `FHCRC` is now verified on every decode path, not only the new
   types.** `oxiarc-deflate`'s legacy one-shot `gzip_decompress` /
   `GzipDecoder` and `oxiarc-archive`'s `GzipReader` were both re-based on
@@ -2823,7 +2855,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
-[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/cool-japan/oxiarc/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6

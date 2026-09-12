@@ -7,7 +7,7 @@ Pure Rust TIFF 6.0 / BigTIFF reader and writer, part of the OxiArc ecosystem.
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-complete-brightgreen)
 
-**Version: 0.4.2 (2026-09-08) | 535 tests + 38 doctests passing (`--all-features`)**
+**Version: 0.4.2 (2026-09-12) | 535 tests + 38 doctests passing (`--all-features`)**
 
 No C, no FFI, `#![forbid(unsafe_code)]`, no `unwrap()` in library code.
 

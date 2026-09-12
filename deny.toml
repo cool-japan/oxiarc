@@ -21,6 +21,13 @@ allow = [
 # dropping rpassword; warn instead of denying until upstream aligns.
 multiple-versions = "warn"
 wildcards = "deny"
+# Path-only sibling dev-dependencies (no version) are how oxiarc-http avoids
+# packaging a version requirement against not-yet-published siblings into
+# its published manifest (path deps are stripped from dev-dependencies at
+# publish time; a versioned one would survive and fail to resolve). These
+# are workspace-local and version-controlled by definition, not an
+# unreviewed wildcard onto the open registry, so exempt them from the check.
+allow-wildcard-paths = true
 
 # COOLJAPAN policy: oxiarc-* crates exist specifically to replace these
 # formats/algorithms in pure Rust. A member crate depending on any of them

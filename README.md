@@ -128,8 +128,8 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 
 | Crate | Description | Lines | Tests |
 |-------|-------------|-------|-------|
-| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), SHA-256, EntryBuilder, Serde | ~7,086 | 200 |
-| `oxiarc-deflate` | DEFLATE (RFC 1951), zlib-faithful encoder, resumable `InflateStream`/`WrappedInflate`, async deflate, GZip (multi-member) | ~23,129 | 455 |
+| `oxiarc-core` | Core primitives: BitStream (LSB + MSB), RingBuffer, CRC-16/32/64 (slicing-by-8), SHA-256, EntryBuilder, Serde | ~7,086 | 203 |
+| `oxiarc-deflate` | DEFLATE (RFC 1951), zlib-faithful encoder, resumable `InflateStream`/`WrappedInflate`, async deflate, GZip (multi-member) | ~23,129 | 456 |
 | `oxiarc-lzhuf` | LZH compression (lh0, lh1, lh4, lh5, lh6, lh7, lhd) with LZSS + Huffman + custom dictionaries | ~9,782 | 269 |
 | `oxiarc-bzip2` | Bzip2 with BWT + MTF + RLE + multi-table Huffman, multi-stream decode, de-randomisation | ~3,303 | 104 |
 | `oxiarc-lz4` | LZ4 block/frame + LZ4-HC with XXHash32, linked (block-dependent) frames, acceleration parameter | ~6,229 | 158 |
@@ -146,9 +146,9 @@ OxiArc is a comprehensive archive/compression library and CLI tool written in pu
 | `oxiarc-tiff` | TIFF 6.0 + BigTIFF decoder/encoder: LZW/Deflate/ZSTD/LZMA/JPEG/PackBits/CCITT, `rayon`, `tiff`-0.11-shaped compat | ~26,601 | 535 |
 | `oxiarc-image` | Thin `image`-0.25-crate-shaped facade over PNG/JPEG/TIFF (`DynamicImage`, `ImageReader`, no image processing) | ~4,301 | 145 |
 | `oxiarc-cli` | CLI tool with progress bars, filters, JSON output, dry-run mode, enforced `--memory-limit`, PNG/JPEG/TIFF detect/info, man pages | ~7,844 | 124 |
-| **Total** | **Pure Rust archive/compression library** | **~224,511 code lines (678 Rust files; 714 workspace-wide incl. fuzz)** | **5,155** |
+| **Total** | **Pure Rust archive/compression library** | **227,104 code lines workspace-wide (716 Rust files incl. `fuzz/` and `formal/`)** | **5,159** |
 
-Lines are tokei Rust code lines per crate (src + tests + examples); the Tests column is nextest (all-features, per-crate); the workspace additionally has 346 doctests (not attributed per crate), for **5,501 tests total**. Measured 2026-09-08.
+Lines are tokei `Code`-column Rust lines (the per-crate column is `src` + `tests` + `examples`; the Total row is measured on the workspace root, so it also covers `fuzz/` and `formal/`, which sit outside `--workspace`). The Tests column is nextest (all-features, per-crate); the workspace additionally has 346 doctests (not attributed per crate), for **5,505 tests total**. Measured 2026-09-12.
 
 ## Installation
 
@@ -489,7 +489,7 @@ oxiarc info image.png        # dimensions, colour type, bit depth, compression,
 | oxiarc-cli      | Stable  | 71         | 124           |
 | **Total**       |         | **3,969**  | **5,155**     |
 
-Test counts measured 2026-09-08 (nextest, all features, per-crate, 0 failed, 0 skipped; the workspace additionally has 346 doctests not attributed per crate, for **5,501 tests total**). Public-API item counts are a `rg '^\s*pub (fn|struct|enum|trait|const|static|type|mod)'` sweep over each crate's `src/`, measured the same day — a coarser proxy than a rustdoc item count, and not directly comparable to any pre-0.4.2 snapshot that used a different methodology, but current and consistent across all 18 crates. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions (the five new 0.4.2 crates — `oxiarc-http`, `oxiarc-png`, `oxiarc-jpeg`, `oxiarc-tiff`, `oxiarc-image` — each carry their own live reference-oracle suite from day one; see the table below). Ahead of a 1.0 release, 18+ public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, `ContentCoding`, `UnsupportedReason`, `ColorSpace`, `ImageFormat`, `DynamicImage`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
+Test counts measured 2026-09-12 (nextest, all features, per-crate, 0 failed, 0 skipped; the workspace additionally has 346 doctests not attributed per crate, for **5,505 tests total**). Public-API item counts are a `rg '^\s*pub (fn|struct|enum|trait|const|static|type|mod)'` sweep over each crate's `src/`, measured 2026-09-08 and still current (no `src/` item was added, removed or renamed by any commit since) — a coarser proxy than a rustdoc item count, and not directly comparable to any pre-0.4.2 snapshot that used a different methodology, but current and consistent across all 18 crates. All crates are feature-complete and, as of the 2026-07-13 production-hardening campaign, validated against the reference implementation of every format in both directions (the five new 0.4.2 crates — `oxiarc-http`, `oxiarc-png`, `oxiarc-jpeg`, `oxiarc-tiff`, `oxiarc-image` — each carry their own live reference-oracle suite from day one; see the table below). Ahead of a 1.0 release, 18+ public format/method/status/error enums (`FlushMode`, `CompressStatus`/`DecompressStatus`, `CompressionMethod`, `EntryType`, `ArchiveFormat`, zstd `BlockType`/`LiteralsBlockType`, `Lz4Level`, `ContentCoding`, `UnsupportedReason`, `ColorSpace`, `ImageFormat`, `DynamicImage`, the codec error enums, and more) are marked `#[non_exhaustive]` for forward-compatible matching.
 Streaming compression/decompression support in `oxiarc-deflate`:
 - `GzipStreamEncoder`/`GzipStreamDecoder` with configurable block sizes
 - `ZlibStreamEncoder`/`ZlibStreamDecoder` with flush modes

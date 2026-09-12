@@ -35,27 +35,32 @@ categories = ["compression", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-oxiarc-core = { version = "0.4", path ="oxiarc-core" }
-oxiarc-deflate = { version = "0.4", path ="oxiarc-deflate" }
-oxiarc-lzhuf = { version = "0.4", path ="oxiarc-lzhuf" }
-oxiarc-lzw = { version = "0.4", path ="oxiarc-lzw" }
-oxiarc-lzma = { version = "0.4", path ="oxiarc-lzma" }
-oxiarc-bzip2 = { version = "0.4", path ="oxiarc-bzip2" }
-oxiarc-lz4 = { version = "0.4", path ="oxiarc-lz4" }
-oxiarc-zstd = { version = "0.4", path ="oxiarc-zstd" }
-oxiarc-snappy = { version = "0.4", path ="oxiarc-snappy" }
-oxiarc-brotli = { version = "0.4", path ="oxiarc-brotli" }
-oxiarc-archive = { version = "0.4", path ="oxiarc-archive" }
-oxiarc-szip = { version = "0.4", path = "oxiarc-szip" }
-oxiarc-http = { version = "0.4", path = "oxiarc-http" }
-oxiarc-png = { version = "0.4", path = "oxiarc-png" }
-oxiarc-jpeg = { version = "0.4", path = "oxiarc-jpeg" }
-oxiarc-tiff = { version = "0.4", path = "oxiarc-tiff" }
-oxiarc-image = { version = "0.4", path = "oxiarc-image" }
+oxiarc-core = { version = "0.4.2", path ="oxiarc-core" }
+oxiarc-deflate = { version = "0.4.2", path ="oxiarc-deflate" }
+oxiarc-lzhuf = { version = "0.4.2", path ="oxiarc-lzhuf" }
+oxiarc-lzw = { version = "0.4.2", path ="oxiarc-lzw" }
+oxiarc-lzma = { version = "0.4.2", path ="oxiarc-lzma" }
+oxiarc-bzip2 = { version = "0.4.2", path ="oxiarc-bzip2" }
+oxiarc-lz4 = { version = "0.4.2", path ="oxiarc-lz4" }
+oxiarc-zstd = { version = "0.4.2", path ="oxiarc-zstd" }
+oxiarc-snappy = { version = "0.4.2", path ="oxiarc-snappy" }
+oxiarc-brotli = { version = "0.4.2", path ="oxiarc-brotli" }
+oxiarc-archive = { version = "0.4.2", path ="oxiarc-archive" }
+oxiarc-szip = { version = "0.4.2", path = "oxiarc-szip" }
+oxiarc-http = { version = "0.4.2", path = "oxiarc-http" }
+oxiarc-png = { version = "0.4.2", path = "oxiarc-png" }
+oxiarc-jpeg = { version = "0.4.2", path = "oxiarc-jpeg" }
+oxiarc-tiff = { version = "0.4.2", path = "oxiarc-tiff" }
+oxiarc-image = { version = "0.4.2", path = "oxiarc-image" }
 
 # External dependencies
 thiserror = "2.0.18"
-encoding_rs = "0.8.35"
+# Capped below 0.8.40: encoding_rs 0.8.40+ pulls in `multiversion` for SIMD
+# dispatch and requires rustc 1.88, but this workspace's MSRV is 1.85
+# (`rust-version` above, enforced by `cargo +1.85.0 check --workspace` and
+# clippy.toml's `msrv` gate) — 0.8.35..<0.8.40 is the real latest range that
+# still builds on 1.85. Raise the cap once the workspace MSRV moves to 1.88+.
+encoding_rs = ">=0.8.35, <0.8.40"
 clap = { version = "4.6.1", features = ["derive"] }
 clap_complete = "4.6.7"
 indicatif = "0.18.6"

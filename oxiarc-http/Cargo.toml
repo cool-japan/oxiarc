@@ -62,16 +62,21 @@ criterion = { workspace = true }
 # The tests, examples and benches build fixtures with the matching oxiarc
 # encoders, so they need these unconditionally — the library's own use of
 # them stays feature-gated and optional above.
-oxiarc-deflate = { workspace = true }
-oxiarc-brotli = { workspace = true }
-oxiarc-zstd = { workspace = true }
+# Path-only (no version): a versioned sibling dev-dependency survives into
+# the packaged manifest (cargo strips `path` but keeps `version`), and
+# `cargo publish` then fails resolving it against crates.io before that
+# sibling's own release has landed. Path-only dev-deps are dropped from the
+# published manifest entirely, so this only ever affects local `cargo test`.
+oxiarc-deflate = { path = "../oxiarc-deflate" }
+oxiarc-brotli = { path = "../oxiarc-brotli" }
+oxiarc-zstd = { path = "../oxiarc-zstd" }
 # tests/cross_crate_inflate.rs only: proves a PNG IDAT stream, a TIFF
 # deflate strip and an HTTP gzip body all decode byte-identically through
 # the same oxiarc-deflate core, however the input is split. Both crates'
 # own default features are used as-is (PNG has no cargo features to gate
 # the base codec; TIFF's `deflate` codec is in its default feature set).
-oxiarc-png = { workspace = true }
-oxiarc-tiff = { workspace = true }
+oxiarc-png = { path = "../oxiarc-png" }
+oxiarc-tiff = { path = "../oxiarc-tiff" }
 
 [[bench]]
 name = "decode_bench"
