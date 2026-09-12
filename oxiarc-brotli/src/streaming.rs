@@ -29,12 +29,17 @@
 //! does; the per-meta-block encoder it shares is the same code that path
 //! round-trips and that reference decoders accept.
 //!
-//! ## [`BrotliDecompressor`]
+//! ## [`BrotliDecompressor`] — incremental
 //!
-//! Reads the *entire* compressed input and materializes the *entire*
-//! decompressed output in memory on the first `read` call; subsequent reads
-//! serve from that buffer. Peak memory is proportional to the decompressed
-//! size (bounded by [`BrotliDecompressor::with_max_output`]).
+//! A thin `Read` shell over [`crate::BrotliStream`]. It pulls at most 64 KiB
+//! of compressed data at a time and decodes straight into the caller's buffer,
+//! so the first byte is available long before the source reaches EOF and peak
+//! memory is `O(window)` rather than `O(decompressed size)`. A `read` that
+//! cannot be satisfied from one refill loops; `ErrorKind::Interrupted` from the
+//! inner reader is retried, `WouldBlock` propagates unchanged (the decoder
+//! state stays intact for the retry), and an inner `Ok(0)` switches the decoder
+//! to [`FlushMode::Finish`](oxiarc_core::traits::FlushMode::Finish) so a
+//! truncated stream is an error rather than a short read.
 //!
 //! ## Drop behavior
 //!
@@ -62,7 +67,7 @@
 //! let mut compressor = BrotliCompressor::new(&mut output, params)
 //!     .with_progress(noop_progress())
 //!     .with_cancel(token.clone());
-//! compressor.write_all(b"Hello, Brotli!").unwrap();
+//! compressor.write_all(b"Hello, Brotli!").expect("write");
 //! let _ = compressor.finish();
 //! ```
 
@@ -71,11 +76,14 @@ use std::io::{self, Read, Write};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
 
+use oxiarc_core::traits::FlushMode;
+
 use crate::bit_writer::BitWriter;
 use crate::compress::{BrotliParams, EncoderState, encode_meta_block, write_window_bits};
 use crate::decompress::decompress_with_hooks;
 use crate::error::BrotliError;
 use crate::pool::BrotliPool;
+use crate::stream::{BrotliStatus, BrotliStream};
 
 /// Default buffer size for streaming operations (256KB).
 const DEFAULT_BUF_SIZE: usize = 256 * 1024;
@@ -103,8 +111,8 @@ const DEFAULT_BUF_SIZE: usize = 256 * 1024;
 /// let mut output = Vec::new();
 /// let params = BrotliParams::default();
 /// let mut compressor = BrotliCompressor::new(&mut output, params);
-/// compressor.write_all(b"Hello, Brotli!").unwrap();
-/// let output = compressor.finish().unwrap();
+/// compressor.write_all(b"Hello, Brotli!").expect("write");
+/// let output = compressor.finish().expect("finish");
 /// ```
 pub struct BrotliCompressor<W: Write> {
     /// Inner writer that receives compressed data.
@@ -204,7 +212,7 @@ impl<W: Write> BrotliCompressor<W> {
     /// let params = BrotliParams::default();
     /// let mut compressor = BrotliCompressor::new(&mut output, params)
     ///     .with_pool(&pool);
-    /// compressor.write_all(b"Hello, pooled Brotli!").unwrap();
+    /// compressor.write_all(b"Hello, pooled Brotli!").expect("write");
     /// let _ = compressor.finish();
     /// ```
     #[must_use]
@@ -380,12 +388,39 @@ impl<W: Write> Drop for BrotliCompressor<W> {
     }
 }
 
+/// Size of the compressed-input staging buffer pulled from the inner reader.
+const DECODE_STAGING: usize = 64 * 1024;
+
+/// Hard ceiling on the staging buffer.
+///
+/// The buffer only grows past [`DECODE_STAGING`] when the decoder consumed
+/// nothing from a full buffer — which can only happen inside an atomic
+/// meta-block-header retry. [`BrotliStream`] rejects a header longer than
+/// 1 MiB, so this ceiling is never the thing that stops a valid stream; it just
+/// makes the adapter's own memory bound explicit instead of implied.
+const MAX_STAGING: usize = 4 * 1024 * 1024;
+
 /// A streaming Brotli decompressor that implements `Read`.
 ///
-/// The first `read` call consumes the inner reader to its end, decompresses
-/// everything, and buffers the whole output in memory; subsequent reads
-/// serve from that buffer. Peak memory is proportional to the decompressed
-/// size.
+/// A thin shell over [`BrotliStream`]: at most 64 KiB of compressed data is
+/// held at a time and decoded straight into the caller's buffer, so output is
+/// available before the source reaches EOF and peak memory is bounded by the
+/// stream's sliding window rather than by the decompressed size.
+///
+/// I/O behaviour:
+///
+/// * `ErrorKind::Interrupted` from the inner reader is retried;
+/// * `ErrorKind::WouldBlock` propagates unchanged, with the decoder state
+///   intact so the same `read` can simply be retried;
+/// * an inner `Ok(0)` means end of input, which switches the decoder to
+///   [`FlushMode::Finish`] — a stream that ends mid-meta-block is then an
+///   error, never a short read;
+/// * `read(&mut [])` returns `Ok(0)` without touching the inner reader;
+/// * a source that is empty from the very first read yields `Ok(0)` rather
+///   than an error. This is the behaviour this type has always had and is kept
+///   deliberately: a zero-byte body is treated as "nothing to decode", not as a
+///   truncated stream. The strict reading — a zero-byte body is not a valid
+///   Brotli stream — is what [`crate::decompress()`] and [`BrotliStream`] apply.
 ///
 /// Supports optional progress reporting via [`ProgressHandle`],
 /// cooperative cancellation via [`CancellationToken`], and a memory budget
@@ -393,30 +428,39 @@ impl<W: Write> Drop for BrotliCompressor<W> {
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```rust
 /// use std::io::Read;
-/// use oxiarc_brotli::streaming::BrotliDecompressor;
+/// use oxiarc_brotli::{compress, streaming::BrotliDecompressor};
 ///
-/// let compressed_data: Vec<u8> = vec![]; // ... compressed data ...
-/// let mut decompressor = BrotliDecompressor::new(&compressed_data[..]);
+/// let compressed = compress(b"decoded as it arrives", 5).expect("compress");
+/// let mut decompressor = BrotliDecompressor::new(&compressed[..]);
 /// let mut output = Vec::new();
-/// decompressor.read_to_end(&mut output).unwrap();
+/// decompressor.read_to_end(&mut output).expect("read");
+/// assert_eq!(output, b"decoded as it arrives");
 /// ```
 pub struct BrotliDecompressor<R: Read> {
     /// Inner reader providing compressed data.
     inner: R,
-    /// Decompressed output buffer.
-    output_buf: Vec<u8>,
-    /// Current read position in the output buffer.
-    output_pos: usize,
-    /// Whether decompression is complete.
+    /// The bounded push decoder doing the actual work.
+    stream: BrotliStream,
+    /// Compressed bytes staged from `inner`.
+    staging: Vec<u8>,
+    /// How many bytes of `staging` are valid.
+    staged: usize,
+    /// How many bytes of `staging` the decoder has taken.
+    staged_pos: usize,
+    /// Whether `inner` has reported end of input.
+    input_done: bool,
+    /// Whether the decoder reported [`BrotliStatus::StreamEnd`].
     finished: bool,
-    /// Optional progress sink; receives `on_progress` after decompression.
+    /// Optional progress sink, forwarded to the decoder.
     progress: Option<ProgressHandle>,
-    /// Optional cancellation token; checked before decompression starts.
+    /// Optional cancellation token, forwarded to the decoder.
     cancel: Option<CancellationToken>,
-    /// Optional memory budget; enforced per meta-block while decoding.
+    /// Optional memory budget, forwarded to the decoder.
     max_output: Option<usize>,
+    /// Whether `stream` has been configured from the builders above.
+    configured: bool,
 }
 
 impl<R: Read> BrotliDecompressor<R> {
@@ -424,19 +468,23 @@ impl<R: Read> BrotliDecompressor<R> {
     pub fn new(inner: R) -> Self {
         BrotliDecompressor {
             inner,
-            output_buf: Vec::new(),
-            output_pos: 0,
+            stream: BrotliStream::new(),
+            staging: Vec::new(),
+            staged: 0,
+            staged_pos: 0,
+            input_done: false,
             finished: false,
             progress: None,
             cancel: None,
             max_output: None,
+            configured: false,
         }
     }
 
     /// Attach a progress sink.
     ///
-    /// The sink's `on_progress(bytes_in_consumed, Some(bytes_in_consumed))` is
-    /// called once after the entire compressed input has been decompressed.
+    /// The sink's `on_progress(bytes_out_so_far, None)` is called after every
+    /// decoded meta-block.
     #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
         self.progress = Some(handle);
@@ -445,7 +493,7 @@ impl<R: Read> BrotliDecompressor<R> {
 
     /// Attach a cancellation token.
     ///
-    /// The token is checked before decompression begins. If it has been
+    /// The token is checked at every meta-block boundary. If it has been
     /// cancelled, reading returns an I/O error with the message
     /// `"operation cancelled"`.
     #[must_use]
@@ -458,63 +506,166 @@ impl<R: Read> BrotliDecompressor<R> {
     ///
     /// The cap is enforced *during* decoding — before the meta-block that
     /// would exceed it is decoded — so an over-budget stream is rejected
-    /// without its expansion being allocated. Reading then fails with an
-    /// I/O error carrying [`crate::BrotliError::MemoryBudgetExceeded`]'s
-    /// message. Without this setting the crate's default 256 MB guard
-    /// applies.
+    /// without its expansion being produced, and without the compressed
+    /// remainder being downloaded. Reading then fails with an I/O error
+    /// carrying [`crate::BrotliError::MemoryBudgetExceeded`]'s message.
+    /// Without this setting the crate's default 256 MB guard applies.
     #[must_use]
     pub fn with_max_output(mut self, max_output: usize) -> Self {
         self.max_output = Some(max_output);
         self
     }
 
-    /// Read all compressed input and decompress it, threading hooks per meta-block.
-    fn decompress_all(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
+    /// Refuse a stream whose declared sliding window exceeds `bytes`.
+    ///
+    /// Checked while reading the stream header, before the window is
+    /// allocated. Defaults to [`crate::DEFAULT_MAX_WINDOW`] (16 MiB), which
+    /// admits every RFC 7932 window.
+    #[must_use]
+    pub fn with_max_window(mut self, bytes: usize) -> Self {
+        self.stream = std::mem::take(&mut self.stream).with_max_window(bytes);
+        self
+    }
+
+    /// Attach a shared (custom LZ77) dictionary.
+    ///
+    /// The source's backward references may then reach into `dictionary`; this
+    /// is the `Read`-shaped counterpart of
+    /// [`BrotliStream::with_dictionary`](crate::BrotliStream::with_dictionary)
+    /// and is what an HTTP client feeds a `Content-Encoding: dcb` body after
+    /// stripping its 36-byte header (see [`crate::dcb`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::io::Read;
+    /// use oxiarc_brotli::{compress_with_dictionary, BrotliDecompressor, BrotliParams};
+    ///
+    /// let dictionary = b"a dictionary both peers hold".repeat(16);
+    /// let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+    /// let compressed =
+    ///     compress_with_dictionary(b"a dictionary both peers hold!", &dictionary, &params)
+    ///         .expect("compress");
+    ///
+    /// let mut out = Vec::new();
+    /// BrotliDecompressor::new(&compressed[..])
+    ///     .with_dictionary(dictionary)
+    ///     .read_to_end(&mut out)
+    ///     .expect("decompress");
+    /// assert_eq!(out, b"a dictionary both peers hold!");
+    /// ```
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Vec<u8>) -> Self {
+        self.stream = std::mem::take(&mut self.stream).with_dictionary(dictionary);
+        self
+    }
+
+    /// Apply the builder settings to the decoder on first use.
+    fn configure(&mut self) {
+        if self.configured {
+            return;
         }
-
-        // Read all input data.
-        let mut compressed = Vec::new();
-        self.inner.read_to_end(&mut compressed)?;
-
-        if compressed.is_empty() {
-            self.finished = true;
-            return Ok(());
+        self.configured = true;
+        let mut stream = std::mem::take(&mut self.stream);
+        if let Some(limit) = self.max_output {
+            stream = stream.with_max_output(limit as u64);
         }
+        if let Some(handle) = self.progress.clone() {
+            stream = stream.with_progress(handle);
+        }
+        if let Some(token) = self.cancel.clone() {
+            stream = stream.with_cancel(token);
+        }
+        self.stream = stream;
+    }
 
-        // Decompress with per-meta-block progress, cancellation and
-        // memory-budget enforcement.
-        self.output_buf = decompress_with_hooks(
-            &compressed,
-            self.progress.as_ref(),
-            self.cancel.as_ref(),
-            self.max_output,
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-        self.output_pos = 0;
-        self.finished = true;
-
-        Ok(())
+    /// Pull one staging buffer's worth of compressed bytes from `inner`.
+    ///
+    /// Retries `Interrupted`; propagates every other error, `WouldBlock`
+    /// included, without disturbing the decoder.
+    fn refill(&mut self) -> io::Result<()> {
+        if self.staging.is_empty() {
+            self.staging = vec![0u8; DECODE_STAGING];
+        }
+        if self.staged_pos > 0 {
+            self.staging.copy_within(self.staged_pos..self.staged, 0);
+            self.staged -= self.staged_pos;
+            self.staged_pos = 0;
+        }
+        if self.staged == self.staging.len() {
+            // Nothing consumed from a full buffer: the decoder is holding it
+            // all inside an atomic meta-block-header parse. Grow so progress is
+            // still possible.
+            if self.staging.len() >= MAX_STAGING {
+                return Err(io::Error::other(
+                    "brotli meta-block header exceeds the staging buffer",
+                ));
+            }
+            let grown = (self.staging.len() * 2).min(MAX_STAGING);
+            self.staging.resize(grown, 0);
+        }
+        loop {
+            match self.inner.read(&mut self.staging[self.staged..]) {
+                Ok(0) => {
+                    self.input_done = true;
+                    return Ok(());
+                }
+                Ok(n) => {
+                    self.staged += n;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
 impl<R: Read> Read for BrotliDecompressor<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if !self.finished {
-            self.decompress_all()?;
-        }
-
-        let remaining = &self.output_buf[self.output_pos..];
-        if remaining.is_empty() {
+        if buf.is_empty() || self.finished {
             return Ok(0);
         }
-
-        let to_copy = buf.len().min(remaining.len());
-        buf[..to_copy].copy_from_slice(&remaining[..to_copy]);
-        self.output_pos += to_copy;
-
-        Ok(to_copy)
+        self.configure();
+        loop {
+            let flush = if self.input_done {
+                FlushMode::Finish
+            } else {
+                FlushMode::None
+            };
+            let progress = self
+                .stream
+                .decode(&self.staging[self.staged_pos..self.staged], buf, flush)
+                .map_err(io::Error::from)?;
+            self.staged_pos += progress.consumed;
+            if progress.status == BrotliStatus::StreamEnd {
+                self.finished = true;
+            }
+            if progress.produced > 0 {
+                return Ok(progress.produced);
+            }
+            if self.finished {
+                return Ok(0);
+            }
+            if progress.status == BrotliStatus::NeedOutput {
+                // `buf` is non-empty, so a decoder that produced nothing while
+                // asking for more room cannot make progress.
+                return Err(io::Error::other("brotli decoder made no progress"));
+            }
+            if self.input_done {
+                // `FlushMode::Finish` above turns a genuine shortfall into an
+                // error, so reaching here means the decoder is idling.
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            self.refill()?;
+            if self.input_done && self.stream.total_in() == 0 {
+                // The source was empty from the start: preserve this type's
+                // long-standing "nothing to decode" answer rather than
+                // reporting a truncated stream.
+                self.finished = true;
+                return Ok(0);
+            }
+        }
     }
 }
 

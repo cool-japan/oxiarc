@@ -30,11 +30,12 @@ use crate::context::{
 use crate::dictionary;
 use crate::error::{BrotliError, BrotliResult};
 use crate::huffman::{HuffmanTree, read_prefix_code};
+use crate::shared_dict;
 use crate::tables::{BLOCK_COUNT_CODES, COPY_LENGTH_CODES, INSERT_LENGTH_CODES, decompose_command};
 
 /// Maximum allowed output size (256 MB limit for safety against
 /// decompression bombs; a documented guard, not an RFC limit).
-const MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
 
 /// The output-size cap enforced while a stream is being decoded.
 ///
@@ -140,6 +141,62 @@ pub fn decompress_with_limit(data: &[u8], max_output: usize) -> BrotliResult<Vec
     decompress_with_hooks(data, None, None, Some(max_output))
 }
 
+/// Decompress a Brotli stream whose backward references may reach into a
+/// *shared* (custom LZ77) dictionary.
+///
+/// This is the decoding half of the reference `brotli --dictionary=FILE`
+/// option and of `Content-Encoding: dcb` bodies (RFC 9842): `dictionary` is
+/// content both peers already have, and the stream may reference it at
+/// distances beyond everything it has itself produced — beyond its declared
+/// window, in fact. See [`crate::shared_dict`] for the exact distance space,
+/// which was established by measurement against `brotli 1.1.0`.
+///
+/// Passing an empty `dictionary` is identical to [`decompress`].
+///
+/// # Errors
+///
+/// The same errors as [`decompress`], plus
+/// [`BrotliError::DictionaryError`] when `dictionary` exceeds
+/// [`crate::shared_dict::MAX_SHARED_DICTIONARY`].
+///
+/// # Example
+///
+/// ```rust
+/// use oxiarc_brotli::{compress_with_dictionary, decompress_with_dictionary, BrotliParams};
+///
+/// let dictionary = b"the quick brown fox jumps over the lazy dog".repeat(64);
+/// let message = b"the quick brown fox jumps over the lazy dog, again";
+///
+/// let params = BrotliParams { quality: 9, ..BrotliParams::default() };
+/// let compressed = compress_with_dictionary(message, &dictionary, &params).expect("compress");
+/// let decoded = decompress_with_dictionary(&compressed, &dictionary).expect("decompress");
+/// assert_eq!(decoded, message);
+///
+/// // The dictionary is not optional: the same bytes decode to something else
+/// // (or not at all) without it.
+/// assert_ne!(oxiarc_brotli::decompress(&compressed).ok(), Some(message.to_vec()));
+/// ```
+pub fn decompress_with_dictionary(data: &[u8], dictionary: &[u8]) -> BrotliResult<Vec<u8>> {
+    shared_dict::check_dictionary_len(dictionary.len())?;
+    decompress_instrumented(data, None, None, None, None, dictionary)
+}
+
+/// [`decompress_with_dictionary`] with the caller-chosen output budget of
+/// [`decompress_with_limit`].
+///
+/// # Errors
+///
+/// The union of [`decompress_with_dictionary`]'s and
+/// [`decompress_with_limit`]'s errors.
+pub fn decompress_with_dictionary_and_limit(
+    data: &[u8],
+    dictionary: &[u8],
+    max_output: usize,
+) -> BrotliResult<Vec<u8>> {
+    shared_dict::check_dictionary_len(dictionary.len())?;
+    decompress_instrumented(data, None, None, Some(max_output), None, dictionary)
+}
+
 /// Decompress with optional per-meta-block progress and cancellation hooks
 /// and an optional caller-supplied output budget.
 ///
@@ -153,7 +210,7 @@ pub(crate) fn decompress_with_hooks(
     cancel: Option<&CancellationToken>,
     max_output: Option<usize>,
 ) -> BrotliResult<Vec<u8>> {
-    decompress_instrumented(data, progress, cancel, max_output, None)
+    decompress_instrumented(data, progress, cancel, max_output, None, &[])
 }
 
 /// The block-splitting and context-modeling shape of one decoded meta-block.
@@ -189,7 +246,7 @@ pub struct MetaBlockShape {
 /// The same errors as [`decompress`].
 pub fn decompress_reporting_shapes(data: &[u8]) -> BrotliResult<(Vec<u8>, Vec<MetaBlockShape>)> {
     let mut shapes = Vec::new();
-    let output = decompress_instrumented(data, None, None, None, Some(&mut shapes))?;
+    let output = decompress_instrumented(data, None, None, None, Some(&mut shapes), &[])?;
     Ok((output, shapes))
 }
 
@@ -201,6 +258,7 @@ fn decompress_instrumented(
     cancel: Option<&CancellationToken>,
     max_output: Option<usize>,
     mut shapes: Option<&mut Vec<MetaBlockShape>>,
+    shared: &[u8],
 ) -> BrotliResult<Vec<u8>> {
     if data.is_empty() {
         return Err(BrotliError::UnexpectedEof);
@@ -220,11 +278,7 @@ fn decompress_instrumented(
 
     // Ring buffer of the last four distances (Section 4): the last distance
     // is 4, then 11, 15, 16. Persists across meta-blocks.
-    let mut state = DecoderState {
-        dist_ring: [16, 15, 11, 4],
-        dist_ring_idx: 0,
-        window_size,
-    };
+    let mut state = DecoderState::new(window_size);
 
     loop {
         if let Some(token) = cancel {
@@ -282,7 +336,8 @@ fn decompress_instrumented(
             }
         }
 
-        let shape = decode_compressed_meta_block(&mut reader, &mut output, mlen, &mut state)?;
+        let shape =
+            decode_compressed_meta_block(&mut reader, &mut output, mlen, &mut state, shared)?;
         if let Some(ref mut collected) = shapes {
             collected.push(shape);
         }
@@ -313,7 +368,7 @@ fn decompress_instrumented(
 }
 
 /// Read the stream header WBITS field (RFC 7932 Section 9.1).
-fn read_window_bits(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
+pub(crate) fn read_window_bits(reader: &mut BitReader<'_>) -> BrotliResult<u32> {
     if !reader.read_bit()? {
         return Ok(16);
     }
@@ -379,7 +434,10 @@ pub(crate) fn read_block_type_count(reader: &mut BitReader<'_>) -> BrotliResult<
 }
 
 /// Read a block count using the 26-symbol block-count code (Section 6).
-fn read_block_count(reader: &mut BitReader<'_>, tree: &HuffmanTree) -> BrotliResult<u32> {
+pub(crate) fn read_block_count(
+    reader: &mut BitReader<'_>,
+    tree: &HuffmanTree,
+) -> BrotliResult<u32> {
     let sym = tree.decode_symbol(reader)?;
     let (base, extra_bits) = *BLOCK_COUNT_CODES
         .get(sym as usize)
@@ -388,15 +446,15 @@ fn read_block_count(reader: &mut BitReader<'_>, tree: &HuffmanTree) -> BrotliRes
 }
 
 /// Per-category block-switching state (Section 6).
-struct BlockCategory {
+pub(crate) struct BlockCategory {
     /// Number of block types (NBLTYPESx).
-    num_types: u32,
+    pub(crate) num_types: u32,
     /// Current block type.
-    btype: usize,
+    pub(crate) btype: usize,
     /// Block type of the block that preceded the current one.
-    prev_btype: usize,
+    pub(crate) prev_btype: usize,
     /// Remaining element count for the current block.
-    blen: u32,
+    pub(crate) blen: u32,
     /// Prefix code over the block type alphabet (present when >= 2 types).
     btype_tree: Option<HuffmanTree>,
     /// Prefix code over the block count alphabet (present when >= 2 types).
@@ -406,7 +464,7 @@ struct BlockCategory {
 impl BlockCategory {
     /// Read the NBLTYPES header field and, when >= 2, the block type and
     /// block count prefix codes plus the first block count (Section 9.2).
-    fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
+    pub(crate) fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
         let num_types = read_block_type_count(reader)?;
         if num_types >= 2 {
             let btype_tree = read_prefix_code(reader, num_types + 2)?;
@@ -434,29 +492,45 @@ impl BlockCategory {
 
     /// Consume one element of this category, performing a block switch
     /// first when the current block is exhausted (Section 6).
-    fn tick(&mut self, reader: &mut BitReader<'_>) -> BrotliResult<()> {
+    ///
+    /// The overwhelmingly common outcome — one category, or a block that still
+    /// has elements left — is a compare and a decrement, so it is inlined into
+    /// both command loops; the switch itself is out of line. `tick` runs three
+    /// times per command and was 5.6 % of the push decoder's profile purely as
+    /// a call.
+    #[inline(always)]
+    pub(crate) fn tick(&mut self, reader: &mut BitReader<'_>) -> BrotliResult<()> {
         if self.num_types < 2 {
             return Ok(());
         }
-        if self.blen == 0 {
-            let (Some(btype_tree), Some(blen_tree)) = (&self.btype_tree, &self.blen_tree) else {
-                return Err(BrotliError::CorruptedData(
-                    "missing block switch codes".to_string(),
-                ));
-            };
-            let sym = btype_tree.decode_symbol(reader)?;
-            let new_type = match sym {
-                0 => self.prev_btype,
-                1 => (self.btype + 1) % self.num_types as usize,
-                _ => (sym - 2) as usize,
-            };
-            self.prev_btype = self.btype;
-            self.btype = new_type;
-            self.blen = read_block_count(reader, blen_tree)?;
+        if self.blen > 0 {
+            self.blen -= 1;
+            return Ok(());
         }
-        // The first block count from the header can legitimately be zero
-        // only through a switch above, so blen > 0 is guaranteed here for
-        // valid streams; treat 0 defensively.
+        self.switch_block(reader)
+    }
+
+    /// The block switch of [`BlockCategory::tick`] (Section 6): decode the new
+    /// block type and its count, then consume one element of the new block.
+    #[inline(never)]
+    fn switch_block(&mut self, reader: &mut BitReader<'_>) -> BrotliResult<()> {
+        let (Some(btype_tree), Some(blen_tree)) = (&self.btype_tree, &self.blen_tree) else {
+            return Err(BrotliError::CorruptedData(
+                "missing block switch codes".to_string(),
+            ));
+        };
+        let sym = btype_tree.decode_symbol(reader)?;
+        let new_type = match sym {
+            0 => self.prev_btype,
+            1 => (self.btype + 1) % self.num_types as usize,
+            _ => (sym - 2) as usize,
+        };
+        self.prev_btype = self.btype;
+        self.btype = new_type;
+        self.blen = read_block_count(reader, blen_tree)?;
+        // The first block count from the header can legitimately be zero only
+        // through a switch above, so blen > 0 is guaranteed here for valid
+        // streams; treat 0 defensively.
         if self.blen == 0 {
             return Err(BrotliError::CorruptedData("zero block count".to_string()));
         }
@@ -466,14 +540,27 @@ impl BlockCategory {
 }
 
 /// Distance ring buffer and window state shared across meta-blocks.
-struct DecoderState {
-    dist_ring: [usize; 4],
-    dist_ring_idx: usize,
-    window_size: usize,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoderState {
+    /// The last four distances, most recent at `dist_ring_idx - 1`.
+    pub(crate) dist_ring: [usize; 4],
+    /// Write cursor into `dist_ring` (masked with 3).
+    pub(crate) dist_ring_idx: usize,
+    /// `(1 << WBITS) - 16`, the largest in-window backward reference.
+    pub(crate) window_size: usize,
 }
 
 impl DecoderState {
-    fn last_distance(&self) -> usize {
+    /// The initial ring state of RFC 7932 Section 4: last = 4, then 11, 15, 16.
+    pub(crate) const fn new(window_size: usize) -> Self {
+        DecoderState {
+            dist_ring: [16, 15, 11, 4],
+            dist_ring_idx: 0,
+            window_size,
+        }
+    }
+
+    pub(crate) fn last_distance(&self) -> usize {
         self.dist_ring[(self.dist_ring_idx.wrapping_sub(1)) & 3]
     }
 
@@ -481,14 +568,14 @@ impl DecoderState {
         self.dist_ring[(self.dist_ring_idx.wrapping_sub(n)) & 3]
     }
 
-    fn push_distance(&mut self, distance: usize) {
+    pub(crate) fn push_distance(&mut self, distance: usize) {
         self.dist_ring[self.dist_ring_idx & 3] = distance;
         self.dist_ring_idx = self.dist_ring_idx.wrapping_add(1);
     }
 }
 
 /// Read a literal or distance context map (RFC 7932 Section 7.3).
-fn read_context_map(
+pub(crate) fn read_context_map(
     reader: &mut BitReader<'_>,
     num_trees: u32,
     size: usize,
@@ -543,6 +630,135 @@ fn inverse_move_to_front(data: &mut [u8]) {
     }
 }
 
+/// Everything a compressed meta-block's header declares (RFC 7932 Section
+/// 9.2), parsed as one unit.
+///
+/// Both decoders share this parser: the one-shot [`decompress`] path and the
+/// incremental [`crate::stream::BrotliStream`], whose header tier re-parses
+/// from a rolled-back bit cursor until the whole header has arrived. Sharing
+/// it is what makes the two decoders read the header at bit-identical
+/// positions.
+pub(crate) struct MetaBlockHeader {
+    /// Literal block-switch state.
+    pub(crate) cat_l: BlockCategory,
+    /// Insert-and-copy block-switch state.
+    pub(crate) cat_i: BlockCategory,
+    /// Distance block-switch state.
+    pub(crate) cat_d: BlockCategory,
+    /// Context mode per literal block type.
+    pub(crate) context_modes: Vec<ContextMode>,
+    /// Literal context map.
+    pub(crate) cmapl: ContextMap,
+    /// Distance context map.
+    pub(crate) cmapd: ContextMap,
+    /// `NTREESL` literal prefix codes.
+    pub(crate) literal_trees: Vec<HuffmanTree>,
+    /// `NBLTYPESI` insert-and-copy prefix codes.
+    pub(crate) ic_trees: Vec<HuffmanTree>,
+    /// `NTREESD` distance prefix codes.
+    pub(crate) distance_trees: Vec<HuffmanTree>,
+    /// `NDIRECT`, already shifted left by `NPOSTFIX`.
+    pub(crate) ndirect: u32,
+    /// `NPOSTFIX`.
+    pub(crate) npostfix: u32,
+    /// `(1 << NPOSTFIX) - 1`.
+    pub(crate) postfix_mask: u32,
+    /// The block-splitting shape, for [`decompress_reporting_shapes`].
+    pub(crate) shape: MetaBlockShape,
+}
+
+impl MetaBlockHeader {
+    /// Parse a compressed meta-block header from `reader`.
+    pub(crate) fn read(reader: &mut BitReader<'_>) -> BrotliResult<Self> {
+        // Block type headers, in the fixed order L, I, D.
+        let cat_l = BlockCategory::read(reader)?;
+        let cat_i = BlockCategory::read(reader)?;
+        let cat_d = BlockCategory::read(reader)?;
+
+        // Distance parameters.
+        let npostfix = reader.read_bits(2)?;
+        let ndirect = reader.read_bits(4)? << npostfix;
+        let postfix_mask = (1u32 << npostfix) - 1;
+        let distance_alphabet_size = 16 + ndirect + (48 << npostfix);
+
+        // Context modes, one per literal block type.
+        let mut context_modes = Vec::with_capacity(cat_l.num_types as usize);
+        for _ in 0..cat_l.num_types {
+            let mode_bits = reader.read_bits(2)? as u8;
+            let mode = ContextMode::from_bits(mode_bits).ok_or_else(|| {
+                BrotliError::InvalidContextMap(format!("invalid context mode {mode_bits}"))
+            })?;
+            context_modes.push(mode);
+        }
+
+        // Literal and distance context maps (always preceded by NTREES fields).
+        let ntreesl = read_block_type_count(reader)?;
+        let cmapl_size = cat_l.num_types as usize * NUM_LITERAL_CONTEXTS;
+        let cmapl = if ntreesl >= 2 {
+            let map = read_context_map(reader, ntreesl, cmapl_size)?;
+            ContextMap {
+                map,
+                num_contexts: NUM_LITERAL_CONTEXTS,
+                num_trees: ntreesl as usize,
+            }
+        } else {
+            ContextMap::trivial(cat_l.num_types as usize, NUM_LITERAL_CONTEXTS)
+        };
+
+        let ntreesd = read_block_type_count(reader)?;
+        let cmapd_size = cat_d.num_types as usize * NUM_DISTANCE_CONTEXTS;
+        let cmapd = if ntreesd >= 2 {
+            let map = read_context_map(reader, ntreesd, cmapd_size)?;
+            ContextMap {
+                map,
+                num_contexts: NUM_DISTANCE_CONTEXTS,
+                num_trees: ntreesd as usize,
+            }
+        } else {
+            ContextMap::trivial(cat_d.num_types as usize, NUM_DISTANCE_CONTEXTS)
+        };
+
+        // Prefix code arrays: NTREESL literal codes, NBLTYPESI insert-and-copy
+        // codes, NTREESD distance codes.
+        let mut literal_trees = Vec::with_capacity(ntreesl as usize);
+        for _ in 0..ntreesl {
+            literal_trees.push(read_prefix_code(reader, 256)?);
+        }
+        let mut ic_trees = Vec::with_capacity(cat_i.num_types as usize);
+        for _ in 0..cat_i.num_types {
+            ic_trees.push(read_prefix_code(reader, 704)?);
+        }
+        let mut distance_trees = Vec::with_capacity(ntreesd as usize);
+        for _ in 0..ntreesd {
+            distance_trees.push(read_prefix_code(reader, distance_alphabet_size)?);
+        }
+
+        let shape = MetaBlockShape {
+            literal_types: cat_l.num_types,
+            insert_and_copy_types: cat_i.num_types,
+            distance_types: cat_d.num_types,
+            literal_trees: ntreesl,
+            distance_trees: ntreesd,
+        };
+
+        Ok(MetaBlockHeader {
+            cat_l,
+            cat_i,
+            cat_d,
+            context_modes,
+            cmapl,
+            cmapd,
+            literal_trees,
+            ic_trees,
+            distance_trees,
+            ndirect,
+            npostfix,
+            postfix_mask,
+            shape,
+        })
+    }
+}
+
 /// Decode one compressed meta-block (RFC 7932 Sections 9.2/9.3), reporting the
 /// block-splitting shape its header declared.
 fn decode_compressed_meta_block(
@@ -550,80 +766,34 @@ fn decode_compressed_meta_block(
     output: &mut Vec<u8>,
     mlen: usize,
     state: &mut DecoderState,
+    shared: &[u8],
 ) -> BrotliResult<MetaBlockShape> {
     let block_start = output.len();
     let target_len = block_start + mlen;
 
-    // Block type headers, in the fixed order L, I, D.
-    let mut cat_l = BlockCategory::read(reader)?;
-    let mut cat_i = BlockCategory::read(reader)?;
-    let mut cat_d = BlockCategory::read(reader)?;
-
-    // Distance parameters.
-    let npostfix = reader.read_bits(2)?;
-    let ndirect = reader.read_bits(4)? << npostfix;
-    let postfix_mask = (1u32 << npostfix) - 1;
-    let distance_alphabet_size = 16 + ndirect + (48 << npostfix);
-
-    // Context modes, one per literal block type.
-    let mut context_modes = Vec::with_capacity(cat_l.num_types as usize);
-    for _ in 0..cat_l.num_types {
-        let mode_bits = reader.read_bits(2)? as u8;
-        let mode = ContextMode::from_bits(mode_bits).ok_or_else(|| {
-            BrotliError::InvalidContextMap(format!("invalid context mode {mode_bits}"))
-        })?;
-        context_modes.push(mode);
-    }
-
-    // Literal and distance context maps (always preceded by NTREES fields).
-    let ntreesl = read_block_type_count(reader)?;
-    let cmapl_size = cat_l.num_types as usize * NUM_LITERAL_CONTEXTS;
-    let cmapl = if ntreesl >= 2 {
-        let map = read_context_map(reader, ntreesl, cmapl_size)?;
-        ContextMap {
-            map,
-            num_contexts: NUM_LITERAL_CONTEXTS,
-            num_trees: ntreesl as usize,
-        }
-    } else {
-        ContextMap::trivial(cat_l.num_types as usize, NUM_LITERAL_CONTEXTS)
-    };
-
-    let ntreesd = read_block_type_count(reader)?;
-    let cmapd_size = cat_d.num_types as usize * NUM_DISTANCE_CONTEXTS;
-    let cmapd = if ntreesd >= 2 {
-        let map = read_context_map(reader, ntreesd, cmapd_size)?;
-        ContextMap {
-            map,
-            num_contexts: NUM_DISTANCE_CONTEXTS,
-            num_trees: ntreesd as usize,
-        }
-    } else {
-        ContextMap::trivial(cat_d.num_types as usize, NUM_DISTANCE_CONTEXTS)
-    };
-
-    // Prefix code arrays: NTREESL literal codes, NBLTYPESI insert-and-copy
-    // codes, NTREESD distance codes.
-    let mut literal_trees = Vec::with_capacity(ntreesl as usize);
-    for _ in 0..ntreesl {
-        literal_trees.push(read_prefix_code(reader, 256)?);
-    }
-    let mut ic_trees = Vec::with_capacity(cat_i.num_types as usize);
-    for _ in 0..cat_i.num_types {
-        ic_trees.push(read_prefix_code(reader, 704)?);
-    }
-    let mut distance_trees = Vec::with_capacity(ntreesd as usize);
-    for _ in 0..ntreesd {
-        distance_trees.push(read_prefix_code(reader, distance_alphabet_size)?);
-    }
+    let MetaBlockHeader {
+        mut cat_l,
+        mut cat_i,
+        mut cat_d,
+        context_modes,
+        cmapl,
+        cmapd,
+        literal_trees,
+        ic_trees,
+        distance_trees,
+        ndirect,
+        npostfix,
+        postfix_mask,
+        shape,
+    } = MetaBlockHeader::read(reader)?;
 
     // ── Command loop ─────────────────────────────────────────────────────
     while output.len() < target_len {
         // Insert-and-copy command symbol.
         cat_i.tick(reader)?;
-        let ic_tree = ic_trees
-            .get(cat_i.btype)
-            .ok_or(BrotliError::InvalidBlockType(cat_i.btype as u8))?;
+        let Some(ic_tree) = ic_trees.get(cat_i.btype) else {
+            return Err(BrotliError::InvalidBlockType(cat_i.btype as u8));
+        };
         let ic_symbol = ic_tree.decode_symbol(reader)?;
         if ic_symbol >= 704 {
             return Err(BrotliError::CorruptedData(format!(
@@ -644,9 +814,9 @@ fn decode_compressed_meta_block(
         }
         for _ in 0..insert_length {
             cat_l.tick(reader)?;
-            let mode = *context_modes
-                .get(cat_l.btype)
-                .ok_or(BrotliError::InvalidBlockType(cat_l.btype as u8))?;
+            let Some(&mode) = context_modes.get(cat_l.btype) else {
+                return Err(BrotliError::InvalidBlockType(cat_l.btype as u8));
+            };
             let p1 = output.last().copied().unwrap_or(0);
             let p2 = if output.len() >= 2 {
                 output[output.len() - 2]
@@ -683,66 +853,113 @@ fn decode_compressed_meta_block(
             decode_distance(reader, dsym, state, ndirect, npostfix, postfix_mask)?
         };
 
-        if distance <= max_distance {
-            // Backward reference into the sliding window.
-            if !is_code_zero {
-                state.push_distance(distance);
+        match shared_dict::classify_distance(distance, max_distance, shared.len()) {
+            shared_dict::DistanceSource::Output => {
+                // Backward reference into the sliding window.
+                if !is_code_zero {
+                    state.push_distance(distance);
+                }
+                if output.len() + copy_length > target_len {
+                    return Err(BrotliError::CorruptedData(
+                        "copy length exceeds meta-block length".to_string(),
+                    ));
+                }
+                // Overlapping copies are well-defined byte-by-byte.
+                for _ in 0..copy_length {
+                    let byte = output[output.len() - distance];
+                    output.push(byte);
+                }
             }
-            if output.len() + copy_length > target_len {
-                return Err(BrotliError::CorruptedData(
-                    "copy length exceeds meta-block length".to_string(),
-                ));
+            shared_dict::DistanceSource::Shared { offset, available } => {
+                // A shared-dictionary reference is an ordinary backward
+                // reference into the extended history, so — unlike a static
+                // dictionary word — it does go onto the distance ring.
+                if !is_code_zero {
+                    state.push_distance(distance);
+                }
+                if output.len() + copy_length > target_len {
+                    return Err(BrotliError::CorruptedData(
+                        "copy length exceeds meta-block length".to_string(),
+                    ));
+                }
+                if copy_length > available {
+                    return Err(dictionary_overrun(distance, copy_length, available));
+                }
+                output.extend_from_slice(&shared[offset..offset + copy_length]);
             }
-            // Overlapping copies are well-defined byte-by-byte.
-            for _ in 0..copy_length {
-                let byte = output[output.len() - distance];
-                output.push(byte);
-            }
-        } else {
-            // Static dictionary reference (Section 8). Never pushed to the
-            // distance ring buffer.
-            if !(dictionary::MIN_DICTIONARY_WORD_LENGTH..=dictionary::MAX_DICTIONARY_WORD_LENGTH)
-                .contains(&copy_length)
-            {
-                return Err(BrotliError::InvalidDistance {
-                    distance,
-                    max_distance,
-                });
-            }
-            let word_id = (distance - max_distance - 1) as u64;
-            let ndbits = dictionary::NDBITS[copy_length] as u64;
-            let index = (word_id & ((1 << ndbits) - 1)) as u32;
-            let transform_id = (word_id >> ndbits) as usize;
-            if transform_id >= dictionary::NUM_TRANSFORMS {
-                return Err(BrotliError::InvalidDistance {
-                    distance,
-                    max_distance,
-                });
-            }
-            let word = dictionary::lookup_word(copy_length, index)?;
-            dictionary::apply_transform_to(word, transform_id, output)?;
-            if output.len() > target_len {
-                return Err(BrotliError::CorruptedData(
-                    "dictionary word exceeds meta-block length".to_string(),
-                ));
+            shared_dict::DistanceSource::Static { word_id } => {
+                // Static dictionary reference (Section 8). Never pushed to the
+                // distance ring buffer.
+                if !(dictionary::MIN_DICTIONARY_WORD_LENGTH
+                    ..=dictionary::MAX_DICTIONARY_WORD_LENGTH)
+                    .contains(&copy_length)
+                {
+                    return Err(BrotliError::InvalidDistance {
+                        distance,
+                        max_distance,
+                    });
+                }
+                let ndbits = dictionary::NDBITS[copy_length] as u64;
+                let index = (word_id & ((1 << ndbits) - 1)) as u32;
+                let transform_id = (word_id >> ndbits) as usize;
+                if transform_id >= dictionary::NUM_TRANSFORMS {
+                    return Err(BrotliError::InvalidDistance {
+                        distance,
+                        max_distance,
+                    });
+                }
+                let word = dictionary::lookup_word(copy_length, index)?;
+                dictionary::apply_transform_to(word, transform_id, output)?;
+                if output.len() > target_len {
+                    return Err(BrotliError::CorruptedData(
+                        "dictionary word exceeds meta-block length".to_string(),
+                    ));
+                }
             }
         }
     }
 
-    Ok(MetaBlockShape {
-        literal_types: cat_l.num_types,
-        insert_and_copy_types: cat_i.num_types,
-        distance_types: cat_d.num_types,
-        literal_trees: ntreesl,
-        distance_trees: ntreesd,
-    })
+    Ok(shape)
+}
+
+/// The error for a shared-dictionary copy that runs past the end of the
+/// dictionary.
+///
+/// A shared-dictionary reference addresses `dict_len - (distance -
+/// max_backward)` and may take at most the bytes from there to the end of the
+/// dictionary: the dictionary is a *compound* history block, not a prefix
+/// glued to the sliding window, so a copy cannot walk out of it and continue in
+/// the produced output. `brotli 1.1.0` rejects such a stream ("corrupt input")
+/// — verified in `tests/brotli_oracle.rs::
+/// test_oracle_reference_rejects_a_copy_past_the_dictionary_end`, which feeds
+/// the reference two streams differing only in one copy length.
+///
+/// Kept out of line and `#[cold]` deliberately. The backward-reference loop
+/// this sits next to is the hottest loop in this decoder, and its speed turned
+/// out to depend on the exact shape of the code around it: inlining a rare
+/// continuation into the same function tripled the decode time of a
+/// copy-dominated stream (measured: 616 us -> 2.10 ms on a 1 MiB repetitive
+/// payload). Out of line, the hot loop's code generation cannot be perturbed
+/// by it at all.
+#[cold]
+#[inline(never)]
+pub(crate) fn dictionary_overrun(
+    distance: usize,
+    copy_length: usize,
+    available: usize,
+) -> BrotliError {
+    BrotliError::CorruptedData(format!(
+        "shared-dictionary copy of {copy_length} bytes at distance {distance} runs {} bytes \
+         past the end of the dictionary (only {available} available)",
+        copy_length - available
+    ))
 }
 
 /// Convert a distance symbol into a distance (RFC 7932 Section 4).
 ///
 /// Returns `(distance, is_code_zero)`; `is_code_zero` distances are not
 /// pushed onto the ring buffer.
-fn decode_distance(
+pub(crate) fn decode_distance(
     reader: &mut BitReader<'_>,
     dsym: u32,
     state: &DecoderState,

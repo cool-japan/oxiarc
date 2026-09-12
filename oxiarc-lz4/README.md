@@ -7,7 +7,7 @@ Pure Rust implementation of LZ4 compression algorithm with LZ4-HC (High Compress
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.1 (2026-07-30) | 166 tests passing**
+**Version: 0.4.2 (2026-09-08) | 173 tests passing (158 via nextest + 15 doctests, `--all-features`)**
 
 ## Overview
 
@@ -29,7 +29,7 @@ LZ4 is a lossless compression algorithm focused on compression and decompression
 - **Cancellation support** - `with_cancel(CancellationToken)` builder on compressor/decompressor types
 - **True bounded-memory streaming** - `Lz4Compressor` emits complete blocks on the fly with no full-input buffering
 - **State-machine block parser** - `Lz4Decompressor` processes one block at a time via an internal state machine
-- **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap working-set size
+- **Memory budget builder** - `with_memory_budget(usize)` on both encoder and decoder to cap **input-side** working-set size (the encoder's unflushed input and the decoder's buffered-but-not-yet-decoded compressed bytes); decompressed output is not itself capped by this budget
 - **Block-layer prefix dictionary** - `compress_block_with_dict` / `decompress_block_dict` free functions and `Lz4DictBlockEncoder` / `Lz4DictBlockDecoder` builders for prefix-dictionary block compression (dictionary truncated to last 64 KiB per LZ4 spec)
 - **Property-tested** - `proptest`-based round-trip and no-panic fuzzing, plus a dedicated dictionary round-trip suite (`tests/dict_block_roundtrip.rs`)
 - **LASTLITERALS(5) + block-independence compliance** - Encoders now honor the LZ4 end-of-block invariant (reference `lz4` previously rejected frames for common repetitive inputs); the frame decoder correctly follows the block-independence flag via a new `FrameDescriptor::with_block_independence` builder plus a rolling dictionary (`lz4 -BD` linked frames previously failed at block 2); verified byte-identical against reference `lz4 1.10.0` (fixed in 0.3.6)
@@ -57,9 +57,11 @@ assert_eq!(decompressed, original);
 
 ### Frame Format (High-Level)
 
-`Lz4Compressor`/`Lz4Decompressor` implement the bounded-memory streaming
-`Compressor`/`Decompressor` traits (true block-at-a-time streaming — see the
-"Progress and Cancellation" section below for per-block hooks). Their
+`Lz4Compressor`/`Lz4Decompressor` implement `oxiarc-core`'s `Compressor`/
+`Decompressor` traits with true block-at-a-time streaming (see "Memory budget
+builder" above: the `with_memory_budget` cap this pair shares is input-side
+only, not a bound on decompressed output — see the "Progress and
+Cancellation" section below for per-block hooks). Their
 `compress_all`/`decompress_all` convenience methods run a whole buffer
 through that same state machine in one call:
 
@@ -156,10 +158,10 @@ The same pattern applies to `Lz4Decompressor`, `Lz4DictFrameEncoder`, and `Lz4Di
 ```toml
 [dependencies]
 # Default (no parallel)
-oxiarc-lz4 = "0.4.1"
+oxiarc-lz4 = "0.4.2"
 
 # With parallel compression
-oxiarc-lz4 = { version = "0.4.1", features = ["parallel"] }
+oxiarc-lz4 = { version = "0.4.2", features = ["parallel"] }
 ```
 
 ## Use Cases

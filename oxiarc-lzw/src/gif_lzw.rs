@@ -10,7 +10,11 @@
 //! - Code width grows as the dictionary grows (max 12 bits / 4096 codes)
 //! - When dictionary is full, a clear code is emitted and the dictionary resets
 
-use crate::bitstream_lsb::{LsbBitReader, LsbBitWriter};
+use crate::bits::LsbCodes;
+use crate::bitstream_lsb::LsbBitWriter;
+use crate::config::{LzwBitOrder, LzwConfig};
+use crate::decoder::{VecSink, decode_into_sink};
+use crate::dictionary::LzwDictionary;
 use crate::error::{LzwError, Result};
 use std::collections::HashMap;
 
@@ -164,125 +168,55 @@ pub fn gif_compress(data: &[u8], minimum_code_size: u8) -> Result<Vec<u8>> {
 // Decoder
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The generic code-table configuration that describes GIF's LZW dialect.
+///
+/// GIF is LSB-first with the standard (late) code-width change, an initial
+/// width of `minimum_code_size + 1` and a 12-bit ceiling. Its clear and EOI
+/// codes fall out of `min_bits` exactly as [`LzwConfig::clear_code`]
+/// computes them (`1 << (min_bits - 1)` and one more), so the shared
+/// decode loop needs no GIF-specific rules at all.
+fn gif_config(minimum_code_size: u8) -> LzwConfig {
+    LzwConfig {
+        min_bits: minimum_code_size + 1,
+        max_bits: 12,
+        use_clear_code: true,
+        early_change: false,
+        bit_order: LzwBitOrder::Lsb,
+    }
+}
+
 /// Decompress GIF LZW-encoded `data` using the given `minimum_code_size`.
 ///
 /// The `data` parameter must be the raw LZW byte stream (without GIF
 /// sub-block framing).
+///
+/// Decoding ends at the End-of-Information code or when the input runs out
+/// — GIF has no length framing, so a stream that stops early yields the
+/// bytes decoded so far rather than an error.
+///
+/// # Errors
+///
+/// Returns [`LzwError::InvalidBitWidth`] unless
+/// `2 <= minimum_code_size <= 11` (GIF spec §22), and
+/// [`LzwError::InvalidCode`] for a code outside the current table.
 pub fn gif_decompress(data: &[u8], minimum_code_size: u8) -> Result<Vec<u8>> {
     if !(2..=11).contains(&minimum_code_size) {
         return Err(LzwError::InvalidBitWidth(minimum_code_size));
     }
 
-    let state = GifState::new(minimum_code_size);
-    let mut reader = LsbBitReader::new(data);
+    // `min_bits` here is 3..=12, below the `>= 9` floor `LzwConfig::validate`
+    // enforces for the public configurations, so the table is built with the
+    // internal constructor that accepts GIF's narrower initial widths.
+    let mut dict = LzwDictionary::with_small_min_bits(gif_config(minimum_code_size))?;
 
-    // Decoder dictionary: maps code → byte string.
-    // We use a flat Vec indexed by code for O(1) decode lookups.
-    // Codes 0..clear_code are single bytes; we reconstruct them on reset.
-    let capacity = (state.max_codes() as usize) + 1;
-    let mut dec_dict: Vec<Vec<u8>> = Vec::with_capacity(capacity);
-    let mut code_width = state.initial_width;
-    let mut next_code: u16 = 0;
-
-    /// Reset the decoding dictionary to the initial single-byte state.
-    fn reset_decoder(
-        dec_dict: &mut Vec<Vec<u8>>,
-        code_width: &mut usize,
-        next_code: &mut u16,
-        state: &GifState,
-    ) {
-        dec_dict.clear();
-        for i in 0..state.clear_code {
-            dec_dict.push(vec![i as u8]);
-        }
-        // Placeholders for clear code and EOI.
-        dec_dict.push(Vec::new()); // clear_code
-        dec_dict.push(Vec::new()); // eoi_code
-        *code_width = state.initial_width;
-        *next_code = state.first_code();
-    }
-
-    reset_decoder(&mut dec_dict, &mut code_width, &mut next_code, &state);
-
-    let mut output: Vec<u8> = Vec::new();
-    let mut prev_code: Option<u16> = None;
-
-    while let Some(code) = reader.read_bits(code_width) {
-        if code == state.clear_code {
-            // Clear code: reset the dictionary.
-            reset_decoder(&mut dec_dict, &mut code_width, &mut next_code, &state);
-            prev_code = None;
-            continue;
-        }
-
-        if code == state.eoi_code {
-            // End of Information: normal termination.
-            break;
-        }
-
-        // ── Resolve the string for `code` ───────────────────────────────────
-
-        let entry: Vec<u8> = if (code as usize) < dec_dict.len() {
-            // Common case: code is already in the dictionary.
-            dec_dict[code as usize].clone()
-        } else if code == next_code {
-            // KwKwK special case: the code refers to the entry we are about
-            // to add.  The entry is prev_string + prev_string[0].
-            match prev_code {
-                Some(pc) => {
-                    let prev = dec_dict.get(pc as usize).ok_or(LzwError::InvalidCode(pc))?;
-                    let first = *prev.first().ok_or(LzwError::InvalidCode(pc))?;
-                    let mut s = prev.clone();
-                    s.push(first);
-                    s
-                }
-                None => return Err(LzwError::InvalidCode(code)),
-            }
-        } else {
-            // Code beyond next_code is always an error.
-            return Err(LzwError::InvalidCode(code));
-        };
-
-        // Output the decoded bytes.
-        output.extend_from_slice(&entry);
-
-        // ── Add a new dictionary entry ───────────────────────────────────────
-        // New entry = prev_string + entry[0].
-        if let Some(pc) = prev_code {
-            if next_code <= state.max_codes() {
-                let first_byte = *entry.first().ok_or(LzwError::InvalidCode(code))?;
-                let prev = dec_dict.get(pc as usize).ok_or(LzwError::InvalidCode(pc))?;
-                let mut new_entry = prev.clone();
-                new_entry.push(first_byte);
-
-                // The invariant `next_code as usize == dec_dict.len()` must
-                // hold at this point; any deviation indicates a logic bug.
-                if next_code as usize == dec_dict.len() {
-                    dec_dict.push(new_entry);
-                } else {
-                    // Invariant violated — should never happen.
-                    return Err(LzwError::InvalidCode(next_code));
-                }
-
-                next_code += 1;
-
-                // Grow code width when needed.
-                // The decoder is always one entry behind the encoder, so the
-                // decoder must increase the width one step earlier than the
-                // encoder.  The encoder fires at `next_code > 2^width`
-                // (i.e., next_code == 2^width + 1); the decoder fires at
-                // `next_code >= 2^width` (i.e., next_code == 2^width).
-                if next_code >= (1u16 << code_width) && code_width < state.max_width {
-                    code_width += 1;
-                }
-            }
-            // If next_code > max_codes the dictionary is full; we stop adding
-            // entries (clear code will reset when the encoder does the same).
-        }
-
-        prev_code = Some(code);
-    }
-
+    // GIF image data carries no uncompressed length, so the decode is
+    // bounded only by the stream itself — exactly as before 0.4.2, when this
+    // function grew an unbounded `Vec` and cloned a `Vec<u8>` per decoded
+    // code.
+    let mut output = Vec::new();
+    let sink = VecSink::new(&mut output, usize::MAX);
+    let written = decode_into_sink::<false, true, LsbCodes, _>(&mut dict, data, sink)?;
+    output.truncate(written);
     Ok(output)
 }
 

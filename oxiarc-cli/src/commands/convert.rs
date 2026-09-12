@@ -505,7 +505,8 @@ fn extract_all_entries<R: std::io::Read + std::io::Seek>(
             }
         }
         _ => {
-            return Err(format!("Cannot read entries from {} format", format).into());
+            let hint = crate::utils::image_format_hint(reader);
+            return Err(format!("Cannot read entries from {} format{hint}", format).into());
         }
     }
 

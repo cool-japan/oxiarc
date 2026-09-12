@@ -1,5 +1,75 @@
 
-# oxiarc-lzma - Development Status (v0.4.1, 2026-07-30)
+# oxiarc-lzma - Development Status (v0.4.2, 2026-09-07)
+
+## XZ container (`oxiarc_lzma::xz`) — COMPLETE (new in 0.4.2)
+
+- [x] Stream header/footer, block headers, multi-block streams, index
+      (records + CRC-32) and footer Backward-Size cross-check
+- [x] Multi-stream files (`cat a.xz b.xz`) and Stream Padding, decoded and
+      concatenated like `xz -d`; trailing garbage is an error, not a silent
+      short read
+- [x] Block Uncompressed Size vs. decoded length, index record count vs.
+      block count, and reserved block-header flag bits — the only
+      cross-checks available on the `LZMA_CHECK_NONE` streams libtiff writes
+- [x] Check types: None, CRC-32, CRC-64/ECMA-182, SHA-256 (FIPS 180-4,
+      dependency-free), verified **after** the filter chain per the spec
+- [x] Block filter chains (1-4 filters, LZMA2 last, duplicates rejected):
+      Delta (0x03) and all eight BCJ converters — x86 / PowerPC / IA-64 /
+      ARM / ARM-Thumb / SPARC / ARM64 / RISC-V (0x0B) — each byte-for-byte
+      validated against liblzma (CPython `lzma`) and the `xz` CLI in both
+      directions separately, and at non-zero start offsets
+- [x] Unknown filter IDs: named `UnsupportedMethod` error, never silently
+      mis-decoded (before 0.4.2 every non-LZMA2 filter was silently dropped)
+- [x] Block Padding and Index Padding must be null bytes (spec 3.4 / 4.4),
+      the Stream Footer's own CRC-32 is verified, a declared Compressed Size
+      of zero is rejected, and a block's LZMA2 payload must be consumed
+      exactly — `tests/xz_verify.rs`
+- [x] `xz::decompress_into(src, &mut dst)` / `xz::decompress_with_limit(data,
+      max)` / `XzReader::with_max_output(u64)` — output cap enforced during
+      decoding, chunk by chunk
+- [x] `oxiarc-archive` re-exports the module unchanged (same public paths)
+- [x] libtiff `tiffcp -c lzma` (TIFF `Compression = 34925`) multi-strip
+      differential suite and an `xz` CLI check-type sweep, behind `xz-oracle`
+- [x] `XzWriter` multi-block output: `with_block_size(u64)` (default 64
+      MiB — chosen so even LZMA2's worst case, all-stored chunks, cannot
+      push a block past the reader's 100 MiB per-block cap), one index
+      record per block, unpadded sizes — `writer_splits_large_input_into_blocks`,
+      `multi_block_streams_carry_a_check_per_block`, and the `xz-oracle`
+      `multi_block_streams_interoperate_with_the_xz_cli` (both directions,
+      `xz -l` block count checked)
+- [x] `xz::XzDecoder` — a reusable decoder context (`new`, `with_max_output`,
+      `decompress_into(&mut self, src, dst)`, `reset`) that keeps its LZMA2
+      dictionary buffer, probability model and coder state allocated across
+      calls instead of rebuilding them per stream (the TIFF `Compression =
+      34925` shape: thousands of same-dictionary-size strips). A guard
+      (`block_opener_permits_decoder_reuse` in `header.rs`) keeps this safe: every
+      independent XZ block must open with a chunk that resets the
+      dictionary, which a *fresh* `Lzma2Decoder` already enforces on its
+      own but a *reused* one would silently skip without it. Proven
+      byte-identical to always-fresh decoding first (`tests` in
+      `src/xz/decoder.rs`: a malformed non-resetting block rejected
+      identically whether the decoder handling it is fresh or reused, and
+      `a_bigger_dictionary_is_never_decoded_against_a_smaller_cached_ring`,
+      which pins the cache's dictionary-size key with a stream whose match
+      distance really does reach past the cached ring — a mere size
+      *alternation* does not, since a payload smaller than the smallest
+      dictionary in the sequence never exercises the wrap point), then
+      measured (`benches/xz_decoder_reuse.rs`, 1000 × 64 KiB streams).
+      `xz::decompress_into` / `xz::decompress_with_limit` are unchanged,
+      thin one-shot entry points.
+- [x] SHA-256 moved to `oxiarc_core::sha256` (FIPS 180-4, unchanged
+      behaviour/bytes); `oxiarc-lzma` depends on it instead of carrying a
+      private copy, so `oxiarc-http` (RFC 9842 dictionary-hash matching) can
+      share the same implementation without depending on `oxiarc-lzma`.
+- [x] Block-check integrity coverage (`tests/xz_check_integrity.rs`): the
+      writer emits the reference CRC-32 / CRC-64 / SHA-256 of *each block*,
+      a corrupted or truncated check field is rejected through every entry
+      point (including a primed `XzDecoder`), and — behind `xz-oracle` —
+      real `xz -t` / `xz -dc` / `xz --robot -lvv` accept what this writer
+      emits for **all four** check types, not just the default CRC-32.
+      Added because the check comparison itself had no test at all: it
+      could be disabled outright and the whole suite stayed green.
+
 
 ## Completed Features (COMPLETE)
 
@@ -117,8 +187,8 @@
     - Verify concatenation invariant: raw byte stream has exactly N `0xE0` control bytes and exactly one trailing `0x00`.
   - **Risk:** the `0xE0` control byte + end-marker stripping is the only delicate bit. Mitigation: `verify_concatenation_invariant` test inspects raw byte stream. Compression ratio drops vs. serial when chunks are small (no cross-chunk dictionary continuation); doc-comment this and default chunk to 1 MiB.
 - [x] Memory pool for large dictionaries — `LzmaPool` thread-safe pool with power-of-two buckets, `PooledBuf<'a>` RAII wrapper, `LzmaDecoderPooled<'p, R>` decoder; amortizes 64 MiB alloc/free per entry at level 9 (done 2026-05-16)
-- [x] Streaming with bounded memory (done 2026-05-17)
-  - `LzmaCompressor` / `LzmaDecompressor` wrapper types in `oxiarc-lzma/src/streaming.rs`.
+- [x] Memory-budgeted one-shot compression/decompression (done 2026-05-17; **not incremental streaming** — see the 2026-09-07 doc-truth correction to `streaming.rs`'s module doc, and use `Lzma2StreamEncoder`/`Lzma2StreamDecoder` for genuine chunk-at-a-time I/O)
+  - `LzmaCompressor` / `LzmaDecompressor` wrapper types in `oxiarc-lzma/src/streaming.rs` — despite the module's filename and this item's original ("Streaming with bounded memory") title, both are one-shot `&[u8] -> Vec<u8>` calls with a pre-flight budget *estimate*, not incremental decoders; the budget is real, the streaming was never real. Title corrected here to stop this file from re-asserting the exact overclaim `streaming-truth-audit.md` §12 flagged as the worst offender in the workspace.
   - `with_memory_budget(budget: usize) -> Self` builder on both types.
   - Defaults: `LZMA_COMPRESSOR_DEFAULT_BUDGET = 64 MiB`, `LZMA_DECOMPRESSOR_DEFAULT_BUDGET = 64 MiB`.
   - Pre-flight check: `dict_size + input.len() + LZMA_SCRATCH_OVERHEAD > budget` → `OxiArcError::MemoryBudgetExceeded`.

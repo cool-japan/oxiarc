@@ -3,6 +3,15 @@
 Last re-verified: 2026-07-13 (v0.3.6 hardening pass), against Pillow 12.1.0 /
 libtiff 4.7.1 on macOS. The full test matrix below was re-run at that date.
 
+Internals note (2026-09-08, v0.4.2): the decoder was rebuilt in this release
+around libtiff's own `LZWDecode` shape, so the function names quoted below
+describe the code as it stood at v0.3.6, not as it stands now. Every
+*behaviour* described here is still current and still covered by tests —
+only the internal naming moved. Today the code-width rule lives in
+`decoder.rs`'s `grow_threshold()`, which returns `2^width - 1` under TIFF's
+early-change rule and `2^width` under the standard (late) rule; that "minus
+one" is the same one-below-the-encoder threshold Issue 1 below describes.
+
 ## Resolved Issues
 
 ### Issue 1: All 256 Byte Values (0-255)
@@ -11,8 +20,10 @@ libtiff 4.7.1 on macOS. The full test matrix below was re-run at that date.
 
 Encoding a sequence containing all 256 byte values decoded bytes 254-255
 incorrectly, caused by an encoder/decoder desync at the 9-to-10 bit width
-transition. Fixed by the decoder-side `update_bit_width_decode()` threshold
-(one below the encoder's, compensating for the decoder's one-entry lag).
+transition. Fixed by giving the decoder a threshold one below the encoder's,
+compensating for the decoder's one-entry lag (in v0.3.6 that lived in
+`update_bit_width_decode()`; since v0.4.2 it is `grow_threshold()` in
+`decoder.rs` — see the note at the top of this file).
 Covered by `test_lzw_all_byte_values` and the `allbytes_256` reference
 fixture (which is byte-identical to libtiff's output).
 
@@ -91,7 +102,8 @@ written by older versions must be rewritten.
 
 `LzwConfig::new(0, 12).clear_code()` panicked with subtract-with-overflow in
 debug builds (and returned bogus values in release). `LzwConfig::new` now
-validates `9 <= min_bits <= max_bits <= 12` and returns `Result`;
+validates `9 <= min_bits <= max_bits <= 16` (the ceiling was 12 before
+0.4.2, which raised it to the UNIX `compress` maximum) and returns `Result`;
 `clear_code`/`eoi_code`/`first_code`/`max_code` use saturating arithmetic so
 even an invalid struct-literal config cannot panic, and
 `LzwConfig::validate()` is the authoritative gate (called by
@@ -104,9 +116,11 @@ even an invalid struct-literal config cannot panic, and
 - **Horizontal-differencing predictor (TIFF tag 317)**: out of scope for
   this crate. Predictor pre/post-processing is a container-level transform
   that callers (e.g. OxiGDAL) must apply around the raw LZW codec.
-- **Old-style LSB-first TIFF LZW**: pre-TIFF-6.0 writers that packed codes
-  LSB-first are not supported (libtiff only reads, never writes, that
-  variant).
+- **Old-style LSB-first TIFF LZW**: supported since 0.4.2 via
+  `LzwConfig::TIFF_COMPAT_LSB` (libtiff's `LZWDecodeCompat` variant: the
+  standard late width change plus LSB-first packing). libtiff only ever
+  reads that variant, so this crate reads it too and never writes it — the
+  TIFF encoder stays on `LzwConfig::TIFF`.
 - **Streaming frame format**: the `LzwStreamEncoder`/`LzwStreamDecoder`
   framing is private to this crate (it is not part of the TIFF or GIF file
   formats) and changed in v0.3.6 (Issue 4 above).
@@ -122,6 +136,21 @@ even an invalid struct-literal config cannot panic, and
 - Truncated/corrupted strips: return `Err` (or detectably short data),
   never panic, never full-length wrong bytes
 - GIF LZW round-trip suite (`gif_lzw`): PASS (unchanged by this pass)
+
+## Added 2026-09-08 (0.4.2, track LZW3)
+
+- Code widths 9-16 and an explicit `LzwConfig::bit_order`; `LzwConfig::GIF`
+  is LSB-first and no longer identical to `LzwConfig::TIFF_OLD_STYLE` (a
+  documented footgun, now closed and pinned by a behavioural test).
+- UNIX `compress` / `.Z` container (`oxiarc_lzw::z`), byte-identical to
+  `compress -b N -c` in both directions; `gzip -dc` and `uncompress -c`
+  reproduce this crate's streams for every width those tools accept
+  (they refuse `max_bits < 12` on macOS/BSD, which is their limitation, not
+  this crate's).
+- `.Z` truncation is deliberately **not** an error: the format has no
+  end-of-information code, so a truncated stream decodes to a prefix, the
+  same way `gzip -dc` behaves. Callers that need completeness must get it
+  from the transport.
 
 ## Production Readiness
 

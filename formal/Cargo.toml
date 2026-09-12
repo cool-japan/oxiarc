@@ -1,0 +1,65 @@
+# Standalone package: deliberately its own `[workspace]` so it is NOT a member
+# of the `oxiarc` root workspace. It depends on the three real `oxiarc` crates
+# by relative path and on `oxiformal` by relative path, and it is built and
+# verified on its own (`cargo build`, `cargo test`, `cargo formal check`).
+#
+# Nothing outside this directory belongs to this package: its `target/` and its
+# `Cargo.lock` are ignored by `formal/.gitignore`, and the root workspace never
+# sees it (a nested package that declares its own `[workspace]` is invisible to
+# the parent, and the root manifest has no globbed `members` entry).
+[workspace]
+
+[package]
+name = "oxiarc-formal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "cargo-formal harnesses over oxiarc's public bit-cache, xxhash32 and Huffman-entry API, with measured L1 verdicts"
+
+[dependencies]
+# The real crates, by relative path. `default-features = false` everywhere:
+# every target of `src/harness.rs` is in the feature-free core of each crate.
+# `oxiarc-core` is needed by every leg -- `BitCache` lives there, and so does
+# the error type the deflate entry points return.
+oxiarc-core = { path = "../oxiarc-core", default-features = false }
+oxiarc-lz4 = { path = "../oxiarc-lz4", default-features = false }
+oxiarc-deflate = { path = "../oxiarc-deflate", default-features = false }
+# Becomes a crates.io version once `oxiformal` is published; a relative path
+# to the cargo-formal checkout beside this one until then.
+oxiformal = { path = "../../cargo-formal/crates/oxiformal" }
+
+[package.metadata.formal]
+schema = 1
+default-layers = ["hygiene", "bmc", "contract"]
+# 16 covers `refill_bytes`' byte loop (at most 7 iterations plus the exit
+# test), `consume`/`align_to_byte`/`take_byte` (loop-free), and the four-byte
+# tail loops of `xxhash32_with_seed` / `XxHash32::finish`. The Huffman
+# table-build loops of `from_code_lengths` run far past it; that harness says
+# so in its doc comment.
+unwind = 16
+budget = { max-conflicts = 200000, timeout-ms = 30000, seed = 1 }
+# Explicit, not the cargo-formal default (which would be "every path
+# dependency"): these three are exactly the crates whose bodies the harnesses
+# need lowered.
+dep-crates = ["oxiarc-core", "oxiarc-lz4", "oxiarc-deflate"]
+
+[[package.metadata.formal.target]]
+path = "src/lib.rs"
+layers = ["hygiene", "bmc", "contract"]
+
+[lints.rust]
+unsafe_code = "forbid"
+# `formal` is set by the `cargo-formal` driver build; `oxiformal_runtime_checks`
+# is set via RUSTFLAGS for the randomized-execution build. Declared here so
+# `unexpected_cfgs` stays quiet in all three builds (see the crate's module
+# docs for what each build proves).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(formal)', 'cfg(oxiformal_runtime_checks)'] }
+
+[lints.clippy]
+unwrap_used = "deny"
+
+[profile.dev]
+# Left at the Rust default (`overflow-checks = true`, implied by
+# `debug-assertions`): the point of the `RUSTFLAGS="--cfg
+# oxiformal_runtime_checks" cargo test` build is that the arithmetic and the
+# `debug_assert!`s the L1 encoder calls refuted really do panic there.

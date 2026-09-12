@@ -175,6 +175,31 @@ pub struct LzhEncoder {
     progress: Option<ProgressHandle>,
     /// Whether to use the optimal (2-pass DP) parser instead of greedy.
     use_optimal: bool,
+    /// Compressed bytes produced by [`Compressor::compress`] that did not fit
+    /// in the caller's output slice, staged for delivery on later calls.
+    ///
+    /// Only the [`Compressor`] entry point uses this; [`encode`](Self::encode)
+    /// and [`compress_to_vec`](Self::compress_to_vec) write straight to the
+    /// caller's sink and never touch it.
+    out_pending: Vec<u8>,
+    /// How much of `out_pending` the caller has already received.
+    out_pending_pos: usize,
+    /// Uncompressed input accumulated by [`Compressor::compress`] for the
+    /// whole-stream methods (`-lh1-`, `-lh2-`, `-lh3-`, `-lzs-`, `-lz5-`),
+    /// whose codecs cannot be resumed across calls and therefore need every
+    /// byte before they can encode anything. Empty for every other method.
+    in_pending: Vec<u8>,
+}
+
+/// `true` for the methods whose encoders consume the whole input in one pass
+/// (adaptive Huffman / pre-seeded ring state that cannot be resumed across
+/// calls), so [`Compressor::compress`] must buffer input until
+/// [`FlushMode::Finish`] instead of encoding incrementally.
+fn buffers_whole_input(method: LzhMethod) -> bool {
+    matches!(
+        method,
+        LzhMethod::Lh1 | LzhMethod::Lh2 | LzhMethod::Lh3 | LzhMethod::Lzs | LzhMethod::Lz5
+    )
 }
 
 impl std::fmt::Debug for LzhEncoder {
@@ -204,6 +229,9 @@ impl LzhEncoder {
             finished: false,
             progress: None,
             use_optimal: false,
+            out_pending: Vec::new(),
+            out_pending_pos: 0,
+            in_pending: Vec::new(),
         }
     }
 
@@ -266,6 +294,28 @@ impl LzhEncoder {
     pub fn reset(&mut self) {
         self.lzss.reset();
         self.finished = false;
+        self.out_pending = Vec::new();
+        self.out_pending_pos = 0;
+        self.in_pending = Vec::new();
+    }
+
+    /// Copy staged compressed bytes into `output`, reclaiming the staging
+    /// buffer once the caller has received all of them.
+    fn drain_pending(&mut self, output: &mut [u8]) -> usize {
+        let available = &self.out_pending[self.out_pending_pos..];
+        let to_copy = available.len().min(output.len());
+        output[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.out_pending_pos += to_copy;
+        if self.out_pending_pos >= self.out_pending.len() {
+            self.out_pending = Vec::new();
+            self.out_pending_pos = 0;
+        }
+        to_copy
+    }
+
+    /// `true` while compressed bytes are staged but not yet handed back.
+    fn has_pending(&self) -> bool {
+        self.out_pending_pos < self.out_pending.len()
     }
 
     /// Encode data.
@@ -400,12 +450,41 @@ impl Default for LzhEncoder {
 }
 
 impl Compressor for LzhEncoder {
+    /// Streaming compression: compressed bytes that do not fit in `output`
+    /// are staged inside the encoder and drained across subsequent calls.
+    ///
+    /// A call that stages more than it can deliver reports
+    /// [`NeedsOutput`](CompressStatus::NeedsOutput); pure drain calls report
+    /// `consumed == 0` so the caller re-offers its unconsumed input, and
+    /// [`Done`](CompressStatus::Done) is reported only once a
+    /// [`FlushMode::Finish`] stream has been delivered in full.
+    ///
+    /// Before 0.4.2 the bytes that did not fit were silently **discarded**
+    /// while the call still reported `NeedsOutput`/`Done`, so
+    /// [`compress_all`](Compressor::compress_all) — which uses a fixed 32 KiB
+    /// buffer — returned a truncated stream, with no error, for any payload
+    /// whose compressed form exceeded that size.
     fn compress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         flush: FlushMode,
     ) -> Result<(usize, usize, CompressStatus)> {
+        // Deliver anything staged by a previous call before compressing more:
+        // the encoder must never hold output the caller has not seen while
+        // also reporting that it is done.
+        if self.has_pending() {
+            let to_copy = self.drain_pending(output);
+            let status = if self.has_pending() {
+                CompressStatus::NeedsOutput
+            } else if self.finished {
+                CompressStatus::Done
+            } else {
+                CompressStatus::NeedsInput
+            };
+            return Ok((0, to_copy, status));
+        }
+
         if self.finished {
             return Ok((0, 0, CompressStatus::Done));
         }
@@ -413,15 +492,31 @@ impl Compressor for LzhEncoder {
         let finish = matches!(flush, FlushMode::Finish);
 
         let mut buffer = Vec::new();
-        self.encode(input, &mut buffer, finish)?;
+        if buffers_whole_input(self.method) {
+            // `-lh1-`/`-lh2-`/`-lh3-`/`-lzs-`/`-lz5-` cannot encode a prefix:
+            // hold every byte until the caller finishes, then encode once.
+            // Without this, `compress_all` (which drives `FlushMode::None`
+            // while input remains) could not compress with these methods at
+            // all — it failed with "requires a single call with finish=true"
+            // for any non-empty payload.
+            self.in_pending.extend_from_slice(input);
+            if !finish {
+                return Ok((input.len(), 0, CompressStatus::NeedsInput));
+            }
+            let data = std::mem::take(&mut self.in_pending);
+            self.encode(&data, &mut buffer, true)?;
+        } else {
+            self.encode(input, &mut buffer, finish)?;
+        }
 
-        let to_copy = buffer.len().min(output.len());
-        output[..to_copy].copy_from_slice(&buffer[..to_copy]);
+        self.out_pending = buffer;
+        self.out_pending_pos = 0;
+        let to_copy = self.drain_pending(output);
 
-        let status = if finish {
-            CompressStatus::Done
-        } else if to_copy < buffer.len() {
+        let status = if self.has_pending() {
             CompressStatus::NeedsOutput
+        } else if finish {
+            CompressStatus::Done
         } else {
             CompressStatus::NeedsInput
         };
@@ -433,8 +528,10 @@ impl Compressor for LzhEncoder {
         LzhEncoder::reset(self);
     }
 
+    /// `true` only once the stream has been finished **and** every staged
+    /// byte has been handed back to the caller.
     fn is_finished(&self) -> bool {
-        self.finished
+        self.finished && !self.has_pending()
     }
 }
 

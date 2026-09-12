@@ -22,10 +22,10 @@
 //!
 //! // Compress data
 //! let original = b"Hello, World! Hello, World!";
-//! let compressed = deflate(original, 6).unwrap();
+//! let compressed = deflate(original, 6).expect("deflate");
 //!
 //! // Decompress data
-//! let decompressed = inflate(&compressed).unwrap();
+//! let decompressed = inflate(&compressed).expect("inflate");
 //! assert_eq!(&decompressed, original);
 //! ```
 //!
@@ -54,26 +54,39 @@
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub(crate) mod decode_table;
 pub mod deflate;
+mod encoder;
 pub mod gzip;
 pub mod huffman;
 pub mod inflate;
+pub(crate) mod inflate_core;
 pub mod lz77;
 pub mod optimal;
 pub mod pool;
+pub mod reader;
+pub(crate) mod sink;
+pub mod stream;
 pub mod streaming;
 pub mod tables;
 mod window;
+pub mod wrapper;
 pub mod zlib;
 
 #[cfg(feature = "async-io")]
 pub mod async_deflate;
 
 #[cfg(feature = "async-io")]
+pub mod async_reader;
+
+#[cfg(feature = "async-io")]
 pub mod raw_stream;
 
 #[cfg(feature = "parallel")]
 pub mod parallel;
+
+#[cfg(feature = "async-io")]
+pub use async_reader::AsyncInflateReader;
 
 #[cfg(feature = "async-io")]
 pub use raw_stream::{RawDeflateWriter, RawInflateReader};
@@ -86,13 +99,17 @@ pub use parallel::{
 
 // Re-exports
 pub use deflate::{Deflater, MAX_DICTIONARY_SIZE, deflate};
+pub use encoder::{LevelConfig, Strategy};
 pub use gzip::{GzipDecoder, GzipEncoder, gzip_compress, gzip_decompress};
 pub use huffman::{HuffmanBuilder, HuffmanTree};
 pub use inflate::{Inflater, MAX_OUTPUT_CAPACITY_HINT, inflate, inflate_into};
 pub use lz77::{Lz77Encoder, Lz77Params, Lz77Preset, Lz77Token};
 pub use optimal::OptimalParser;
 pub use pool::{DeflatePool, PoolStats};
+pub use reader::InflateReader;
+pub use stream::{InflateProgress, InflateStatus, InflateStream};
 pub use streaming::{GzipStreamDecoder, GzipStreamEncoder, ZlibStreamDecoder, ZlibStreamEncoder};
+pub use wrapper::{GzipHeaderInfo, InflateWrapper, TrailingPolicy, WrappedInflate};
 pub use zlib::{
     Adler32, ZlibCompressor, ZlibDecompressor, zlib_compress, zlib_compress_with_dict,
     zlib_decompress, zlib_decompress_into, zlib_decompress_with_dict, zlib_requires_dictionary,

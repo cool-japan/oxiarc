@@ -1,0 +1,86 @@
+[package]
+name = "oxiarc-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "HTTP content-coding (RFC 9110 Content-Encoding / Accept-Encoding: gzip, deflate, br, zstd) for OxiArc - Pure Rust, bounded, incremental"
+readme = "README.md"
+keywords = ["http", "gzip", "content-encoding", "brotli", "zstd"]
+categories = ["compression", "web-programming::http-client", "web-programming::http-server"]
+exclude = ["TODO.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["gzip", "deflate"]
+# RFC 1952 gzip / x-gzip. Both sides: `encode_body`/`Encoder`, and the
+# `Decoder`/`DecodedBody` gzip stage (multi-member, RFC 1952 §2.2).
+gzip = ["dep:oxiarc-deflate"]
+# RFC 1950 zlib-wrapped deflate (and the RFC 9110 §8.4.1.2 raw-deflate sniff,
+# decode side only). Shares `oxiarc-deflate` with `gzip`; the two features are
+# independent switches over the same dependency.
+deflate = ["dep:oxiarc-deflate"]
+# RFC 7932 Brotli.
+brotli = ["dep:oxiarc-brotli"]
+# RFC 8878 Zstandard, and `dcz` (Compression Dictionary Transport, RFC 9842)
+# when a dictionary is supplied — see `EncodeOptions::dictionary`. `brotli`
+# carries the same coding's `dcb` variant.
+zstd = ["dep:oxiarc-zstd"]
+# Legacy UNIX `compress` / `x-compress` — `oxiarc_lzw::z`'s `.Z` container,
+# both directions (`Decoder`/`decode_body` decode; `encode_body`/`Encoder`
+# encode). `.Z` has no end-of-information code: a truncated body decodes to
+# a valid, silently short prefix, not an error — see
+# `ContentCoding::Compress`'s doc comment.
+compress = ["dep:oxiarc-lzw"]
+# `AsyncDecodedBody`, the `tokio::io::AsyncRead` twin of `DecodedBody`.
+async-io = ["dep:tokio", "oxiarc-core/async-io"]
+# Differential oracle tests (tests/http_oracle.rs) that decode streams built
+# by CPython's `zlib`/`gzip` modules and by the reference `brotli` / `zstd`
+# CLIs, rather than by oxiarc's own encoders. Self-skips (does not fail) at
+# runtime when a tool is absent, matching the established `zlib-oracle` /
+# `brotli-oracle` / `zstd-oracle` pattern. Never enabled by default; not
+# needed for normal library use.
+http-oracle = []
+
+[dependencies]
+oxiarc-core = { workspace = true }
+oxiarc-deflate = { workspace = true, optional = true }
+oxiarc-brotli = { workspace = true, optional = true }
+oxiarc-zstd = { workspace = true, optional = true }
+oxiarc-lzw = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+# The tests, examples and benches build fixtures with the matching oxiarc
+# encoders, so they need these unconditionally — the library's own use of
+# them stays feature-gated and optional above.
+# Path-only (no version): a versioned sibling dev-dependency survives into
+# the packaged manifest (cargo strips `path` but keeps `version`), and
+# `cargo publish` then fails resolving it against crates.io before that
+# sibling's own release has landed. Path-only dev-deps are dropped from the
+# published manifest entirely, so this only ever affects local `cargo test`.
+oxiarc-deflate = { path = "../oxiarc-deflate" }
+oxiarc-brotli = { path = "../oxiarc-brotli" }
+oxiarc-zstd = { path = "../oxiarc-zstd" }
+# tests/cross_crate_inflate.rs only: proves a PNG IDAT stream, a TIFF
+# deflate strip and an HTTP gzip body all decode byte-identically through
+# the same oxiarc-deflate core, however the input is split. Both crates'
+# own default features are used as-is (PNG has no cargo features to gate
+# the base codec; TIFF's `deflate` codec is in its default feature set).
+oxiarc-png = { path = "../oxiarc-png" }
+oxiarc-tiff = { path = "../oxiarc-tiff" }
+
+[[bench]]
+name = "decode_bench"
+harness = false
+
+[lints]
+workspace = true

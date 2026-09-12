@@ -153,6 +153,16 @@ const HUFFMAN_LITERALS_MIN: usize = 64;
 ///
 /// Chooses the smallest valid representation among RLE (all bytes equal),
 /// Huffman-compressed (when it wins and self-verifies), and Raw.
+/// [`encode_literals_section`] for the literals decoder's own tests.
+///
+/// The four-stream Huffman sections this produces are the only realistic
+/// input for the differential between the interleaved and checked decoders,
+/// and hand-writing one would test the hand-written bits, not the format.
+#[cfg(test)]
+pub(crate) fn encode_literals_section_for_test(literals: &[u8]) -> Result<Vec<u8>> {
+    encode_literals_section(literals)
+}
+
 fn encode_literals_section(literals: &[u8]) -> Result<Vec<u8>> {
     if literals.is_empty() {
         // Raw literals with 0 size: single header byte.
@@ -542,10 +552,13 @@ fn choose_mode(frequencies: &[u32], category: TableCategory) -> SequenceCompress
     // Single distinct symbol -> RLE.
     let mut used = frequencies.iter().enumerate().filter(|&(_, &f)| f > 0);
     let first = used.next();
-    if let Some((symbol, &count)) = first
-        && count == total
-    {
-        return SequenceCompressionMode::Rle(symbol as u8);
+    // NOTE: deliberately NOT an `if let ... && ...` let-chain: those need
+    // rustc 1.88 and this workspace's MSRV is 1.85 (see `rust-version` in the
+    // root Cargo.toml and `msrv` in clippy.toml).
+    if let Some((symbol, &count)) = first {
+        if count == total {
+            return SequenceCompressionMode::Rle(symbol as u8);
+        }
     }
 
     let predefined = predefined_distribution(category);
@@ -1289,15 +1302,21 @@ mod tests {
         for (index, (got, &(literal_len, match_len, offset))) in
             decoded.iter().zip(expected.iter()).enumerate()
         {
+            // `Sequence` stores the format's `u32` bounds; the expectations
+            // here are `usize`, so widen the decoded side rather than
+            // narrowing (and possibly truncating) the expectation.
             assert_eq!(
-                got.literal_length, literal_len,
+                got.literal_length as usize, literal_len,
                 "literal length differs at sequence {index}"
             );
             assert_eq!(
-                got.match_length, match_len,
+                got.match_length as usize, match_len,
                 "match length differs at sequence {index}"
             );
-            assert_eq!(got.offset, offset, "offset differs at sequence {index}");
+            assert_eq!(
+                got.offset as usize, offset,
+                "offset differs at sequence {index}"
+            );
         }
     }
 

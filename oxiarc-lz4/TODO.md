@@ -1,4 +1,4 @@
-# oxiarc-lz4 - Development Status (v0.4.1, 2026-07-30)
+# oxiarc-lz4 - Development Status (v0.4.2, 2026-08-06)
 
 ## Completed Features (COMPLETE)
 

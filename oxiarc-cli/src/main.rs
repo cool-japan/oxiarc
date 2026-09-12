@@ -3,6 +3,7 @@
 //! A Pure Rust archive utility supporting ZIP, GZIP, TAR, LZH, XZ, 7z, CAB, LZ4, Zstd, Bzip2, Brotli, and Snappy formats.
 
 mod commands;
+mod image_probe;
 mod style;
 mod utils;
 mod windows;
@@ -27,6 +28,7 @@ use style::{ColorChoice, Styler};
 #[command(long_about = "
 OxiArc is a Pure Rust implementation of common archive formats.
 Supported formats: ZIP, GZIP, TAR, LZH, XZ, 7z, LZ4, Zstd, Bzip2, Brotli, Snappy
+The detect and info subcommands additionally recognise PNG, JPEG and TIFF images by magic.
 
 Examples:
   oxiarc list archive.zip
@@ -54,6 +56,8 @@ Examples:
   oxiarc convert archive.7z output.zip
   oxiarc test archive.lzh
   oxiarc info archive.7z
+  oxiarc detect photo.jpg
+  oxiarc info image.png
   oxiarc man ./man
 ")]
 /// Top-level parsed command line for the `oxiarc` binary.
@@ -257,14 +261,14 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Show information about an archive
+    /// Show information about an archive, or a PNG/JPEG/TIFF image
     #[command(alias = "i")]
     Info {
-        /// Archive file to inspect (use "-" for stdin)
+        /// Archive or image file to inspect (use "-" for stdin)
         archive: String,
     },
 
-    /// Detect archive format
+    /// Detect archive format, or a PNG/JPEG/TIFF image
     Detect {
         /// File to detect (use "-" for stdin)
         file: String,

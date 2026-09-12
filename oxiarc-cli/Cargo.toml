@@ -24,6 +24,15 @@ path = "src/main.rs"
 oxiarc-core.workspace = true
 oxiarc-archive.workspace = true
 oxiarc-lzma.workspace = true
+# Image-format recognition for `detect`/`info` only (a CLI-layer fallback,
+# never wired into `ArchiveFormat` — see repo-conventions.md §13's cost
+# table). `oxiarc-image` is deliberately not a dependency here: it is a
+# thin re-encoding facade, not a detection/inspection surface, so it would
+# add a dependency edge for no benefit over talking to these three crates
+# directly.
+oxiarc-png.workspace = true
+oxiarc-jpeg.workspace = true
+oxiarc-tiff.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 indicatif.workspace = true

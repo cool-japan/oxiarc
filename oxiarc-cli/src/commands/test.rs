@@ -330,8 +330,9 @@ pub fn cmd_test(
             }
         }
         _ => {
+            let hint = crate::utils::image_format_hint(&mut reader);
             return Err(format!(
-                "unsupported or unrecognized archive format for {}: {}",
+                "unsupported or unrecognized archive format for {}: {}{hint}",
                 input_display_name(archive),
                 format
             )

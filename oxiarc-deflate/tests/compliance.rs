@@ -26,12 +26,13 @@ fn expected_zlib_header(level: u8) -> (u8, u8) {
     let cmf: u8 = 0x78;
 
     // FLEVEL encoding (bits 6-7 of FLG)
+    // zlib's own `deflateInit2` mapping: level < 2 -> 0, level < 6 -> 1,
+    // level == 6 -> 2, else 3.
     let flevel: u8 = match level {
-        0..=2 => 0, // Fastest
-        3..=5 => 1, // Fast
+        0..=1 => 0, // Fastest
+        2..=5 => 1, // Fast
         6 => 2,     // Default
-        7..=9 => 3, // Maximum
-        _ => 2,     // Default fallback
+        _ => 3,     // Maximum
     };
 
     let fdict: u8 = 0;

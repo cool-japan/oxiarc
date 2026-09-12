@@ -3,11 +3,104 @@
 
 Pure Rust implementation of LZMA (Lempel-Ziv-Markov chain Algorithm) compression.
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.2-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.1** (2026-07-30) — 187 tests passing.
+**Version 0.4.2** (2026-09-08) — 277 tests passing (+ 12 doctests, 14 with
+`--all-features`).
+
+**What's new in 0.4.2**:
+
+- **A reusable decoder context, `xz::XzDecoder`.** `xz::decompress_into` is a
+  thin one-shot wrapper: every call parses a fresh `XzReader`, which starts
+  with no cached LZMA2 decoder and so rebuilds its dictionary buffer from
+  nothing. `XzDecoder::new()` / `.with_max_output(u64)` /
+  `.decompress_into(&mut self, src, dst)` / `.reset()` keeps that decoder
+  (dictionary buffer, probability model, coder state) allocated across
+  calls instead — the case this targets is TIFF `Compression = 34925`,
+  where every strip or tile of one image is its own complete `.xz` stream
+  and a large image can carry thousands of them, all sharing one dictionary
+  size. A stream declaring a different dictionary size still decodes
+  correctly; it just falls back to a fresh allocation, exactly like the
+  free function always does. `xz::decompress_into` /
+  `xz::decompress_with_limit` are unchanged, existing one-shot entry
+  points — `XzDecoder` is additive, not a replacement. Reuse is proven
+  byte-identical to always-fresh decoding (including across a dictionary
+  *size mismatch* mid-sequence) before it is measured for speed; a
+  criterion bench (`benches/xz_decoder_reuse.rs`, 1000 × 64 KiB same-shape
+  streams) compares reuse against fresh-per-call — on an otherwise-idle
+  machine this has measured as modestly faster (low single digits to
+  ~18%), but run it yourself for a number you can trust on your own
+  hardware rather than trusting a figure quoted here, since a build
+  machine under concurrent load can easily swing the two comparisons in
+  either direction. The LZMA2 probability model is reallocated fresh per
+  block by the format itself regardless of reuse (an independent XZ block
+  must reset its dictionary, state *and* properties), so only the
+  dictionary buffer's allocation is actually avoided; the win is real but
+  bounded at this payload size, and is reported honestly rather
+  than engineered to look larger.
+- **SHA-256 moved to `oxiarc_core::sha256`.** The `.xz` container's
+  `CheckType::Sha256` block check used to carry its own private FIPS 180-4
+  implementation; it now shares `oxiarc_core::sha256::Sha256` (`new`,
+  `update`, `finalize`, one-shot `compute`) with the rest of the ecosystem
+  — `oxiarc-http` can use the same implementation for the dictionary-hash
+  matching RFC 9842 (Compression Dictionary Transport) defines, without
+  depending on `oxiarc-lzma`. No wire-format or behavioural change; the
+  bytes a `CheckType::Sha256` stream carries are identical to before.
+- **New `oxiarc_lzma::xz` module — the `.xz` container lives here now.** The
+  stream/block framing, index, and CRC-32 / CRC-64 / SHA-256 checks moved out
+  of `oxiarc-archive/src/xz/`, which now re-exports this module unchanged
+  (`oxiarc_archive::xz::{CheckType, XzReader, XzWriter, compress, decompress}`
+  are the same paths, same behaviour). Image codecs can now read `.xz` without
+  pulling in eight archive codecs — TIFF `Compression = 34925` stores a
+  complete `.xz` stream per strip/tile.
+- **`.xz` block filter chains are implemented, not ignored.** The reader used
+  to parse the filter list only to find LZMA2's dictionary-size property and
+  silently drop every other filter, which produced *silently wrong output*
+  rather than an error. It now implements the Delta filter and all eight
+  BCJ branch converters (x86, PowerPC, IA-64, ARM, ARM-Thumb, SPARC, ARM64
+  and RISC-V), each validated byte-for-byte against liblzma and the `xz`
+  CLI in **both** directions — encode and decode are compared separately,
+  because a converter can round-trip its own output perfectly while
+  disagreeing with the reference. Unknown filter IDs are a hard error.
+  This is what makes libtiff's LZMA TIFFs (`Delta(dist=1) + LZMA2`) decode
+  correctly.
+- **The block check is verified after the filter chain**, per the xz spec —
+  it covers the block's original data, not the LZMA2 output.
+- **Multi-stream `.xz` files decode completely.** A `.xz` file is one or more
+  streams with optional Stream Padding (what `cat a.xz b.xz` and parallel
+  compressors produce); the reader used to stop after the first stream and
+  return its bytes as a clean success — a silent short read. It now decodes
+  every stream and concatenates them exactly as `xz -d` does (verified
+  against `xz 5.8.3`, including its rule that trailing padding must be a
+  multiple of four null bytes), and rejects trailing garbage instead of
+  ignoring it.
+- **Header fields that carry redundancy are cross-checked.** libtiff writes
+  `LZMA_CHECK_NONE`, so on that path there is no checksum at all: a block's
+  declared Uncompressed Size is now compared with what it decoded to, the
+  index's record count with the number of blocks actually read, and the
+  reserved block-header flag bits must be zero (all three were parsed and
+  discarded before).
+- **Every padding and checksum field of the container is now verified.**
+  Block Padding and Index Padding must be null bytes (xz spec 3.4 / 4.4);
+  Block Padding is covered by no checksum at all, and on a
+  `LZMA_CHECK_NONE` stream — what libtiff writes — neither is the block, so
+  accepting arbitrary bytes there meant accepting bytes nothing checked.
+  The Stream Footer's own CRC-32 is verified (it was read and ignored), a
+  declared Compressed Size of zero is rejected instead of falling through
+  to the self-describing block path, and a block's LZMA2 payload must be
+  consumed exactly by the decoder.
+- **`XzWriter` writes multi-block streams.** A payload whose compressed form
+  exceeded the reader's 100 MiB per-block limit used to produce a file this
+  crate could not read back; input is now split into blocks of at most
+  `with_block_size(...)` uncompressed bytes (64 MiB by default), one index
+  record each. Streams that fit in one block are byte-identical to before.
+- **Bounded decoding**: `xz::decompress_into(src, &mut dst)` decodes a complete
+  `.xz` stream into a caller-sized buffer, and `xz::decompress_with_limit(data,
+  max)` caps a growable decode. Both enforce the cap *during* decoding (after
+  every LZMA2 chunk), so a decompression bomb is rejected before it is
+  materialised; `XzReader::with_max_output(u64)` exposes the same guard.
 
 **What's new in 0.3.6**:
 
@@ -46,7 +139,7 @@ It's used in:
 - **Pure Rust** - No C bindings, fully safe code
 - **Compression and Decompression** - Full roundtrip support
 - **Configurable levels** - 0-9 compression levels
-- **Streaming API** - Memory-efficient processing
+- **Streaming API** - `Lzma2StreamEncoder`/`Lzma2StreamDecoder` (`std::io::Write`/`Read`) genuinely stream LZMA2 chunk-at-a-time with bounded memory; `LzmaCompressor`/`LzmaDecompressor` (in `streaming.rs`) are a *different*, one-shot `&[u8] -> Vec<u8>` pair that only pre-flights a memory-budget estimate before running — see their doc comments before reaching for them expecting incremental I/O
 - **Range Coder** - Precise 11-bit probability model
 - **Progress reporting** - `with_progress(Arc<dyn ProgressSink>)` builder on LZMA2 codecs
 - **Cooperative cancellation** - `with_cancel(CancellationToken)` builder on LZMA2 codecs
@@ -170,9 +263,12 @@ let compressed = compress(data, LzmaLevel::DEFAULT)?;
 // Raw compression (no header)
 let raw = compress_raw(data, LzmaLevel::DEFAULT)?;
 
-// Streaming encoder
+// Builder-configured one-shot encoder (NOT streaming despite the type
+// living alongside the codec's other builders: `compress` takes `self`
+// and the whole input in one call, returning the whole output)
 let mut encoder = LzmaEncoder::new(LzmaLevel::DEFAULT);
 let compressed = encoder.compress(data)?;
+// For genuine chunk-at-a-time I/O, use `Lzma2StreamEncoder`/`Lzma2StreamDecoder` instead.
 ```
 
 ### Decompression
@@ -254,10 +350,10 @@ assert_eq!(&decompressed, data.as_ref());
 ```toml
 [dependencies]
 # Default (serial only)
-oxiarc-lzma = "0.4.1"
+oxiarc-lzma = "0.4.2"
 
 # With parallel LZMA2 compression
-oxiarc-lzma = { version = "0.4.1", features = ["parallel"] }
+oxiarc-lzma = { version = "0.4.2", features = ["parallel"] }
 ```
 
 ## Usage
@@ -266,7 +362,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-lzma = "0.4.1"
+oxiarc-lzma = "0.4.2"
 ```
 
 ## Modules

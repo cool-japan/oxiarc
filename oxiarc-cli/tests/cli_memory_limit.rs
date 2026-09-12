@@ -355,3 +355,102 @@ fn test_single_file_extract_creates_missing_output_dir() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// FINALGATE F1: a valid RFC 1952 §2.2 concatenated `.gz` (`cat a.gz b.gz`,
+/// `pigz`, `bgzip`, rsyncable gzips) must extract to the concatenation of
+/// every member. It used to fail with a spurious `CRC mismatch` and exit 1,
+/// because the archive-layer reader treated the file's *last* 8 bytes as the
+/// only trailer and inflated everything before them as one member.
+#[test]
+fn test_multi_member_gzip_extracts_every_member() {
+    let dir = unique_dir("multimember_gz");
+    let archive = dir.join("two.gz");
+
+    let first = b"first member payload\n".repeat(400);
+    let second = b"second member payload\n".repeat(400);
+    let mut stream = compress(&first, "gz");
+    stream.extend_from_slice(&compress(&second, "gz"));
+    std::fs::write(&archive, &stream).expect("write multi-member fixture");
+
+    let out = dir.join("out");
+    let output = Command::new(cli_bin())
+        .args(["extract", "--color=never"])
+        .arg(&archive)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("run oxiarc extract");
+
+    assert!(
+        output.status.success(),
+        "multi-member .gz extract failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    assert_eq!(
+        std::fs::read(out.join("payload.bin")).expect("read extracted file"),
+        expected,
+        "multi-member .gz lost a member"
+    );
+
+    // `oxiarc test` and `oxiarc list` go through the same reader.
+    for subcommand in ["test", "list"] {
+        let output = Command::new(cli_bin())
+            .args([subcommand, "--color=never"])
+            .arg(&archive)
+            .output()
+            .expect("run oxiarc subcommand");
+        assert!(
+            output.status.success(),
+            "`oxiarc {subcommand}` on a multi-member .gz failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The multi-member fix must not open a `--memory-limit` hole: a bomb split
+/// across three members, each individually under the limit, is still refused
+/// (the cap now bounds the running total across every member, inside a
+/// DEFLATE block, rather than trusting the last member's ISIZE field).
+#[test]
+fn test_multi_member_gzip_bomb_rejected_under_memory_limit() {
+    let dir = unique_dir("multimember_bomb");
+    let archive = dir.join("bomb.gz");
+
+    let member = vec![0u8; BOMB_SIZE / 3];
+    let mut stream = compress(&member, "gz");
+    stream.extend_from_slice(&compress(&member, "gz"));
+    stream.extend_from_slice(&compress(&member, "gz"));
+    std::fs::write(&archive, &stream).expect("write multi-member bomb");
+
+    let out = dir.join("out");
+    let output = Command::new(cli_bin())
+        .args(["extract", "--color=never", "--memory-limit", LIMIT])
+        .arg(&archive)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("run oxiarc extract");
+
+    assert!(
+        !output.status.success(),
+        "multi-member gzip bomb was accepted under --memory-limit {LIMIT}"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "multi-member gzip bomb panicked instead of erroring cleanly"
+    );
+    assert_eq!(
+        files_written(&out),
+        0,
+        "multi-member gzip bomb was rejected but still wrote output files"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

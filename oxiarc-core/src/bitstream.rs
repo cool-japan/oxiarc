@@ -28,15 +28,15 @@
 //! let mut output = Vec::new();
 //! {
 //!     let mut writer = BitWriter::new(&mut output);
-//!     writer.write_bits(0b101, 3).unwrap();  // Write 3 bits
-//!     writer.write_bits(0b1100, 4).unwrap(); // Write 4 bits
-//!     writer.flush().unwrap();
+//!     writer.write_bits(0b101, 3).expect("write 3 bits");  // Write 3 bits
+//!     writer.write_bits(0b1100, 4).expect("write 4 bits"); // Write 4 bits
+//!     writer.flush().expect("flush writer");
 //! }
 //!
 //! // Reading bits
 //! let mut reader = BitReader::new(Cursor::new(&output));
-//! assert_eq!(reader.read_bits(3).unwrap(), 0b101);
-//! assert_eq!(reader.read_bits(4).unwrap(), 0b1100);
+//! assert_eq!(reader.read_bits(3).expect("read 3 bits"), 0b101);
+//! assert_eq!(reader.read_bits(4).expect("read 4 bits"), 0b1100);
 //! ```
 
 use crate::error::{OxiArcError, Result};
@@ -149,6 +149,126 @@ impl BitCache {
         }
         self.len -= n;
         self.consumed += n as u64;
+    }
+
+    /// Load whole bytes from `src` with one unaligned 64-bit little-endian
+    /// read, returning the number of bytes taken (`0` or `1..=7`).
+    ///
+    /// This is the accumulator-only form of the bulk refill a
+    /// [`BitReader`] performs against its prefetch buffer: it lets a decoder
+    /// that already owns the compressed bytes as a slice run the same single
+    /// `u64::from_le_bytes` per refill without a `Read` in the loop.
+    ///
+    /// Returns `0` (a no-op) when fewer than 8 bytes are available — the
+    /// load reads 8 bytes even though it keeps at most 7 — or when the cache
+    /// already holds more than 55 bits. Callers must therefore fall back to
+    /// [`BitCache::refill_bytes`] for the tail of a stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_core::BitCache;
+    ///
+    /// let mut cache = BitCache::default();
+    /// let taken = cache.refill_bulk(&[0xFF; 8]);
+    /// assert_eq!(taken, 7);
+    /// assert_eq!(cache.available(), 56);
+    /// // Fewer than 8 bytes: nothing is loaded.
+    /// assert_eq!(BitCache::default().refill_bulk(&[0xFF; 7]), 0);
+    /// ```
+    #[inline(always)]
+    pub fn refill_bulk(&mut self, src: &[u8]) -> usize {
+        if self.len > 55 {
+            return 0;
+        }
+        match src.first_chunk::<8>() {
+            Some(chunk) => bulk_load(chunk, &mut self.buffer, &mut self.len),
+            None => 0,
+        }
+    }
+
+    /// Top up the cache one byte at a time until it holds at least `want`
+    /// bits or `src` is exhausted, returning the number of bytes taken.
+    ///
+    /// `want` must be at most 56, which keeps the accumulator within its
+    /// 63-bit ceiling. Running out of input is not an error: the caller
+    /// detects it through [`BitCache::available`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_core::BitCache;
+    ///
+    /// let mut cache = BitCache::default();
+    /// assert_eq!(cache.refill_bytes(&[0x01, 0x02, 0x03], 16), 2);
+    /// assert_eq!(cache.available(), 16);
+    /// assert_eq!(cache.peek_bits(8), 0x01);
+    /// ```
+    #[inline]
+    pub fn refill_bytes(&mut self, src: &[u8], want: u8) -> usize {
+        debug_assert!(want <= 56);
+        let mut used = 0usize;
+        while self.len < want && self.len <= 55 {
+            let Some(&byte) = src.get(used) else {
+                break;
+            };
+            self.buffer |= (byte as u64) << self.len;
+            self.len += 8;
+            used += 1;
+        }
+        used
+    }
+
+    /// Discard the sub-byte remainder so the cache holds whole bytes only.
+    ///
+    /// Returns the number of bits discarded, which are counted as consumed
+    /// (the analogue of [`BitReader::align_to_byte`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_core::BitCache;
+    ///
+    /// let mut cache = BitCache::default();
+    /// cache.refill_bytes(&[0xAB, 0xCD], 16);
+    /// cache.consume(3);
+    /// assert_eq!(cache.align_to_byte(), 5);
+    /// assert_eq!(cache.available(), 8);
+    /// ```
+    #[inline]
+    pub fn align_to_byte(&mut self) -> u8 {
+        let remainder = self.len % 8;
+        if remainder > 0 {
+            self.consume(remainder);
+        }
+        remainder
+    }
+
+    /// Pop one whole byte, LSB-first, when at least 8 bits are held.
+    ///
+    /// The cache must already be byte-aligned (see
+    /// [`BitCache::align_to_byte`]); otherwise the byte returned would
+    /// straddle two stream bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oxiarc_core::BitCache;
+    ///
+    /// let mut cache = BitCache::default();
+    /// cache.refill_bytes(&[0xAB, 0xCD], 16);
+    /// assert_eq!(cache.take_byte(), Some(0xAB));
+    /// assert_eq!(cache.take_byte(), Some(0xCD));
+    /// assert_eq!(cache.take_byte(), None);
+    /// ```
+    #[inline]
+    pub fn take_byte(&mut self) -> Option<u8> {
+        if self.len < 8 {
+            return None;
+        }
+        let byte = (self.buffer & 0xFF) as u8;
+        self.consume(8);
+        Some(byte)
     }
 }
 
@@ -1466,5 +1586,111 @@ mod tests {
             .read_bits(16)
             .expect_err("must surface EOF once the reader is genuinely exhausted");
         assert!(matches!(err, OxiArcError::UnexpectedEof { .. }));
+    }
+
+    // ── BitCache slice-side refills ─────────────────────────────────────
+    //
+    // These must reproduce, bit for bit, what a `BitReader` over the same
+    // bytes produces: the slice-driven DEFLATE decoder relies on it.
+
+    /// Deterministic xorshift PRNG (no external dependency).
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn cache_refill_bulk_matches_bit_reader() {
+        let mut rng = XorShift(0x1234_5678_9ABC_DEF0);
+        let data: Vec<u8> = (0..4096).map(|_| rng.next_u64() as u8).collect();
+
+        let mut cache = BitCache::default();
+        let mut pos = 0usize;
+        let mut reference = BitReader::buffered(Cursor::new(data.clone()));
+
+        // Read a pseudo-random schedule of bit widths through both paths.
+        for _ in 0..2000 {
+            let want = (rng.next_u64() % 17) as u8 + 1;
+            if cache.available() < want {
+                if let Some(rest) = data.get(pos..) {
+                    pos += cache.refill_bulk(rest);
+                }
+                if let Some(rest) = data.get(pos..) {
+                    pos += cache.refill_bytes(rest, want);
+                }
+            }
+            if cache.available() < want {
+                break;
+            }
+            let got = cache.peek_bits(want);
+            cache.consume(want);
+            let expected = reference.read_bits(want).expect("reference read");
+            assert_eq!(got, expected, "bit stream diverged at width {want}");
+        }
+    }
+
+    #[test]
+    fn cache_refill_bulk_is_a_noop_when_short_or_full() {
+        let mut cache = BitCache::default();
+        assert_eq!(cache.refill_bulk(&[0u8; 7]), 0);
+        assert_eq!(cache.available(), 0);
+
+        assert_eq!(cache.refill_bulk(&[0xFFu8; 8]), 7);
+        assert_eq!(cache.available(), 56);
+        // 56 > 55, so the second bulk load is refused.
+        assert_eq!(cache.refill_bulk(&[0xFFu8; 8]), 0);
+        assert_eq!(cache.available(), 56);
+    }
+
+    #[test]
+    fn cache_refill_bytes_stops_at_want_and_at_end_of_input() {
+        let mut cache = BitCache::default();
+        assert_eq!(cache.refill_bytes(&[1, 2, 3, 4], 24), 3);
+        assert_eq!(cache.available(), 24);
+        // Already satisfied: nothing more is taken.
+        assert_eq!(cache.refill_bytes(&[5, 6], 24), 0);
+        // Short input: takes what there is.
+        let mut cache = BitCache::default();
+        assert_eq!(cache.refill_bytes(&[9], 32), 1);
+        assert_eq!(cache.available(), 8);
+    }
+
+    #[test]
+    fn cache_refill_bytes_never_exceeds_the_accumulator_ceiling() {
+        let mut cache = BitCache::default();
+        let src = [0xFFu8; 16];
+        cache.refill_bytes(&src, 56);
+        assert!(cache.available() <= 63, "accumulator overflowed");
+        assert!(cache.available() >= 56);
+    }
+
+    #[test]
+    fn cache_align_and_take_byte() {
+        let mut cache = BitCache::default();
+        cache.refill_bytes(&[0xDE, 0xAD, 0xBE], 24);
+        cache.consume(4);
+        assert_eq!(cache.align_to_byte(), 4);
+        assert_eq!(cache.available(), 16);
+        assert_eq!(cache.take_byte(), Some(0xAD));
+        assert_eq!(cache.take_byte(), Some(0xBE));
+        assert_eq!(cache.take_byte(), None);
+        // Aligning an already-aligned cache is a no-op.
+        assert_eq!(cache.align_to_byte(), 0);
+    }
+
+    #[test]
+    fn cache_consumed_counts_aligned_and_taken_bits() {
+        let mut cache = BitCache::default();
+        cache.refill_bytes(&[1, 2, 3], 24);
+        cache.consume(3);
+        cache.align_to_byte();
+        cache.take_byte();
+        assert_eq!(cache.consumed(), 3 + 5 + 8);
     }
 }

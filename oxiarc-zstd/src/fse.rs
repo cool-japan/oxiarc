@@ -8,8 +8,9 @@
 //! (which carries a sentinel `1` bit above the final data bit) and consumes
 //! bits from the most-recently-written end towards byte 0. This mirrors the
 //! reference `BIT_initDStream` / `BIT_readBits` / `BIT_reloadDStream`
-//! semantics.
+//! semantics. That reader lives in [`crate::backward_bits`].
 
+use crate::backward_bits::FseBitReader;
 use oxiarc_core::error::{OxiArcError, Result};
 
 /// Maximum accuracy log for FSE tables (sequence literal/match lengths).
@@ -37,6 +38,19 @@ pub struct FseTable {
     entries: Vec<FseTableEntry>,
     /// Accuracy log (table size = 1 << accuracy_log).
     accuracy_log: u8,
+}
+
+/// The corruption error for an FSE state that fell outside its table.
+///
+/// Shared by [`FseTable::get`] and by callers that index [`FseTable::entries`]
+/// directly, so the two report the same thing for the same input.
+#[cold]
+#[inline(never)]
+pub fn state_out_of_range(state: usize, table_size: usize) -> OxiArcError {
+    OxiArcError::corrupted(
+        0,
+        format!("FSE state {state} out of range (table size {table_size})"),
+    )
 }
 
 impl FseTable {
@@ -166,16 +180,22 @@ impl FseTable {
     /// Get table entry for a given state, bounds-checked.
     #[inline]
     pub fn get(&self, state: usize) -> Result<&FseTableEntry> {
-        self.entries.get(state).ok_or_else(|| {
-            OxiArcError::corrupted(
-                0,
-                format!(
-                    "FSE state {} out of range (table size {})",
-                    state,
-                    self.entries.len()
-                ),
-            )
-        })
+        self.entries
+            .get(state)
+            .ok_or_else(|| state_out_of_range(state, self.entries.len()))
+    }
+
+    /// The decode table itself, for a loop that indexes it many times.
+    ///
+    /// A `&FseTable` reaches its entries through a `Vec` header, so every
+    /// lookup reloads a pointer and a length; the sequence loop performs three
+    /// per sequence and hoists the slices out with this instead. The
+    /// bounds check itself stays — an FSE state is derived from the bitstream
+    /// and a corrupt one must be refused, not masked into range — and
+    /// [`state_out_of_range`] keeps the message identical to [`Self::get`]'s.
+    #[inline]
+    pub fn entries(&self) -> &[FseTableEntry] {
+        &self.entries
     }
 
     /// Get the accuracy log.
@@ -187,125 +207,6 @@ impl FseTable {
     #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.entries.len()
-    }
-}
-
-/// FSE/Huffman backward bitstream reader (RFC 8878).
-///
-/// The encoder appends bit-fields least-significant-bit first into a
-/// little-endian bit sequence, then terminates the stream with a single `1`
-/// sentinel bit and zero-pads to a byte boundary. The decoder locates the
-/// sentinel in the **last** byte and reads fields back in reverse write
-/// order: each `read_bits(n)` returns the `n` bits immediately below the
-/// current position, exactly like the reference `BIT_readBits`.
-///
-/// Reads past the beginning of the stream ("overflow") yield zero bits and
-/// set an internal flag, matching `BIT_DStream_overflow`; callers decide
-/// whether that terminates decoding (Huffman-weight streams) or is an error
-/// (sequence streams).
-pub struct FseBitReader<'a> {
-    /// Input bytes.
-    data: &'a [u8],
-    /// Number of unread data bits (bit position of the read cursor, counting
-    /// from the start of the stream). Negative once over-read.
-    bits_remaining: i64,
-}
-
-impl<'a> FseBitReader<'a> {
-    /// Create a new FSE bit reader.
-    pub fn new(data: &'a [u8]) -> Result<Self> {
-        if data.is_empty() {
-            return Err(OxiArcError::corrupted(0, "empty FSE bitstream"));
-        }
-
-        let last_byte = data[data.len() - 1];
-        if last_byte == 0 {
-            return Err(OxiArcError::corrupted(
-                0,
-                "FSE bitstream has no sentinel bit (last byte is zero)",
-            ));
-        }
-
-        // The sentinel is the highest set bit of the last byte; data bits sit
-        // below it (and in all preceding bytes).
-        let sentinel_pos = 7 - last_byte.leading_zeros() as i64;
-        let bits_remaining = (data.len() as i64 - 1) * 8 + sentinel_pos;
-
-        Ok(Self {
-            data,
-            bits_remaining,
-        })
-    }
-
-    /// Number of unread data bits. Negative if the stream was over-read.
-    pub fn bits_remaining(&self) -> i64 {
-        self.bits_remaining
-    }
-
-    /// Whether more bits were consumed than the stream contains.
-    pub fn is_overflowed(&self) -> bool {
-        self.bits_remaining < 0
-    }
-
-    /// Whether the stream was consumed exactly (all data bits read, no overflow).
-    pub fn is_finished(&self) -> bool {
-        self.bits_remaining == 0
-    }
-
-    /// Peek `n` bits (n <= 32) below the current position without consuming.
-    ///
-    /// If fewer than `n` bits remain, the missing low bits read as zero
-    /// (mirroring the reference container behaviour near the stream start).
-    #[inline]
-    pub fn peek_bits(&self, n: u8) -> u32 {
-        debug_assert!(n <= 32);
-        if n == 0 {
-            return 0;
-        }
-        let end = self.bits_remaining;
-        if end <= 0 {
-            return 0;
-        }
-        let start = end - n as i64;
-        let lo = start.max(0);
-        let first_byte = (lo / 8) as usize;
-        // end >= 1 here, so (end - 1) is a valid bit index.
-        let last_byte = ((end - 1) / 8) as usize;
-
-        // Gather the covering bytes little-endian (at most 5 for n <= 32).
-        let mut window = 0u64;
-        for (k, idx) in (first_byte..=last_byte).enumerate() {
-            if let Some(&b) = self.data.get(idx) {
-                window |= (b as u64) << (8 * k);
-            }
-        }
-
-        let shift = (lo - first_byte as i64 * 8) as u32;
-        let avail = (end - lo) as u32; // 1..=32
-        let field = (window >> shift) & ((1u64 << avail) - 1);
-        // Bits below the stream start are zero: shift the real bits up.
-        let result = if start < 0 {
-            field << ((-start) as u32)
-        } else {
-            field
-        };
-        result as u32
-    }
-
-    /// Consume `n` bits without returning them.
-    #[inline]
-    pub fn skip_bits(&mut self, n: u8) {
-        self.bits_remaining -= n as i64;
-    }
-
-    /// Read `n` bits (n <= 32) from the stream.
-    ///
-    /// Over-reads return zero-padded values and mark the reader overflowed.
-    #[inline]
-    pub fn read_bits(&mut self, n: u8) -> u32 {
-        let value = self.peek_bits(n);
-        self.bits_remaining -= n as i64;
-        value
     }
 }
 

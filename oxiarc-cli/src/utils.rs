@@ -20,11 +20,17 @@ pub fn parse_byte_size(s: &str) -> Result<u64, String> {
     } else {
         (s, 1u64)
     };
-    num_str
+    let value = num_str
         .parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("invalid byte size: '{s}'"))
+        .map_err(|_| format!("invalid byte size: '{s}'"))?;
+    // `n * mult` overflows for anything past ~18 exabytes: in a debug build
+    // that is a panic, in a release build a silently wrapped (and therefore
+    // far too small) limit. Both are wrong; say so instead.
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("byte size out of range: '{s}'"))
 }
+use crate::image_probe::ImageKind;
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use oxiarc_core::{Entry, EntryType};
@@ -34,6 +40,66 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 pub type ExtractedEntry = (String, bool, Vec<u8>);
+
+/// How many leading bytes [`crate::image_probe::sniff`] can possibly need.
+///
+/// The longest magic it inspects is PNG's 8-byte signature (JPEG needs 3,
+/// TIFF 4), so a fixed, tiny prefix answers "is this an image?" exactly as
+/// well as the whole file would — and, unlike a `read_to_end`, it cannot be
+/// turned into an unbounded allocation by pointing the CLI at a huge file.
+const IMAGE_MAGIC_PREFIX: usize = 16;
+
+/// Read up to [`IMAGE_MAGIC_PREFIX`] bytes from the start of `reader` and
+/// ask [`crate::image_probe::sniff`] what they look like.
+///
+/// Rewinds `reader` to offset 0 first and leaves it positioned just past
+/// whatever was read; every caller either rewinds again or drops the reader
+/// immediately. Any I/O error degrades to `None` rather than let a
+/// diagnostics helper become the reported error.
+///
+/// See `image_probe`'s module docs for why images are recognised here at
+/// all, rather than through `oxiarc_archive::ArchiveFormat`.
+pub fn sniff_image_kind<R: Read + std::io::Seek>(reader: &mut R) -> Option<ImageKind> {
+    if reader.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return None;
+    }
+    let mut prefix = [0u8; IMAGE_MAGIC_PREFIX];
+    let mut filled = 0usize;
+    while filled < prefix.len() {
+        match reader.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    crate::image_probe::sniff(&prefix[..filled])
+}
+
+/// A short, clarifying suffix for an "unsupported/unrecognized archive
+/// format" error: empty for anything that is not a recognised image, or a
+/// note telling the user what the input actually is when it is one.
+///
+/// Every subcommand except `detect`/`info` still cannot act on a PNG/JPEG/
+/// TIFF file — none of them are archives — but "unrecognized format" alone
+/// reads as "this tool doesn't know what this file is" when the real
+/// situation is "this tool knows exactly what this is, and it isn't an
+/// archive". Rewinds `reader` to the start and reads at most
+/// [`IMAGE_MAGIC_PREFIX`] bytes (never the whole input); on any I/O error
+/// this degrades to an empty string rather than let a diagnostics helper
+/// itself become the reported error.
+///
+/// See `image_probe`'s module docs for why images are recognised here at
+/// all, rather than through `oxiarc_archive::ArchiveFormat`.
+pub fn image_format_hint<R: Read + std::io::Seek>(reader: &mut R) -> String {
+    match sniff_image_kind(reader) {
+        Some(kind) => format!(
+            " (this looks like a {}, not an archive — try `oxiarc info` or `oxiarc detect` instead)",
+            kind.label()
+        ),
+        None => String::new(),
+    }
+}
 
 /// A seekable byte source: either a file on disk or an in-memory buffer read
 /// from standard input. Used by the read-only commands (`list`, `test`,
@@ -449,5 +515,94 @@ mod tests {
     #[test]
     fn test_parse_byte_size_whitespace() {
         assert_eq!(parse_byte_size("  100M  ").unwrap(), 100_000_000);
+    }
+
+    #[test]
+    fn test_parse_byte_size_rejects_overflow() {
+        // `18446744073709551g` parses as a `u64` and only overflows on the
+        // multiply: a debug build used to panic here and a release build
+        // used to wrap to a nonsensically small limit.
+        assert!(parse_byte_size("18446744073709551g").is_err());
+        assert!(parse_byte_size("18446744073709551615k").is_err());
+        assert_eq!(parse_byte_size("18446744073709551615").unwrap(), u64::MAX);
+    }
+
+    /// `image_format_hint` exists purely to phrase an error better; it must
+    /// never buffer the whole input to do it. A 4 MiB blob whose first bytes
+    /// are a PNG signature must be answered after a single short read.
+    #[test]
+    fn image_format_hint_reads_only_a_short_prefix() {
+        let mut blob = b"\x89PNG\r\n\x1a\n".to_vec();
+        blob.resize(4 << 20, 0x5A);
+        let mut cursor = std::io::Cursor::new(blob);
+
+        let hint = image_format_hint(&mut cursor);
+        assert!(hint.contains("PNG image"), "hint: {hint}");
+        assert!(
+            cursor.position() <= IMAGE_MAGIC_PREFIX as u64,
+            "image_format_hint consumed {} bytes; it must stop after {IMAGE_MAGIC_PREFIX}",
+            cursor.position()
+        );
+
+        // And a non-image blob of the same size costs the same short read
+        // and produces no hint at all.
+        let mut other = std::io::Cursor::new(vec![0x00u8; 4 << 20]);
+        assert_eq!(image_format_hint(&mut other), "");
+        assert!(other.position() <= IMAGE_MAGIC_PREFIX as u64);
+    }
+
+    /// A source shorter than the prefix, and an empty one, must both be
+    /// answered without error.
+    #[test]
+    fn sniff_image_kind_handles_short_sources() {
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert_eq!(sniff_image_kind(&mut empty), None);
+
+        let mut three = std::io::Cursor::new(vec![0xFF, 0xD8, 0xFF]);
+        assert_eq!(sniff_image_kind(&mut three), Some(ImageKind::Jpeg));
+
+        let mut two = std::io::Cursor::new(vec![0xFF, 0xD8]);
+        assert_eq!(sniff_image_kind(&mut two), None);
+    }
+
+    /// A `Read` that only ever hands back one byte at a time (and throws an
+    /// `Interrupted` in between) must still fill the prefix: a magic split
+    /// across short reads is exactly what a pipe does.
+    #[test]
+    fn sniff_image_kind_survives_one_byte_reads() {
+        struct Dribble {
+            data: Vec<u8>,
+            pos: usize,
+            interrupt_next: bool,
+        }
+        impl Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                self.interrupt_next = true;
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        impl std::io::Seek for Dribble {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.pos = 0;
+                self.interrupt_next = false;
+                Ok(0)
+            }
+        }
+
+        let mut dribble = Dribble {
+            data: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+            pos: 0,
+            interrupt_next: false,
+        };
+        assert_eq!(sniff_image_kind(&mut dribble), Some(ImageKind::Png));
     }
 }

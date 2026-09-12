@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-test 1  "oxiarc-test " 
+.TH oxiarc-test 1  "oxiarc-test 0.4.2" 
 .SH NAME
 oxiarc\-test \- Test archive integrity
 .SH SYNOPSIS
-\fBoxiarc\-test\fR [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> 
+\fBoxiarc\-test\fR [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> 
 .SH DESCRIPTION
 Test archive integrity
 .SH OPTIONS
@@ -15,5 +15,10 @@ Show verbose output
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIARCHIVE\fR>
-Archive file to test
+Archive file to test (use "\-" for stdin)
+.SH VERSION
+v0.4.2

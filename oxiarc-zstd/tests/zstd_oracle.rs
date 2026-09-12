@@ -21,11 +21,28 @@ use std::process::{Command, Stdio};
 
 /// Locate the `zstd` binary via `which`; `None` means the tests self-skip.
 fn find_zstd() -> Option<PathBuf> {
-    let output = Command::new("which").arg("zstd").output().ok()?;
+    // Probe the bare name first and use it as-is when it spawns:
+    // `which` does not exist on Windows outside a POSIX shell (the
+    // oracle would silently self-skip there), and inside one — MSYS /
+    // Git Bash — it prints a POSIX path such as `/mingw64/bin/...`
+    // that `CreateProcess` cannot open (the oracle would then panic
+    // on spawn instead of running). Letting the OS resolve the name
+    // avoids both. Only spawnability is checked, not the exit status.
+    if Command::new("zstd").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("zstd"));
+    }
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("zstd").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if path.is_empty() {
         None
     } else {
@@ -599,4 +616,389 @@ fn oracle_encode_fse_compressed_sequence_tables() {
         "no block used FSE_Compressed_Mode; the oracle check would be vacuous"
     );
     eprintln!("[zstd-oracle] FSE_Compressed_Mode sequence tables accepted by reference zstd");
+}
+
+// ---------------------------------------------------------------------------
+// Incremental decode leg
+// ---------------------------------------------------------------------------
+
+/// Drive `ZstdStream` over `frame`, feeding `in_chunk` bytes per call and
+/// taking at most `out_chunk` bytes back, and return the decoded output.
+fn incremental_decode(frame: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, String> {
+    use oxiarc_core::traits::FlushMode;
+    use oxiarc_zstd::{ZstdStatus, ZstdStream};
+
+    // Reference frames made with `--long` declare 16-128 MiB windows, so the
+    // oracle raises the declared-window ceiling; the ring still only grows to
+    // the number of bytes actually produced.
+    let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; out_chunk.max(1)];
+    let mut pos = 0usize;
+    let mut calls = 0usize;
+
+    loop {
+        calls += 1;
+        if calls > 40_000_000 {
+            return Err("decoder did not terminate".to_string());
+        }
+        let end = pos.saturating_add(in_chunk).min(frame.len());
+        let flush = if end == frame.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream
+            .decode(&frame[pos..end], &mut scratch, flush)
+            .map_err(|e| e.to_string())?;
+        pos += progress.consumed;
+        out.extend_from_slice(&scratch[..progress.produced]);
+        if progress.status == ZstdStatus::StreamEnd {
+            stream.finish().map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
+    }
+}
+
+/// Decode direction, incremental: every reference frame across the full
+/// level/flag matrix must decode byte-identically through the *push* decoder,
+/// at several chunk schedules including one byte in / one byte out.
+#[test]
+fn oracle_incremental_decode_reference_frames() {
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_decode_reference_frames");
+        return;
+    }
+
+    let flag_sets: &[&[&str]] = &[
+        &["-1"],
+        &["-3"],
+        &["-9"],
+        &["-19"],
+        &["--ultra", "-22"],
+        &["--long=24", "-6"],
+        &["--no-check", "-3"],
+        &["--no-content-size", "-3"],
+    ];
+
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    for (name, data) in test_inputs() {
+        for flags in flag_sets {
+            let frame = zstd_compress(&data, flags)
+                .unwrap_or_else(|e| panic!("reference compress {name} {flags:?}: {e}"));
+
+            // Big payloads only get the coarse schedules so the suite stays
+            // fast; small ones get the pathological ones too.
+            let mut schedules: Vec<(usize, usize)> =
+                vec![(usize::MAX, 1 << 16), (1, 1 << 16), (4096, 37), (13, 7)];
+            if data.len() <= 4096 {
+                schedules.push((1, 1));
+                schedules.push((3, 5));
+            }
+
+            for (ic, oc) in schedules {
+                total += 1;
+                match incremental_decode(&frame, ic, oc) {
+                    Ok(out) if out == data => passed += 1,
+                    Ok(out) => panic!(
+                        "[{name} {flags:?} {ic}/{oc}] incremental decode produced {} bytes, expected {}",
+                        out.len(),
+                        data.len()
+                    ),
+                    Err(e) => panic!("[{name} {flags:?} {ic}/{oc}] incremental decode failed: {e}"),
+                }
+            }
+        }
+    }
+    assert_eq!(passed, total);
+    eprintln!(
+        "[zstd-oracle] incremental decode: {passed}/{total} reference frame/chunk-schedule pairs byte-identical"
+    );
+}
+
+/// The bounded one-shot helpers agree with the reference CLI, and their caps
+/// are honoured on reference frames.
+#[test]
+fn oracle_bounded_helpers_on_reference_frames() {
+    if find_zstd().is_none() {
+        skip_note("oracle_bounded_helpers_on_reference_frames");
+        return;
+    }
+
+    let mut checked = 0usize;
+    for (name, data) in test_inputs() {
+        for flags in [
+            &["-3"][..],
+            &["--long=24", "-6"][..],
+            &["--no-check", "-3"][..],
+        ] {
+            let frame = zstd_compress(&data, flags)
+                .unwrap_or_else(|e| panic!("reference compress {name} {flags:?}: {e}"));
+
+            let out = oxiarc_zstd::decompress_with_limit(&frame, data.len())
+                .unwrap_or_else(|e| panic!("[{name} {flags:?}] decompress_with_limit: {e}"));
+            assert_eq!(out, data, "[{name} {flags:?}] decompress_with_limit");
+
+            let mut dst = vec![0u8; data.len()];
+            let n = oxiarc_zstd::decompress_into(&frame, &mut dst)
+                .unwrap_or_else(|e| panic!("[{name} {flags:?}] decompress_into: {e}"));
+            assert_eq!(n, data.len(), "[{name} {flags:?}] decompress_into length");
+            assert_eq!(dst, data, "[{name} {flags:?}] decompress_into content");
+
+            if !data.is_empty() {
+                assert!(
+                    oxiarc_zstd::decompress_with_limit(&frame, data.len() - 1).is_err(),
+                    "[{name} {flags:?}] a tight cap must be enforced"
+                );
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("[zstd-oracle] bounded helpers: {checked} reference frames within cap");
+}
+
+/// A truncated reference frame must be an error through the push decoder — a
+/// short `Ok` would be silent data loss.
+#[test]
+fn oracle_incremental_truncation_is_an_error() {
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_truncation_is_an_error");
+        return;
+    }
+
+    let data = b"truncate me at every quarter ".repeat(400);
+    let frame = zstd_compress(&data, &["-6"]).expect("reference compress");
+    for cut in [1usize, frame.len() / 4, frame.len() / 2, frame.len() - 1] {
+        let result = incremental_decode(&frame[..cut], usize::MAX, 1 << 16);
+        assert!(
+            result.is_err(),
+            "truncation at {cut}/{} decoded successfully",
+            frame.len()
+        );
+    }
+}
+
+/// The single most important differential for a windowed decoder: reference
+/// frames whose payload is **far larger than their declared `Window_Size`**.
+///
+/// Everything else in this file compresses at most 600 KB, and `zstd`'s default
+/// window at level 3+ is 2 MiB, so no other test ever makes the ring wrap. Here
+/// the payload is 4 MiB against declared windows of 128 KiB and 1 KiB, so the
+/// ring wraps 32x and 4096x respectively and every back-reference lands at or
+/// near the window boundary — exactly the arithmetic that the old
+/// "whole output is the window" decoder never had to get right.
+#[test]
+fn oracle_incremental_small_window_large_payload() {
+    use oxiarc_core::traits::FlushMode;
+    use oxiarc_zstd::{ZstdStatus, ZstdStream};
+
+    if find_zstd().is_none() {
+        skip_note("oracle_incremental_small_window_large_payload");
+        return;
+    }
+
+    // Compressible enough that the encoder emits long matches, and long enough
+    // to wrap even a 1 KiB window thousands of times.
+    let mut raw = Vec::with_capacity(4 << 20);
+    let mut i = 0u32;
+    while raw.len() < (4 << 20) {
+        raw.extend_from_slice(
+            format!("record {i:08} name=widget-{} qty={}\n", i % 97, i % 13).as_bytes(),
+        );
+        i += 1;
+    }
+    raw.truncate(4 << 20);
+
+    let flag_sets: &[&[&str]] = &[
+        &["--zstd=wlog=17", "-6"],  // 128 KiB window, 32x wrap
+        &["--zstd=wlog=10", "-3"],  // 1 KiB window, 4096x wrap
+        &["--long=17", "-9"],       // long mode with a small window
+        &["--zstd=wlog=11", "-19"], // deep search, 2 KiB window
+    ];
+
+    for flags in flag_sets {
+        let frame = zstd_compress(&raw, flags)
+            .unwrap_or_else(|e| panic!("reference compress {flags:?}: {e}"));
+
+        // The declared window really is small, or the test proves nothing.
+        assert_eq!(frame[4] & 0x20, 0, "{flags:?}: expected a windowed frame");
+        let wd = frame[5];
+        let base = 1u64 << (10 + u32::from(wd >> 3));
+        let declared = base + (base >> 3) * u64::from(wd & 7);
+        assert!(
+            declared <= 256 * 1024,
+            "{flags:?}: declared window {declared} is not smaller than the payload"
+        );
+
+        for chunk in [usize::MAX, 4096, 1] {
+            let mut stream = ZstdStream::new().with_max_window(usize::MAX);
+            let mut out = Vec::with_capacity(raw.len());
+            let mut scratch = vec![0u8; 64 * 1024];
+            let mut pos = 0usize;
+            loop {
+                let end = pos.saturating_add(chunk).min(frame.len());
+                let flush = if end == frame.len() {
+                    FlushMode::Finish
+                } else {
+                    FlushMode::None
+                };
+                let progress = stream
+                    .decode(&frame[pos..end], &mut scratch, flush)
+                    .unwrap_or_else(|e| panic!("[{flags:?} chunk {chunk}] decode failed: {e}"));
+                pos += progress.consumed;
+                out.extend_from_slice(&scratch[..progress.produced]);
+                if progress.status == ZstdStatus::StreamEnd {
+                    break;
+                }
+            }
+            assert!(
+                out == raw,
+                "[{flags:?} chunk {chunk}] wrapped-ring decode differs from the input"
+            );
+            // The whole 4 MiB was produced through a ring no larger than the
+            // frame's declared window.
+            assert!(
+                stream.window_size() as u64 <= declared.max(1),
+                "[{flags:?}] window grew to {} for a declared {declared}",
+                stream.window_size()
+            );
+        }
+
+        // And through the bounded one-shot helper.
+        let got = oxiarc_zstd::decompress_with_limit(&frame, raw.len())
+            .unwrap_or_else(|e| panic!("[{flags:?}] decompress_with_limit: {e}"));
+        assert!(got == raw, "[{flags:?}] decompress_with_limit differs");
+    }
+
+    eprintln!(
+        "[zstd-oracle] wrapped-ring decode: 4 MiB through 1-128 KiB declared windows, byte-identical"
+    );
+}
+
+/// A real `zstd --train` (formatted, RFC 8878 §5) dictionary must be refused by
+/// name, never mistaken for raw content.
+///
+/// This is the case a hand-built fixture cannot prove: frames compressed
+/// against a formatted dictionary use `Repeat_Mode` for their sequence tables
+/// and may use `Treeless` literals, both of which resolve against the
+/// dictionary's *entropy tables* — data that a content-only seed does not
+/// carry. Accepting the dictionary as content would therefore hand back wrong
+/// bytes for exactly the frames that need it, which is why the decoder refuses
+/// it instead.
+#[test]
+fn oracle_formatted_dictionary_is_refused_not_misdecoded() {
+    if find_zstd().is_none() {
+        skip_note("oracle_formatted_dictionary_is_refused_not_misdecoded");
+        return;
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "oxiarc_zstd_oracle_traindict_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let samples = dir.join("samples");
+    std::fs::create_dir_all(&samples).expect("create scratch dir");
+
+    // Deterministic sample corpus for `--train` (a xorshift keeps it hermetic).
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let words = [
+        "alice", "bob", "carol", "dave", "users", "orders", "widgets", "invoices",
+    ];
+    for i in 0..400 {
+        let user = words[(next() % words.len() as u64) as usize];
+        let path = words[(next() % words.len() as u64) as usize];
+        let id = next() % 10_000;
+        let record = format!(
+            "{{\"user\":\"{user}\",\"action\":\"GET /api/v1/{path} HTTP/1.1\",\
+             \"host\":\"example.com\",\"id\":{id}}}\n"
+        );
+        let repeats = 1 + (next() % 4) as usize;
+        std::fs::write(samples.join(format!("s{i}.json")), record.repeat(repeats))
+            .expect("write sample");
+    }
+
+    let dict_path = dir.join("formatted.dict");
+    let train = Command::new("zstd")
+        .arg("--train")
+        .arg("-q")
+        .arg("--maxdict=16384")
+        .arg("-o")
+        .arg(&dict_path)
+        .args(
+            (0..400)
+                .map(|i| samples.join(format!("s{i}.json")))
+                .collect::<Vec<_>>(),
+        )
+        .output();
+    let trained = matches!(train, Ok(ref out) if out.status.success()) && dict_path.exists();
+    if !trained {
+        eprintln!(
+            "[zstd-oracle] `zstd --train` unavailable; skipping \
+             'oracle_formatted_dictionary_is_refused_not_misdecoded' (self-skip)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let dict = std::fs::read(&dict_path).expect("read dictionary");
+    assert_eq!(
+        &dict[..4],
+        &[0x37, 0xA4, 0x30, 0xEC],
+        "`zstd --train` did not write a formatted dictionary"
+    );
+    let dict_arg = dict_path.to_string_lossy().to_string();
+
+    let payload = "{\"user\":\"alice\",\"action\":\"GET /api/v1/users HTTP/1.1\",\
+                   \"host\":\"example.com\",\"id\":42}\n"
+        .repeat(40);
+    let payload = payload.into_bytes();
+
+    for level in ["-1", "-3", "-19"] {
+        let frame = run_zstd(&["-q", "-c", level, "-D", &dict_arg], &payload)
+            .expect("reference compress with a formatted dictionary");
+
+        // Every entry point that takes a dictionary must refuse it by name.
+        let one_shot = oxiarc_zstd::decompress_multi_frame_with_dict(&frame, &dict);
+        assert!(
+            one_shot
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+            "decompress_multi_frame_with_dict ({level}) did not refuse a formatted dictionary: \
+             {one_shot:?}"
+        );
+
+        use oxiarc_core::traits::FlushMode;
+        let mut stream = oxiarc_zstd::ZstdStream::new()
+            .with_max_window(usize::MAX)
+            .with_dictionary(dict.clone());
+        let mut out = vec![0u8; 1 << 16];
+        let pushed = stream.decode(&frame, &mut out, FlushMode::Finish);
+        assert!(
+            pushed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("formatted Zstandard dictionary")),
+            "ZstdStream ({level}) did not refuse a formatted dictionary: {pushed:?}"
+        );
+
+        // And without any dictionary the frame's `Dictionary_ID` is refused.
+        let mut bare = oxiarc_zstd::ZstdStream::new().with_max_window(usize::MAX);
+        let bare_result = bare.decode(&frame, &mut out, FlushMode::Finish);
+        assert!(
+            bare_result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("requires dictionary ID")),
+            "ZstdStream ({level}) did not refuse a dictionary-ID frame: {bare_result:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

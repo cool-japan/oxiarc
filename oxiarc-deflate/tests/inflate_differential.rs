@@ -6,7 +6,11 @@
 //! * the exact-mode path used when a `BitReader` may not read ahead
 //!   (`BitReader::new`), which routes every symbol through
 //!   `HuffmanTree::decode` and its bit-at-a-time fallback,
-//! * the decompress-into-a-slice path (`inflate_into` / `zlib_decompress_into`).
+//! * the decompress-into-a-slice path (`inflate_into` / `zlib_decompress_into`),
+//! * the resumable push path (`InflateStream` / `WrappedInflate`), driven at
+//!   several feed granularities — it shares the symbol loop with the first
+//!   path but reaches it through a different state machine, so the two are
+//!   compared entry by entry rather than assumed equivalent.
 //!
 //! Everything here is exercised against inputs covering all three block types
 //! (stored / fixed Huffman / dynamic Huffman), maximum-distance
@@ -19,9 +23,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use oxiarc_core::BitReader;
+use oxiarc_core::traits::FlushMode;
 use oxiarc_deflate::{
-    Inflater, deflate, inflate, inflate_into, zlib_compress, zlib_decompress, zlib_decompress_into,
+    InflateReader, InflateStatus, InflateStream, InflateWrapper, Inflater, TrailingPolicy,
+    WrappedInflate, deflate, gzip_compress, inflate, inflate_into, zlib_compress, zlib_decompress,
+    zlib_decompress_into,
 };
+use std::io::Read;
 
 // ---------------------------------------------------------------------------
 // Corpus
@@ -111,6 +119,52 @@ fn inflate_exact_mode(compressed: &[u8]) -> oxiarc_core::error::Result<Vec<u8>> 
     inflater.inflate(&mut reader)
 }
 
+/// Decode through the resumable push API with a fixed feed schedule.
+fn inflate_push(
+    compressed: &[u8],
+    in_chunk: usize,
+    out_size: usize,
+) -> oxiarc_core::error::Result<Vec<u8>> {
+    let mut stream = InflateStream::new();
+    let mut out = Vec::new();
+    let mut scratch = vec![0u8; out_size];
+    let mut fed = 0usize;
+    loop {
+        let end = (fed + in_chunk).min(compressed.len());
+        let flush = if end >= compressed.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream.inflate(&compressed[fed..end], &mut scratch, flush)?;
+        fed += progress.consumed;
+        out.extend_from_slice(&scratch[..progress.produced]);
+        if progress.status == InflateStatus::StreamEnd {
+            return Ok(out);
+        }
+    }
+}
+
+/// Decode through the blocking `Read` adapter, pulling `read_size` bytes at
+/// a time so the staging buffer is drained in the same shapes a real caller
+/// would use (`read_size == 1` is the pathological one).
+fn inflate_via_reader(
+    compressed: &[u8],
+    wrapper: InflateWrapper,
+    read_size: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut reader = InflateReader::new(compressed, wrapper);
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; read_size];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
 #[test]
 fn all_decode_paths_agree() {
     for (name, data) in corpus() {
@@ -131,6 +185,55 @@ fn all_decode_paths_agree() {
                 "{name} level {level}: inflate_into len"
             );
             assert_eq!(buf, data, "{name} level {level}: inflate_into bytes");
+
+            // The fifth path: the resumable push decoder, at three feed
+            // granularities so the fast loop, the careful per-symbol path
+            // and the output-bound path are all exercised on every entry.
+            for (in_chunk, out_size) in [(1usize, 64usize), (7, 4096), (4096, 65_536)] {
+                let via_push = inflate_push(&compressed, in_chunk, out_size)
+                    .unwrap_or_else(|e| panic!("{name} level {level} {in_chunk}/{out_size}: {e}"));
+                assert_eq!(
+                    via_push, via_vec,
+                    "{name} level {level}: push path at {in_chunk}/{out_size}"
+                );
+            }
+
+            // And the growable push front end, which shares the window with
+            // the one-shot decoder.
+            let via_grow = InflateStream::new()
+                .inflate_to_vec(&compressed)
+                .expect("inflate_to_vec");
+            assert_eq!(
+                via_grow, via_vec,
+                "{name} level {level}: growable push path"
+            );
+
+            // The seventh path: the blocking `Read` adapter, byte at a time
+            // and at the size of its own staging buffer. Both must agree
+            // with every other path, framed and unframed.
+            for read_size in [1usize, 3, 65_536] {
+                let via_reader = inflate_via_reader(&compressed, InflateWrapper::Raw, read_size)
+                    .unwrap_or_else(|e| panic!("{name} level {level} raw/{read_size}: {e}"));
+                assert_eq!(
+                    via_reader, via_vec,
+                    "{name} level {level}: InflateReader(raw) at {read_size}"
+                );
+            }
+
+            let gzipped = gzip_compress(&data, level).expect("gzip_compress");
+            for (framing, read_size) in [
+                (InflateWrapper::Gzip, 1usize),
+                (InflateWrapper::Gzip, 65_536),
+                (InflateWrapper::Auto, 1),
+                (InflateWrapper::Auto, 65_536),
+            ] {
+                let via_reader = inflate_via_reader(&gzipped, framing, read_size)
+                    .unwrap_or_else(|e| panic!("{name} level {level} {framing:?}: {e}"));
+                assert_eq!(
+                    via_reader, data,
+                    "{name} level {level}: InflateReader({framing:?}) at {read_size}"
+                );
+            }
         }
     }
 }
@@ -146,6 +249,42 @@ fn zlib_wrapper_paths_agree() {
             let n = zlib_decompress_into(&compressed, &mut buf).expect("zlib into");
             assert_eq!(n, data.len(), "{name} level {level}");
             assert_eq!(buf, data, "{name} level {level}");
+
+            // The push wrapper must agree with the slice functions, both
+            // when told the framing and when sniffing it.
+            for framing in [InflateWrapper::Zlib, InflateWrapper::Auto] {
+                let mut decoder =
+                    WrappedInflate::new(framing).trailing_policy(TrailingPolicy::Reject);
+                let mut out = Vec::new();
+                let mut scratch = vec![0u8; 251];
+                let mut fed = 0usize;
+                loop {
+                    let progress = decoder
+                        .inflate(&compressed[fed..], &mut scratch, FlushMode::Finish)
+                        .unwrap_or_else(|e| panic!("{name} level {level} {framing:?}: {e}"));
+                    fed += progress.consumed;
+                    out.extend_from_slice(&scratch[..progress.produced]);
+                    if progress.status == InflateStatus::StreamEnd {
+                        break;
+                    }
+                }
+                assert_eq!(out, data, "{name} level {level}: push {framing:?}");
+                assert_eq!(decoder.members_decoded(), 1);
+                assert_eq!(decoder.total_in(), compressed.len() as u64);
+            }
+
+            // The `Read` adapter must agree with all of them, at both feed
+            // extremes, for zlib framing and for the sniffing mode.
+            for framing in [InflateWrapper::Zlib, InflateWrapper::Auto] {
+                for read_size in [1usize, 65_536] {
+                    let via_reader = inflate_via_reader(&compressed, framing, read_size)
+                        .unwrap_or_else(|e| panic!("{name} level {level} {framing:?}: {e}"));
+                    assert_eq!(
+                        via_reader, data,
+                        "{name} level {level}: InflateReader({framing:?}) at {read_size}"
+                    );
+                }
+            }
         }
     }
 }
@@ -504,4 +643,41 @@ fn gzip_isize_hint_is_only_a_hint() {
         result.is_err(),
         "a bogus ISIZE must be reported, not silently accepted"
     );
+}
+
+/// `zlib_decompress` / `zlib_decompress_into` read the Adler-32 from the
+/// **last four bytes of the input slice**, not from the position after the
+/// DEFLATE stream. That makes them exact-slice functions: a buffer with a
+/// trailing tail is rejected rather than silently accepted. Pinned here so a
+/// later re-base onto `WrappedInflate` — which would locate the trailer
+/// correctly and therefore *accept* the tail — cannot change it silently.
+#[test]
+fn zlib_slice_functions_require_an_exact_member() {
+    let data = b"exact slice semantics".to_vec();
+    let member = zlib_compress(&data, 6).expect("zlib_compress");
+
+    assert_eq!(zlib_decompress(&member).expect("exact"), data);
+
+    let mut with_tail = member.clone();
+    with_tail.extend_from_slice(b"XYZ");
+    assert!(
+        zlib_decompress(&with_tail).is_err(),
+        "a trailing tail must be rejected by the exact-slice function"
+    );
+    let mut buf = vec![0u8; data.len()];
+    assert!(
+        zlib_decompress_into(&with_tail, &mut buf).is_err(),
+        "zlib_decompress_into must reject a trailing tail too"
+    );
+
+    // The documented alternative for a buffer with an unknown tail: the
+    // wrapper locates the trailer itself and applies a trailing policy.
+    let mut decoder = WrappedInflate::new(InflateWrapper::Zlib)
+        .multi_member(false)
+        .trailing_policy(TrailingPolicy::Stop);
+    let mut scratch = vec![0u8; 256];
+    let progress = decoder
+        .inflate(&with_tail, &mut scratch, FlushMode::Finish)
+        .expect("the wrapper tolerates a tail under TrailingPolicy::Stop");
+    assert_eq!(&scratch[..progress.produced], &data[..]);
 }

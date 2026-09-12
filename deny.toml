@@ -21,6 +21,13 @@ allow = [
 # dropping rpassword; warn instead of denying until upstream aligns.
 multiple-versions = "warn"
 wildcards = "deny"
+# Path-only sibling dev-dependencies (no version) are how oxiarc-http avoids
+# packaging a version requirement against not-yet-published siblings into
+# its published manifest (path deps are stripped from dev-dependencies at
+# publish time; a versioned one would survive and fail to resolve). These
+# are workspace-local and version-controlled by definition, not an
+# unreviewed wildcard onto the open registry, so exempt them from the check.
+allow-wildcard-paths = true
 
 # COOLJAPAN policy: oxiarc-* crates exist specifically to replace these
 # formats/algorithms in pure Rust. A member crate depending on any of them
@@ -43,6 +50,19 @@ deny = [
     { name = "snap", use-instead = "oxiarc-snappy" },
     { name = "brotli", use-instead = "oxiarc-brotli" },
     { name = "brotli-decompressor", use-instead = "oxiarc-brotli" },
+    # Image container/codec formats this workspace implements natively (P3).
+    # NOTE: never ban `weezl` — it is a legitimate dev-dependency LZW oracle
+    # of oxiarc-lzw (its own tiff-oracle) and, as of 0.4.2, of
+    # oxiarc-lzw/tests/bit_order_differential.rs too.
+    { name = "png", use-instead = "oxiarc-png" },
+    { name = "tiff", use-instead = "oxiarc-tiff" },
+    { name = "image", use-instead = "oxiarc-image (or oxiarc-png / oxiarc-jpeg / oxiarc-tiff directly)" },
+    { name = "jpeg-decoder", use-instead = "oxiarc-jpeg" },
+    { name = "jpeg-encoder", use-instead = "oxiarc-jpeg" },
+    { name = "zune-jpeg", use-instead = "oxiarc-jpeg" },
+    { name = "zune-png", use-instead = "oxiarc-png" },
+    { name = "zune-core", use-instead = "oxiarc-png / oxiarc-jpeg (no shared zune-core dependency needed)" },
+    { name = "mozjpeg", use-instead = "oxiarc-jpeg" },
     # Wider COOLJAPAN ecosystem bans that also apply to this workspace.
     { name = "bincode", use-instead = "oxicode" },
     { name = "rustfft", use-instead = "oxifft" },

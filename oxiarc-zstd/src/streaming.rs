@@ -4,10 +4,17 @@
 //! [`ZstdStreamDecoder`] (implements [`std::io::Read`]) for processing Zstandard data
 //! through standard Rust I/O traits.
 //!
-//! The streaming encoder buffers all written data and compresses it into a
-//! single Zstandard frame when [`ZstdStreamEncoder::finish`] is called. This
-//! matches the behaviour of many Zstd wrapper crates that operate on in-memory
-//! buffers.
+//! The streaming encoder buffers written data and emits one complete Zstandard
+//! frame per `block_size` bytes (128 KiB by default), so its memory is bounded
+//! by the block size; the output is a sequence of concatenated frames.
+//!
+//! The decoder is a thin `Read` shell over [`crate::ZstdStream`], the bounded
+//! push decoder: it serves the first byte without reading the whole input and
+//! never materialises either side, holding one 128 KiB block carry, two 64 KiB
+//! staging buffers and the sliding window. The window grows lazily and is
+//! bounded by `min(the frame's declared Window_Size, the bytes actually
+//! produced)`; see [`ZstdStreamDecoder`] for the two builders that make that
+//! bound a constant on untrusted input.
 //!
 //! # Example
 //!
@@ -28,10 +35,9 @@
 //! ```
 
 use crate::encode::ZstdEncoder;
-use crate::frame::{decompress_multi_frame, decompress_multi_frame_with_dict};
 use oxiarc_core::cancel::CancellationToken;
 use oxiarc_core::progress::ProgressHandle;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 /// Default block size for the incremental encoder (128 KiB).
 const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
@@ -45,7 +51,7 @@ const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 /// called.
 ///
 /// The output is a sequence of valid concatenated Zstandard frames and can be
-/// decoded with [`decompress_multi_frame`].
+/// decoded with [`crate::decompress_multi_frame`].
 ///
 /// Supports optional progress reporting via [`ProgressHandle`] and
 /// cooperative cancellation via [`CancellationToken`] using the
@@ -253,166 +259,15 @@ impl<W: Write> Write for ZstdStreamEncoder<W> {
 // Streaming decoder
 // ---------------------------------------------------------------------------
 
-/// Streaming Zstandard decoder that implements [`Read`].
-///
-/// All compressed data is read eagerly from the inner reader on the first
-/// `read` call, decompressed into an internal buffer, and then served from
-/// that buffer for subsequent reads.
-///
-/// Supports optional progress reporting via [`ProgressHandle`] and
-/// cooperative cancellation via [`CancellationToken`] using the
-/// [`ZstdStreamDecoder::with_progress`] / [`ZstdStreamDecoder::with_cancel`] builders.
-pub struct ZstdStreamDecoder<R: Read> {
-    /// The wrapped reader providing compressed input.
-    inner: R,
-    /// Decompressed output buffer.
-    output_buffer: Vec<u8>,
-    /// Current read position inside `output_buffer`.
-    output_pos: usize,
-    /// Whether the compressed stream has been fully consumed.
-    finished: bool,
-    /// Optional pre-trained dictionary data for decompression.
-    dict: Option<Vec<u8>>,
-    /// Optional progress sink.
-    progress: Option<ProgressHandle>,
-    /// Optional cancellation token.
-    cancel: Option<CancellationToken>,
-}
-
-impl<R: Read> ZstdStreamDecoder<R> {
-    /// Create a new streaming decoder wrapping `reader`.
-    pub fn new(reader: R) -> Self {
-        Self {
-            inner: reader,
-            output_buffer: Vec::new(),
-            output_pos: 0,
-            finished: false,
-            dict: None,
-            progress: None,
-            cancel: None,
-        }
-    }
-
-    /// Create a new streaming decoder with a dictionary.
-    ///
-    /// Dictionary-based decompression requires the same dictionary that was
-    /// used during compression.
-    pub fn with_dictionary(reader: R, dict: Vec<u8>) -> Self {
-        Self {
-            inner: reader,
-            output_buffer: Vec::new(),
-            output_pos: 0,
-            finished: false,
-            dict: if dict.is_empty() { None } else { Some(dict) },
-            progress: None,
-            cancel: None,
-        }
-    }
-
-    /// Attach a progress sink.
-    ///
-    /// The sink's `on_progress(decompressed_bytes, None)` is called once
-    /// after the entire stream is decompressed into the internal buffer.
-    /// `on_finish()` is called at the same point.
-    #[must_use]
-    pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
-        self.progress = Some(handle);
-        self
-    }
-
-    /// Attach a cancellation token.
-    ///
-    /// The token is checked before the compressed stream is read and
-    /// decompressed. If cancelled, an I/O error wrapping
-    /// [`oxiarc_core::error::OxiArcError::Cancelled`] is returned.
-    #[must_use]
-    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
-        self.cancel = Some(token);
-        self
-    }
-
-    /// Read and decompress all compressed data from the inner reader.
-    ///
-    /// Handles concatenated Zstandard frames (multi-frame streams) by using
-    /// [`decompress_multi_frame`].  Skippable frames are silently ignored.
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        if self.finished || self.output_pos < self.output_buffer.len() {
-            return Ok(());
-        }
-
-        // Cooperative cancellation check before reading.
-        if let Some(ref token) = self.cancel {
-            token.check().map_err(|e| io::Error::other(e.to_string()))?;
-        }
-
-        let mut compressed = Vec::new();
-        self.inner.read_to_end(&mut compressed)?;
-
-        if compressed.is_empty() {
-            self.finished = true;
-            return Ok(());
-        }
-
-        // Use multi-frame decompression so that a stream of concatenated
-        // frames (as produced by the incremental encoder) is handled correctly.
-        // When a dictionary is set, use the dict-aware variant so that all
-        // frames in the concatenated stream are decoded with the same dictionary
-        // (the encoder writes one frame per block, each referencing the dict).
-        self.output_buffer = if let Some(ref dict) = self.dict {
-            decompress_multi_frame_with_dict(&compressed, dict)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-        } else {
-            decompress_multi_frame(&compressed)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-        };
-        self.output_pos = 0;
-        self.finished = true;
-
-        let total = self.output_buffer.len() as u64;
-        if let Some(ref handle) = self.progress {
-            handle.on_progress(total, None);
-            handle.on_finish();
-        }
-
-        Ok(())
-    }
-
-    /// Returns the total number of decompressed bytes available (including
-    /// bytes already consumed via `read`).
-    pub fn decompressed_size(&self) -> usize {
-        self.output_buffer.len()
-    }
-
-    /// Returns `true` if all decompressed data has been read.
-    pub fn is_finished(&self) -> bool {
-        self.finished && self.output_pos >= self.output_buffer.len()
-    }
-}
-
-impl<R: Read> Read for ZstdStreamDecoder<R> {
-    /// Read decompressed data into `buf`.
-    ///
-    /// On the first call this eagerly decompresses the entire compressed
-    /// stream from the inner reader. Subsequent calls serve from the buffer.
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.fill_buffer()?;
-
-        let available = self.output_buffer.len() - self.output_pos;
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let to_copy = buf.len().min(available);
-        buf[..to_copy]
-            .copy_from_slice(&self.output_buffer[self.output_pos..self.output_pos + to_copy]);
-        self.output_pos += to_copy;
-        Ok(to_copy)
-    }
-}
+// `ZstdStreamDecoder` lives in `crate::read` (so neither file exceeds the
+// workspace file-size budget) and is re-exported here, which is where it has
+// always been in the public API.
+pub use crate::read::ZstdStreamDecoder;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn test_stream_encoder_basic() {

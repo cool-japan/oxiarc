@@ -243,6 +243,18 @@ impl HuffmanTree {
     }
 
     /// Decode a single symbol from the bit reader in `O(1)`.
+    ///
+    /// # Partial input
+    ///
+    /// [`BitReader::peek_bits`] zero-pads past the end of its buffer, so two
+    /// decision points can be reached by *phantom* bits: a root slot that
+    /// matches no code, and the sub-table index of a code longer than
+    /// the 8-bit root table. When the reader was built by
+    /// [`BitReader::resume`] with `partial = true` — i.e. more bytes of the
+    /// stream may still arrive — both report [`BrotliError::UnexpectedEof`]
+    /// instead of a corruption error, so an incremental decoder can rewind and
+    /// retry. Over a complete buffer the behaviour is unchanged.
+    #[inline]
     pub fn decode_symbol(&self, reader: &mut BitReader<'_>) -> BrotliResult<u16> {
         if let Some(sym) = self.degenerate {
             return Ok(sym);
@@ -255,15 +267,26 @@ impl HuffmanTree {
         let peeked = reader.peek_bits(ROOT_BITS)?;
         let entry = self.entries[peeked as usize];
         if entry.bits as u32 <= ROOT_BITS {
+            // `drop_bits` refuses to consume bits that do not exist, so a code
+            // resolved entirely inside the root table is already EOF-safe.
             reader.drop_bits(entry.bits as u32)?;
             return Ok(entry.value);
         }
         if entry.bits == INVALID_BITS {
+            if reader.is_partial_input() && reader.buffered_bits() < ROOT_BITS {
+                // The zero padding, not the stream, chose this empty slot.
+                return Err(BrotliError::UnexpectedEof);
+            }
             return Err(BrotliError::InvalidHuffmanCode(
                 "bit pattern matches no code".to_string(),
             ));
         }
         let total_bits = entry.bits as u32;
+        if reader.is_partial_input() && reader.buffered_bits() < total_bits {
+            // The sub-table index would be selected by bits that have not
+            // arrived yet; any symbol read here would be a guess.
+            return Err(BrotliError::UnexpectedEof);
+        }
         let peeked2 = reader.peek_bits(total_bits)?;
         let sub_index = (peeked2 >> ROOT_BITS) as usize;
         let entry2 = self.entries[entry.value as usize + sub_index];

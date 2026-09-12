@@ -105,6 +105,40 @@ impl ZstdDict {
     }
 }
 
+/// Magic number that introduces a *formatted* dictionary (RFC 8878 §5),
+/// `0xEC30A437` stored little-endian.
+const FORMATTED_DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+
+/// Whether `dict` is a formatted (RFC 8878 §5) dictionary rather than raw
+/// content.
+///
+/// RFC 8878 §5: a dictionary is *formatted* when it is at least 8 bytes long
+/// and starts with `Magic_Number` = `0xEC30A437`; anything else is a
+/// **raw content** dictionary, whose bytes are used directly as the LZ77
+/// history prefix. This is exactly the rule the reference decoder applies
+/// (`ZSTD_loadDictionaryContent` falls back to raw content when the magic is
+/// absent or the dictionary is shorter than 8 bytes).
+///
+/// A formatted dictionary additionally carries a `Dictionary_ID`, the entropy
+/// tables (one Huffman literals table and three FSE tables) that a frame may
+/// reference through `Repeat_Mode`, and three initial repeat offsets. This
+/// crate implements raw content dictionaries only, so a formatted dictionary
+/// is *rejected with a named error* rather than mistaken for content: seeding
+/// the window with a formatted dictionary's header and tables would silently
+/// produce wrong output on exactly the frames that need it.
+pub(crate) fn is_formatted_dictionary(dict: &[u8]) -> bool {
+    dict.len() >= 8 && dict[..4] == FORMATTED_DICT_MAGIC
+}
+
+/// The named error returned when a formatted dictionary is supplied.
+pub(crate) fn formatted_dictionary_error() -> OxiArcError {
+    OxiArcError::unsupported_method(
+        "formatted Zstandard dictionary (RFC 8878 §5 Magic_Number 0xEC30A437): \
+         this decoder implements raw content dictionaries only, so pass the raw \
+         dictionary content instead of a `zstd --train` dictionary file",
+    )
+}
+
 /// Train a dictionary from sample data.
 ///
 /// This implements a simplified dictionary training algorithm:
@@ -328,5 +362,35 @@ mod tests {
             "dictionary should contain common substrings: {:?}",
             dict_str
         );
+    }
+    #[test]
+    fn formatted_dictionary_detection_follows_rfc_8878_section_5() {
+        // Magic 0xEC30A437 little-endian plus a 4-byte Dictionary_ID.
+        let mut formatted = vec![0x37, 0xA4, 0x30, 0xEC, 0x01, 0x02, 0x03, 0x04];
+        formatted.extend_from_slice(b"entropy tables and content follow");
+        assert!(is_formatted_dictionary(&formatted));
+
+        // Raw content that merely starts with the same four bytes but is
+        // shorter than eight bytes is raw content, exactly as the reference
+        // decoder treats it.
+        assert!(!is_formatted_dictionary(&[0x37, 0xA4, 0x30, 0xEC, 0x01]));
+        // Ordinary raw content.
+        assert!(!is_formatted_dictionary(b"plain raw dictionary content"));
+        assert!(!is_formatted_dictionary(&[]));
+        // Byte-order mistakes must not be mistaken for the magic.
+        assert!(!is_formatted_dictionary(&[
+            0xEC, 0x30, 0xA4, 0x37, 0x01, 0x02, 0x03, 0x04
+        ]));
+    }
+
+    #[test]
+    fn formatted_dictionary_error_names_the_format() {
+        let message = formatted_dictionary_error().to_string();
+        assert!(
+            message.contains("formatted Zstandard dictionary"),
+            "{message}"
+        );
+        assert!(message.contains("0xEC30A437"), "{message}");
+        assert!(message.contains("raw"), "{message}");
     }
 }

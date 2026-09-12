@@ -937,6 +937,11 @@ pub struct Lz4DictCompressor {
     dict: Lz4Dict,
     desc: FrameDescriptor,
     finished: bool,
+    /// The compressed frame, staged for the caller and drained across calls
+    /// when it does not fit in one output slice.
+    pending: Vec<u8>,
+    /// How much of `pending` the caller has already received.
+    pending_pos: usize,
 }
 
 impl Lz4DictCompressor {
@@ -947,6 +952,8 @@ impl Lz4DictCompressor {
             dict,
             desc: FrameDescriptor::new(),
             finished: false,
+            pending: Vec::new(),
+            pending_pos: 0,
         }
     }
 
@@ -957,6 +964,8 @@ impl Lz4DictCompressor {
             dict,
             desc,
             finished: false,
+            pending: Vec::new(),
+            pending_pos: 0,
         }
     }
 
@@ -964,15 +973,60 @@ impl Lz4DictCompressor {
     pub fn dict(&self) -> &Lz4Dict {
         &self.dict
     }
+
+    /// Copy staged compressed bytes into `output`, reclaiming the staging
+    /// buffer once the caller has received all of them.
+    fn drain_pending(&mut self, output: &mut [u8]) -> usize {
+        let available = &self.pending[self.pending_pos..];
+        let to_copy = available.len().min(output.len());
+        output[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.pending_pos += to_copy;
+        if self.pending_pos >= self.pending.len() {
+            self.pending = Vec::new();
+            self.pending_pos = 0;
+        }
+        to_copy
+    }
+
+    /// `true` while compressed bytes are staged but not yet handed back.
+    fn has_pending(&self) -> bool {
+        self.pending_pos < self.pending.len()
+    }
 }
 
 impl Compressor for Lz4DictCompressor {
+    /// Buffers every byte of input and compresses the whole frame on the
+    /// first [`FlushMode::Finish`] call, then hands the frame back **one
+    /// output buffer at a time**.
+    ///
+    /// While staged bytes remain the status is
+    /// [`NeedsOutput`](CompressStatus::NeedsOutput) and `consumed` is `0`;
+    /// only the call that delivers the last byte reports
+    /// [`Done`](CompressStatus::Done).
+    ///
+    /// Before 0.4.2 a frame larger than the caller's output slice was
+    /// recompressed from scratch on every call and never delivered at all —
+    /// [`compress_all`](Compressor::compress_all), whose buffer is a fixed
+    /// 32 KiB, looped forever on any payload whose compressed frame exceeded
+    /// that size.
     fn compress(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         flush: FlushMode,
     ) -> Result<(usize, usize, CompressStatus)> {
+        // Deliver anything staged by a previous call first, so the frame is
+        // never held inside the compressor while it claims to be done.
+        if self.has_pending() {
+            let written = self.drain_pending(output);
+            let status = if self.has_pending() {
+                CompressStatus::NeedsOutput
+            } else {
+                CompressStatus::Done
+            };
+            return Ok((0, written, status));
+        }
+
         if self.finished {
             return Ok((0, 0, CompressStatus::Done));
         }
@@ -981,17 +1035,19 @@ impl Compressor for Lz4DictCompressor {
         self.buffer.extend_from_slice(input);
 
         if matches!(flush, FlushMode::Finish) {
-            // Compress the buffer using the dictionary
+            // Compress the buffer using the dictionary, exactly once.
             let desc = self.desc.with_content_size(self.buffer.len() as u64);
-            let compressed = compress_frame_with_dict_options(&self.buffer, &self.dict, desc)?;
+            self.pending = compress_frame_with_dict_options(&self.buffer, &self.dict, desc)?;
+            self.pending_pos = 0;
+            self.finished = true;
 
-            if compressed.len() <= output.len() {
-                output[..compressed.len()].copy_from_slice(&compressed);
-                self.finished = true;
-                Ok((input.len(), compressed.len(), CompressStatus::Done))
+            let written = self.drain_pending(output);
+            let status = if self.has_pending() {
+                CompressStatus::NeedsOutput
             } else {
-                Ok((input.len(), 0, CompressStatus::NeedsOutput))
-            }
+                CompressStatus::Done
+            };
+            Ok((input.len(), written, status))
         } else {
             Ok((input.len(), 0, CompressStatus::NeedsInput))
         }
@@ -1000,10 +1056,14 @@ impl Compressor for Lz4DictCompressor {
     fn reset(&mut self) {
         self.buffer.clear();
         self.finished = false;
+        self.pending = Vec::new();
+        self.pending_pos = 0;
     }
 
+    /// `true` only once the frame has been compressed **and** every staged
+    /// byte has been handed back to the caller.
     fn is_finished(&self) -> bool {
-        self.finished
+        self.finished && !self.has_pending()
     }
 }
 
@@ -1015,6 +1075,11 @@ pub struct Lz4DictDecompressor {
     buffer: Vec<u8>,
     dict: Lz4Dict,
     finished: bool,
+    /// Decompressed bytes staged for the caller, produced by the single
+    /// whole-frame decode this type performs.
+    pending: Vec<u8>,
+    /// How much of `pending` the caller has already received.
+    pending_pos: usize,
 }
 
 impl Lz4DictDecompressor {
@@ -1024,12 +1089,28 @@ impl Lz4DictDecompressor {
             buffer: Vec::new(),
             dict,
             finished: false,
+            pending: Vec::new(),
+            pending_pos: 0,
         }
     }
 
     /// Get the dictionary.
     pub fn dict(&self) -> &Lz4Dict {
         &self.dict
+    }
+
+    /// Copy staged decompressed bytes into `output`, reclaiming the staging
+    /// buffer once it has all been delivered.
+    fn drain_pending(&mut self, output: &mut [u8]) -> usize {
+        let available = &self.pending[self.pending_pos..];
+        let to_copy = available.len().min(output.len());
+        output[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.pending_pos += to_copy;
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        to_copy
     }
 }
 
@@ -1040,7 +1121,17 @@ impl Decompressor for Lz4DictDecompressor {
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
         if self.finished {
-            return Ok((0, 0, DecompressStatus::Done));
+            // Keep handing back staged bytes; a frame decompresses in one shot
+            // but the caller's buffer is usually far smaller than the result,
+            // so reporting `Done` before it has all been delivered would
+            // silently truncate (`decompress_all` stops at the first `Done`).
+            let written = self.drain_pending(output);
+            let status = if self.pending_pos < self.pending.len() {
+                DecompressStatus::NeedsOutput
+            } else {
+                DecompressStatus::Done
+            };
+            return Ok((0, written, status));
         }
 
         // Buffer all input
@@ -1051,10 +1142,16 @@ impl Decompressor for Lz4DictDecompressor {
             // Minimum frame size
             match decompress_frame_with_dict(&self.buffer, 64 * 1024 * 1024, &self.dict) {
                 Ok(decompressed) => {
-                    let to_copy = decompressed.len().min(output.len());
-                    output[..to_copy].copy_from_slice(&decompressed[..to_copy]);
+                    self.pending = decompressed;
+                    self.pending_pos = 0;
                     self.finished = true;
-                    Ok((input.len(), to_copy, DecompressStatus::Done))
+                    let written = self.drain_pending(output);
+                    let status = if self.pending_pos < self.pending.len() {
+                        DecompressStatus::NeedsOutput
+                    } else {
+                        DecompressStatus::Done
+                    };
+                    Ok((input.len(), written, status))
                 }
                 Err(_) => {
                     // Need more data
@@ -1068,6 +1165,8 @@ impl Decompressor for Lz4DictDecompressor {
 
     fn reset(&mut self) {
         self.buffer.clear();
+        self.pending.clear();
+        self.pending_pos = 0;
         self.finished = false;
     }
 

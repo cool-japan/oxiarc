@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-extract 1  "oxiarc-extract " 
+.TH oxiarc-extract 1  "oxiarc-extract 0.4.2" 
 .SH NAME
 oxiarc\-extract \- Extract files from an archive
 .SH SYNOPSIS
-\fBoxiarc\-extract\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-P\fR|\fB\-\-progress\fR] [\fB\-f\fR|\fB\-\-format\fR] [\fB\-\-overwrite\fR] [\fB\-\-skip\-existing\fR] [\fB\-\-prompt\fR] [\fB\-t\fR|\fB\-\-preserve\-timestamps\fR] [\fB\-\-preserve\-permissions\fR] [\fB\-p\fR|\fB\-\-preserve\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-password\fR] [\fB\-\-strict\-names\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
+\fBoxiarc\-extract\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-I\fR|\fB\-\-include\fR] [\fB\-X\fR|\fB\-\-exclude\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-P\fR|\fB\-\-progress\fR] [\fB\-f\fR|\fB\-\-format\fR] [\fB\-\-overwrite\fR] [\fB\-\-skip\-existing\fR] [\fB\-\-prompt\fR] [\fB\-t\fR|\fB\-\-preserve\-timestamps\fR] [\fB\-\-preserve\-permissions\fR] [\fB\-p\fR|\fB\-\-preserve\fR] [\fB\-n\fR|\fB\-\-dry\-run\fR] [\fB\-\-password\fR] [\fB\-\-strict\-names\fR] [\fB\-\-lenient\fR] [\fB\-\-memory\-limit\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> [\fIFILES\fR] 
 .SH DESCRIPTION
 Extract files from an archive
 .SH OPTIONS
@@ -22,7 +22,7 @@ Exclude files matching pattern (glob syntax)
 Show verbose output
 .TP
 \fB\-P\fR, \fB\-\-progress\fR
-Show progress bar
+Show progress bar (opt\-in; off by default)
 .TP
 \fB\-f\fR, \fB\-\-format\fR \fI<FORMAT>\fR
 Format hint for stdin (gzip, xz, bz2, lz4, zst, br, snappy)
@@ -89,8 +89,13 @@ Refuse to extract entries exceeding this memory limit (e.g. 100M, 512K, 1G)
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIARCHIVE\fR>
 Archive file to extract (use "\-" for stdin)
 .TP
 [\fIFILES\fR]
 Files to extract (all if empty)
+.SH VERSION
+v0.4.2

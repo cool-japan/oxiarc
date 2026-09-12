@@ -1,10 +1,17 @@
-//! Bounded-memory LZMA streaming compressor and decompressor.
+//! Memory-budgeted, one-shot LZMA compression and decompression.
 //!
-//! [`LzmaCompressor`] and [`LzmaDecompressor`] provide a one-shot
-//! `compress` / `decompress` interface with configurable memory budgets.
-//! Both types enforce that the dictionary size plus the input chunk size
-//! plus a conservative scratch overhead stay within the configured budget
-//! before performing any allocation-heavy operation.
+//! [`LzmaCompressor`] and [`LzmaDecompressor`] provide a **one-shot**
+//! `compress` / `decompress` interface (a full `&[u8]` in, a full
+//! `Vec<u8>` out) with configurable memory budgets. Neither type is an
+//! incremental/streaming codec despite this module's name: both estimate the
+//! peak memory a single call would need — dictionary size plus the whole
+//! input length plus a conservative scratch overhead — and reject the call
+//! up front if that estimate exceeds the configured budget, before
+//! performing any allocation-heavy operation. The budget is real and
+//! enforced; there is no partial-input/partial-output push API here. For a
+//! genuine chunk-at-a-time LZMA2 decoder, use
+//! [`crate::lzma2_stream::Lzma2StreamDecoder`] (`std::io::Read`-based,
+//! bounded-memory, real state machine across chunk boundaries).
 //!
 //! ## Memory budget
 //!

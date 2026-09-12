@@ -1,16 +1,21 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH oxiarc-detect 1  "oxiarc-detect " 
+.TH oxiarc-detect 1  "oxiarc-detect 0.4.2" 
 .SH NAME
-oxiarc\-detect \- Detect archive format
+oxiarc\-detect \- Detect archive format, or a PNG/JPEG/TIFF image
 .SH SYNOPSIS
-\fBoxiarc\-detect\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIFILE\fR> 
+\fBoxiarc\-detect\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIFILE\fR> 
 .SH DESCRIPTION
-Detect archive format
+Detect archive format, or a PNG/JPEG/TIFF image
 .SH OPTIONS
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
 <\fIFILE\fR>
-File to detect
+File to detect (use "\-" for stdin)
+.SH VERSION
+v0.4.2

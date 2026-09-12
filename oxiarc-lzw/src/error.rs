@@ -18,7 +18,7 @@ pub enum LzwError {
     },
 
     /// Invalid bit width specified.
-    #[error("Invalid bit width: {0} (must be 9-12)")]
+    #[error("Invalid bit width: {0} (must be 9-16)")]
     InvalidBitWidth(u8),
 
     /// Unexpected end of data.
@@ -33,6 +33,47 @@ pub enum LzwError {
     InvalidClearCode {
         /// Bit position of invalid clear code.
         position: u64,
+    },
+
+    /// The stream does not start with the UNIX `compress` magic `1F 9D`
+    /// (see [`crate::z`]).
+    #[error("not a .Z stream: expected magic 1F 9D, found {magic:02X?}")]
+    ZInvalidMagic {
+        /// The first two bytes that were found instead.
+        magic: [u8; 2],
+    },
+
+    /// A `.Z` stream ended before its three-byte header was complete.
+    #[error(".Z stream is shorter than its 3-byte header ({len} bytes)")]
+    ZTruncatedHeader {
+        /// Number of bytes actually available.
+        len: usize,
+    },
+
+    /// A `.Z` header declares a maximum code width outside 9-16.
+    #[error("unsupported .Z code width: {0} bits (must be 9-16)")]
+    ZUnsupportedMaxBits(u8),
+
+    /// Decoding produced more output than the caller's limit allows.
+    ///
+    /// Raised *during* decoding, as soon as the limit is crossed, so a
+    /// decompression bomb never fully expands in memory.
+    #[error("decompressed output exceeds the {limit}-byte limit")]
+    OutputLimitExceeded {
+        /// The limit that was crossed, in bytes.
+        limit: usize,
+    },
+
+    /// The caller-supplied output buffer is too small for the decoded
+    /// stream.
+    ///
+    /// Unlike [`LzwError::OutputLimitExceeded`] this is a sizing mistake
+    /// rather than a security bound; the total decoded size is not reported
+    /// because decoding stops as soon as the buffer overflows.
+    #[error("output buffer of {available} bytes is too small for the decoded stream")]
+    BufferTooSmall {
+        /// Capacity of the buffer that was supplied.
+        available: usize,
     },
 
     /// I/O error.

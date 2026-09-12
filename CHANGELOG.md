@@ -5,6 +5,1385 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-12
+
+**The P2/P3 program: HTTP `Content-Encoding` decoding and three new image
+container formats, all Pure Rust, closing the two routes (`flate2` via
+`ureq`'s default `gzip` feature, and `png`/`tiff` via the `image` facade)
+that accounted for `flate2` in 39 of 93 `~/work` project lockfiles.** Five
+new crates — `oxiarc-http`, `oxiarc-png`, `oxiarc-jpeg`, `oxiarc-tiff`,
+`oxiarc-image` — bring the workspace from 13 to **18 member crates**. The
+keystone underneath all of them is a rewritten, genuinely resumable
+DEFLATE/zlib/gzip core (`InflateStream`, `WrappedInflate`, `InflateReader`/
+`AsyncInflateReader`) that replaces the `read_to_end`-then-decode decoders
+every streaming consumer used to be built on; `oxiarc-zstd` and
+`oxiarc-brotli` gained the equivalent push decoders (`ZstdStream`,
+`BrotliStream`). Alongside the new crates: a from-scratch DEFLATE
+*encoder* rewrite (`oxiarc-deflate`, now byte-identical to CPython's
+`zlib.compress` at every level 1-9; level 0's stored blocks are cut at a
+different, RFC-legal boundary, so its bytes differ — never by being
+larger), a decode-throughput rebuild of
+`oxiarc-zstd` around the reference decoder's data layout, a TIFF/GIF LZW
+decoder rebuilt to libtiff's own algorithm shape, Brotli shared-dictionary
+support and `Content-Encoding: dcb`/`dcz` (RFC 9842), the legacy UNIX
+`compress`/`.Z` container (`oxiarc-lzw::z`, `Content-Encoding: compress`),
+and CCITT Group 3/4 uncompressed mode. **No archive/stream wire format
+changed and no public read/decode-path API was removed.** Four narrow
+breaking changes, all scoped and named at their own entries below: (1)
+`LzwConfig::GIF` is now genuinely LSB-first (it was accidentally identical
+to `TIFF_OLD_STYLE`'s MSB-first value before this release — no published
+version ever carried the old, wrong value); (2) `LzwConfig` gained a
+`bit_order` field, so any external struct-literal construction of it no
+longer compiles without setting one (`LzwConfig::new` and the named
+constants are unaffected — `oxiarc-lzw` has been published since before
+this cycle, unlike the five brand-new crates below, so this one reaches
+real downstream callers); (3) `oxiarc-zstd`'s `decompress_multi_frame` and
+its `_with_dict` twin no longer tolerate *leading* garbage or a
+truncated-but-recognised skippable-frame prefix (callers relying on
+`Ok(vec![])` for non-Zstandard input must check the error instead —
+trailing-garbage tolerance is unchanged); (4) the `dcz` wire preamble
+gained a dictionary-binding header within this same unreleased cycle, so a
+`dcz` body produced by an *earlier* unreleased build of `oxiarc-http` is
+no longer readable by the version shipping in this release (no published
+consumer is affected either way). Final state,
+measured 2026-09-12 on the full workspace: **5,505 tests passing, 0
+failed, 0 skipped** (5,159 via `cargo nextest run --workspace
+--all-features` + 346 doctests via `cargo test --doc --workspace
+--all-features`); zero clippy warnings on every crate individually
+(`--all-features --all-targets -D warnings`, also with
+`--no-default-features`) as reported by each track, **and** workspace-wide:
+`cargo fmt --all -- --check`, `cargo clippy --workspace` in both feature
+sets, `cargo build --workspace --no-default-features`, `RUSTDOCFLAGS='-D
+warnings' cargo doc --workspace --no-deps --all-features` and a real
+`cargo +1.85.0 check --workspace` MSRV compile all ran green on the
+quiescent tree — first on 2026-09-08 (GATES, re-run independently by the
+FINALGATE gatekeeper and again after its findings were applied) and again
+on 2026-09-12 (`/runall`'s own full re-verification immediately ahead of
+this release, all counts re-derived from a clean `cargo nextest`/doctest
+run rather than reused). The 2026-09-12 pass additionally caught and fixed
+two real defects the 2026-09-08 gates could not have seen: an MSRV
+regression that had crept in between the two dates (`encoding_rs` had
+drifted to 0.8.41, silently requiring rustc 1.88 against every line of
+this workspace's own code staying 1.85-clean), and a latent semver gap in
+the internal `oxiarc-*` dependency requirements themselves (see the
+`encoding_rs` and "Internal `oxiarc-*` dependency requirements tightened"
+entries under Changed for both); `cargo deny check bans` clean with
+the new PNG/JPEG/TIFF/`image` bans in place; 716 files / 227,104 Rust code
+lines (tokei `Code` column, workspace root including `fuzz/` and
+`formal/`, measured 2026-09-12).
+
+### Added
+
+- **`oxiarc-tiff`: CCITT Group 3/4 uncompressed mode (ITU-T T.4 §4.2.1.3.2,
+  Table 5/T.4), both directions.** The mode transmits pixels at about one bit
+  each instead of Huffman-coding runs, which is the difference between shrinking
+  and *expanding* a dithered or halftoned bilevel page. Decode is unconditional
+  — the entrance code (`0000001111` on a two-dimensionally coded line,
+  `000000001111` on a one-dimensionally coded one) is unambiguous, so a file
+  that carries the mode without setting `T4Options` bit 1 / `T6Options` bit 1
+  still decodes, where before it was a named error. Encode is opt-in through the
+  new `ImageSpec::with_ccitt_uncompressed(bool)`, which also writes the option
+  bit into whichever of tags 292/293 the codec owns; the encoder prices the
+  Huffman coding and the uncompressed coding of every row exactly and takes the
+  mode only where it is strictly smaller, so enabling it can only shrink a page.
+  A 512x64 dithered page more than halves in all three dialects, and a page of
+  long runs comes out byte-identical to one written with the mode off.
+  **Interoperability**: libtiff 4.7.1 *parses* these files (`tiffinfo` prints
+  "Group 4 Options: uncompressed data") but cannot decode them
+  (`Fax4Decode: Uncompressed data (not supported)`), which is why the mode is
+  never written unless asked for.
+- **`oxiarc-tiff`: `ImageSpec::with_jpeg_restart_rows(u16)` and
+  `CodecContext::jpeg_restart_rows`**, writing a `DRI` segment and `RSTn`
+  markers every *n* MCU rows (`cjpeg -restart n`). `0`, the default, writes
+  none, which is what libtiff writes. libtiff reads the result.
+- **`oxiarc-jpeg`: two-component frames (`ColorSpace::Unknown(2)`), libjpeg's
+  `JCS_UNKNOWN` layout.** Sequential identifiers `1`/`2`, one shared
+  quantisation and Huffman slot, no subsampling, no colour transform, and
+  neither a `JFIF` nor an Adobe marker (libjpeg writes neither for
+  `JCS_UNKNOWN`). `InputColor::LumaAlpha` reaches it by asking for it
+  explicitly — its default target is still one-component `Luma`, which
+  keeps dropping the alpha channel exactly as before. The decoder already
+  handled any component count outside `1..=4` generically; only the
+  encoder's `component_template` needed the one new row. No external
+  libjpeg tool can *decode* a two-component stream (none has an output path
+  for a colour space it cannot map to grayscale or RGB — checked against
+  `djpeg`, `tjbench` and Pillow), so this is verified by decomposing a
+  two-component source into its two channels and checking each alone
+  against real `cjpeg`/`djpeg`, by `djpeg -verbose`'s frame/scan header
+  trace, and — closing the remaining gap — by embedding one in a TIFF page
+  and confirming libtiff's *own* embedded libjpeg decodes the interleaved
+  scan byte-identically to this crate's decoder (`tiffcp -c none`; see the
+  `oxiarc-tiff` entry below). This is what
+  `oxiarc-tiff`'s two-channel chunky JPEG refusal — a named error for part
+  of this same unreleased version and never in a published one — was
+  waiting on.
+- **A resumable, truly-incremental DEFLATE/zlib/gzip core, replacing the
+  read-to-end decoders that used to serve every consumer.** The root
+  problem this closes: `GzipStreamDecoder`/`ZlibStreamDecoder::fill_buffer`
+  called `read_to_end` and decoded the *whole* stream before serving the
+  first byte, `ZlibStreamDecoder::with_max_output` was enforced only after
+  full expansion, and `Inflater as Decompressor` could not accept partial
+  input (a second call after a mid-stream EOF returned `Ok((0, n, Done))`
+  with the output silently truncated) — the same shape of bug `BrotliDecompressor<R>`
+  and `ZstdStreamDecoder<R>` had, and `oxiarc-zstd` had no output cap at
+  all. New `oxiarc_deflate::stream::InflateStream` —
+  `new`/`with_window_capacity(bytes)`, `inflate(&mut self, input: &[u8],
+  output: &mut [u8], flush: FlushMode) -> Result<InflateProgress { consumed,
+  produced, status }>` (`InflateStatus::{NeedInput, NeedOutput, StreamEnd}`),
+  `set_dictionary`, `reset`/`reset_keep_history`/`reset_for_next_member`
+  (preserves the bit accumulator across gzip members), `align_to_byte`,
+  `at_sync_flush`, `take_buffered_byte`, `bits_consumed`, `total_in`,
+  `total_out`, `with_max_output`, `with_ratio_guard` — a fast cached-symbol
+  loop while `input_remaining >= 8 && output_space >= 258`, a careful
+  per-symbol resumable path otherwise, 32 KiB linear history, and a sticky
+  fault latch (cleared only by `reset()`) that turns "decoder already
+  failed" into an error on every later call instead of quietly returning
+  short output. New `oxiarc_deflate::wrapper::WrappedInflate` layers zlib
+  and gzip framing on top: `new(InflateWrapper::{Raw, Zlib, Gzip, Auto})`
+  (`Auto` sniffs the 2-byte zlib header at offset 0 only, no Adler-32
+  retry), `multi_member`, `trailing_policy(TrailingPolicy::{Reject,
+  AllowZeros, Stop})`, `with_max_output`, `with_ratio_guard`,
+  `with_dictionary`, `verify_header_crc` (gzip FHCRC, **default `true`**;
+  the legacy one-shot `gzip_decompress`/`GzipDecoder` *were* re-based on
+  this core and now verify FHCRC too — a member whose FHCRC is corrupt,
+  which 0.4.1 silently accepted, is now rejected exactly as `gzip -d`
+  rejects it; see **Changed** below), `verify_checksum`
+  (default `true`; PNG's IDAT chain sets it `false` and relies on its own
+  CRC-per-chunk instead), `strict_first_member` (default `true` on every
+  new consumer; the legacy `GzipStreamDecoder` keeps returning `Ok(0)` on
+  non-gzip leading bytes, unchanged), `gzip_header() -> Option<&GzipHeaderInfo>`,
+  `members_decoded`, `reset`. New `oxiarc_deflate::{InflateReader<R: Read>,
+  AsyncInflateReader<R: AsyncRead>}` wrap either core behind a mandatory
+  64 KiB output staging buffer, retry `Interrupted`, propagate `WouldBlock`,
+  turn an inner `Ok(0)` into `FlushMode::Finish` so a truncated stream is an
+  error rather than a silent short read, replace the previous
+  `debug_assert` no-progress guard with a real `Err`, and implement the
+  zlib "fewer than 6 unconsumed bytes at EOF after a complete member ⇒
+  stop" rule in the adapter, not the core. `GzipStreamDecoder`,
+  `ZlibStreamDecoder`, `RawInflateReader` (RFC 4978, `FlushMode::None`
+  always), `async_deflate`, and `Inflater as Decompressor`
+  (`FlushMode::Finish`) are all re-based on this core with every existing
+  public item and guarantee preserved; `decompressed_size()` is
+  re-documented as "produced so far", not a final total. **One push API
+  serves both P2 and P3**: PNG's `IDAT` chain, an HTTP chunked/streamed
+  body and a self-contained TIFF strip are the same "feed bytes, get bytes,
+  ask again" shape, and `oxiarc-png` / `oxiarc-http` both consume
+  `InflateStream`/`WrappedInflate` directly rather than each growing its
+  own partial decoder. `Decompressor::decompress` keeps its documented
+  whole-remaining-input (`FlushMode::Finish`) contract; there is no new
+  `oxiarc-core::stream` module and no blanket `Decompressor` impl, by
+  design — `AsyncDecompressorWrapper<Inflater>` is documented unsupported
+  and points callers at `AsyncInflateReader` instead. Extensive new test
+  coverage (byte-at-a-time feeding, 1-byte output buffers, proptest split
+  points, truncation at every offset under bounded call-count budgets,
+  multi-member gzip, every gzip header flag, zlib concatenation with 1-3
+  byte accumulator residue, cap/ratio enforcement mid-block including a
+  committed 812 KB→123 MiB single-block bomb generator, CAB-style
+  reset/`set_dictionary` cycles) plus a new `tests/cross_crate_inflate.rs`
+  proving a PNG `IDAT` chain split across chunks, an HTTP gzip body split
+  across arbitrary reads, and a TIFF deflate strip all decode to
+  byte-identical output through this one shared core.
+- New **`oxiarc-zstd::stream::ZstdStream`** push decoder: `decode(&mut
+  self, input, output, flush) -> Result<ZstdProgress>` (fields mirror
+  `InflateProgress`), `finish()`, `with_max_output(u64)`,
+  `with_max_window(usize)`, `with_multi_frame(bool)`,
+  `with_dictionary(Vec<u8>)` — a real sliding-window ring rather than
+  "the output `Vec` is the window", incremental XXH64, and a memory
+  ceiling enforced *before* a block is decoded (a compressed block is
+  conservatively charged 128 KiB then re-charged its real size, an
+  RLE/raw block is charged from its header before it is materialised).
+  New `decompress_into`/`decompress_with_limit`/
+  `decompress_multi_frame_with_limit`; `ZstdStreamDecoder<R>` and the
+  async adapter are re-based on `ZstdStream` so they are genuinely
+  incremental rather than `read_to_end`-then-decode, with the output cap
+  honoured pre-decode instead of after. Fixed in the same pass: stale
+  literals-Huffman/FSE tables surviving `ZstdDecoder::reset` (a reused
+  decoder could decode a `Treeless`/`Repeat` block at the start of a new
+  frame against the *previous* frame's tables).
+- New **`oxiarc-brotli::stream::BrotliStream`** push decoder: meta-block
+  headers are parsed atomically with a bit-cursor rollback (a header that
+  straddles a `decode()` call boundary is retried whole, never
+  half-applied), the command loop is symbol-resumable, the window ring is
+  real and lazily allocated (`with_max_window`), and a
+  `decompress_reporting_shapes` API exposes `MetaBlockShape` for
+  differential testing against the one-shot decoder.
+  `BrotliDecompressor<R>` and its async adapter are re-based on it.
+- **`oxiarc_lzw::decompress_tiff_into(src, dst) -> Result<usize>`** — a
+  prefix/suffix table TIFF-LZW decoder with no per-code `Vec` allocation
+  (the old-style `early_change = false` fallback is still available for
+  pre-1993 files). `.xz` container framing (`XzReader`/`XzWriter`,
+  `CheckType`, `compress`/`decompress`) moved from `oxiarc-archive` into
+  `oxiarc_lzma::xz`, re-exported unchanged from `oxiarc-archive::xz` so no
+  downstream import breaks.
+- **`oxiarc-http`'s headers layer** (`ContentCoding` — an `Ord` from least-
+  to most-preferred, `parse_content_encoding`; `QValue`, a thousandths-
+  precision `u16`; `AcceptEncoding` builder,
+  `to_header_value() -> Option<String>`; RFC 9110-conformant `negotiate`
+  honouring `*` and `q=0`; `DecodeLimits { max_output, max_ratio, .. }`;
+  server-side `encode_body`), the foundation the decoders below are built
+  on. RFC 9110 example tables from the spec text are runnable tests, not
+  paraphrased.
+- **New crate `oxiarc-jpeg`** — a from-scratch Pure Rust JPEG (ITU-T T.81 /
+  ISO/IEC 10918-1) decoder and encoder. Decoder: all four marker-defined
+  processes (baseline, extended sequential, progressive with Annex G AC
+  refinement/EOB runs, and lossless SOF3 in 2-16 bit precision), a 9-bit
+  fast Huffman lookup, the exact-integer islow IDCT and libjpeg-exact fancy
+  upsampling, fixed-point YCbCr/YCCK/CMYK colour conversion, 1-4 components
+  at every sampling factor libjpeg supports, restart markers, `DNL`,
+  APPn/COM passthrough (JFIF/EXIF/Adobe/ICC), a `TableSet`/`load_tables`/
+  `decode_abbreviated_into`/`frame_header`/`decode_into_strided` surface
+  built specifically for TIFF's `JPEGTables` (compression 7) to reuse
+  without ever concatenating raw JPEG buffers, resource limits, and a
+  no-panic corpus — verified byte-parity against `djpeg -dct int`.
+  Encoder: baseline and 12-bit extended sequential (`SOF1`, dynamic
+  quantisation-table precision), standard and optimized (libjpeg
+  tie-breaking-exact) Huffman, quality-scaled quantisation tables
+  byte-identical to libjpeg's, box downsampling at 4:4:4/4:2:2/4:2:0 with
+  edge replication, restart intervals, JFIF/Adobe headers, gray/YCbCr/
+  RGB/CMYK, progressive encoding with libjpeg's default scan script,
+  `write_tables_only`/`encode_scan_only` (the other half of the TIFF
+  `JPEGTables` mode) and lossless encoding — verified **byte-identical**
+  to `cjpeg`, including progressive, optimized and 12-bit output. Also
+  ships arithmetic coding (SOF9/10/11, `DAC`; feature `arithmetic`,
+  **default-on**) verified byte-identical to libjpeg both directions, and
+  OJPEG (old-style, `Compression = 6`) reconstruction helpers for TIFF's
+  benefit. Hierarchical JPEG (SOF5/6/7/13/14/15) has no reference encoder
+  to test against and returns a named `Unsupported` error rather than
+  best-effort output, per the Phase 8 owner decision. `#![forbid(unsafe_code)]`.
+- **`oxiarc-jpeg`: reduced- and enlarged-scale decoding** — `Scale`
+  (numerator 1-16 over denominator 8, i.e. libjpeg's `-scale M/8`;
+  `Scale::{FULL, ONE_HALF, ONE_QUARTER, ONE_EIGHTH}` constants),
+  `DecodeOptions::scale` (default `Scale::FULL`, a byte-for-byte no-op;
+  ignored for lossless frames, matching libjpeg), and `ImageInfo::{scaled_width,
+  scaled_height}` (`ceil(dim * M / 8)`), which every decode entry point now
+  sizes its output from. `M` in `{1, 2, 4, 8}` is byte-identical to `djpeg
+  -dct int -scale M/8` (ported `jidctred.c` reduced-size IDCT kernels for
+  1x1/2x2/4x4 plus the pre-existing full-size one); the other twelve values
+  use one general kernel verified to a numeric tolerance (peak error 3,
+  MSE 0.0531 over 2.1M samples, 216 configurations) against `djpeg`,
+  including restart-marker streams and twelve-bit precision. `rayon`'s
+  parallel band splitter honours the scaled geometry at every `M`.
+- **`oxiarc-jpeg`: migration-aid compat facades**, always compiled (no
+  Cargo feature) — `compat::zune` (a `zune_jpeg`-shaped `JpegDecoder`:
+  `new`/`new_with_options`/`decode_headers`/`info`/`dimensions`/
+  `output_buffer_size`/`input_colorspace`/`output_colorspace`/
+  `set_options`/`icc_profile`/`exif`/`decode`, output colour space
+  `Rgb`/`Rgba`/`Luma`/`YCbCr`) and `compat::jpeg_decoder` (a
+  `jpeg-decoder`-shaped `Decoder<R: Read>`: `new`/`read_info`/`info`/
+  `decode`/`icc_profile`/`exif_data`/`inner_mut`, matching the real
+  crate's `ImageInfo`/`PixelFormat`/`CodingProcess` shapes), alongside the
+  pre-existing `compat::JpegEncoder`. One deliberate deviation: real
+  `jpeg_decoder::Decoder::info()` panics for a component count outside
+  `{1, 3, 4}`; this crate's no-panic policy turns that into
+  `Result<Option<ImageInfo>, JpegError>` instead.
+- **New crate `oxiarc-png`** — a from-scratch Pure Rust PNG (ISO/IEC
+  15948) decoder and encoder built on `oxiarc-deflate`. Decoder: a chunk
+  reader with per-chunk CRC-32 (reusing `oxiarc-core`'s PNG-compatible
+  CRC-32 table, not a second one), every colour type × bit depth, filter
+  kernels specialised per bytes-per-pixel, Adam7 interlacing with its
+  sub-byte edge cases handled correctly (1×1, width < 5, height == 1
+  empty passes), `expected_raw` computed exactly once so allocation never
+  guesses, incremental `IDAT` decode via `WrappedInflate(Zlib)`
+  (`verify_checksum(false)` by default, matching the reference `png`
+  crate's own leniency; strict mode available), both a pull `Decoder<R:
+  Read>`/`Reader` (`read_info`, `next_row`, `next_frame`,
+  `Transformations::{EXPAND, STRIP_16, ALPHA, ..}` matching `png` 0.18's
+  output-colour-type table exactly) and a push `StreamingDecoder`, lenient
+  defaults matching `png` 0.18 (ancillary-chunk CRC skip, out-of-range
+  palette index treated as opaque black, `tRNS` truncation tolerated) with
+  a strict mode, Apple `CgBI` PNGs (raw-deflate `IDAT`, BGR(A) swap,
+  premultiplied-alpha flag exposed) decoded under the lenient default and
+  named-error-rejected under strict, and untrusted-input limits. Encoder:
+  filter strategies (None/Sub/Up/Avg/Paeth/adaptive MSAD/entropy),
+  interlaced encoding, `Deflater` driven directly rather than through
+  `ZlibStreamEncoder` (which sync-flushes every 128 KiB and would fragment
+  every scanline run), `Encoder`/`Writer`/`StreamWriter`, every ancillary
+  chunk (`PLTE`, `tRNS`, `gAMA`, `cHRM`, `sRGB`, `iCCP`, `cICP`, `mDCv`,
+  `cLLi`, `sBIT`, `bKGD`, `hIST`, `pHYs`, `sPLT`, `tIME`, `tEXt`/`zTXt`/
+  `iTXt` keyword rules, `eXIf`, `oFFs`/`sCAL`/`pCAL`, `sTER`, unknown-chunk
+  retention), and full APNG (`acTL`/`fcTL`/`fdAT` sequence numbers,
+  dispose/blend compositing to RGBA8/16). A `png`-0.18-shaped compat facade
+  lives at the crate root plus a `v017` module for the older API shape.
+  Optional `parallel` (per-band filtering; DEFLATE itself stays serial)
+  and `async-io` features. `#![forbid(unsafe_code)]`.
+- **New crate `oxiarc-tiff`** — a from-scratch Pure Rust TIFF 6.0 (+
+  BigTIFF) decoder and encoder. Core: a byte-order layer for both
+  endiannesses, classic and BigTIFF headers, IFD parsing across all 18 tag
+  value types (inline and offset-indirected, `LONG8`/`SLONG8`/`IFD8`,
+  count-overflow guards, lazy value loading, IFD-loop detection, `SubIFD`
+  trees), a tag table spanning baseline, extension, GeoTIFF, EXIF, GPS,
+  XMP, ICC, IPTC, Photoshop and DNG numbers, strip/tile geometry, sample
+  unpacking at 1/2/4/8/12/16/24/32/64-bit depths and `FillOrder 2`,
+  predictors 1/2/3 (correct file-order arithmetic under planar striding),
+  and photometric conversions (`MinIsWhite`, palette, the YCbCr matrix,
+  CMYK passthrough). Codecs: None, PackBits and CCITT RLE/G3-1D/G3-2D/G4
+  (private modules — no independent second consumer exists for these two
+  in the ecosystem, so they are not a separate crate; T4/T6 options,
+  `FillOrder`, and now uncompressed mode, see below), Deflate/Adobe
+  Deflate (8/32946, via `WrappedInflate(Zlib)` per strip with an explicit
+  `TrailingPolicy`), LZW (5, via `oxiarc_lzw::decompress_tiff_into`),
+  ZSTD (50000), LZMA (34925, via `oxiarc_lzma::xz`), JPEG (7, via
+  `oxiarc-jpeg`'s `TableSet`/`decode_abbreviated_into` — a photometric ×
+  APP14 × chroma-subsampling table, `RowsPerStrip` rounded to
+  `8·Vmax` on write) and old-style JPEG (`Compression = 6`, OJPEG flavour
+  (a) via libtiff-compatible reconstruction, flavours (b)/(c)
+  constructively); WebP/JXL/LERC return a named `Unsupported`/
+  `FeatureNotCompiled` rather than a silent stored fallback, and a
+  `CodecRegistry` plugin trait lets a caller add its own. A full writer
+  exists for every codec above (strips and tiles, multi-page, arbitrary
+  tags including GeoTIFF passthrough, classic/BigTIFF chosen
+  automatically, offsets patched after the fact). A `tiff`-0.11-shaped
+  `compat` feature (`Decoder`/`DecodingResult` with the real crate's exact
+  11/6 variant counts, `TiffEncoder`/`ImageEncoder`; `half` is a
+  dependency only here), `rayon` (parallel strip/tile decode — see the
+  pooling entry below) and `mmap` round it out.
+  `#![forbid(unsafe_code)]`.
+- **`oxiarc-brotli`: shared (custom LZ77) dictionary support, both
+  directions.** `compress_with_dictionary`, `decompress_with_dictionary`,
+  `decompress_with_dictionary_and_limit`, and `with_dictionary` on
+  `BrotliStream` (surviving `reset()`), `BrotliDecompressor` and
+  `BrotliAsyncDecompressor`. The distance space a dictionary opens up
+  (`shared_dict`: ordinary output, then the dictionary, then the Appendix
+  A static words, all relative to `max_backward = min(window, produced)`)
+  was established by probes against `brotli 1.1.0 -D` rather than
+  assumed. A shared dictionary is a *compound history block*: a copy may
+  not run past its end, and one that would is rejected as corrupt — which
+  is what the reference decoder does, re-derived every oracle run from a
+  pair of streams differing in one copy length (this replaces an earlier
+  "straddle" behaviour that turned out to be a fabrication — see Fixed,
+  below). The encoder seeds its match finder with the dictionary and
+  encodes every meta-block both with and without it, keeping the smaller,
+  so attaching a dictionary can never cost ratio; `prefix_len == 0` stays
+  byte-identical to the dictionary-free encoder. Verified against the
+  reference CLI: **72/72** reference `-D` streams decode byte-identically
+  and **96/96** of ours are accepted by `brotli -d -D` (70 of them smaller
+  than the dictionary-free encoding); a 20 KiB slice of a 78 KB dictionary
+  goes from 594 bytes to **27**.
+- **`oxiarc-brotli`: `Content-Encoding: dcb` framing (RFC 9842).** New
+  `dcb` module — `DCB_MAGIC` (`FF 44 43 42`), `DCB_HEADER_LEN` (36),
+  `dictionary_id` (SHA-256, via `oxiarc_core::sha256`), `write_header`,
+  `parse_header`, `verify_header`, `compress`, `decompress`,
+  `decompress_with_limit` — re-exported at the crate root as
+  `write_dcb_header`/`parse_dcb_header`/`verify_dcb_header`/`compress_dcb`/
+  `decompress_dcb`/`decompress_dcb_with_limit`. A body from the wire is
+  treated as untrusted: truncation at every offset, a flip of every header
+  byte and 1,098 payload mutations are all covered, with both decoders
+  required to agree on every one. This is what lets `oxiarc-http` stop
+  refusing `dcb` (see below).
+- **`oxiarc-lzw`: UNIX `compress(1)` / `.Z` container support**
+  (`oxiarc_lzw::z`). `1F 9D` header with the block-mode flag and 9-16 bit
+  code widths, LSB-first 8-code groups with the reference's exact
+  group-alignment and table-reset semantics, KwKwK, and no
+  end-of-information code (a truncated stream decodes to a *prefix*,
+  exactly as `gzip -dc` does — the format has no way to signal "the body
+  was cut short"; a transport-level check like `Content-Length` has to
+  catch that). One-shot `decompress`/`decompress_with_limit`/
+  `decompress_into`/`compress`/`compress_with_block_mode`, plus
+  `ZReader<R: Read>` (a genuinely incremental reader with
+  `with_max_output`, its compressed working set bounded to one 16 KiB
+  chunk plus under `max_bits` bytes of carry plus the ~193 KiB code table
+  — the decoded working set is *not* bounded unless `with_max_output` is
+  set, since one 16 KiB chunk of 16-bit codes can legitimately expand to
+  hundreds of MB) and `ZWriter<W: Write>` (batches of about 32 KiB;
+  `finish()` must be called or the tail is lost). `compress(data, n)` is
+  byte-identical to `compress -b n -c`, and `gzip -dc`/`uncompress -c`
+  reproduce this crate's streams; gated by the new self-skipping
+  `z-oracle` feature plus committed fixtures in
+  `oxiarc-lzw/tests/data/z/`. This is what `Content-Encoding: compress`
+  needs (see the `oxiarc-http` entry below).
+- **`oxiarc-lzw`: explicit bit order.** `LzwConfig` gains a `bit_order`
+  field (`LzwBitOrder::{Msb, Lsb}`) honoured by every generic entry point,
+  plus `LzwConfig::with_bit_order` and `LzwConfig::TIFF_COMPAT_LSB` for
+  libtiff's pre-1993 `LZWDecodeCompat` strips (late width change + LSB
+  packing), which this crate previously could not decode at all — checked
+  in both directions against `weezl` (an existing dev-dependency oracle;
+  never a banned crate).
+- **`oxiarc-lzw`: code widths up to 16 bits.** `LzwConfig::max_bits` now
+  accepts 9-16 (`MAX_SUPPORTED_BITS`), with the dictionary counter, the
+  width-growth rule and the encoder's reset trigger all computed in `u32`
+  so the 65,536-entry exhausted state is representable (12 remains the
+  TIFF/GIF default). `LzwStreamMode::Config(LzwConfig)` lets the streaming
+  adapters use any bit order and code width; `Config(LzwConfig::TIFF)` is
+  byte-identical to `LzwStreamMode::Tiff`.
+- **`oxiarc-lzw`: GIF decode is now validated against a reference for the
+  first time.** New self-skipping `gif-oracle` feature drives Pillow's own
+  GIF decoder in both directions: 20 Pillow-written GIFs (interlaced and
+  not, five payload shapes, sides 1-200) decode byte-identically, 20 GIFs
+  built around `gif_compress` output read back byte-identically in
+  Pillow, and every minimum code size 2-8 round-trips through it. The GIF
+  codec had previously only ever been round-tripped against itself.
+- **`oxiarc-lzma`: `xz::XzDecoder`** — a reusable decoder context (`new`,
+  `with_max_output`, `decompress_into`, `reset`) that keeps its LZMA2
+  dictionary buffer, probability model and coder state allocated across
+  calls instead of rebuilding them per stream; targets TIFF
+  `Compression = 34925`, where one image can be thousands of independent
+  same-dictionary-size `.xz` strips. `xz::decompress_into` is a one-line
+  wrapper over it; `xz::decompress_with_limit` is unchanged (a growable
+  `Vec` from one call has no caller-held state to reuse in the first
+  place). A guard (`block_opener_permits_decoder_reuse`) restores the
+  "every independent XZ block must reset its dictionary" enforcement that
+  blind decoder reuse would otherwise weaken; every already-accepted
+  stream is still accepted. `XzWriter` gained multi-block output
+  (`with_block_size`, default 64 MiB) with a per-block `CheckType`
+  (`None`/`Crc32`/`Crc64`/`Sha256`).
+- **`oxiarc-core`: new `sha256` module** (`Sha256::{new, update, finalize,
+  compute}`, `hex32`) — dependency-free FIPS 180-4, moved here from
+  `oxiarc-lzma`'s `.xz` reader/writer (same implementation, same bytes,
+  independently re-verified against Python's `hashlib` including the
+  56-byte and 112-byte NIST multi-block vectors and one million `'a'`
+  bytes) so other crates — `oxiarc-brotli`'s `dcb` framing and
+  `oxiarc-http`'s `dcz` preamble, both above — can share it without
+  depending on `oxiarc-lzma`.
+- **`oxiarc-http` decoders** (the `Decoder`/`DecodedBody` layer): a
+  private `CodingDecoder` trait over `WrappedInflate` (gzip multi-member,
+  `x-gzip`, and `deflate` sniffed `Auto` at offset 0 per RFC 9110
+  §8.4.1.2, since some servers emit raw DEFLATE under that name),
+  `BrotliStream`, and `ZstdStream` (+ `dcz`, RFC 9842's Zstandard
+  dictionary variant, when a dictionary is supplied); chained codings
+  (`Content-Encoding: gzip, br`) apply in reverse order; push
+  `Decoder::feed_into`; a pull `DecodedBody<R: Read + BufRead>` and, under
+  `async-io`, `AsyncDecodedBody`; `identity` and `compress` token
+  recognition; `finish()` failing is documented as "the response failed",
+  not a soft warning. Recipes for `ureq` 3 (default-features = false plus
+  a manual `Accept-Encoding`), `reqwest` (`bytes_stream`), and `oxihttp`
+  ship as runnable `examples/`. Every RFC example is a test, alongside
+  per-coding round-trips against the matching oxiarc encoder and against
+  python-produced fixtures, byte-at-a-time feeding, chunk invariance,
+  `DecodeLimits` enforcement, and the negotiation table.
+- **`oxiarc-http`: `Content-Encoding: compress`/`x-compress` (legacy UNIX
+  `.Z`) is now fully functional, both directions**, behind the new
+  `compress` Cargo feature. `decode/compress.rs`'s `CompressCodingDecoder`
+  bridges `oxiarc_lzw::z::ZReader`'s pull `Read` shape onto this crate's
+  push `CodingDecoder` seam through a small `Arc<Mutex<VecDeque<u8>>>`
+  queue, whose read end reports `WouldBlock` rather than `Ok(0)` when
+  starved so end-of-body is never confused with "no bytes yet". The
+  bridge **meters how much compressed input it hands the inner reader**:
+  `ZReader` decodes a whole pull to completion, into a buffer of its own,
+  before serving the first byte of it, and at its native 16 KiB pull a
+  body that expands 4992:1 would otherwise materialise ~128 MiB inside one
+  `read` call. The bridge retunes its pull size after every completed
+  fill from the worst per-fill expansion ratio measured so far, targeting
+  a 64 KiB fill: streaming a 128 MiB, 4992:1 `.Z` body through
+  `DecodedBody` with `DecodeLimits::unlimited()` and 4 KiB reads went from
+  **134,605,718 bytes** of peak live allocation to **893,668** (an
+  ordinary 32 MiB text body: 2,508,454 → 542,439), with no throughput
+  cost — interleaved A/B (best-of-9) makes the metered path **~8 % faster**,
+  since the smaller working set fits cache. `encode_body`/`Encoder<W>`
+  gain a real streaming `Compress` arm (`oxiarc_lzw::z::ZWriter`); new
+  `EncodeOptions::compress_max_bits` (default 16). `.Z` has no
+  end-of-information code and no checksum, so a truncated/corrupted body
+  decodes to a plausible, silently short prefix — exactly like
+  `gzip -dc`/BSD `uncompress` — now a documented, tested exception on
+  every one of this crate's cross-coding invariant tests. Gated by
+  `tests/allocations.rs`'s new Gate 4.
+- **`oxiarc-http`: `Content-Encoding: dcb` (RFC 9842, Brotli variant) is
+  now fully functional, decode and encode**, now that `oxiarc-brotli` has
+  shared-dictionary support (above) — the exact condition the original
+  Phase 8 owner decision named. `decode/dcb.rs`'s `DcbCodingDecoder`
+  buffers `oxiarc_brotli::dcb`'s 36-byte preamble (magic + the
+  dictionary's SHA-256) across as many calls as it takes, verifies it
+  against the caller's dictionary before a single Brotli byte decodes,
+  then hands the rest to `BrotliStream::with_dictionary`; a wrong or
+  absent dictionary is refused before any decoding, never a silent
+  fallback to plain `br`. `encode_body` produces one via
+  `oxiarc_brotli::compress_dcb`. The *streaming* `Encoder<W>` refuses
+  `Dcb` by name (`UnsupportedReason::StreamingUnsupported`) —
+  `oxiarc-brotli` has no dictionary-aware *streaming* encoder to wrap,
+  only the one-shot `compress_with_dictionary`/`dcb::compress` — so
+  `encode_body`'s one-shot path is the only way to produce a `dcb` body
+  from this crate. `ContentCoding::{Compress, Dcb}::is_decodable`/
+  `is_encodable` now track real, feature-gated capability instead of
+  being unconditionally `false`.
+- **New crate `oxiarc-image`** — a thin, `image`-0.25-crate-shaped facade
+  over `oxiarc-png`/`oxiarc-jpeg`/`oxiarc-tiff`, for the ~10 of 17
+  actionable ecosystem projects that depend on the `image` facade rather
+  than on `png`/`tiff` directly. Magic-byte and extension format
+  sniffing, `ImageReader`, `DynamicImage` (10 variants: `Luma8/16`,
+  `LumaA8/16`, `Rgb8/16/32F`, `Rgba8/16/32F`), `ImageBuffer<P>` with
+  `Pixel`/`Primitive` traits, and `codecs::{png, jpeg, tiff}::{Decoder,
+  Encoder}` shaped to match `image` 0.25's own API, for projects
+  migrating off `image` without adopting each codec crate's native API
+  directly. TIFF's 32-bit-per-channel IEEE-float round trip
+  (`ColorType::Rgb32F`/`Rgba32F`) is supported end to end, including
+  straight/premultiplied-alpha handling at float precision, and
+  `DynamicImage::from_decoder` mirrors `image` 0.25's own constructor.
+  Deliberately **not** an image-processing library: no
+  resize/blur/rotate/crop, no `imageops`, no `GenericImage(View)`, no
+  animation — a migration aid for format I/O only, documented as such.
+  `#![forbid(unsafe_code)]`.
+- **`oxiarc detect`/`oxiarc info` now recognise PNG, JPEG and TIFF images
+  by magic bytes** as a CLI-layer fallback when the input is not a
+  recognised archive format (deliberately never added to `ArchiveFormat`
+  itself, per the cost/benefit analysis in the Phase 8 design report —
+  that would need five new "recognised, but not an archive" error paths
+  across `list`/`extract`/`test`/`convert`/`add`, for a status `detect`/
+  `info` can already report through a small standalone sniffing table
+  instead): `detect` prints a brief summary, `info` prints dimensions,
+  colour type, bit depth, compression and a chunk/segment/IFD summary.
+  Every other subcommand now appends a short, specific hint to its
+  existing "unsupported format" error ("this looks like a PNG, not an
+  archive — try `oxiarc info`...") instead of a generic message, computed
+  from a bounded-length read (at most 16 bytes) rather than buffering the
+  whole input just to check a magic number. Man pages (11 × 2 directories)
+  and shell completions (4 shells × 2 directories) regenerated to match.
+- **15 new `cargo-fuzz` targets** under `fuzz/fuzz_targets/`:
+  `fuzz_inflate_stream`, `fuzz_wrapped_inflate`, `fuzz_inflate_reader`,
+  `fuzz_zstd_stream`, `fuzz_brotli_stream`, `fuzz_http_decode`,
+  `fuzz_http_headers`, `fuzz_png_decode`, `fuzz_png_limits`,
+  `fuzz_png_streaming`, `fuzz_jpeg_decode`, `fuzz_jpeg_tables`,
+  `fuzz_tiff_read`, `fuzz_tiff_ifd`, `fuzz_image_open` — a superset of the
+  12 the Phase 8 program named, plus a reusable
+  `fuzz/support/counting_alloc.rs` peak-tracking global allocator for
+  allocation-bound assertions. `fuzz_zstd_stream` differentially fuzzes
+  `ZstdStream` against the legacy `decompress_multi_frame` and, after the
+  `oxiarc-zstd` legacy-hardening fixes above landed, asserts genuine
+  two-directional agreement (not just "if both accept, bytes match") with
+  one precisely-scoped, evidence-backed carve-out for the permanent
+  declared-window-ceiling split — 983,701 fuzz executions found none.
+  `oxiarc-image`'s `tests/adversarial.rs` (truncation/corruption/short-read
+  hardening across all three codecs) is the always-on substitute for a
+  16th target, `fuzz_image_open`, which is recorded but not yet built.
+
+### Changed
+
+- **`encoding_rs` capped to `>=0.8.35, <0.8.40`.** 0.8.40+ pulls in
+  `multiversion` for SIMD dispatch and raises its own MSRV to rustc 1.88,
+  silently breaking this workspace's real `cargo +1.85.0 check --workspace`
+  — the declared `rust-version = "1.85"` is enforced, not aspirational (see
+  `clippy.toml`'s `msrv` gate and the `Strategy::Fixed` entry below, which
+  exists precisely because a past `cargo +1.85.0` catch found a real
+  let-chain regression the same way). `oxiarc-archive` is the only
+  consumer; the cap keeps it on the latest 1.85-compatible release rather
+  than dropping the dependency outright. Raise the cap once the workspace
+  MSRV moves to 1.88+.
+- **Internal `oxiarc-*` dependency requirements tightened from `"0.4"`
+  (`^0.4`) to `"0.4.2"` (`^0.4.2`) across all 17 sibling entries in
+  `[workspace.dependencies]`.** Several of this release's new crates use
+  APIs another sibling only gained in 0.4.2 itself (`oxiarc_core::sha256`,
+  `BitCache::take_byte`/`align_to_byte`, `oxiarc_deflate::WrappedInflate` &
+  co., `oxiarc_lzma::xz`); a caller resolving the old `^0.4` range could
+  legitimately land on an already-published 0.4.0/0.4.1 that lacks them —
+  not a first-publication artifact, a real semver gap for any consumer
+  whose resolver picks an older compatible version. Pure Rust semver
+  hygiene; local builds are unaffected (path dependencies still resolve
+  from source regardless of this version string).
+- **gzip `FHCRC` is now verified on every decode path, not only the new
+  types.** `oxiarc-deflate`'s legacy one-shot `gzip_decompress` /
+  `GzipDecoder` and `oxiarc-archive`'s `GzipReader` were both re-based on
+  the new `WrappedInflate` core, whose `verify_header_crc` defaults to
+  `true`. A gzip member that sets `FLG.FHCRC` and carries a corrupt CRC-16
+  over its own header — silently accepted by 0.4.1, which skipped the field
+  — is now rejected with a checksum-mismatch error, exactly as `gzip -d`
+  rejects it. Streams without the flag (the overwhelming majority, including
+  everything `gzip`, `pigz` and oxiarc itself write by default) are
+  unaffected. Opt out with `WrappedInflate::verify_header_crc(false)` or
+  `InflateReader::verify_header_crc(false)`.
+- **`OxiArcError::CrcMismatch`'s message now reads "checksum mismatch"
+  rather than "CRC mismatch".** The variant has always carried *every*
+  whole-stream checksum this workspace verifies, including zlib's
+  **Adler-32** trailer (RFC 1950 §8.2) — the one PNG `IDAT` chains, TIFF
+  Deflate strips and HTTP `Content-Encoding: deflate` bodies all decode
+  through — so a corrupt Adler-32 used to be reported as a "CRC mismatch",
+  sending anyone debugging it to look for a field that is not there. The
+  variant, its `expected`/`computed` fields and every raise site are
+  unchanged (renaming or splitting the variant would be a breaking change on
+  a published crate); only the `Display` text changed, and each raise site
+  now names its own algorithm in its rustdoc.
+- **`oxiarc-deflate`: the inflate fast loop rewritten around packed decode
+  tables — decode throughput up across every data shape, with no change to
+  any decoder guarantee.** The symbol loop used to decode through
+  `HuffmanTree` and then look the symbol's meaning up in four more tables
+  (`LENGTH_EXTRA_BITS`, `LENGTH_BASE`, `DISTANCE_EXTRA_BITS`,
+  `DISTANCE_BASE`) behind a `< 256 / == 256 / > 285` comparison chain. A new
+  crate-private `decode_table::DecodeTable` folds all of that into the table
+  entry: one `u32` carries the symbol *kind* (literal / end-of-block /
+  sub-table / invalid), the code length, the extra-bit count and the payload
+  (literal byte, length base, distance base, sub-table offset), so a literal
+  is one masked load and a match needs no side tables at all. The table is
+  built by **zlib's one-pass `inflate_table` algorithm** — symbols counting
+  sorted into canonical order, the reversed code maintained by a backwards
+  increment — instead of reversing every symbol's code with a per-bit loop
+  twice per block. Around it: one bulk refill per iteration (>= 56 bits,
+  checked once as a single invariant, so no inner step re-checks
+  availability), up to three literals decoded from one 32-bit peek with a
+  single `consume`, the bit accumulator and both cursors in locals, the loop
+  `#[inline(never)]` so it does not share a register allocation with the
+  resumable path (which was spilling the input cursor to the stack on every
+  refill), and match copies in machine words — 8-byte chunks inline for the
+  short non-overlapping case, a byte fill for distance 1, word tiling with
+  pattern doubling for distances 2-7, and `memmove` only above 64 bytes
+  where its vector width wins. The growable entry points (`inflate`,
+  `InflateStream::inflate_to_vec`) now decode into the tail of the buffer
+  they are filling, so the window is written once and back-references
+  resolve in place, and the first buffer is sized from the input instead of
+  always starting at 64 KiB.
+  **Nothing observable changed**: the same bytes come out (the differential
+  suite, the CPython `zlib` oracle and the PNG/TIFF/HTTP/archive suites all
+  pass unchanged), the sticky-fault, `NeedInput`/`NeedOutput`, `FlushMode`
+  and no-silent-truncation semantics are untouched, no byte outside the
+  output a call reports is ever written, and `HuffmanTree` keeps its public
+  API (it is still the encoder's, and still the bit-at-a-time fallback's).
+  Resident memory *fell*: the two per-tree root-sized scratch buffers are
+  gone, and `oxiarc-http`'s streaming allocation peak went from ~216 KiB to
+  178 KiB against its 224 KiB budget. Measured with
+  `cargo run --release --example inflate_ab` (new: an interleaved A/B of all
+  four decode entry points against `zlib.decompress` over six data shapes x
+  three sizes x levels 1/6/9, every arm's output verified before it is
+  timed) and `benches/deflate_bench.rs::inflate_shapes` (new).
+  Measured by running the pre-change binary and the current one alternately
+  on the same corpora (so neither gets a quieter machine), 1 MiB payloads,
+  MB/s of output through `inflate_into` — with the worst of the five decode
+  arms over CPython's `zlib.decompress` in the same rounds. Every figure is
+  a median of medians (the median across three interleaved rounds of each
+  round's own median); ranges span levels 1/6/9, and the last column is the
+  same ratio computed from each round's best iteration instead, which on a
+  machine at load ~45 is the load-robust figure:
+
+  | Shape | before -> after | worst arm vs python | best-of-round |
+  |---|---:|---:|---:|
+  | PNG-filtered scanlines | 1008-1032 -> 1649-1701 (1.6x) | 0.52-0.61x -> 0.86-0.87x | 0.77-0.83x |
+  | text (HTML-like) | 576-989 -> 910-1625 (1.6x) | 0.41-0.54x -> 0.65-0.78x | 0.63-0.74x |
+  | a full flush every 8 KiB | 478-572 -> 696-868 (1.5x) | 0.45-0.48x -> 0.66-0.72x | 0.64-0.70x |
+  | long-match JSON | 2964-3298 -> 3773-3812 (1.1-1.3x) | 0.96-0.97x -> 1.10-1.13x | 1.01-1.02x |
+  | RGB8 image rows | 278-281 -> 307-310 (1.1x) | 0.56-0.60x -> 0.65-0.67x | 0.65-0.66x |
+  | incompressible (stored) | 30848-32832 -> 31048-34090 | 2.54-2.80x -> 2.75-2.92x | 2.38-2.49x |
+
+  The reference is CPython 3.14 linking `/usr/lib/libz.1.dylib` 1.2.12 —
+  Apple's *tuned* system zlib, not stock zlib. Stated exactly against the
+  ">= 0.60x on every shape" requirement, on medians: **1 MiB is met on every
+  shape and level** (0.65x-2.92x); **64 KiB is met on four of six** (RGB8
+  image rows 0.46x at level 6 and the full-flush shape 0.59x at level 9 are
+  short on medians, 0.60x and 0.71x on best-of-round, where every 64 KiB
+  shape then clears the line); **16 MiB is met on three of six**
+  (PNG-filtered 0.51x-0.60x, RGB8 0.58x-0.67x, text 0.58x-0.77x, five of
+  six >= 0.61x on best-of-round). Re-measured 2026-09-08 across three more
+  full 54-row passes at load 60-71: PNG-filtered at 16 MiB lands at
+  0.47x-0.67x on medians and 0.48x-0.57x on best-of-round — the same band and
+  the same verdict, marginally lower at the top because those passes ran at a
+  higher load than the originals'. None of that is a regression: on the four
+  decode-bound shapes the python ratio improves in all 36 measured rows and
+  `inflate_into` is 1.04x-3.3x faster, while the two `memcpy`-bound shapes
+  (stored blocks, long-match JSON) scatter in both directions within noise.
+  64 KiB decodes are 20-40 microsecond measurements on a loaded shared
+  machine, and the 16 MiB PNG corpus is only 2.6x compressible (against 7.9x
+  at 1 MiB), i.e. a second literal-heavy shape at that size. The full matrix, the method and the
+  changes that did *not* pay off are in `oxiarc-deflate/README.md` and
+  `oxiarc-deflate/TODO.md`.
+
+- **`oxiarc-zstd`: decode throughput rebuilt around the reference decoder's
+  data layout.** The speed-up is strongly shape-dependent — it is large exactly
+  where the decoder was doing per-byte work, and small where it was already
+  bound by `memcpy` (see the table below). The motivating
+  measurement came from the TIFF track: on a 4096x4096 RGB8 page in 16-row
+  strips, our ZSTD strip decode delivered ~110 MB/s where `libzstd` inside
+  `tiffcp` was an order of magnitude ahead, the largest gap in the whole codec
+  matrix. **That gap is closed**: re-measured 2026-09-08 on the same geometry
+  (4096x4096, 16-row strips, medians of 15 interleaved rounds, three runs at
+  load 110 down to 20), the whole-image ZSTD ratio against `tiffcp -c none` is
+  **0.96x on Gray16 and 1.65x on RGB8**, from 5.07x and 6.24x — the Gray16 row
+  now meets the crate's `<= 1.25x` gate outright, and ZSTD is no longer the
+  outlier of that matrix. Profiling found the cost was almost never in the entropy decoding
+  itself but in how the decoder reached the bits and moved the bytes:
+  `FseBitReader` gathered up to five bounds-checked byte loads *per bit-field
+  read* (a Huffman literals stream calls it once per output byte, a sequence
+  stream six to nine times per sequence); an overlapping match copied
+  `out[i % offset]` one byte at a time, an integer division per output byte;
+  the window ring reduced every index with `% cap`, and `cap` is not a power of
+  two, so each was a real `udiv`; short literal and match runs went through
+  `memcpy`/`memmove` **calls** whose overhead dwarfed the 3-20 bytes they moved
+  (`_platform_memmove` was **51 %** of a 50 MB text decode); the window
+  re-allocated and re-zeroed on every growth step (`2x` the final capacity in
+  `bzero` over a doubling sequence); `xxhash`'s `read_u64_le` was eight
+  bounds-checked byte loads and was not being inlined; and the legacy
+  `ZstdDecoder` allocated a fresh literals and sequences `Vec` for **every
+  block**. All of that is gone. What replaces it: a 64-bit bit container with
+  bulk refills (`src/backward_bits.rs`, modelled on the reference
+  `BIT_DStream_t`), split into a register-resident `BitCursor` a decode loop
+  keeps out of memory; **reloads on a fixed schedule instead of a
+  data-dependent test** (four Huffman symbols per stream per reload; two
+  reloads per sequence), because that test is a mispredicting branch; the four
+  Huffman literal streams decoded **in lockstep**, which is what RFC 8878's
+  four-stream layout exists for — four independent `peek -> table load -> skip`
+  chains instead of one; pattern-doubling overlapping-match copies on both
+  decode paths (`offset`, `2*offset`, `4*offset`, ...); a new `src/short_copy.rs`
+  of call-free fixed-width copies for short runs; one conditional subtraction
+  in place of every ring `%`; in-place ring growth that zeroes only the new
+  tail; and scratch buffers reused across blocks on the legacy path too.
+  **No output changed**: the `zstd-oracle` differential suite (reference `zstd`
+  1.5.7, both directions), the embedded OxiGDAL corpus, the mutation and
+  truncation sweeps and every ZSTD4 accept/refuse test are unchanged and green,
+  and two new differentials pin the fast paths against the implementations they
+  replace — `literals::tests::the_interleaved_pass_agrees_with_the_checked_decoder`
+  (interleaved vs checked, over real encoder-produced four-stream sections) and
+  `frame`/`window`'s `..._matches_the_byte_at_a_time_definition` (pattern
+  doubling vs `out.push(out[len - offset])`, every offset x length combination),
+  plus a differential oracle in `backward_bits` that replays the byte-gathering
+  reader's exact `peek`/`bits_remaining`/`is_overflowed`/`is_finished` at every
+  step. Public API unchanged. New `examples/decode_throughput.rs` measures the
+  whole matrix against `zstd -b -d` in interleaved rounds; `benches/stream_bench.rs`
+  gained a `zstd_shape/*` group over the same shapes.
+
+  Before/after, `decompress_into`, MB/s of output, best of two 7-round runs of
+  each build **alternated back to back** on the same machine at load averages
+  27-37 on 8 cores (the two builds' rounds are therefore comparable to each
+  other; the absolute numbers are not comparable to an idle machine):
+
+  | shape (level) | before | after | |
+  |---|---|---|---|
+  | RGB8 TIFF strip 288 KiB (1) | 127.9 | 926.4 | **7.2x** |
+  | RGB8 TIFF strip 288 KiB (3) | 227.3 | 921.2 | **4.1x** |
+  | RGB8 TIFF strip 288 KiB (9) | 235.8 | 975.3 | **4.1x** |
+  | RGB8 TIFF strip 288 KiB (19) | 94.5 | 193.4 | 2.0x |
+  | RGB8 TIFF strip 1 MiB (1) | 139.5 | 944.9 | **6.8x** |
+  | RGB8 TIFF strip 1 MiB (3) | 126.1 | 561.3 | **4.5x** |
+  | RGB8 TIFF strip 1 MiB (9) | 137.4 | 624.4 | **4.5x** |
+  | RGB8 TIFF strip 1 MiB (19) | 87.4 | 171.0 | 2.0x |
+  | text corpus 50 MB (3) | 315.8 | 701.8 | 2.2x |
+  | text corpus 50 MB (19) | 598.5 | 1235.5 | 2.1x |
+  | incompressible 8 MiB (3) | 8552.2 | 9507.3 | 1.1x |
+  | highly repetitive 8 MiB (3) | 1238.7 | 10220.2 | **8.3x** |
+
+  The two shapes that barely move are the ones that were already bound by
+  `memcpy` rather than by per-byte work, which is the point: nothing was slow
+  there to begin with. Against the reference decoder the same frames now run at
+  0.5x-0.75x of `zstd -b -d` on every shape except the 50 MB text corpus at
+  level 3 (0.43x-0.58x depending on the round; see `oxiarc-zstd/README.md`),
+  and 3.6x on highly repetitive data. `decompress_into` also gained a
+  caller-buffer-sized first window allocation (`ZstdStream::with_window_hint`,
+  crate-internal) so a one-shot decode into a known-size buffer no longer walks
+  the ring's doubling sequence — memory the caller has *already allocated* is
+  the one size that may drive an allocation, and the lazy growth that protects
+  against a declared `Window_Size` is untouched.
+
+- **`oxiarc-zstd`: `decompress_multi_frame` no longer tolerates *leading*
+  garbage, and a recognised-but-truncated frame is an error wherever it sits.**
+  Trailing tolerance is unchanged and now stated exactly in the doc comment:
+  bytes that start no recognisable frame end the stream gracefully **after at
+  least one complete frame has been decoded**; the same bytes before any frame
+  are an error. A truncated skippable frame (magic with no size field, or a
+  payload that runs off the end) is an error on both paths — a recognised frame
+  start is never trailing garbage. A complete skippable frame still does not
+  count as a decoded frame, so `[skippable]` alone remains an empty stream
+  while `[skippable][2 stray bytes]` is now an error. Callers that relied on
+  `Ok(vec![])` for non-zstd input must check the error instead.
+- **`oxiarc-zstd`: the declared-`Window_Size` policy is now explicit, and
+  differs by entry point on purpose.** `ZstdStream` keeps a real sliding-window
+  ring, so it refuses a declaration above `with_max_window` (8 MiB by default)
+  before allocating; the unbounded `decompress` / `decompress_multi_frame` keep
+  no ring — their output `Vec` *is* the window — so they accept any declaration,
+  as they always have; and `decompress_with_limit` /
+  `decompress_multi_frame_with_limit` now refuse a declaration above
+  `max(max_output, 128 MiB)`, 128 MiB being the reference decoder's own
+  `ZSTD_WINDOWLOG_MAX_DEFAULT` (`zstd -d` rejects a 2 GiB-window frame with
+  "Window size larger than maximum : 2147483648 > 134217728"). The ceiling is
+  deliberately **not** the caller's output limit: measured against `zstd` 1.5.7,
+  a payload piped through `-3` declares a 2 MiB window and one piped through
+  `--long=24 -6` declares 16 MiB — whatever the payload's length, and with no
+  `Frame_Content_Size` — so `Window_Size > limit` would reject ordinary
+  reference frames. A declared `Frame_Content_Size` past the limit is still
+  refused before anything is decoded. `decompress_into` stays unrestricted: a
+  container's chunk already bounds it.
+- **`oxiarc-tiff` now encodes `Compression = 7` (JPEG) through
+  `oxiarc_jpeg::Encoder`** instead of the baseline encoder it carried while
+  `oxiarc-jpeg` had none. `compression/jpeg/encode.rs` went from 659 lines of
+  DCT, Huffman and downsampling code to 334 lines that map a TIFF
+  `CodecContext` onto `oxiarc_jpeg::EncodeOptions` and drive
+  `write_tables_only` / `encode_scan_only` / `encode`. `JPEGTables` (tag 347)
+  is unchanged — verified byte-identical to the old encoder's for gray, YCbCr
+  4:2:2, RGB and CMYK at qualities 1, 10, 25, 50, 75, 95 and 100 before the
+  swap, and now checked byte-identical to `tiffcp -c jpeg`'s in the
+  `tiff-oracle` suite. The strips' marker order follows libjpeg's
+  (`SOI DQT SOF DHT SOS`) rather than the old `SOI DQT DHT SOF SOS`; both are
+  conformant abbreviated datastreams and libtiff, Pillow and `tifffile` read
+  either. A chunk with exactly two channels was a named error for part of this
+  same unreleased version and never in a published one — the swap's local
+  encoder had produced a two-component frame that `oxiarc-jpeg` could not —
+  and is fixed below, in the same version, rather than shipped and documented
+  as a regression: see the `oxiarc-jpeg` two-component entry above.
+  `ImageSpec::validate`'s refusal (and the `plan()` arm that produced it) are
+  both gone; a greyscale-plus-alpha *chunky* JPEG page now round-trips
+  (`tests/roundtrip.rs::a_two_channel_jpeg_page_round_trips_chunky_through_
+  jcs_unknown`), and so does `PlanarConfiguration::Planar` (each channel its
+  own single-component frame), which remains a legitimate way to write the
+  same page. Verified against real libtiff: `tiffinfo` parses the chunky
+  file cleanly, and `tiffcp -c none` makes libtiff's own embedded libjpeg
+  decode the two-component scan byte-identically to this crate's decoder.
+- **`oxiarc-tiff` per-image codec scratch is now pooled rather than held in a
+  single slot.** The reusable `WrappedInflate`, `ZstdStream`, `XzDecoder` and
+  CCITT changing-element buffers used to live behind one `Mutex` each, held for
+  the length of a chunk's decode — correct, but it made a `rayon` decode of a
+  Deflate, CCITT, ZSTD or LZMA page serialise every worker behind the codec. A
+  pool hands each worker a decoder of its own and locks only around the
+  hand-off. Measured, interleaved, 4096x4096, medians of nine rounds: Deflate
+  went from 0.98x to **2.24x**, Group 4 from no gain to **3.04x**, Group 3 2D
+  to **2.03x**, LZW to 2.13x. Serial decode is unchanged (the pool holds
+  exactly one entry) and output is byte-identical either way, which
+  `tests/codec_reuse.rs` now asserts for all four codecs, including eight
+  threads decoding one page through one shared `CodecState`.
+- **`oxiarc-deflate`: the DEFLATE *encoder* rewritten as a faithful port of
+  zlib's `deflate.c`/`trees.c`.** `Deflater` output is now **byte-identical
+  to CPython's `zlib.compress(data, level)` at every level 1-9** (source
+  text, HTML, log lines, binary records, runs, random data, PNG-filtered
+  scanlines — 90 of 90 corpus×level pairs). Previously output was up to
+  **179 % larger** than zlib's on the same bytes: `find_match` never
+  terminated an empty hash-chain bucket correctly (burning the whole
+  match-search budget on nothing), levels 1-4 could only ever emit
+  fixed-Huffman blocks, the lazy-matching rule diverged from zlib's, there
+  was no `TOO_FAR` distance-cost rule, and — the most consequential bug —
+  every `deflate()` call emitted its own block and its own Huffman tree
+  instead of tracking window/hash-chain/tree state across calls, so a 2 MiB
+  stream fed as 1 KiB calls cost **13x more** than one 1 MiB call and
+  produced *different, larger* output. All of that is gone: levels now
+  select a row of zlib's `configuration_table` (greedy `deflate_fast` at
+  1-3, lazy `deflate_slow` at 4-9 including `TOO_FAR` and `good_length`
+  chain quartering), a block's type (stored/fixed/dynamic) is chosen on
+  its real bit cost with the tree description included, blocks are cut at
+  16,383 symbols as zlib does, and the call-size no longer changes the
+  output or the cost — the same 2 MiB stream now costs 34.4 ms at 1 KiB
+  calls against 33.0 ms for one 1 MiB call, byte-identical either way.
+  Level-6 throughput is **0.77x-1.53x of CPython zlib** (was 0.10x-0.40x).
+  New `Deflater::with_strategy(Strategy)` exposes zlib's
+  `Z_DEFAULT_STRATEGY`/`Z_FILTERED`/`Z_HUFFMAN_ONLY`/`Z_RLE`/`Z_FIXED`
+  (`Filtered` suits predictor output such as PNG scanlines and TIFF
+  horizontal differencing; `Rle` restricts matching to distance 1); all
+  five are now byte-identical to CPython `zlib.compressobj(level,
+  DEFLATED, -15, 8, strategy)` — `Z_FIXED` against zlib >= 1.2.13, whose
+  block-type rule it follows (see the `Strategy::Fixed` entry under
+  Fixed). `Deflater::with_optimal_parsing(level)`
+  (graph-based DP parsing) is now **never larger than the default ladder
+  at the same level** (it used to be up to 2 % *larger* on noisy image
+  rows, because its candidate set bought rare long-distance codes for
+  3-byte matches without the `TOO_FAR` filter) and is now **call-size
+  invariant** with no per-call cost cliff (it used to be up to 25x slower
+  and 9.5 % larger fed one byte at a time than fed as one call — a DP span
+  used to start as soon as 262 bytes were buffered, so a byte-at-a-time
+  caller re-ran a 259-position candidate collection to emit one byte).
+  Levels 1-9 stay exact; level 0's all-stored output depends on the same
+  caller-buffering behaviour zlib's own `deflate_stored` does, and is
+  documented as never larger than CPython's rather than byte-identical to
+  it. New `tests/zlib_encoder_oracle.rs` (byte-identity at every level and
+  strategy, behind the self-skipping `zlib-oracle` feature) and
+  `tests/encoder_behaviour.rs`/`encoder_adversarial.rs` (hermetic:
+  call-size invariance, cross-call matching, block-type selection through
+  an independent block walker that is deliberately not built on this
+  crate's own inflater); new `examples/zlib_ab.rs` prints the ratio,
+  optimal-parser, throughput and per-call tables without `criterion`. A
+  steady-state `Decoder::feed_into` loop over a gzip body used to allocate
+  79 times in 64 calls (two fresh scratch `Vec`s per Huffman-table
+  rebuild, despite the method's own doc claiming reuse) and a 32 KiB
+  inflate history buffer transiently overshot to ~125 KB before
+  truncating on every large decode — both are fixed (decode throughput
+  unchanged, ±2%), so the encoder becoming spec-correct did not regress
+  `oxiarc-http`'s allocation-bound gate.
+- **`oxiarc-lzw`: the TIFF/GIF LZW decoder is 1.25x-2.6x faster and now
+  runs at 0.73-0.80x of the *throughput* of libtiff 4.7.1's own
+  `LZWDecode`** (i.e. 1.25x-1.37x of its decode *time* — stated as both
+  numbers because the bare ratio reads ambiguously as either; re-measured
+  2026-09-08 over three runs of seven interleaved rounds at load 56-66, the
+  band widens to 1.00x-1.56x of libtiff's decode time — a noisier measurement,
+  not a slower decoder, since rows that agreed to +-0.01x on a quiet machine
+  scattered by +-0.3x at that load, so the figure above remains the better
+  estimate of the code's cost). Measured on
+  4096x4096 TIFF pages written by `tiffcp -c lzw`, strips of 60 KiB to
+  1 MiB, three arms (pre-rewrite / now / libtiff) interleaved per round:
+  RGB8 rows 233→156 ms, 16-bit grayscale 103→69 ms, text 38→30 ms,
+  incompressible data 107→41 ms. Rebuilt to libtiff's `LZWDecode` shape:
+  the code table is one packed `u64` per entry (prefix, length, first
+  byte, last byte, an all-bytes-equal bit) so a code costs one table load
+  and one table store where a five-field struct cost four loads and five
+  stores; codes are shifted out of a four-byte window at a bit position
+  the loop keeps in a register instead of a stateful reader written back
+  every code; a new table entry is created *before* the current code is
+  emitted, turning KwKwK into one comparison; all-equal runs are emitted
+  with a fill instead of a chain walk; and the chain walk stops one step
+  above the root, so a three-byte string costs one table load and a
+  two-byte string none. `gif_decompress` shares the same loop now instead
+  of cloning a `Vec<u8>` per emitted code (5.8x-24x faster on 1 MiB
+  payloads). Output is byte-identical for every dialect (`TIFF`,
+  `TIFF_OLD_STYLE`, `TIFF_COMPAT_LSB`, `GIF`) and both bit orders, checked
+  against libtiff, Pillow, `compress(1)`, `uncompress` and `gzip -dc`
+  (668,091 differential comparisons against the pre-rewrite decoder, zero
+  mismatches). New `examples/lzw_vs_libtiff.rs` reproduces the `tiffcp`
+  half of the comparison with only PATH tools (self-skips without
+  `tiffcp`; needs a quiet machine — above roughly load 20 a *single*
+  round's ratio can swing 0.91x-1.79x, though the median/min-of-many-round
+  estimators this crate's own gate uses stay accurate through load 46 in
+  testing).
+- **Breaking (within this still-unreleased version): `LzwConfig::GIF` is
+  now genuinely LSB-first.** Before this cycle `LzwConfig` had no
+  bit-order field, so `LzwConfig::GIF` and `LzwConfig::TIFF_OLD_STYLE`
+  were literally the same value and any caller passing `LzwConfig::GIF`
+  into the generic decode/encode entry points silently got MSB-first
+  behaviour. Callers who used `LzwConfig::GIF` that way must switch to
+  `LzwConfig::TIFF_OLD_STYLE`. The dedicated `gif_compress`/
+  `gif_decompress` codec functions were always correct and are
+  unaffected; no published release ever shipped the old, wrong value.
+- **Breaking: `LzwConfig` gained a field.** The new `bit_order:
+  LzwBitOrder` field (see Added, above) means any external struct-literal
+  construction of `LzwConfig` — `oxiarc-lzw` has been a published crate
+  since before this cycle — no longer compiles without setting it.
+  `LzwConfig::new` and the existing named constants (`GIF`, `TIFF`,
+  `TIFF_OLD_STYLE`, and the new `TIFF_COMPAT_LSB`) are unaffected; only a
+  direct `LzwConfig { .. }` literal is.
+- **`oxiarc-zstd`: the crate-internal decoded-sequence record narrowed
+  from three `usize` fields to three `u32` (24 → 12 bytes)**, which the
+  RFC 8878 format's own bounds allow (literal length ≤ 131071, match
+  length ≤ 131074, offset ≤ 2^32 - 4) and which is not a public API change
+  (`mod sequences;` is private). The worst-case reservation an attacker
+  can buy with a crafted `Number_of_Sequences` halves, from ~2.35 MB to
+  ~1.2 MB. Landed alongside a decoder rewrite that lifts the sequence loop
+  out of `&mut self` so the three FSE tables and the repeat-offset stack
+  are plain locals copied back on every exit, success and error alike.
+- **`oxiarc-image`: `DynamicImage::to_luma8`/`to_luma16` (and the two
+  `to_luma_alpha*` built on them) now use `image` 0.25's own sRGB/Rec. 709
+  luma weights** (`(2126 R + 7152 G + 722 B) / 10000`) instead of BT.601's
+  `0.299/0.587/0.114` — pure red now grayscales to 54, not 76,
+  byte-identical to `image` for the four 8-bit `DynamicImage` variants,
+  which is the entire point of a drop-in facade. No JPEG output byte is
+  affected: `write_to(.., ImageFormat::Jpeg)` routes only grayscale
+  sources through `to_luma8`, and both coefficient sets sum to exactly
+  their divisor, so `luma(l, l, l) == l` under either.
+- **`oxiarc-image`: the `DynamicImage` colour conversions were rewritten**
+  from per-pixel `get_pixel`/`put_pixel` with `f64` scaling to per-variant
+  slice loops with exact integer scaling (`u8 -> u16` is `* 257`; `u16 ->
+  u8` is `(v * 255 + 32767) / 65535`): **5.8x faster** `Rgb8 -> to_rgba8`,
+  **4.3x** `Luma8 -> to_rgba8`, **3.0x** `Rgb16 -> to_rgba8` (1024×1024,
+  interleaved A/B, best of 25). Output is byte-identical apart from the
+  luma-weight change above, proven by a new golden table
+  (`tests/conversions.rs`) pinning every `to_*`/`into_*` method for all
+  ten `DynamicImage` variants, and by exhaustive equivalence tests over
+  all 256 `u8` and all 65,536 `u16` sample values.
+- **`oxiarc-image`: `ImageDecoder::read_image` now returns
+  `ImageError::Parameter` when `buf.len() != total_bytes()`**, in both
+  directions and for all three codecs. Its doc previously promised a
+  panic — matching `image::ImageDecoder`'s own contract — that no
+  implementation actually performed: PNG silently returned `Ok(())` from
+  an over-sized buffer, leaving the tail unwritten with no error at all.
+  Documented as a deliberate deviation from `image` (an error, not a
+  panic) rather than a promise nothing kept.
+
+### Security
+
+- **`oxiarc-cli`: `--memory-limit` accepted an SI byte-size string whose
+  multiply overflows `u64` (e.g. `18446744073709551g`) — a debug-build
+  panic, or, in release, a silent wraparound to a far-too-small limit.**
+  This flag is the CLI's advertised decompression-bomb defense (see
+  v0.3.6's "CLI" paragraph), so a limit that silently becomes tiny (or a
+  crash on an untrusted invocation) is a defense-in-depth regression, not
+  a cosmetic parsing bug. Fixed with `checked_mul` and a named "byte size
+  out of range" error. Pre-existing since the flag was introduced (v0.2.8);
+  found by the Wave 3 fuzz/CLI-hardening pass, not by fuzzing the flag
+  itself — `oxiarc-cli/src/utils.rs::parse_byte_size`'s own unit tests
+  now cover it directly.
+- **`oxiarc-zstd`: a Zstandard frame using offset code 31 (RFC 8878's
+  maximum, reachable through an RLE or custom offset FSE table) computed
+  `Offset_Value = (1 << 31) + readBits(31)` — up to 2^32 - 1 — in `usize`.**
+  On a 32-bit target (wasm32, armv7, i686) that overflows: a panic in a
+  debug build, a silently wrong decoded offset in a release one. 64-bit
+  hosts were never affected, which is why this went unnoticed since the
+  crate's original sequence decoder. The intermediate is now computed in
+  `u64`; the result, at most 2^32 - 4, always fits.
+- *(See also, under Fixed below: `oxiarc-zstd`'s legacy one-shot decoders —
+  `decompress`, `decompress_multi_frame`, `ZstdDecoder::decode_frame`,
+  present and public since well before this release — accepted several
+  classes of malformed/adversarial Zstandard frame that the streaming
+  `ZstdStream` decoder already refused (an unvalidated `Dictionary_ID`,
+  an unenforced per-block decompressed-size maximum, tolerated leading
+  garbage, a refused-instead-of-skipped skippable-frame prefix) and could
+  carry a failed frame's partially-regenerated output into the next
+  `decode_frame` call on a reused decoder. All are fixed in shared code so
+  the two decode paths cannot drift apart again; see the `oxiarc-zstd`
+  entries below for the full detail and the differential-fuzzing
+  provenance.)*
+
+### Fixed
+
+- **`oxiarc-archive`/`oxiarc-cli`: a valid multi-member `.gz` failed with
+  "CRC mismatch" — `oxiarc extract`, `test`, `list`, `info` and `convert`
+  could not read any concatenated gzip file.** `GzipReader::decompress` read
+  the whole input into memory, treated its **last 8 bytes** as *the* member
+  trailer, and inflated everything before them as one member. Every RFC 1952
+  §2.2 concatenated file — `cat a.gz b.gz`, `pigz`, `bgzip`, rsyncable
+  gzips, and oxiarc's own `compress_gzip_parallel` output — was therefore
+  rejected outright (a hard error and exit 1, not a first-member result),
+  even though `oxiarc_deflate::gzip_decompress`, `GzipStreamDecoder` and
+  `InflateReader::gzip` all decoded the same bytes correctly. `GzipReader`
+  is now built on the shared resumable core
+  (`WrappedInflate(InflateWrapper::Gzip).multi_member(true)
+  .trailing_policy(AllowZeros)`) and streams the input in 64 KiB buffers
+  instead of buffering the whole compressed file, so: every member decodes
+  and their contents concatenate; trailing `0x00` padding is tolerated while
+  other trailing garbage is still rejected; each member's CRC-32, `ISIZE`
+  **and `FHCRC`** are verified (see **Changed**); and the `ISIZE` mismatch
+  message is now the core's `gzip ISIZE mismatch: stored N, decoded M`.
+  `GzipReader::header()` still reports the *first* member's header.
+- **`oxiarc-cli`: `--memory-limit` could be evaded by a multi-member gzip
+  bomb.** The gzip path pre-checked only the trailing `ISIZE` field, which
+  for a concatenated stream describes just the *last* member, and otherwise
+  relied on a post-decode backstop — so a bomb split across members was
+  fully expanded in memory before being refused. The new
+  `GzipReader::with_max_output(u64)` is now wired to `--memory-limit`, so
+  the cap is enforced **inside a DEFLATE block, across the running total of
+  every member**, and the bomb is never materialised.
+- **`oxiarc-brotli`: `BrotliStream` could stall for ever on a complete stream,
+  and report it as truncated.** The geometric retry schedule that keeps atomic
+  meta-block prelude re-parsing linear waits for the buffered input to grow by
+  at least 64 bytes before re-attempting a prelude — but it measured that
+  growth with a counter relative to the internal carry, which is compacted and
+  rebased between calls and can hold a whole byte inside the bit accumulator
+  instead. Two consequences: a stream whose prelude parse ran short with fewer
+  than 64 bytes still to come never got its retry, and a byte that *did* arrive
+  could be gated and then look like "nothing new" for ever. A caller feeding
+  with `FlushMode::None` and calling `finish()` at the end therefore saw
+  `NeedInput` for ever and `finish()` reported a **complete** stream as
+  `UnexpectedEof`, while the identical bytes fed in one call decoded fine. The
+  schedule now measures arrival against the monotone `total_in`, and a
+  `decode(&[], ..)` drain call — the caller saying "this is all I have right
+  now" — retries immediately instead of waiting for input that may never come.
+  Every shipping adapter (`BrotliDecompressor`, the async twin,
+  `oxiarc-http`'s `br` stage) switches to `FlushMode::Finish` at source EOF and
+  so was never affected; a caller driving `BrotliStream` directly was. Found by
+  `fuzz_brotli_stream` once its window and output caps made it ~16x faster
+  (448 → 7,000+ exec/s); both libFuzzer fixtures are pinned as unit tests, and
+  a 1,513,723-execution campaign on the fixed decoder found nothing further.
+- **`oxiarc-http`: trailing garbage after a body could be accepted, depending
+  on the read granularity.** `DecodedBody` and `AsyncDecodedBody` closed the
+  body the moment the coded stream reported `StreamEnd`, without first
+  establishing that the *source* was spent. The four codings differ in whether
+  they need a further byte to report `StreamEnd` at all, so `XXXX` appended to
+  a `br` body was rejected when the stream and the garbage landed in one read
+  and silently **accepted** when the body's last byte arrived on its own —
+  `read_to_end` returning `Ok` on a response with 4 unexplained bytes after it.
+  Both adapters now keep the body open until the source is exhausted whenever
+  the trailing policy inspects what follows (the default `Reject`, and
+  `AllowZeros`); the finished decoder applies `check_trailing` to whatever
+  arrives. `TrailingData::Ignore` still closes at once and never reads a byte
+  the caller did not ask for. gzip, deflate and zstd were unaffected in
+  practice — their decoders already need the extra byte — but the guarantee is
+  now structural rather than incidental, and is pinned at one-byte granularity
+  for every coding in both adapters.
+- **`oxiarc-lzma`: `XzDecoder::with_max_output` reported a tripped budget as
+  a self-contradictory `BufferTooSmall { needed: n, available: n }`.** The
+  effective cap is `min(configured, dst.len())`, but every
+  `MemoryBudgetExceeded` from the inner reader was mapped to
+  `BufferTooSmall` against `dst.len()` — so `with_max_output(1000)` into a
+  100,000-byte `dst` produced `Buffer too small: need 100000 bytes, have
+  100000`, and a caller could not tell "your buffer is short" from "your
+  configured limit tripped". The mapping now applies only when `dst` is the
+  binding cap; a *tighter* configured cap passes `MemoryBudgetExceeded`
+  through unchanged. `oxiarc-tiff`, the only in-workspace consumer, never
+  sets `with_max_output` and is unaffected.
+- **MSRV: a multi-line let-chain in `oxiarc-zstd` broke the declared
+  `rust-version = "1.85"`.** `oxiarc-zstd/src/compressed_block.rs`'s
+  `choose_mode` wrote `if let Some((symbol, &count)) = first` on one line and
+  `&& count == total` on the next — a let-chain, which needs rustc 1.88. It
+  compiled without complaint on the development toolchain (rustc 1.95) and
+  `cargo +1.85.0 check --workspace` failed on it with
+  ``error[E0658]: `let` expressions in this position are unstable``. Because the
+  chain spans two lines, the single-line `rg 'if let .*=.*&& |&& let '` scan used
+  throughout the cycle returned empty on the file. De-sugared to nested `if`s
+  (identical semantics — `clippy.toml` pins `msrv = "1.85"`, so `collapsible_if`
+  will not suggest the chain back), and the whole workspace now passes
+  `cargo +1.85.0 check --workspace`.
+- **Twelve rustdoc errors under `RUSTDOCFLAGS="-D warnings"`, in four crates.**
+  `cargo doc --workspace --no-deps --all-features` is now exit 0 for all 18
+  crates. Doc text only — no API, signature or behaviour change.
+  - `oxiarc-lzma`: `xz/mod.rs`'s module docs linked to `decompress_into`,
+    `decompress_with_limit` and `XzDecoder` unqualified. Because `lib.rs` puts an
+    outer `///` comment on `pub mod xz;` *and* the module carries `//!` inner
+    docs, rustdoc resolves the merged fragments in the crate root's scope: those
+    three did not resolve at all, and `[`decompress`]` silently pointed at the
+    unrelated crate-root `oxiarc_lzma::decompress` (the LZMA one-shot, not the XZ
+    one). Every link is now written as `crate::xz::…`. Also fixed:
+    `[module documentation](self)` in `xz/decoder.rs` (the private `xz::decoder`
+    module) and a link to the private `DEFAULT_BLOCK_SIZE` in `xz/writer.rs`.
+  - `oxiarc-jpeg`: `compat/zune.rs` linked to `JpegError` and
+    `JpegError::Unsupported`, which the file imports under `#[cfg(test)]` and are
+    therefore out of scope in a doc build (now `crate::JpegError…`); `tiff/mod.rs`
+    linked to the private `ojpeg` module (now points at its public re-exports).
+  - `oxiarc-lzw`: `z::ZReader::into_inner` linked to the private `READ_CHUNK`.
+  - `oxiarc-deflate`: the `deflate` module docs linked to the private
+    `crate::encoder`.
+
+- **`oxiarc-zstd`: the legacy one-shot decoders accepted three classes of frame
+  the RFC forbids.** Differential fuzzing of `decompress_multi_frame` against
+  the new `ZstdStream` (`fuzz/fuzz_targets/fuzz_zstd_stream.rs`) found four
+  independently-rooted inputs, in about ten cumulative minutes, that the legacy
+  `ZstdDecoder::decode_frame` core accepted and the hardened push decoder
+  refused. Three were real defects, now fixed *in shared code* so the two paths
+  cannot drift again:
+  1. **`Dictionary_ID` was never validated.** A frame naming a dictionary the
+     caller never supplied (RFC 8878 §3.1.1.1.1.6) decoded to silently wrong
+     bytes — its matches reach into content the decoder does not have. Every
+     entry point (`decompress`, `decompress_frame`, `decompress_multi_frame`,
+     `ZstdDecoder::decode_frame`, `decompress_with_limit`) now refuses it with
+     the same `InvalidHeader` the streaming decoder already used;
+     `Dictionary_ID` 0 still means "no dictionary", and the `*_with_dict`
+     entries are unaffected.
+  2. **`Block_Maximum_Decompressed_Size` was never enforced.** A block may not
+     regenerate more than `min(Window_Size, 128 KiB)`, further bounded by a
+     declared `Frame_Content_Size`. `Raw`/`RLE` blocks are now charged from the
+     block header — before an RLE block expands — and `Compressed` blocks
+     inside the sequence executor, so an over-large block is refused without
+     first materialising it.
+  3. **Leading garbage was tolerated.** `decompress_multi_frame`'s loop stopped
+     and returned `Ok(accumulated)` on fewer than four bytes, an unknown magic,
+     or a truncated skippable frame *at any position, including the very
+     first* — so `decompress_multi_frame(b"not zstd at all")` was `Ok(vec![])`.
+     Those are now errors before any frame has been decoded, matching
+     `ZstdStream` byte for byte.
+  The fourth finding, an ~11 MB declared `Window_Size`, is a deliberate split
+  and is now documented as one (see *Changed*). Pinned by
+  `oxiarc-zstd/tests/legacy_hardening.rs` — 16 tests that drive **both** paths
+  over every case, including the fuzzer's own minimised artifacts, and assert
+  identical accept/refuse plus identical bytes whenever both accept, and by
+  `oxiarc-zstd/tests/legacy_verify.rs` (below).
+
+- **`oxiarc-zstd`: a reused `ZstdDecoder` carried a failed frame's partial
+  output into the next one.** `ZstdDecoder::decode_frame` took its output
+  buffer only on success, so after a truncated or corrupt frame the buffer
+  still held whatever that frame had already regenerated, and the *next*
+  `decode_frame` on the same decoder returned it prepended to the new frame's
+  content. With a checksum on the following frame the symptom was a bogus
+  `CrcMismatch`; with neither a checksum nor a `Frame_Content_Size` — what
+  `zstd --no-check` writes from a pipe — it was silent: 131 076 bytes returned
+  as `Ok` where 4 were expected. `decode_frame` now resets the per-frame state
+  (output buffer plus the literals Huffman table and the three sequence FSE
+  tables, so a `Treeless`/`Repeat` block at the start of a new frame is
+  rejected rather than decoded with the previous frame's tables) at the start
+  of every call, exactly as `ZstdStream::begin_frame` does; a configured
+  dictionary survives. `ZstdDecoder::reset` stays public and is no longer
+  something a caller has to remember. The one-shot free functions were never
+  affected — they build a fresh decoder per frame.
+
+- **`oxiarc-zstd`: the legacy one-shot decoders refused a skippable frame
+  placed in front of a Zstandard frame.** `zstd -d` decodes
+  `[skippable][frame]` exactly like `[frame]`, and so do `ZstdStream`,
+  `decompress_into` and `decompress_with_limit` — but `decompress`,
+  `decompress_frame` and `ZstdDecoder::decode_frame` stopped at the skippable
+  magic with `InvalidMagic`, so a container that prefixes its payload with
+  metadata decoded on one path and failed on the other. All of them now walk
+  past a complete skippable-frame prefix (RFC 8878 §3.1.2); `decompress_frame`
+  reports it in the byte count it returns, so walking a concatenated stream
+  still lands on the next frame. A *truncated* skippable frame remains an
+  error wherever it sits, and leading bytes that are not a recognised frame
+  start remain an error. Found by the adversarial sweep in
+  `oxiarc-zstd/tests/legacy_verify.rs`, which now pins the whole matrix: 8000+
+  crafted frames over every `Window_Descriptor` byte and 5501+ truncated,
+  mutated and spliced inputs, asserting the legacy and streaming families
+  reach the same verdict with no carve-out beyond the documented
+  declared-window split.
+
+- **`oxiarc-tiff`: CCITT Group 4 decode was quadratic in the number of runs
+  per row.** The two-dimensional row decoder re-scanned the reference line's
+  changing elements from element zero for every code word. Since `a0` never
+  moves backwards inside a row, the search can resume where the previous one
+  stopped. Timed against the restarting search directly, interleaved, medians
+  of five, on three 4096x4096 Group 4 pages: **1.03x** on a page with a few
+  long runs per row, **4.8x** on the benches' bilevel fixture and **24.6x** on
+  a halftone page with hundreds of runs per row — free where fax coding is at
+  home, decisive where it is not. `tests/tiff_oracle_codecs.rs`'s byte-identity
+  checks against `tiffcp -c g3` and `-c g4` are unchanged. `BitReader::peek` was also a byte-at-a-time loop and
+  is now one shift-and-mask over a three-byte window.
+- **`oxiarc-tiff`: `cargo nextest run --no-default-features` passes again.**
+  Eight tests in `tests/corrupt_no_panic.rs` and `tests/proptest_roundtrip.rs`
+  built their fixtures with `Compression::Lzw` / `CcittGroup4` / `Deflate`
+  unconditionally and panicked on `FeatureNotCompiled` before testing anything.
+  Each fixture is now gated on the feature that compiles its codec, with
+  `PackBits` (which needs no feature) keeping the corpus non-empty. The default
+  and `--all-features` corpora are unchanged.
+- **`oxiarc-deflate`: `Strategy::Fixed` (zlib's `Z_FIXED`) follows zlib
+  1.2.13's block-type rule.** A block is stored whenever a stored block
+  beats the *static* code (`stored + 4 <= static`), as in zlib >= 1.2.13,
+  whose `_tr_flush_block` narrows `opt_lenb` to the static cost under
+  `Z_FIXED` before the stored test. zlib <= 1.2.12 — including macOS's
+  system zlib 1.2.12, which CPython links there — applies `Z_FIXED` only
+  after that test, still weighing the dynamic cost, and so writes a fixed
+  block wherever `dynamic < stored + 4 <= static`. Within this unreleased
+  cycle the rule briefly followed 1.2.12, because the CPython oracle it
+  was first checked against linked 1.2.12. It is now pinned hermetically
+  (`tests/encoder_behaviour.rs`), and the oracle observes which rule its
+  reference applies: against zlib >= 1.2.13 all five strategies are
+  byte-identical to CPython over ten corpora at four levels; against an
+  older zlib the `Z_FIXED` comparisons that differ are held block by block
+  to exactly that rule change instead. `with_strategy` was new API in this
+  same unreleased cycle with zero committed coverage, which is why the
+  first version shipped untested.
+- **`oxiarc-deflate`: two defects in the new resumable inflate core
+  (introduced and fixed within this same unreleased cycle).** A match
+  straddling the 32 KiB history window's boundary could, when its tail
+  landed within 8 bytes of a small (≤ ~32 KiB) caller-supplied output
+  buffer, silently drop the last 1-7 bytes of the match in a release
+  build (a debug build hit a `debug_assert` instead) — reachable through
+  the public `InflateStream::inflate` via any of `oxiarc-png`,
+  `oxiarc-tiff` or `oxiarc-http` decoding into a buffer that size, though
+  no PNG/TIFF/HTTP test or CPython oracle ever happened to hit the narrow
+  `(cursor, distance, length)` alignment needed; `inflate()`/
+  `inflate_to_vec` were unaffected (their buffer is never below 64 KiB).
+  Separately, a dynamic Huffman block whose alphabet's *shortest* code is
+  longer than the decode table's root index (e.g. `HDIST = 1` with one
+  15-bit distance code — a shape zlib itself rejects as an incomplete
+  code, which is exactly why the port's missing root-width clamp never
+  showed up against the CPython oracle, but this crate deliberately
+  tolerates incomplete codes) built a table whose fill loop's stride
+  arithmetic underflowed: a panic in debug, and in release **the decode
+  loop never terminated** (confirmed hung past 120 s). Both fixed with no
+  output or throughput change on any shape actually exercised by the
+  existing suite (interleaved A/B: every shape within ±1.3% of the
+  pre-fix binary); the LZ77 word-copy `memmove` threshold is 64 bytes
+  (`WORD_COPY_MAX`), and the `HuffmanTree`/`DecodeTable` differential now
+  covers 460 shapes and 12.5M bit patterns.
+- **`oxiarc-brotli`: a shared-dictionary copy that ran past the end of the
+  dictionary could decode to the wrong bytes without an error.** Both
+  decoders used to continue such a copy in the produced output (a
+  "straddle"); `brotli 1.1.0` rejects the stream instead — re-derived from
+  a pair of hand-built streams differing in exactly one copy length, at
+  two window sizes. The incremental decoder resolved the continuation
+  against its bounded ring, so on a stream crafted to trigger it the
+  answer depended on the caller's output-buffer size: correct at some
+  sizes, `InvalidDistance` at others, `Ok` with silently wrong bytes at
+  others again — a hostile `dcb` body could make a proxy emit silently
+  wrong bytes. Both decoders now reject the overrun where the distance is
+  resolved, before a byte of the copy is produced, so they agree with
+  each other and with the reference whatever chunking the caller uses.
+  Only hand-built streams can reach this — neither this crate's encoder
+  nor the reference's ever emits such a command. Removing the straddle
+  machinery also narrowed the decoder's per-command state from 40 to 24
+  bytes, which measurably helped the one throughput shape (copy-dense
+  streams at large windows) that had been short of its target. That shape is
+  still short: 0.80x when BROTLI3-verify measured it, and 0.71x-0.76x (min) /
+  0.70x-0.79x (paired) when re-measured 2026-09-08 at load 60-76, against a
+  0.85x target. The other three shapes clear it comfortably.
+- **`oxiarc-lzw`: `z::ZReader` (the `.Z`/`Content-Encoding: compress`
+  push decoder) buffered the whole compressed body instead of a bounded
+  window.** Its bit position was measured from the last code-width
+  change, so it retained every compressed byte since that event — and a
+  16-bit stream stops changing width early (a non-block-mode stream has
+  no `CLEAR` codes at all), making the retained tail the *entire* stream
+  and the decode quadratic. `with_max_output` did not help (it bounds
+  output, not the compressed carry). Measured on a 5.2 MB stream: 20.5 MB
+  of live heap before, 230 KB after; an 8 MiB payload went from 762 ms to
+  107 ms. The decoder now rolls its group origin forward every eight
+  codes, exactly as the reference `getcode()` does.
+- **`oxiarc-lzw`: a crafted 303-byte `.Z` stream could panic the
+  decoder.** At `max_bits = 9` the reference's width rule takes the code
+  width to 10 bits, so a code naming a table slot one past the end of a
+  *full* table was accepted as KwKwK and then used as an array index —
+  an out-of-bounds panic on attacker-controlled input. Such a code is now
+  `LzwError::InvalidCode`, matching the guard the generic (non-`.Z`)
+  decode engine already had.
+- **`oxiarc-lzw`: `z::ZWriter` could report success (`finish() -> Ok`) for
+  a stream a failed inner write had silently corrupted.** `.Z` has no
+  checksum and no end-of-information code, so the result decoded to
+  plausible garbage rather than failing loudly. An inner-writer error is
+  now sticky: every later `write`/`flush`/`finish` fails; a failed header
+  write is no longer recorded as done; and one large `write` call no
+  longer stages its entire compressed output in memory before flushing
+  (batches of about 32 KiB now, matching the crate's documented "small
+  staging buffer" claim, which was not true before this fix).
+- **`oxiarc-jpeg`: the `rayon` parallel decode band merge placed every
+  band after the first at the *unscaled* block pitch**, corrupting every
+  `DecodeOptions::scale` other than `Scale::FULL` on a restart-marker
+  stream — invisible at full scale, where the unscaled and scaled pitch
+  are the same number, and invisible to every existing test because
+  `plan_bands` needs ≥ 256 MCUs and a restart interval, which no
+  scaled-decode fixture had. Measured before the fix on a 256×256
+  4:2:0 image with 16-MCU restarts: **2,686 of 3,072** bytes per row-group
+  differed from the same image decoded serially at `M = 1`; the same
+  magnitude held for 4:4:4, 4:2:2, grayscale, CMYK and arithmetic coding.
+  Fixed by having the band planner read its destination's own per-component
+  block size instead of recomputing it, so the two cannot disagree; the
+  crate's "`rayon` output is byte-identical with and without it" guarantee
+  now holds at every scale, pinned by a serial-vs-parallel differential
+  over `M` in `1..=16` and by a `djpeg -restart` byte-parity oracle.
+- **`oxiarc-jpeg`: `compat::jpeg_decoder` and `compat::zune` each had one
+  accessor that disagreed with what `decode()` actually produced.**
+  `compat::jpeg_decoder::Decoder::info()` reported `PixelFormat::Rgb24`
+  (3 bytes/pixel) for a 12-bit *colour* frame while `decode()` returned
+  6-byte-per-pixel big-endian `u16` samples — a caller sizing a buffer the
+  way the module's own doctest does would read half the image. Such
+  frames now return a named `Unsupported(SamplePrecision)` from both
+  methods instead; twelve-bit *grayscale* is unaffected
+  (`PixelFormat::L16`, already correct), and the frame remains fully
+  decodable via `Decoder::inner_mut()` plus `oxiarc_jpeg::Decoder::decode_u16`.
+  `compat::zune::JpegDecoder::output_buffer_size()` under-reported by 25%
+  for a CMYK source read as `ColorSpace::YCbCr` (`output_buffer_size()`
+  used the color space's nominal component count instead of the source's
+  real one); it now reports what `decode()` actually produces, for every
+  source, and `output_colorspace()` returns the requested space rather
+  than a value that does not match `decode()` either — matching real
+  `zune_jpeg` 0.5.15's own behaviour, verified by reading its source.
+- **`oxiarc-http`: a `dcz` (RFC 9842, Zstandard variant) body carried no
+  binding to the dictionary it claimed to need.** The original decoder
+  decoded *any* ordinary dictionary-referencing Zstandard frame that
+  happened to arrive under `Content-Encoding: dcz`, with no check that it
+  named the caller's own dictionary — a frame built against any
+  dictionary, or none, decoded so long as its sequences did not reference
+  an out-of-range offset. `dcz` bodies now open with an RFC 8878 §3.1.2
+  skippable frame (magic `5E 2A 4D 18`) carrying the dictionary's
+  SHA-256, verified before a single real frame byte decodes; `encode_body`/
+  `Encoder<W>`'s `Dcz` arms write it first. Verified against the
+  reference decoder: a genuine `encode_body`-produced `dcz` body, fed
+  straight to `zstd -D <dict> -d`, has the preamble silently skipped (as
+  any conformant Zstandard decoder must) and the frame after it decoded
+  byte-identically. **Breaking within this same, still-unreleased 0.4.2
+  cycle** (no released consumer is affected): a `dcz` body produced by an
+  earlier `[0.4.2]` build of this crate does not carry this preamble and
+  is now refused as too short.
+- **`oxiarc-http`: every `dcb` decode error named `br` instead of `dcb`.**
+  `HttpCodingError::Corrupt`'s public `coding` field — matched on by
+  callers, and printed by `Display` — was hard-wired to
+  `ContentCoding::Brotli` in the error mapper `dcb` shared with the plain
+  `br` stage, so a short body, a bad magic, a wrong-dictionary digest and
+  a corrupt meta-block all reported a coding the response never sent.
+  `dcz` already reported `dcz` correctly; `dcb` now matches.
+- **`oxiarc-cli`: `list`/`extract`/`test`/`convert`/`add`'s "not an
+  archive, did you mean an image" hint, and `detect`/`info`'s own
+  sniffing, used to read the *entire* input just to check up to 8 magic
+  bytes** — an unbounded allocation driven by file size on what is meant
+  to be a fast rejection path. Peak RSS on a 300 MB unrecognised file:
+  303 MiB before, 3.06 MiB after (a bounded 16-byte-prefix read,
+  retrying on `ErrorKind::Interrupted`). `oxiarc add` also computed this
+  hint *eagerly, before* dispatching on the archive format, so a
+  successful `add` to a ZIP/TAR/LZH archive paid a second full pass over
+  it purely to phrase an error it never reached; now computed only in the
+  fallback arm. `detect`/`info` now sniff the bounded prefix before
+  deciding whether to read the file in full, rather than always
+  buffering it first.
+- **`oxiarc-core`: two panic messages had roughly 30 embedded spaces
+  from a botched line continuation** (`traits.rs`'s `decompress_all` and
+  `async_io.rs`'s async-compress final-flush error) — cosmetic, no
+  behavioural change.
+- **`oxiarc-image`: `guess_format` never recognised AVIF.** The magic-byte
+  table's AVIF row padded its comparison mask to the full 12-byte
+  signature length with zero bytes, which makes the `ftypavif` brand
+  comparison at offset 4 unsatisfiable by any input (`byte & 0x00 == 'f'`
+  is never true) — matched nothing, ever. A real AVIF file was reported
+  as "format could not be determined" instead of the named
+  `Unsupported(Avif)` the crate's own docs promised for all 15 `ImageFormat`
+  variants. Fixed to the real `image` crate's own 4-byte mask (confirmed
+  against its literal source), with a comment on why the mask is
+  deliberately shorter than the signature so it is not "corrected" back.
+- **`oxiarc-image`: decoding a premultiplied-alpha 32-bit-float TIFF
+  clamped un-premultiplied colour samples to 1.0**, silently discarding
+  any HDR highlight above full scale — the straight-alpha path right
+  beside it never clamped, so a file's `ExtraSamples` tag alone decided
+  whether values above 1.0 survived the decode. Neither `image` nor
+  `tiff` un-premultiplies at all, so there was no upstream behaviour to
+  match; the clamp was this crate's own invention and is now removed.
+- **`oxiarc-image`: a JPEG whose declared sample precision is 9-15 bits
+  decoded at up to 1/16th of the `u16` range its `ColorType::L16`/
+  `Rgb16` label promises**, i.e. up to sixteen times too dark once
+  converted to 8-bit. `oxiarc-jpeg` correctly writes such a frame's
+  samples *unscaled* (0..2^P-1); this crate's own `ColorType::L16` label
+  is a *range* contract (`Primitive::<u16>::DEFAULT_MAX_VALUE == 65535`)
+  that every other conversion in the crate assumes, so the samples are
+  now rescaled to the full 16-bit range on decode (`v * 65535 / (2^P -
+  1)`, exact at the endpoints and at P = 16).
+- **`oxiarc-image`: `codecs::png::CompressionType::Level(n)` for `n > 9`
+  was passed straight through to `oxiarc-deflate`**, which has no defined
+  meaning above level 9; now clamped to 9.
+
 ## [0.4.1] - 2026-08-06
 
 **Security hardening (ZIP CSPRNG, constant-time AES, x86 CRC-32, 7z
@@ -1476,7 +2855,8 @@ All crates published at version 0.2.0:
 - Full documentation with examples
 - Workspace-based dependency management
 
-[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiarc/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/cool-japan/oxiarc/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/cool-japan/oxiarc/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/cool-japan/oxiarc/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/cool-japan/oxiarc/compare/v0.3.5...v0.3.6

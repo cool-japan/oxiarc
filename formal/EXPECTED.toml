@@ -1,0 +1,172 @@
+# Machine-readable mirror of the "Measured L1 verdict" doc comment on every
+# `#[harness]` entry point in this package, in exactly the format
+# `cargo-formal`'s own `examples/checked-arith/EXPECTED.toml` uses.
+#
+# **MEASURED, not predicted** (2026-09-08, release `cargo-formal` 0.1.0 CLI +
+# release `formal-driver` with dependency-body and monomorphic-instance
+# lowering, OxiZ 0.3.3, rustc nightly-2026-06-20). The harnesses call the
+# public API of `oxiarc-core`, `oxiarc-lz4` and `oxiarc-deflate` by path;
+# `[package.metadata.formal] dep-crates` names those three, and the run lowered
+# 28 dependency bodies (27 reachable) plus 2 monomorphic instances into the
+# verification conditions. No verdict below was written before the run that
+# produced it.
+#
+# Naming. A property key is the word the **encoder actually mints**, never a
+# description:
+#
+#   * a user-written `oxiformal::assert(..)` is `assert`; a second distinct
+#     assertion raised at the *same* source site is `assert-2`, a third
+#     `assert-3`, and so on.
+#   * an `#[ensures]` clause checked through `#[proof_for_contract]` is
+#     `ensures`, and is reported under layer `contract`. This package has none.
+#   * everything else is the design section 9 closed vocabulary MIR's own
+#     inserted checks produce: `arith-overflow`, `shift-overflow`,
+#     `bounds-check`, `division-by-zero`, `remainder-by-zero`,
+#     `division-overflow`, `neg-overflow`, `unwrap`, `expect`, `panic`,
+#     `slice-range`, `unwinding-assertion`. A bare `debug_assert!` with no
+#     format arguments lowers to `core::panicking::panic`, so its key is
+#     `panic`, not `assert`.
+#   * the pseudo-key `harness` is a **whole-harness** verdict and nothing else:
+#     `"proved"` means "no obligation of this harness is anything but proved"
+#     (including a harness that raises none at all), and `"unsupported"` covers
+#     both `Verdict::Unsupported` and `Verdict::Unverifiable`. It is used here
+#     only for the two harnesses the encoder refused whole, which generate no
+#     verification condition at all.
+#
+# What is listed. Every obligation the harness is *about* -- its `assert`s,
+# plus its `unwinding-assertion` where it has one, plus the `panic` and
+# `shift-overflow` rows of the two precondition harnesses, which are their
+# whole point -- and every incidental MIR-inserted check whose verdict is
+# **not** `proved` (there are none). Incidental checks that came out `proved`
+# are deliberately not enumerated: they are numerous, they carry no
+# information, and listing them would make this file a copy of `report.json`
+# rather than a statement of intent.
+#
+# Keying rule. `[harness.expected]` is a map, so several obligations of one
+# harness that carry the same property name at *different* source sites share
+# one row. The row records the **worst** of their verdicts (`refuted` >
+# `timeout` > `unknown` > `unsupported`/`unverifiable` > `proved`), and a row
+# comment says how many sites there are. Checked mechanically against this
+# run: no such group disagrees in this package, so every row is also the
+# verdict of each of its sites.
+#
+# Measured tally (2026-09-08): 17 property rows over 13 harnesses --
+# 12 proved / 2 refuted / 1 timeout / 2 unsupported. The run's own layer
+# counters, which include the incidental `proved` rows this file does not
+# enumerate, are: bmc 505 proved / 2 refuted / 1 timeout / 0 unknown /
+# 2 unsupported / 0 unverifiable over 510 obligations (508 of them backed by a
+# `vc/NNNN.smt2` reproduction; the two `unsupported` ones generate none), and
+# contract 0 proved / 0 refuted. Hygiene passes with 0 errors, 0 warnings and
+# 0 notes over 2 files. The audit layer's `unverifiable` histogram over the
+# lowered dependency bodies is `raw-pointer` 12, `dyn-trait` 1, `float` 1 --
+# items of `oxiarc-core`/`oxiarc-lz4`/`oxiarc-deflate` that no harness here
+# reaches.
+#
+# `solver-model-rejected` count: **0**. cargo-formal is pinned to OxiZ 0.3.3,
+# whose model gate (upstream item U-Z10) turns a solver model that does not
+# satisfy the verification condition into `unknown` rather than an invented
+# counterexample; sibling packages measured in this phase carry a large tail of
+# such rows. This package has none -- there is not a single `unknown` in the
+# run -- so no row here moves when the pin moves to the fixed OxiZ release.
+# The one `timeout` is a different failure and does not move either: it is a
+# genuinely hard bit-blasting problem (see the row's comment).
+#
+# The two `unsupported` rows are statements about the encoder, not about
+# `oxiarc`: a symbolic-window `copy_from_slice` and a `String::from(&str)` in
+# an error constructor. `README.md` says what each would need.
+
+[[harness]]
+name = "refill_bytes_never_overfills_harness"
+
+[harness.expected]
+"assert" = "proved"  # 4 sites, all proved
+
+[[harness]]
+name = "refill_bytes_want_bound_is_asserted_harness"
+
+[harness.expected]
+"panic" = "refuted"  # `debug_assert!(want <= 56)`; counterexample want = 128
+
+[[harness]]
+name = "peek_bits_within_its_precondition_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "peek_bits_count_bound_is_necessary_harness"
+
+[harness.expected]
+"panic" = "refuted"  # `debug_assert!(count <= 32)`; counterexample count = 255
+# The shift the assertion protects is proved, not refuted: the encoder
+# continues along the edge where the assertion holds, so `1u64 << count` at
+# `bitstream.rs:136` is only reachable with `count <= 32`. 2 sites.
+"shift-overflow" = "proved"
+
+[[harness]]
+name = "consume_never_underflows_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "align_to_byte_leaves_whole_bytes_harness"
+
+[harness.expected]
+"assert" = "proved"  # 3 sites, all proved
+
+[[harness]]
+name = "take_byte_is_some_iff_eight_bits_harness"
+
+[harness.expected]
+"assert" = "proved"  # 5 sites, all proved
+
+[[harness]]
+name = "refill_bulk_zero_extends_harness"
+
+[harness.expected]
+"assert" = "proved"  # 4 sites, all proved
+
+[[harness]]
+name = "xxhash32_never_panics_on_a_short_input_harness"
+
+[harness.expected]
+"bounds-check" = "proved"        # 126 obligations over 5 sites, all proved
+"slice-range" = "proved"         # 31 obligations over 6 sites, all proved
+"unwinding-assertion" = "proved" # 3 sites; the `unwind = 6` bound was enough
+
+[[harness]]
+name = "xxhash32_one_shot_equals_streaming_harness"
+
+[harness.expected]
+# `unsupported(aliasing)` at `../oxiarc-lz4/src/xxhash.rs:156:24`:
+# `self.buffer[..remaining].copy_from_slice(..)` takes a mutable borrow of a
+# window whose bounds are symbolic. No verification condition is generated.
+"harness" = "unsupported"
+
+[[harness]]
+name = "xxhash32_agrees_with_seed_zero_harness"
+
+[harness.expected]
+# The solver did not finish within the 30 000 ms budget, and still returns
+# `unknown` at 120 000 ms: two structurally identical bit-blasted avalanche
+# circuits under a disequality. Not a model-gate `unknown`.
+"assert" = "timeout"
+"unwinding-assertion" = "proved" # 3 sites; the `unwind = 6` bound was enough
+
+[[harness]]
+name = "entry_round_trip_harness"
+
+[harness.expected]
+"assert" = "proved"  # 2 sites, all proved
+
+[[harness]]
+name = "from_code_lengths_never_panics_harness"
+
+[harness.expected]
+# `unsupported(unsupported-callee)` at `../oxiarc-core/src/error.rs:190:22`:
+# no `From<&str> for std::string::String` in the module set, reached through
+# `build_into`'s error path. The predicted blockers (`Iterator::sum`,
+# `Vec::resize`, `Vec::reserve_exact`) all have encoder rules now and are
+# walked past. No verification condition is generated.
+"harness" = "unsupported"

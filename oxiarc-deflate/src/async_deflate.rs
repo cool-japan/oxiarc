@@ -27,18 +27,20 @@
 //!     async_compressor
 //!         .compress_async(&mut input, &mut output)
 //!         .await
-//!         .unwrap();
+//!         .expect("async deflate");
 //! }
 //! ```
 
 use oxiarc_core::async_io::{AsyncCompressor, AsyncDecompressor};
 use oxiarc_core::error::Result;
+use oxiarc_core::traits::FlushMode;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::deflate::Deflater;
 use crate::inflate::Inflater;
+use crate::stream::{InflateStatus, InflateStream};
 
 /// Default buffer size for async DEFLATE operations (64KB).
 const DEFLATE_ASYNC_BUFFER_SIZE: usize = 64 * 1024;
@@ -116,6 +118,14 @@ impl AsyncDecompressor for Inflater {
         self.decompress_async_with_buffer(input, output, DEFLATE_ASYNC_BUFFER_SIZE)
     }
 
+    /// Decompress a raw DEFLATE stream from an async reader into an async
+    /// writer, using at most `2 * buffer_size` bytes of buffering.
+    ///
+    /// The stream is decoded incrementally: compressed bytes are pulled
+    /// `buffer_size` at a time and decoded output is written out as soon as
+    /// it is produced, so peak memory no longer scales with the compressed
+    /// or the decompressed size. A stream that ends in the middle of a
+    /// member is an error, never a short success.
     fn decompress_async_with_buffer<'a, R, W>(
         &'a mut self,
         input: &'a mut R,
@@ -128,28 +138,76 @@ impl AsyncDecompressor for Inflater {
     {
         let buf_size = buffer_size.max(256);
         Box::pin(async move {
-            // The Inflater's `decompress` method processes all input in a single call,
-            // so we must read all compressed bytes first, then decompress in one shot.
-            let mut read_buf = vec![0u8; buf_size];
-            let mut all_compressed: Vec<u8> = Vec::new();
-
-            // Read entire compressed stream
-            loop {
-                let n = input.read(&mut read_buf).await?;
-                if n == 0 {
-                    break;
-                }
-                all_compressed.extend_from_slice(&read_buf[..n]);
+            let mut stream = InflateStream::new();
+            if let Some(dictionary) = self.trait_dictionary() {
+                stream.set_dictionary(dictionary);
             }
 
-            // Decompress all at once using the synchronous inflate path
-            let decompressed = self.inflate_reader(&mut std::io::Cursor::new(&all_compressed))?;
+            let mut in_buf = vec![0u8; buf_size];
+            let mut out_buf = vec![0u8; buf_size];
+            let mut in_pos = 0usize;
+            let mut in_len = 0usize;
+            let mut source_eof = false;
+            let mut total_written = 0usize;
+            let mut stalls = 0u8;
 
-            let total_written = decompressed.len();
-            output.write_all(&decompressed).await?;
+            loop {
+                if in_pos >= in_len && !source_eof {
+                    in_len = input.read(&mut in_buf).await?;
+                    in_pos = 0;
+                    if in_len == 0 {
+                        source_eof = true;
+                    }
+                }
+                // Only once the source is exhausted may running dry be
+                // treated as truncation.
+                let flush = if source_eof {
+                    FlushMode::Finish
+                } else {
+                    FlushMode::None
+                };
+                let progress = stream.inflate(
+                    in_buf.get(in_pos..in_len).unwrap_or_default(),
+                    &mut out_buf,
+                    flush,
+                )?;
+                in_pos = in_pos.saturating_add(progress.consumed);
+                if progress.produced > 0 {
+                    if let Some(fresh) = out_buf.get(..progress.produced) {
+                        output.write_all(fresh).await?;
+                    }
+                    total_written = total_written.saturating_add(progress.produced);
+                }
+                match progress.status {
+                    InflateStatus::StreamEnd => break,
+                    // The source is exhausted and the decoder wants more.
+                    // The call above ran with `FlushMode::Finish`, under
+                    // which the core raises `UnexpectedEof` rather than
+                    // asking for input, so this is unreachable — and it
+                    // stays unreachable structurally rather than by
+                    // argument: breaking here would be a short success on a
+                    // truncated stream, which this method's contract
+                    // forbids.
+                    InflateStatus::NeedInput if source_eof => {
+                        return Err(oxiarc_core::error::OxiArcError::unexpected_eof(1));
+                    }
+                    _ => {}
+                }
+                if progress.consumed == 0 && progress.produced == 0 {
+                    stalls = stalls.saturating_add(1);
+                    if stalls >= 2 {
+                        return Err(oxiarc_core::error::OxiArcError::corrupted(
+                            total_written as u64,
+                            "decoder made no progress",
+                        ));
+                    }
+                } else {
+                    stalls = 0;
+                }
+            }
+
             output.flush().await?;
-
-            // inflate_reader sets finished=true internally via `inflate()`
+            self.mark_finished();
             Ok(total_written)
         })
     }

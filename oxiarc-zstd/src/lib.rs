@@ -20,16 +20,31 @@
 //!   with Raw/RLE fallback)
 //! - Encoder output is accepted by the reference `zstd` CLI; the live
 //!   differential gate lives behind the `zstd-oracle` cargo feature
+//! - Custom block-optimal `FSE_Compressed_Mode` sequence tables on the encode
+//!   path (`FSE_normalizeCount` / `FSE_writeNCount` ports, chosen per category
+//!   against RLE and predefined by total bit cost)
 //! - Raw-content dictionary compression for small data (interoperable with
 //!   `zstd -D` in both directions)
-//! - Streaming Write/Read API
-//! - XXH64 checksum verification
+//! - **Bounded, truly incremental decoding** — [`ZstdStream`] is a resumable
+//!   push decoder with a real sliding-window ring, a pre-decode output budget
+//!   ([`ZstdStream::with_max_output`]) and a declared-window ceiling
+//!   ([`ZstdStream::with_max_window`]). [`ZstdStreamDecoder`] and (with the
+//!   `async-io` feature) [`async_zstd::AsyncZstdReader`] are thin shells over
+//!   it, so neither reads the whole input nor materialises the whole output.
+//!   [`decompress_into`], [`decompress_with_limit`] and
+//!   [`decompress_multi_frame_with_limit`] are the bomb-safe one-shot helpers.
+//! - **One set of format rules for every decoding path.** The dictionary-ID
+//!   requirement, the `Block_Maximum_Decompressed_Size` ceiling and the
+//!   frame-boundary classification (leading garbage is an error; a skippable
+//!   frame in front of a real one is metadata and is walked past; a tail that
+//!   starts no frame ends the stream only after one has been decoded) are
+//!   shared code, so [`decompress_multi_frame`] and [`ZstdStream`] accept and
+//!   refuse exactly the same frames. The declared `Window_Size` is the one
+//!   deliberate exception, because only the streaming decoder keeps a window
+//!   ring — see [`ZstdStream::with_max_window`].
+//! - Streaming `Write` encoder (one frame per 128 KiB block)
+//! - XXH64 checksum verification, one-shot and incremental ([`XxHash64`])
 //! - Optional parallel compression
-//!
-//! Ratio note: sequences always use the predefined/RLE FSE tables (custom
-//! block-optimal tables are not emitted yet), so compression ratio on some
-//! inputs trails the reference encoder even though every frame is fully
-//! interoperable.
 //!
 //! ## Example
 //!
@@ -47,10 +62,29 @@
 //! let decompressed = decode_all(&compressed).expect("decode_all failed");
 //! assert_eq!(decompressed, data);
 //! ```
+//!
+//! ## Bounded decoding of untrusted input
+//!
+//! ```rust
+//! use oxiarc_zstd::{compress_with_level, decompress_with_limit};
+//!
+//! let frame = compress_with_level(&vec![b'A'; 1 << 20], 3).expect("compress");
+//! // A 1 MiB payload from ~100 bytes of input: rejected at the cap, not after
+//! // the allocation.
+//! assert!(decompress_with_limit(&frame, 4096).is_err());
+//! assert_eq!(
+//!     decompress_with_limit(&frame, 2 << 20).expect("decompress").len(),
+//!     1 << 20
+//! );
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+/// Async I/O support (Tokio). Requires the `async-io` feature.
+#[cfg(feature = "async-io")]
+pub mod async_zstd;
+mod backward_bits;
 mod bitwriter;
 mod compressed_block;
 /// Dictionary support for improved compression of small data.
@@ -65,9 +99,15 @@ mod huffman;
 mod huffman_encoder;
 mod literals;
 mod lz77;
+mod read;
 mod sequences;
+mod short_copy;
+/// Bounded, resumable push decoding ([`ZstdStream`]) and the bomb-safe
+/// one-shot helpers built on it.
+pub mod stream;
 /// Streaming compression and decompression.
 pub mod streaming;
+mod window;
 mod xxhash;
 
 // Primary compression API
@@ -81,6 +121,15 @@ pub use frame::{
     ZstdDecoder, decompress, decompress_frame, decompress_multi_frame,
     decompress_multi_frame_with_dict, decompress_with_dict, write_skippable_frame,
 };
+
+// Bounded incremental decoding API
+pub use stream::{
+    ZstdProgress, ZstdStatus, ZstdStream, decompress_into, decompress_multi_frame_with_limit,
+    decompress_with_limit,
+};
+
+// Incremental XXH64 (Zstandard frame checksums)
+pub use xxhash::XxHash64;
 
 // Streaming API
 pub use streaming::{ZstdStreamDecoder, ZstdStreamEncoder};

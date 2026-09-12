@@ -1,8 +1,18 @@
 //! LZ4 bounded-memory true streaming compressor and decompressor.
 //!
 //! Both [`Lz4Compressor`] and [`Lz4Decompressor`] implement block-level
-//! streaming: compressed blocks are emitted / consumed one at a time, so
-//! neither accumulates the full input/output in memory.
+//! streaming: compressed blocks are emitted / consumed one at a time, rather
+//! than the whole input being buffered before any work starts.
+//!
+//! The bound is **per call**, and it is an *input-side* bound: each type's
+//! `with_memory_budget` caps the compressed bytes it stages internally, and a
+//! caller that feeds reasonably sized chunks keeps total memory close to that
+//! budget. Neither type caps its *output*: `Lz4Decompressor` drives its state
+//! machine as far as the input it currently holds allows, staging every block
+//! it decodes until the caller drains it, so handing one call an entire frame
+//! also materialises that frame's entire decompressed output. Decoding
+//! untrusted data with an output-size limit therefore means counting the bytes
+//! drained out, not relying on the memory budget alone.
 
 use super::types::{FrameDescriptor, LZ4_FRAME_MAGIC};
 use crate::block::{compress_block, decompress_block};
@@ -381,9 +391,13 @@ enum DecompressState {
 ///
 /// # Memory budget
 ///
-/// Call [`Lz4Decompressor::with_memory_budget`] to limit how many compressed
-/// bytes may be buffered before being processed.  Exceeding the budget returns
-/// an error.  Defaults to 64 MiB.
+/// Call [`Lz4Decompressor::with_memory_budget`] to limit how many
+/// **compressed (input)** bytes may be buffered before being processed.
+/// Exceeding the budget returns an error. Defaults to 64 MiB. This bounds
+/// `input_buf` only — decompressed output is not itself capped by this
+/// budget; a caller decoding untrusted input who also needs an output-size
+/// limit must enforce one independently (e.g. by counting bytes read back
+/// out through this type's [`Decompressor`] impl).
 pub struct Lz4Decompressor {
     progress: Option<ProgressHandle>,
     cancel: Option<CancellationToken>,
@@ -724,11 +738,20 @@ impl Decompressor for Lz4Decompressor {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize, DecompressStatus)> {
-        // Short-circuit when already done.
+        // Short-circuit when already done: keep draining staged output, and
+        // only report `Done` once the caller has actually received all of it.
+        // Reporting `Done` while `output_buf` still holds undelivered bytes
+        // silently truncates every caller that stops at `Done` — including
+        // this trait's own `decompress_all`, whose 32 KiB buffer is far
+        // smaller than one frame's decompressed size.
         if matches!(self.state, DecompressState::Done) {
-            // Drain any remaining staged output.
             let written = self.drain_output_buf(output);
-            return Ok((0, written, DecompressStatus::Done));
+            let status = if self.output_buf.len() > self.output_pos {
+                DecompressStatus::NeedsOutput
+            } else {
+                DecompressStatus::Done
+            };
+            return Ok((0, written, status));
         }
 
         // Cooperative cancellation.
@@ -759,11 +782,14 @@ impl Decompressor for Lz4Decompressor {
         // Copy staged output to the caller.
         let written = self.drain_output_buf(output);
 
-        let status = if matches!(self.state, DecompressState::Done) {
-            DecompressStatus::Done
-        } else if self.output_buf.len() > self.output_pos {
+        // Undelivered output outranks `Done`: the frame's end marker having
+        // been parsed says nothing about whether the caller has received the
+        // bytes it produced (see the short-circuit above).
+        let status = if self.output_buf.len() > self.output_pos {
             // More decompressed data waiting — caller needs to call again.
             DecompressStatus::NeedsOutput
+        } else if matches!(self.state, DecompressState::Done) {
+            DecompressStatus::Done
         } else {
             DecompressStatus::NeedsInput
         };

@@ -18,9 +18,13 @@
 //! flushed via `sync_flush`. Any remaining data is flushed when
 //! [`finish`](GzipStreamEncoder::finish) is called.
 //!
-//! **Decoders** eagerly read all compressed data from the inner reader on the
-//! first `read` call, decompress it, and serve from an internal buffer. This
-//! matches the pattern used by `oxiarc-zstd`.
+//! **Decoders** are genuinely incremental: they pull at most 64 KiB of
+//! compressed input at a time, decode into a 64 KiB staging buffer and serve
+//! from it, so peak memory is bounded (64 KiB in + 64 KiB out + the 32 KiB
+//! LZ77 history) no matter how large the stream is. Both are thin
+//! configurations of [`InflateReader`] over the
+//! resumable [`WrappedInflate`](crate::WrappedInflate) core, which is what
+//! makes a 3-byte `read` cost a 3-byte copy rather than a decode pass.
 //!
 //! # Example
 //!
@@ -41,10 +45,11 @@
 //! ```
 
 use crate::deflate::Deflater;
-use crate::inflate::Inflater;
+use crate::reader::InflateReader;
+use crate::wrapper::{InflateWrapper, TrailingPolicy};
 use crate::zlib::Adler32;
-use oxiarc_core::{BitReader, Crc32};
-use std::io::{self, Cursor, Read, Write};
+use oxiarc_core::Crc32;
+use std::io::{self, Read, Write};
 
 /// Default block size for incremental encoder flushing (128 KiB).
 const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
@@ -279,251 +284,80 @@ impl<W: Write> Write for GzipStreamEncoder<W> {
 
 /// Streaming GZIP decoder that implements [`Read`].
 ///
-/// All compressed data is read eagerly from the inner reader on the first
-/// `read` call, decompressed into an internal buffer, and then served from
-/// that buffer for subsequent reads.
+/// Compressed data is pulled from the inner reader in 64 KiB chunks and
+/// decoded incrementally into a 64 KiB staging buffer: the first byte is
+/// served without reading the whole stream, and peak memory does not depend
+/// on the stream size.
 ///
-/// Supports concatenated GZIP members: each member is decompressed
-/// independently and the results are concatenated.
+/// Supports concatenated GZIP members (RFC 1952 §2.2): each member is
+/// decompressed in turn and the results are concatenated.
+///
+/// # Lenient framing
+///
+/// This type is deliberately forgiving, and that behaviour is part of its
+/// contract:
+///
+/// * leading bytes that are not GZIP magic end the stream with `Ok(0)`
+///   rather than an error (an empty source therefore decodes to nothing);
+/// * bytes after the last complete member that do not start another one are
+///   ignored.
+///
+/// Use [`InflateReader::gzip`] instead when a malformed stream must be an
+/// error.
+///
+/// # Example
+///
+/// ```
+/// use std::io::Read;
+/// use oxiarc_deflate::{GzipStreamDecoder, gzip_compress};
+///
+/// let compressed = gzip_compress(b"streamed", 6).expect("gzip_compress");
+/// let mut decoder = GzipStreamDecoder::new(&compressed[..]);
+/// let mut plain = Vec::new();
+/// decoder.read_to_end(&mut plain).expect("read");
+/// assert_eq!(plain, b"streamed");
+/// ```
 pub struct GzipStreamDecoder<R: Read> {
-    /// The wrapped reader providing compressed input.
-    inner: R,
-    /// Decompressed output buffer.
-    output_buffer: Vec<u8>,
-    /// Current read position inside `output_buffer`.
-    output_pos: usize,
-    /// Whether the compressed stream has been fully consumed.
-    finished: bool,
+    inner: InflateReader<R>,
 }
 
 impl<R: Read> GzipStreamDecoder<R> {
     /// Create a new streaming GZIP decoder wrapping `reader`.
     pub fn new(reader: R) -> Self {
         Self {
-            inner: reader,
-            output_buffer: Vec::new(),
-            output_pos: 0,
-            finished: false,
+            inner: InflateReader::new(reader, InflateWrapper::Gzip)
+                .multi_member(true)
+                .trailing_policy(TrailingPolicy::Stop)
+                .strict_first_member(false),
         }
     }
 
     /// Consume the decoder and return the inner reader.
+    ///
+    /// Compressed bytes already staged inside the decoder are discarded.
     pub fn into_inner(self) -> R {
-        self.inner
+        self.inner.into_inner()
     }
 
-    /// Read and decompress all compressed data from the inner reader.
+    /// Returns the number of decompressed bytes produced so far.
     ///
-    /// Handles concatenated GZIP members correctly by tracking exact DEFLATE
-    /// block boundaries via the inflater's bit-level parser rather than
-    /// scanning for magic bytes in the compressed payload (which would produce
-    /// false-positive splits whenever `0x1F 0x8B` appears inside DEFLATE data).
-    ///
-    /// Each GZIP member is decoded as:
-    ///   1. 10-byte fixed header (plus optional variable-length fields)
-    ///   2. DEFLATE compressed data  — consumed by `Inflater::inflate_consumed`
-    ///   3. 8-byte trailer: CRC-32 (LE) + ISIZE (LE)
-    ///
-    /// A single `BitReader` is shared across all members so the stream position
-    /// is always exact and no bytes are lost between members.
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        if self.finished || self.output_pos < self.output_buffer.len() {
-            return Ok(());
-        }
-
-        let mut compressed = Vec::new();
-        self.inner.read_to_end(&mut compressed)?;
-
-        if compressed.is_empty() {
-            self.finished = true;
-            return Ok(());
-        }
-
-        let cursor = Cursor::new(compressed);
-        let mut bit_reader = BitReader::buffered(cursor);
-        let mut all_decompressed = Vec::new();
-
-        loop {
-            // ── 1. Peek at the first two bytes to detect GZIP magic ──────────
-            let mut magic = [0u8; 2];
-            match bit_reader.read_bytes(&mut magic) {
-                Ok(()) => {}
-                Err(oxiarc_core::error::OxiArcError::Io(ref e))
-                    if e.kind() == io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(oxiarc_core::error::OxiArcError::UnexpectedEof { .. }) => break,
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-            }
-
-            if magic[0] != GZIP_ID1 || magic[1] != GZIP_ID2 {
-                // Trailing non-GZIP data — stop gracefully.
-                break;
-            }
-
-            // ── 2. Read the rest of the fixed 10-byte header ────────────────
-            // We already consumed 2 bytes (ID1, ID2); read the remaining 8.
-            let mut header_rest = [0u8; 8];
-            bit_reader.read_bytes(&mut header_rest).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("gzip header truncated: {e}"),
-                )
-            })?;
-            let cm = header_rest[0]; // compression method (byte 2)
-            let flg = header_rest[1]; // flags (byte 3)
-            // bytes 2-5: MTIME (ignored), byte 6: XFL (ignored), byte 7: OS (ignored)
-
-            if cm != GZIP_CM_DEFLATE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported gzip compression method: {cm}"),
-                ));
-            }
-
-            // ── 3. Skip optional header fields based on FLG ──────────────────
-            // FEXTRA (bit 2): 2-byte XLEN followed by XLEN bytes
-            if flg & 0x04 != 0 {
-                let mut xlen_buf = [0u8; 2];
-                bit_reader.read_bytes(&mut xlen_buf).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("gzip FEXTRA truncated: {e}"),
-                    )
-                })?;
-                let xlen = u16::from_le_bytes(xlen_buf) as usize;
-                let mut extra = vec![0u8; xlen];
-                bit_reader.read_bytes(&mut extra).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("gzip FEXTRA data truncated: {e}"),
-                    )
-                })?;
-            }
-
-            // FNAME (bit 3): null-terminated string
-            if flg & 0x08 != 0 {
-                let mut byte = [0u8; 1];
-                loop {
-                    bit_reader.read_bytes(&mut byte).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("gzip FNAME truncated: {e}"),
-                        )
-                    })?;
-                    if byte[0] == 0 {
-                        break;
-                    }
-                }
-            }
-
-            // FCOMMENT (bit 4): null-terminated comment
-            if flg & 0x10 != 0 {
-                let mut byte = [0u8; 1];
-                loop {
-                    bit_reader.read_bytes(&mut byte).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("gzip FCOMMENT truncated: {e}"),
-                        )
-                    })?;
-                    if byte[0] == 0 {
-                        break;
-                    }
-                }
-            }
-
-            // FHCRC (bit 1): 2-byte header CRC16 (skip)
-            if flg & 0x02 != 0 {
-                let mut hcrc = [0u8; 2];
-                bit_reader.read_bytes(&mut hcrc).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("gzip FHCRC truncated: {e}"),
-                    )
-                })?;
-            }
-
-            // ── 4. Inflate the DEFLATE payload ────────────────────────────────
-            // `inflate_consumed` reads bits from the shared BitReader and returns
-            // the decompressed data.  On return the BitReader is aligned to the
-            // next byte boundary (any intra-byte padding is skipped), so reading
-            // the 8-byte footer next is safe and exact.
-            let mut inflater = Inflater::new();
-            let (decompressed, _consumed) =
-                inflater.inflate_consumed(&mut bit_reader).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("gzip deflate error: {e}"),
-                    )
-                })?;
-
-            // ── 5. Read and verify the 8-byte GZIP trailer ───────────────────
-            let mut trailer = [0u8; 8];
-            bit_reader.read_bytes(&mut trailer).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("gzip trailer truncated: {e}"),
-                )
-            })?;
-
-            let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-            let stored_isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
-
-            let actual_crc = Crc32::compute(&decompressed);
-            if actual_crc != stored_crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "gzip CRC-32 mismatch: stored {stored_crc:#010x}, computed {actual_crc:#010x}"
-                    ),
-                ));
-            }
-
-            let actual_isize = (decompressed.len() as u64 & 0xFFFF_FFFF) as u32;
-            if actual_isize != stored_isize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("gzip ISIZE mismatch: stored {stored_isize}, computed {actual_isize}"),
-                ));
-            }
-
-            all_decompressed.extend_from_slice(&decompressed);
-        }
-
-        self.output_buffer = all_decompressed;
-        self.output_pos = 0;
-        self.finished = true;
-
-        Ok(())
-    }
-
-    /// Returns the total number of decompressed bytes available.
+    /// Since 0.4.2 this decoder is incremental, so the total size of the
+    /// stream is not known until it has been read to the end: the value
+    /// grows as decoding proceeds instead of being final after the first
+    /// `read`.
     pub fn decompressed_size(&self) -> usize {
-        self.output_buffer.len()
+        usize::try_from(self.inner.total_out()).unwrap_or(usize::MAX)
     }
 
     /// Returns `true` if all decompressed data has been read.
     pub fn is_finished(&self) -> bool {
-        self.finished && self.output_pos >= self.output_buffer.len()
+        self.inner.is_finished()
     }
 }
 
 impl<R: Read> Read for GzipStreamDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.fill_buffer()?;
-
-        let available = self.output_buffer.len() - self.output_pos;
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let to_copy = buf.len().min(available);
-        buf[..to_copy]
-            .copy_from_slice(&self.output_buffer[self.output_pos..self.output_pos + to_copy]);
-        self.output_pos += to_copy;
-        Ok(to_copy)
+        self.inner.read(buf)
     }
 }
 
@@ -750,35 +584,48 @@ impl<W: Write> Write for ZlibStreamEncoder<W> {
 
 /// Streaming Zlib decoder that implements [`Read`].
 ///
-/// All compressed data is read eagerly from the inner reader on the first
-/// `read` call, decompressed into an internal buffer, and then served from
-/// that buffer for subsequent reads.
+/// Compressed data is pulled from the inner reader in 64 KiB chunks and
+/// decoded incrementally into a 64 KiB staging buffer, so the first byte is
+/// served without reading the whole stream and peak memory does not depend
+/// on the stream size.
 ///
-/// Supports concatenated Zlib streams: each stream is decompressed
-/// independently and the results are concatenated.
+/// Supports concatenated Zlib streams: each member is decompressed in turn
+/// and the results are concatenated, with every input byte decoded at most
+/// once (O(n) total — no speculative re-decoding of candidate prefixes).
+///
+/// # Framing
+///
+/// * a stream that does not start with a valid zlib header is an error;
+/// * a preset dictionary (`FDICT`) is rejected;
+/// * bytes after a complete member that do not start another one are
+///   ignored, including a 1-5 byte fragment that happens to look like a
+///   header.
+///
+/// # Example
+///
+/// ```
+/// use std::io::Read;
+/// use oxiarc_deflate::{ZlibStreamDecoder, zlib_compress};
+///
+/// let compressed = zlib_compress(b"streamed", 6).expect("zlib_compress");
+/// let mut decoder = ZlibStreamDecoder::new(&compressed[..]).with_max_output(1 << 20);
+/// let mut plain = Vec::new();
+/// decoder.read_to_end(&mut plain).expect("read");
+/// assert_eq!(plain, b"streamed");
+/// ```
 pub struct ZlibStreamDecoder<R: Read> {
-    /// The wrapped reader providing compressed input.
-    inner: R,
-    /// Decompressed output buffer.
-    output_buffer: Vec<u8>,
-    /// Current read position inside `output_buffer`.
-    output_pos: usize,
-    /// Whether the compressed stream has been fully consumed.
-    finished: bool,
-    /// Optional cap on the total decompressed output size, bounding
-    /// decompression-bomb amplification on untrusted input.
-    max_output: Option<usize>,
+    inner: InflateReader<R>,
 }
 
 impl<R: Read> ZlibStreamDecoder<R> {
     /// Create a new streaming Zlib decoder wrapping `reader`.
     pub fn new(reader: R) -> Self {
         Self {
-            inner: reader,
-            output_buffer: Vec::new(),
-            output_pos: 0,
-            finished: false,
-            max_output: None,
+            inner: InflateReader::new(reader, InflateWrapper::Zlib)
+                .multi_member(true)
+                .trailing_policy(TrailingPolicy::Stop)
+                .strict_first_member(true)
+                .with_lenient_short_tail(true),
         }
     }
 
@@ -788,160 +635,44 @@ impl<R: Read> ZlibStreamDecoder<R> {
     /// accumulated output would exceed `limit` bytes. Recommended when
     /// decoding untrusted input, since a small zlib stream can legally
     /// expand by a factor of ~1000 (decompression bomb).
+    ///
+    /// Since 0.4.2 the cap is enforced *during* decoding — inside a single
+    /// DEFLATE block, not merely between members — so a one-block bomb is
+    /// stopped at the limit instead of after full expansion. The bytes
+    /// decoded up to the limit are still delivered; the error surfaces on
+    /// the following `read`.
     #[must_use]
     pub fn with_max_output(mut self, limit: usize) -> Self {
-        self.max_output = Some(limit);
+        self.inner = self.inner.with_max_output(limit as u64);
         self
     }
 
     /// Consume the decoder and return the inner reader.
+    ///
+    /// Compressed bytes already staged inside the decoder are discarded.
     pub fn into_inner(self) -> R {
-        self.inner
+        self.inner.into_inner()
     }
 
-    /// Read and decompress all compressed data from the inner reader.
+    /// Returns the number of decompressed bytes produced so far.
     ///
-    /// Handles concatenated Zlib streams by decoding each member with a
-    /// streaming inflater that reports exactly how many compressed bytes it
-    /// consumed (mirroring [`GzipStreamDecoder`]), then validating the next
-    /// member's 2-byte header at that exact offset. Each input byte is
-    /// decoded at most once — O(n) total, with no speculative re-decoding
-    /// of candidate prefixes (which was quadratic and amplifiable by
-    /// decompression bombs).
-    ///
-    /// Non-zlib trailing bytes after at least one complete member terminate
-    /// decoding gracefully; a corrupt member (bad DEFLATE data, wrong or
-    /// truncated Adler-32) is an error.
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        if self.finished || self.output_pos < self.output_buffer.len() {
-            return Ok(());
-        }
-
-        let mut compressed = Vec::new();
-        self.inner.read_to_end(&mut compressed)?;
-
-        if compressed.is_empty() {
-            self.finished = true;
-            return Ok(());
-        }
-
-        let mut all_decompressed = Vec::new();
-        let mut pos = 0usize;
-
-        while pos < compressed.len() {
-            let remaining = &compressed[pos..];
-
-            // Minimum member size: 2-byte header + 4-byte Adler-32.
-            if remaining.len() < 6 {
-                break;
-            }
-
-            // Validate the 2-byte zlib header (RFC 1950): CM=8 and the
-            // CMF·FLG check value divisible by 31.
-            let cmf = remaining[0];
-            let flg = remaining[1];
-            if cmf & 0x0F != 8 || ((cmf as u16) * 256 + flg as u16) % 31 != 0 {
-                if pos == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid zlib header",
-                    ));
-                }
-                // Trailing non-zlib data after complete members — stop.
-                break;
-            }
-            if (flg >> 5) & 1 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "zlib preset dictionary (FDICT) not supported by ZlibStreamDecoder",
-                ));
-            }
-
-            // Inflate the member's DEFLATE payload, tracking the exact
-            // number of compressed bytes consumed.
-            let mut bit_reader = BitReader::buffered(Cursor::new(&remaining[2..]));
-            let mut inflater = Inflater::new();
-            let (decompressed, consumed) =
-                inflater.inflate_consumed(&mut bit_reader).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("zlib deflate error: {e}"),
-                    )
-                })?;
-
-            // Enforce the output cap before buffering the member.
-            if let Some(limit) = self.max_output {
-                let total = all_decompressed.len().saturating_add(decompressed.len());
-                if total > limit {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("decompressed output exceeds cap of {limit} bytes"),
-                    ));
-                }
-            }
-
-            // Verify the 4-byte big-endian Adler-32 trailer at its exact
-            // position.
-            let adler_start =
-                2usize.saturating_add(usize::try_from(consumed).unwrap_or(usize::MAX));
-            if adler_start.saturating_add(4) > remaining.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "zlib stream missing Adler-32 trailer",
-                ));
-            }
-            let stored = u32::from_be_bytes([
-                remaining[adler_start],
-                remaining[adler_start + 1],
-                remaining[adler_start + 2],
-                remaining[adler_start + 3],
-            ]);
-            let computed = Adler32::checksum(&decompressed);
-            if stored != computed {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "zlib Adler-32 mismatch: stored {stored:#010x}, computed {computed:#010x}"
-                    ),
-                ));
-            }
-
-            all_decompressed.extend_from_slice(&decompressed);
-            pos += adler_start + 4;
-        }
-
-        self.output_buffer = all_decompressed;
-        self.output_pos = 0;
-        self.finished = true;
-
-        Ok(())
-    }
-
-    /// Returns the total number of decompressed bytes available.
+    /// Since 0.4.2 this decoder is incremental, so the total size of the
+    /// stream is not known until it has been read to the end: the value
+    /// grows as decoding proceeds instead of being final after the first
+    /// `read`.
     pub fn decompressed_size(&self) -> usize {
-        self.output_buffer.len()
+        usize::try_from(self.inner.total_out()).unwrap_or(usize::MAX)
     }
 
     /// Returns `true` if all decompressed data has been read.
     pub fn is_finished(&self) -> bool {
-        self.finished && self.output_pos >= self.output_buffer.len()
+        self.inner.is_finished()
     }
 }
 
 impl<R: Read> Read for ZlibStreamDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.fill_buffer()?;
-
-        let available = self.output_buffer.len() - self.output_pos;
-        if available == 0 {
-            return Ok(0);
-        }
-
-        let to_copy = buf.len().min(available);
-        buf[..to_copy]
-            .copy_from_slice(&self.output_buffer[self.output_pos..self.output_pos + to_copy]);
-        self.output_pos += to_copy;
-        Ok(to_copy)
+        self.inner.read(buf)
     }
 }
 

@@ -3,11 +3,11 @@
 
 Core primitives and traits for the OxiArc archive library.
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.2-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version 0.4.1** (2026-07-30) — 196 tests passing.
+**Version 0.4.2** (2026-09-08) — 231 tests passing (200 via nextest + 31 doctests, `--all-features`).
 
 **What's new in 0.4.0**: New `BitCache` — a register-resident bit accumulator (`available()`, `consumed()`, `peek_mask(mask)`, `peek_bits(count)`, `consume(count)`), re-exported from the crate root and `prelude` alongside `BitReader`/`BitWriter`. `BitReader` gains a buffered/prefetch mode — `BitReader::buffered(reader)` (default 8192-byte prefetch capacity) and `BitReader::with_buffer_capacity(reader, capacity)` — that refills the accumulator via bulk 64-bit little-endian loads instead of one `Read::read` per few bits, much faster whenever the `BitReader` owns its stream; `BitReader::new` (exact mode, never reads ahead) is unchanged and remains the right choice whenever the reader must not advance past bits actually consumed. New `BitReader::into_parts()` recovers `(R, Vec<u8>)` — the underlying reader plus any prefetched-but-unconsumed bytes — for handing a shared stream back to other code (e.g. a byte-aligned section immediately following a DEFLATE member). New supporting methods `buffered_len()`, `available_bits()`, `refill()`, `try_fill(count)`, `peek_bits_prefilled(count)`, `consume_bits(count)`, `detach()`, `reattach(cache)`, and `refill_cache(cache, want)` implement a detach/reattach pattern so a decoder's inner loop can hold the bit accumulator in a local `BitCache` across many symbols instead of round-tripping it through memory on every one.
 
@@ -221,14 +221,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiarc-core = "0.4.1"
+oxiarc-core = "0.4.2"
 ```
 
 Or with optional features:
 
 ```toml
 [dependencies]
-oxiarc-core = { version = "0.4.1", features = ["async-io", "mmap"] }
+oxiarc-core = { version = "0.4.2", features = ["async-io", "mmap"] }
 ```
 
 ## API Summary

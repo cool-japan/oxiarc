@@ -77,17 +77,30 @@ pub fn cmd_add(
     let mut reader = BufReader::new(file);
     let (format, _magic) = ArchiveFormat::detect(&mut reader)?;
     reader.seek(SeekFrom::Start(0))?;
-    drop(reader);
 
     match format {
-        ArchiveFormat::Zip => add_to_zip(archive, files, compression, verbose, quiet, dry_run),
-        ArchiveFormat::Tar => add_to_tar(archive, files, verbose, quiet, dry_run),
-        ArchiveFormat::Lzh => add_to_lzh(archive, files, verbose, quiet, dry_run),
+        ArchiveFormat::Zip => {
+            drop(reader);
+            add_to_zip(archive, files, compression, verbose, quiet, dry_run)
+        }
+        ArchiveFormat::Tar => {
+            drop(reader);
+            add_to_tar(archive, files, verbose, quiet, dry_run)
+        }
+        ArchiveFormat::Lzh => {
+            drop(reader);
+            add_to_lzh(archive, files, verbose, quiet, dry_run)
+        }
         other => {
+            // Only computed on the error path: the appendable formats above
+            // must not pay a second pass over the archive just so an error
+            // they never reach can be phrased better.
+            let image_hint = crate::utils::image_format_hint(&mut reader);
+            drop(reader);
             eprintln!(
                 "{}",
                 styler.error(&format!(
-                    "error: `oxiarc add` does not support the {} format (only ZIP, TAR, and LZH are appendable).",
+                    "error: `oxiarc add` does not support the {} format (only ZIP, TAR, and LZH are appendable).{image_hint}",
                     other
                 ))
             );

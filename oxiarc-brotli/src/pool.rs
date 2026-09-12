@@ -33,8 +33,8 @@
 //! let pool = BrotliPool::new();
 //! let params = BrotliParams { quality: 5, ..Default::default() };
 //! let data = b"hello world hello world hello world";
-//! let c1 = compress_with_params_pooled(data, &params, &pool).unwrap();
-//! let c2 = compress_with_params_pooled(data, &params, &pool).unwrap();
+//! let c1 = compress_with_params_pooled(data, &params, &pool).expect("compress");
+//! let c2 = compress_with_params_pooled(data, &params, &pool).expect("compress");
 //! assert_eq!(c1, c2);
 //! assert!(pool.stats().hash_hits >= 1);
 //! ```
@@ -355,8 +355,8 @@ use crate::error::BrotliResult;
 ///
 /// let pool = BrotliPool::new();
 /// let params = BrotliParams::default();
-/// let c1 = compress_with_params_pooled(b"hello", &params, &pool).unwrap();
-/// let c2 = compress_with_params_pooled(b"hello", &params, &pool).unwrap();
+/// let c1 = compress_with_params_pooled(b"hello", &params, &pool).expect("compress");
+/// let c2 = compress_with_params_pooled(b"hello", &params, &pool).expect("compress");
 /// assert_eq!(c1, c2);
 /// ```
 pub fn compress_with_params_pooled(

@@ -44,14 +44,24 @@ pub enum ZlibLevel {
 }
 
 impl ZlibLevel {
-    /// Convert from compression level (0-9) to zlib level indicator.
+    /// Convert from compression level (0-9) to the zlib header's `FLEVEL`
+    /// hint, using zlib's own `deflateInit2` mapping (levels 0-1 → 0, 2-5 → 1,
+    /// 6 → 2, 7-9 → 3).
+    ///
+    /// The field is advisory — no decoder acts on it — but matching zlib means
+    /// `zlib_compress(data, level)` is byte-identical to
+    /// `zlib.compress(data, level)` at levels 1..=9, which is what the encoder
+    /// oracle asserts. (Level 0 is excluded on purpose: zlib sizes each stored
+    /// block to the room left in its output buffer, so its level-0 bytes depend
+    /// on the caller. This encoder writes into an unbounded sink and emits the
+    /// format maximum, which is never larger — see
+    /// `tests/zlib_encoder_oracle.rs`.)
     fn from_level(level: u8) -> Self {
         match level {
-            0..=2 => Self::Fastest,
-            3..=5 => Self::Fast,
+            0..=1 => Self::Fastest,
+            2..=5 => Self::Fast,
             6 => Self::Default,
-            7..=9 => Self::Maximum,
-            _ => Self::Default,
+            _ => Self::Maximum,
         }
     }
 }
@@ -80,30 +90,44 @@ impl Adler32 {
 
     /// Update the checksum with more data.
     ///
-    /// The naive form (`a += x; b += a;`) is a serial dependency chain of two
-    /// adds per byte and cannot be vectorised. Processing a fixed 32-byte
-    /// group instead uses the closed form
+    /// The naive form (`a += x; b += a;`) is a serial dependency chain of
+    /// two adds per byte and cannot be vectorised. Instead the bytes of a
+    /// block are folded into two fixed-width lane accumulators, both updated
+    /// with pure vertical adds that a compiler turns into SIMD:
     ///
     /// ```text
-    /// b' = b + 32*a + sum_i (32 - i) * x_i
-    /// a' = a + sum_i x_i
+    /// per 32-byte group g:  run[j]      += x[g][j]        // running lane sums
+    ///                       weighted[j] += run[j]         // == sum_g (K-g) x[g][j]
     /// ```
     ///
-    /// which turns the per-byte work into two independent reductions the
-    /// compiler can auto-vectorise, exactly as zlib's own `DO16` unrolling
-    /// does. The result is bit-identical to the byte-at-a-time version.
+    /// With `K` groups of `L = 32` bytes the block's contribution follows in
+    /// closed form from one horizontal reduction per block rather than per
+    /// group:
     ///
-    /// Blocks stay at or below `NMAX` bytes so the 32-bit accumulators
-    /// cannot overflow before the modulo reduction (RFC 1950 / zlib's
-    /// classic bound `255n(n+1)/2 + (n+1)(BASE-1) < 2^32`).
+    /// ```text
+    /// a' = a + sum_j run[j]
+    /// b' = b + K*L*a + L * sum_j weighted[j] - sum_j j * run[j]
+    /// ```
+    ///
+    /// (the last term corrects for the within-group position, since
+    /// `weighted` weights a whole group uniformly). The result is
+    /// bit-identical to the byte-at-a-time version — the identity is exact,
+    /// not an approximation — and `Adler32::update` is therefore
+    /// split-invariant: any chunking of the same data yields the same
+    /// checksum.
+    ///
+    /// Blocks stay at or below `NMAX` bytes and the block-level combination
+    /// is done in `u64`, so no intermediate can overflow (`run[j]` peaks at
+    /// `255 * NMAX/L`, `weighted[j]` at `255 * K(K+1)/2`).
     pub fn update(&mut self, data: &[u8]) {
-        /// Bytes per vectorised group.
-        const GROUP: usize = 32;
-        /// Largest multiple of `GROUP` that is still within `NMAX`.
-        const BLOCK: usize = NMAX - (NMAX % GROUP);
+        /// Bytes per vector step, and the number of lane accumulators.
+        const LANES: usize = 32;
+        /// Largest multiple of `LANES` that is still within `NMAX`.
+        const BLOCK: usize = NMAX - (NMAX % LANES);
 
-        let mut a = self.a;
-        let mut b = self.b;
+        let modulus = u64::from(ADLER_MOD);
+        let mut a = u64::from(self.a);
+        let mut b = u64::from(self.b);
 
         let mut remaining = data;
         while !remaining.is_empty() {
@@ -111,28 +135,49 @@ impl Adler32 {
             let (block, rest) = remaining.split_at(take);
             remaining = rest;
 
-            let mut groups = block.chunks_exact(GROUP);
+            let mut groups = block.chunks_exact(LANES);
+            let mut run = [0u32; LANES];
+            let mut weighted = [0u32; LANES];
+            let mut vector_bytes = 0u64;
             for group in &mut groups {
-                let mut sum = 0u32;
-                let mut weighted = 0u32;
-                for (i, &byte) in group.iter().enumerate() {
-                    sum += byte as u32;
-                    weighted += (GROUP - i) as u32 * byte as u32;
+                // A fixed-size reference, so the two loops below compile to
+                // straight-line vector adds with no length check.
+                if let Ok(group) = <&[u8; LANES]>::try_from(group) {
+                    for (lane, &byte) in run.iter_mut().zip(group.iter()) {
+                        *lane += u32::from(byte);
+                    }
+                    for (acc, &lane) in weighted.iter_mut().zip(run.iter()) {
+                        *acc += lane;
+                    }
+                    vector_bytes += LANES as u64;
                 }
-                b += a * GROUP as u32 + weighted;
-                a += sum;
             }
+
+            if vector_bytes > 0 {
+                let mut sum = 0u64;
+                let mut prefix = 0u64;
+                let mut offset = 0u64;
+                for (index, (&lane, &acc)) in run.iter().zip(weighted.iter()).enumerate() {
+                    sum += u64::from(lane);
+                    prefix += u64::from(acc);
+                    offset += index as u64 * u64::from(lane);
+                }
+                b += vector_bytes * a + LANES as u64 * prefix - offset;
+                a += sum;
+                a %= modulus;
+                b %= modulus;
+            }
+
             for &byte in groups.remainder() {
-                a += byte as u32;
+                a += u64::from(byte);
                 b += a;
             }
-
-            a %= ADLER_MOD;
-            b %= ADLER_MOD;
+            a %= modulus;
+            b %= modulus;
         }
 
-        self.a = a;
-        self.b = b;
+        self.a = a as u32;
+        self.b = b as u32;
     }
 
     /// Finalize and return the checksum.
@@ -167,8 +212,8 @@ impl Default for Adler32 {
 /// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress};
 ///
 /// let data = b"Hello, World! Hello, World!";
-/// let compressed = zlib_compress(data, 6).unwrap();
-/// let decompressed = zlib_decompress(&compressed).unwrap();
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
+/// let decompressed = zlib_decompress(&compressed).expect("zlib_decompress");
 /// assert_eq!(decompressed, data);
 /// ```
 pub fn zlib_compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
@@ -233,8 +278,8 @@ pub fn zlib_compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
 ///
 /// let dict = b"common patterns and shared content";
 /// let data = b"This text has common patterns that match the dictionary";
-/// let compressed = zlib_compress_with_dict(data, 6, dict).unwrap();
-/// let decompressed = zlib_decompress_with_dict(&compressed, dict).unwrap();
+/// let compressed = zlib_compress_with_dict(data, 6, dict).expect("zlib_compress_with_dict");
+/// let decompressed = zlib_decompress_with_dict(&compressed, dict).expect("zlib_decompress_with_dict");
 /// assert_eq!(decompressed, data);
 /// ```
 pub fn zlib_compress_with_dict(input: &[u8], level: u8, dictionary: &[u8]) -> Result<Vec<u8>> {
@@ -297,14 +342,28 @@ pub fn zlib_compress_with_dict(input: &[u8], level: u8, dictionary: &[u8]) -> Re
 ///
 /// * `input` - Zlib compressed data
 ///
+/// # `input` must be exactly one member
+///
+/// The Adler-32 trailer is read from the **last four bytes of `input`**,
+/// not from the position immediately after the DEFLATE stream, so `input`
+/// must end exactly where the member ends. A slice carrying trailing bytes
+/// (padding, a second concatenated member, a container's next field) fails
+/// with [`OxiArcError::CrcMismatch`] — the generic checksum-mismatch error,
+/// raised here for an **Adler-32** — rather than ignoring them. Callers
+/// that hold a buffer with an unknown tail — a PNG `IDAT` chain, a TIFF
+/// strip — should drive
+/// [`WrappedInflate`](crate::WrappedInflate)`::new(`[`InflateWrapper::Zlib`](crate::InflateWrapper)`)`
+/// instead, which locates the trailer itself and applies an explicit
+/// [`TrailingPolicy`](crate::TrailingPolicy).
+///
 /// # Example
 ///
 /// ```
 /// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress};
 ///
 /// let data = b"Hello, World! Hello, World!";
-/// let compressed = zlib_compress(data, 6).unwrap();
-/// let decompressed = zlib_decompress(&compressed).unwrap();
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
+/// let decompressed = zlib_decompress(&compressed).expect("zlib_decompress");
 /// assert_eq!(decompressed, data);
 /// ```
 pub fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
@@ -364,6 +423,8 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
     let stored_checksum = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let computed_checksum = Adler32::checksum(decompressed);
 
+    // `CrcMismatch` is the workspace's generic checksum-mismatch error; the
+    // checksum being compared here is RFC 1950 §8.2's Adler-32, not a CRC.
     if stored_checksum != computed_checksum {
         return Err(OxiArcError::crc_mismatch(
             computed_checksum,
@@ -380,6 +441,15 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
 /// intermediate `Vec`, and the trailing Adler-32 is verified against the
 /// bytes written.
 ///
+/// # `input` must be exactly one member
+///
+/// As with [`zlib_decompress`], the Adler-32 is read from the **last four
+/// bytes of `input`**: this function requires a slice that ends exactly
+/// where the zlib member ends, and rejects one with trailing bytes.
+/// Image codecs holding a buffer with an unknown tail should use
+/// [`WrappedInflate`](crate::WrappedInflate) with an explicit
+/// [`TrailingPolicy`](crate::TrailingPolicy) instead.
+///
 /// # Returns
 ///
 /// The number of bytes written to `output`.
@@ -387,8 +457,9 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// [`OxiArcError::BufferTooSmall`] when the stream decodes to more than
-/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] when the Adler-32
-/// does not match, plus the usual header/EOF/Huffman errors. Preset
+/// `output.len()` bytes, [`OxiArcError::CrcMismatch`] (the generic
+/// checksum-mismatch error) when the **Adler-32** trailer does not match,
+/// plus the usual header/EOF/Huffman errors. Preset
 /// dictionaries are not supported on this path (no history precedes
 /// `output`); use [`zlib_decompress_with_dict`] for those.
 ///
@@ -398,9 +469,9 @@ fn verify_zlib_trailer(input: &[u8], decompressed: &[u8]) -> Result<()> {
 /// use oxiarc_deflate::zlib::{zlib_compress, zlib_decompress_into};
 ///
 /// let data = b"Hello, World! Hello, World!";
-/// let compressed = zlib_compress(data, 6).unwrap();
+/// let compressed = zlib_compress(data, 6).expect("zlib_compress");
 /// let mut out = vec![0u8; data.len()];
-/// let n = zlib_decompress_into(&compressed, &mut out).unwrap();
+/// let n = zlib_decompress_into(&compressed, &mut out).expect("zlib_decompress_into");
 /// assert_eq!(&out[..n], data);
 /// ```
 pub fn zlib_decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
@@ -429,8 +500,8 @@ pub fn zlib_decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize> {
 ///
 /// let dict = b"common patterns and shared content";
 /// let data = b"This text has common patterns that match the dictionary";
-/// let compressed = zlib_compress_with_dict(data, 6, dict).unwrap();
-/// let decompressed = zlib_decompress_with_dict(&compressed, dict).unwrap();
+/// let compressed = zlib_compress_with_dict(data, 6, dict).expect("zlib_compress_with_dict");
+/// let decompressed = zlib_decompress_with_dict(&compressed, dict).expect("zlib_decompress_with_dict");
 /// assert_eq!(decompressed, data);
 /// ```
 pub fn zlib_decompress_with_dict(input: &[u8], dictionary: &[u8]) -> Result<Vec<u8>> {
@@ -519,7 +590,7 @@ pub fn zlib_decompress_with_dict(input: &[u8], dictionary: &[u8]) -> Result<Vec<
 /// use oxiarc_deflate::zlib::{zlib_compress_with_dict, zlib_requires_dictionary};
 ///
 /// let dict = b"test dictionary";
-/// let compressed = zlib_compress_with_dict(b"test data", 6, dict).unwrap();
+/// let compressed = zlib_compress_with_dict(b"test data", 6, dict).expect("zlib_compress_with_dict");
 /// let required_checksum = zlib_requires_dictionary(&compressed);
 /// assert!(required_checksum.is_some());
 /// ```
@@ -1062,6 +1133,63 @@ mod adler_reference_tests {
                 Adler32::checksum(&data),
                 "split={split}"
             );
+        }
+    }
+
+    /// The lane-accumulator form must stay bit-identical to the
+    /// byte-at-a-time definition **from an arbitrary running state**, not
+    /// just from `(a, b) = (1, 0)`. That is the case the block-level
+    /// closed form has to get right: `b` is seeded with `n * a` and the
+    /// intermediate `L * sum(weighted)` is the largest number the routine
+    /// ever forms.
+    #[test]
+    fn matches_reference_from_a_saturated_running_state() {
+        // Drive `a` up towards BASE-1 before the block under test.
+        let warmup = vec![0xFFu8; 1000];
+        let mut reference_a: u32 = 1;
+        let mut reference_b: u32 = 0;
+        let step = |data: &[u8], a: &mut u32, b: &mut u32| {
+            for &byte in data {
+                *a = (*a + byte as u32) % ADLER_MOD;
+                *b = (*b + *a) % ADLER_MOD;
+            }
+        };
+
+        let mut subject = Adler32::new();
+        subject.update(&warmup);
+        step(&warmup, &mut reference_a, &mut reference_b);
+
+        // Worst case for the accumulators: full NMAX-sized blocks of 0xFF.
+        for len in [5536usize, 5552, 5553, 11_104, 17_000] {
+            let block = vec![0xFFu8; len];
+            let mut probe = subject.clone();
+            probe.update(&block);
+            let (mut a, mut b) = (reference_a, reference_b);
+            step(&block, &mut a, &mut b);
+            assert_eq!(probe.finish(), (b << 16) | a, "len={len}");
+        }
+    }
+
+    /// Split-invariance across many random cut points, not just one.
+    #[test]
+    fn many_way_splits_match_a_single_update() {
+        let data: Vec<u8> = (0..60_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let expected = Adler32::checksum(&data);
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..25 {
+            let mut checksum = Adler32::new();
+            let mut pos = 0usize;
+            while pos < data.len() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let take = ((rng % 9_000) as usize + 1).min(data.len() - pos);
+                checksum.update(data.get(pos..pos + take).unwrap_or_default());
+                pos += take;
+            }
+            assert_eq!(checksum.finish(), expected);
         }
     }
 

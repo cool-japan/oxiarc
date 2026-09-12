@@ -18,6 +18,53 @@ pub struct BitReader<'a> {
     bit_buf: u64,
     /// Number of valid bits currently in `bit_buf`.
     bits_in_buf: u32,
+    /// `true` when `data` is only a *prefix* of the stream and more bytes may
+    /// still arrive (the incremental decoder in [`crate::stream`]).
+    ///
+    /// Decoders that peek a fixed window of bits — notably
+    /// [`crate::huffman::HuffmanTree::decode_symbol`] — must distinguish
+    /// "these real bits match no code" (corruption) from "the bits that would
+    /// have decided are not here yet" (need more input). With this flag set
+    /// the ambiguous cases report [`BrotliError::UnexpectedEof`] instead of a
+    /// corruption error, which is what makes chunk-boundary resumption sound.
+    partial_input: bool,
+}
+
+/// A saved position of a [`BitReader`], enough to rewind the reader to an
+/// earlier point in the same (or a longer) buffer.
+///
+/// The incremental decoder in [`crate::stream`] takes one of these before every
+/// resumable step and restores it when the step runs out of input, so a
+/// half-read symbol is never observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitCursorState {
+    byte_pos: usize,
+    bit_buf: u64,
+    bits_in_buf: u32,
+}
+
+impl BitCursorState {
+    /// The position of a reader that has consumed nothing.
+    #[must_use]
+    pub const fn start() -> Self {
+        BitCursorState {
+            byte_pos: 0,
+            bit_buf: 0,
+            bits_in_buf: 0,
+        }
+    }
+
+    /// Bit offset from the start of the buffer this state was taken over.
+    #[must_use]
+    pub const fn bits_consumed(&self) -> usize {
+        self.byte_pos * 8 - self.bits_in_buf as usize
+    }
+}
+
+impl Default for BitCursorState {
+    fn default() -> Self {
+        Self::start()
+    }
 }
 
 impl<'a> BitReader<'a> {
@@ -28,12 +75,110 @@ impl<'a> BitReader<'a> {
             byte_pos: 0,
             bit_buf: 0,
             bits_in_buf: 0,
+            partial_input: false,
         };
         reader.fill_buffer();
         reader
     }
 
+    /// Create a bit reader resuming at `state` over a buffer that may be only
+    /// a prefix of the stream.
+    ///
+    /// `data` must start at the same byte the previous reader's buffer started
+    /// at (use [`BitReader::rebase_state`] after compacting the front of that
+    /// buffer). When `partial` is `true` — more bytes may still arrive —
+    /// decode helpers report [`BrotliError::UnexpectedEof`] rather than a
+    /// corruption error wherever the *missing* bits are what made the decision
+    /// ambiguous. When `partial` is `false` the reader behaves exactly like
+    /// one built by [`BitReader::new`] over the complete stream, so a decoder
+    /// told "this is the last input" accepts and rejects precisely what the
+    /// one-shot decoder does.
+    pub fn resume(data: &'a [u8], state: BitCursorState, partial: bool) -> Self {
+        let mut reader = BitReader {
+            data,
+            byte_pos: state.byte_pos,
+            bit_buf: state.bit_buf,
+            bits_in_buf: state.bits_in_buf,
+            partial_input: partial,
+        };
+        reader.fill_buffer();
+        reader
+    }
+
+    /// Save the current position so a later [`BitReader::restore`] can rewind
+    /// to exactly this point.
+    #[must_use]
+    pub fn save(&self) -> BitCursorState {
+        BitCursorState {
+            byte_pos: self.byte_pos,
+            bit_buf: self.bit_buf,
+            bits_in_buf: self.bits_in_buf,
+        }
+    }
+
+    /// Rewind to a position previously returned by [`BitReader::save`].
+    pub fn restore(&mut self, state: BitCursorState) {
+        self.byte_pos = state.byte_pos;
+        self.bit_buf = state.bit_buf;
+        self.bits_in_buf = state.bits_in_buf;
+        self.fill_buffer();
+    }
+
+    /// Shift a saved state left by `bytes`, after the front `bytes` bytes of
+    /// the underlying buffer have been dropped by a compaction.
+    ///
+    /// # Panics
+    ///
+    /// Never panics; `bytes` beyond the saved position saturates to zero,
+    /// which callers must avoid by compacting only up to the resume point.
+    #[must_use]
+    pub fn rebase_state(state: BitCursorState, bytes: usize) -> BitCursorState {
+        BitCursorState {
+            byte_pos: state.byte_pos.saturating_sub(bytes),
+            bit_buf: state.bit_buf,
+            bits_in_buf: state.bits_in_buf,
+        }
+    }
+
+    /// Whether this reader is looking at a prefix of a longer stream.
+    #[must_use]
+    pub fn is_partial_input(&self) -> bool {
+        self.partial_input
+    }
+
+    /// Number of bits currently held in the accumulator.
+    ///
+    /// Every consuming operation tops the accumulator up, so this is at least
+    /// 57 unless every byte of `data` has already been pulled in — which makes
+    /// it a sound "how many real bits are left" test for code lengths up to
+    /// [`crate::huffman::MAX_HUFFMAN_CODE_LENGTH`].
+    #[must_use]
+    pub fn buffered_bits(&self) -> u32 {
+        self.bits_in_buf
+    }
+
+    /// Total real bits still readable: the accumulator plus the untouched tail
+    /// of the buffer.
+    ///
+    /// The incremental decoder uses this to skip its per-step rollback
+    /// checkpoint: when more bits remain than any single step can consume, that
+    /// step cannot hit end-of-input, so there is nothing to roll back to.
+    #[must_use]
+    #[inline]
+    pub fn bits_available(&self) -> usize {
+        self.bits_in_buf as usize + (self.data.len() - self.byte_pos) * 8
+    }
+
+    /// Number of whole bytes still available for an aligned bulk read.
+    ///
+    /// Only meaningful when the reader is byte-aligned.
+    #[must_use]
+    pub fn aligned_bytes_available(&self) -> usize {
+        (self.bits_in_buf / 8) as usize + (self.data.len() - self.byte_pos)
+    }
+
     /// Fill the bit buffer with as many bytes as possible.
+    #[inline]
     fn fill_buffer(&mut self) {
         while self.bits_in_buf <= 56 && self.byte_pos < self.data.len() {
             self.bit_buf |= (self.data[self.byte_pos] as u64) << self.bits_in_buf;
@@ -43,6 +188,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits (up to 32) and return as u32.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> BrotliResult<u32> {
         if n == 0 {
             return Ok(0);
@@ -69,6 +215,7 @@ impl<'a> BitReader<'a> {
     /// bits that do not exist: a phantom (zero-padded) code longer than the
     /// remaining real bits produces an `UnexpectedEof` at drop time instead
     /// of silently decoding garbage.
+    #[inline]
     pub fn peek_bits(&mut self, n: u32) -> BrotliResult<u32> {
         if n == 0 {
             return Ok(0);
@@ -89,6 +236,7 @@ impl<'a> BitReader<'a> {
     ///
     /// Returns `UnexpectedEof` when fewer than `n` real bits remain, so a
     /// zero-padded peek can never silently over-consume the stream.
+    #[inline]
     pub fn drop_bits(&mut self, n: u32) -> BrotliResult<()> {
         if n == 0 {
             return Ok(());
@@ -203,6 +351,70 @@ impl<'a> BitReader<'a> {
         }
         self.fill_buffer();
         Ok(())
+    }
+
+    /// Copy up to `out.len()` byte-aligned bytes into `out`, returning how
+    /// many were copied.
+    ///
+    /// Unlike [`BitReader::read_bytes_aligned`] this never fails on a short
+    /// buffer: it copies what is available and reports the count, which is
+    /// what an incremental decoder streaming an uncompressed meta-block needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrotliError::CorruptedData`] when the reader is not on a byte
+    /// boundary (an internal invariant violation, not a stream defect).
+    pub fn read_aligned_into(&mut self, out: &mut [u8]) -> BrotliResult<usize> {
+        if self.bits_consumed() % 8 != 0 {
+            return Err(BrotliError::CorruptedData(
+                "internal error: unaligned byte read".to_string(),
+            ));
+        }
+        let mut written = 0;
+        while written < out.len() && self.bits_in_buf >= 8 {
+            out[written] = (self.bit_buf & 0xFF) as u8;
+            self.bit_buf >>= 8;
+            self.bits_in_buf -= 8;
+            written += 1;
+        }
+        if written < out.len() {
+            let available = self.data.len() - self.byte_pos;
+            let take = available.min(out.len() - written);
+            out[written..written + take]
+                .copy_from_slice(&self.data[self.byte_pos..self.byte_pos + take]);
+            self.byte_pos += take;
+            written += take;
+        }
+        self.fill_buffer();
+        Ok(written)
+    }
+
+    /// Skip up to `n` byte-aligned bytes, returning how many were skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrotliError::CorruptedData`] when the reader is not on a byte
+    /// boundary.
+    pub fn skip_aligned_upto(&mut self, n: usize) -> BrotliResult<usize> {
+        if self.bits_consumed() % 8 != 0 {
+            return Err(BrotliError::CorruptedData(
+                "internal error: unaligned byte skip".to_string(),
+            ));
+        }
+        let mut skipped = 0;
+        while skipped < n && self.bits_in_buf >= 8 {
+            self.bit_buf >>= 8;
+            self.bits_in_buf -= 8;
+            skipped += 1;
+        }
+        if skipped < n {
+            let available = self.data.len() - self.byte_pos;
+            let take = available.min(n - skipped);
+            self.byte_pos += take;
+            skipped += take;
+        }
+        self.fill_buffer();
+        Ok(skipped)
     }
 
     /// Read a variable-length integer used in Brotli for various lengths.

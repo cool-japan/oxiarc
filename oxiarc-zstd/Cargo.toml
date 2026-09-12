@@ -19,18 +19,28 @@ all-features = true
 [dependencies]
 oxiarc-core = { workspace = true }
 rayon = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "zstd_bench"
 harness = false
 
+[[bench]]
+name = "stream_bench"
+harness = false
+
 [features]
 default = []
 parallel = ["rayon"]
+# Async I/O support via Tokio: `AsyncZstdDecompressor` (implements
+# `oxiarc_core::async_io::AsyncDecompressor`) and `AsyncZstdReader`
+# (`tokio::io::AsyncRead`), both bounded and built on `ZstdStream`.
+async-io = ["oxiarc-core/async-io", "dep:tokio"]
 # Live differential tests (tests/zstd_oracle.rs) that shell out to the
 # reference `zstd` CLI and verify BOTH directions: reference-compress ->
 # oxiarc-decode (byte-identical) and oxiarc-compress -> reference-decode

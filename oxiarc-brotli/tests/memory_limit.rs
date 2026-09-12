@@ -193,3 +193,123 @@ fn empty_and_tiny_payloads_respect_the_budget() {
         Err(BrotliError::MemoryBudgetExceeded { .. })
     ));
 }
+
+// ─── Bounded memory of the incremental decoder ──────────────────────────────
+
+/// Decoding a body far larger than any buffer must not grow the heap with the
+/// body.
+///
+/// This is the property the old read-all `BrotliDecompressor` could not have:
+/// it allocated the whole compressed input *and* the whole decompressed output
+/// before serving the first byte. The push decoder's peak is the declared
+/// sliding window plus one meta-block's prefix codes, so a 64 MiB body decoded
+/// through a 64 KiB output slice must stay far under the body size.
+#[test]
+fn incremental_decode_is_bounded_by_the_window_not_the_body() {
+    use oxiarc_brotli::{BrotliStatus, BrotliStream};
+    use oxiarc_core::traits::FlushMode;
+
+    /// Uncompressed size of the body used here.
+    const BODY: usize = 64 * 1024 * 1024;
+    /// `lgwin = 22` is what this crate's encoder declares by default, so the
+    /// ring settles at 4 MiB; the ceiling leaves room for that plus the
+    /// prefix-code tables and the test's own buffers.
+    const PEAK_CEILING: usize = 12 * 1024 * 1024;
+
+    let compressed = {
+        let plain = vec![0x2Au8; BODY];
+        compress(&plain, 5).expect("compress")
+    };
+    assert!(
+        compressed.len() < 1 << 20,
+        "fixture must be small: {} bytes",
+        compressed.len()
+    );
+
+    let mut stream = BrotliStream::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    // Re-baseline now that the fixture's plaintext is gone.
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+
+    let mut produced = 0u64;
+    let mut pos = 0usize;
+    loop {
+        let end = (pos + 4096).min(compressed.len());
+        let flush = if end == compressed.len() {
+            FlushMode::Finish
+        } else {
+            FlushMode::None
+        };
+        let progress = stream
+            .decode(&compressed[pos..end], &mut buf, flush)
+            .expect("decode");
+        pos += progress.consumed;
+        produced += progress.produced as u64;
+        if progress.status == BrotliStatus::StreamEnd {
+            break;
+        }
+    }
+    stream.finish().expect("stream must complete");
+
+    let peak = PEAK.load(Ordering::Relaxed);
+    let growth = peak.saturating_sub(baseline);
+    assert_eq!(produced, BODY as u64, "decoded the wrong number of bytes");
+    assert!(
+        growth < PEAK_CEILING,
+        "decoding a {BODY}-byte body allocated {growth} bytes; the decoder is \
+         supposed to be bounded by the sliding window, not the body"
+    );
+}
+
+/// The `Read` adapter inherits that bound: `read_to_end` grows only because
+/// the *caller's* `Vec` grows.
+#[test]
+fn the_read_adapter_does_not_buffer_the_compressed_input() {
+    /// A source that reports a huge body but is generated on the fly, so the
+    /// test can tell "buffered the input" apart from "buffered the output".
+    struct Repeating {
+        chunk: Vec<u8>,
+        pos: usize,
+    }
+    impl Read for Repeating {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.chunk.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(1024).min(self.chunk.len() - self.pos);
+            buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    let compressed = {
+        let plain = vec![0x77u8; 8 * 1024 * 1024];
+        compress(&plain, 5).expect("compress")
+    };
+
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+
+    let mut decoder = BrotliDecompressor::new(Repeating {
+        chunk: compressed,
+        pos: 0,
+    });
+    // Drain into a fixed buffer so the caller's own allocation is constant.
+    let mut sink = vec![0u8; 32 * 1024];
+    let mut total = 0usize;
+    loop {
+        match decoder.read(&mut sink).expect("read") {
+            0 => break,
+            n => total += n,
+        }
+    }
+    let growth = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert_eq!(total, 8 * 1024 * 1024);
+    assert!(
+        growth < 12 * 1024 * 1024,
+        "streaming 8 MiB through a fixed 32 KiB buffer allocated {growth} bytes"
+    );
+}

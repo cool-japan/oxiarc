@@ -7,7 +7,7 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Status](https://img.shields.io/badge/status-Stable-brightgreen)
 
-**Version: 0.4.1 (2026-07-30) | 92 tests passing**
+**Version: 0.4.2 (2026-09-08) | 124 tests passing**
 
 
 ## Features
@@ -21,6 +21,7 @@ Command-line interface for OxiArc - The Oxidized Archiver.
 - `-` (stdin) accepted as the archive argument by `list`, `extract`, `test`, `info`, and `detect`
 - Symlink-aware directory traversal for `create`/`add` (never follows symlinks, cycle-safe via a visited-canonical-path guard) and real-symlink creation on `extract`
 - `convert` refuses to silently overwrite an existing output file
+- `detect`/`info` also recognise PNG, JPEG and TIFF images by magic (a CLI-layer fallback over `oxiarc-png`/`oxiarc-jpeg`/`oxiarc-tiff`, never a new archive format) and print their dimensions/colour type/bit depth/compression, plus a chunk/segment/IFD summary for `info`; every other subcommand refuses an image with a clear "not an archive" error
 
 All features are implemented and tested. API is stable.
 
@@ -176,6 +177,42 @@ Contents:
   Compression ratio: 73.7%
 ```
 
+`info` also recognises PNG, JPEG and TIFF files (they are not archives, but
+`oxiarc-archive` correctly reports them as `Unknown`, so this CLI checks for
+them as a fallback — see [Format Support](#format-support)):
+
+```bash
+oxiarc info photo.jpg
+```
+
+```
+Image Information
+==================
+File: photo.jpg
+Format: JPEG image
+Size: 45678 bytes
+
+Dimensions: 1920x1080
+Colour type: Rgb (3 components)
+Bit depth: 8-bit
+Compression: Baseline/Huffman
+
+Segments:
+  SOI
+  APPn: 16 bytes
+  DQT: 67 bytes
+  DQT: 67 bytes
+  SOF0 (baseline): 17 bytes
+  DHT: 31 bytes
+  DHT: 181 bytes
+  SOS: 12 bytes header, then entropy-coded data
+```
+
+`Colour type` is the *output* colour space the decoder will hand back
+(`Rgb` for a normal 3-component JPEG), not the `YCbCr` the samples are
+stored in; the segment list stops at `SOS`, since everything past it is
+entropy-coded scan data that only the real decoder can walk.
+
 ### detect
 
 Detect the format of a file:
@@ -192,6 +229,19 @@ Extension: .gz
 MIME type: application/gzip
 Magic bytes: [1F, 8B, 08, 00, ...]
 Type: Compression (single file)
+```
+
+Against a PNG/JPEG/TIFF file, `detect` prints its dimensions, colour type/bit
+depth and compression instead of the extension/MIME/magic-bytes block above:
+
+```
+File: image.png
+Format: PNG image
+Dimensions: 800x600
+Colour type: Rgba
+Bit depth: 8-bit
+Compression: Deflate (zlib)
+Type: Image (not an archive)
 ```
 
 ### convert
@@ -233,8 +283,17 @@ Pre-generated pages ship under [`man/`](man/) in this crate.
 | Brotli | Yes | Yes | Yes | Yes | Yes |
 | Snappy | Yes | Yes | Yes | Yes | Yes |
 | ISO 9660 | Yes | Yes | Yes | Yes | No |
+| PNG / JPEG / TIFF | No | No | Yes | Yes | No |
 
 `add` (append to an existing archive) is supported for ZIP, TAR, and LZH only.
+
+PNG/JPEG/TIFF are recognised by `detect`/`info` only — an image is neither
+an archive nor a bare compression stream, so `list`/`extract`/`test`/
+`convert`/`add` refuse one with a clear "this looks like a PNG/JPEG/TIFF
+image, not an archive" error rather than a bare "unrecognized format"
+message. This recognition is a CLI-layer fallback (via `oxiarc-png`/
+`oxiarc-jpeg`/`oxiarc-tiff` directly) and never extends
+`oxiarc_archive::ArchiveFormat` itself.
 
 ## Examples
 
@@ -297,7 +356,7 @@ extracted/created file may be left on disk.
 ```
 Error: Invalid magic number: expected [50, 4B], found [00, 00]
 Error: Unsupported compression method: LZMA
-Error: CRC mismatch: expected 0xABCD1234, computed 0x12345678
+Error: checksum mismatch: expected 0xabcd1234, computed 0x12345678
 Error: Corrupted data at offset 1234
 Error: unsupported or unrecognized archive format for mystery.bin: Unknown
 ```

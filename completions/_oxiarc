@@ -204,7 +204,7 @@ _arguments "${_arguments_options[@]}" : \
 '--quiet[Suppress non-error output]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':archive -- Archive file to inspect (use "-" for stdin):_default' \
+':archive -- Archive or image file to inspect (use "-" for stdin):_default' \
 && ret=0
 ;;
 (detect)
@@ -351,8 +351,8 @@ _oxiarc_commands() {
 'test:Test archive integrity' \
 'create:Create a new archive' \
 'add:Add files to an existing archive (ZIP, TAR, LZH)' \
-'info:Show information about an archive' \
-'detect:Detect archive format' \
+'info:Show information about an archive, or a PNG/JPEG/TIFF image' \
+'detect:Detect archive format, or a PNG/JPEG/TIFF image' \
 'convert:Convert archive to another format' \
 'completion:Generate shell completion scripts' \
 'man:Generate man pages for all subcommands' \
@@ -398,8 +398,8 @@ _oxiarc__subcmd__help_commands() {
 'test:Test archive integrity' \
 'create:Create a new archive' \
 'add:Add files to an existing archive (ZIP, TAR, LZH)' \
-'info:Show information about an archive' \
-'detect:Detect archive format' \
+'info:Show information about an archive, or a PNG/JPEG/TIFF image' \
+'detect:Detect archive format, or a PNG/JPEG/TIFF image' \
 'convert:Convert archive to another format' \
 'completion:Generate shell completion scripts' \
 'man:Generate man pages for all subcommands' \

@@ -233,6 +233,54 @@ pub struct Entry {
     pub extra: Vec<u8>,
 }
 
+/// Split an archive member name into path components, treating **both** `/`
+/// and `\` as separators and discarding any leading root or drive prefix.
+///
+/// Archive member names are foreign data that must be interpreted the same way
+/// on every target, so this deliberately avoids [`std::path::Path`]: on Unix
+/// `Path` does not split on `\` at all, which would let `..\..\etc` pass
+/// through as one innocuous-looking component.
+///
+/// Empty components (from leading, trailing or repeated separators) are
+/// skipped, so `"a//b/"` yields `["a", "b"]`.
+fn archive_path_components(name: &str) -> impl Iterator<Item = &str> {
+    let rest = strip_root_prefix(name);
+    rest.split(['/', '\\']).filter(|c| !c.is_empty())
+}
+
+/// Return `true` if `name` is absolute in *any* of the conventions an archive
+/// may carry: a POSIX root (`/etc`), a Windows root (`\etc`), a drive-qualified
+/// path (`C:\etc`, `C:etc`) or a UNC path (`\\server\share`).
+///
+/// [`std::path::Path::is_absolute`] answers only for the host target — notably
+/// it is `false` for `/etc/passwd` on Windows — which is the wrong question
+/// when validating untrusted archive contents.
+fn is_absolute_archive_path(name: &str) -> bool {
+    strip_root_prefix(name).len() != name.len()
+}
+
+/// Strip a leading root / drive / UNC prefix from `name`, returning the
+/// remaining relative portion (which may be empty).
+///
+/// A leading `X:` is treated as a drive prefix on every platform, so a member
+/// literally named `a:b.txt` — legal on Unix, and rare — is reported as
+/// absolute rather than extracted. That is the deliberate side: on Windows the
+/// same name addresses the alternate data stream `b.txt` of a file `a`, which
+/// is exactly the write an extractor must not be tricked into.
+fn strip_root_prefix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+
+    // Drive-letter prefix: `C:`, optionally followed by a root separator
+    // (`C:\windows`) or not (`C:windows`, relative to the drive's cwd).
+    let after_drive = if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        &name[2..]
+    } else {
+        name
+    };
+
+    after_drive.trim_start_matches(['/', '\\'])
+}
+
 impl Entry {
     /// Create a new file entry.
     pub fn file(name: impl Into<String>, size: u64) -> Self {
@@ -348,26 +396,23 @@ impl Entry {
     ///
     /// Returns an error if the path contains potentially dangerous components
     /// like ".." (parent directory traversal) or absolute paths.
+    ///
+    /// Member names come from untrusted, foreign archives, so the check is
+    /// deliberately platform-independent and does **not** go through
+    /// [`std::path::Path`], whose notion of "absolute" and of a component
+    /// separator differs per target: `/etc/passwd` is not absolute for `Path`
+    /// on Windows, and `..\\etc` is a single `Normal` component for `Path`
+    /// on Unix. Both are rejected here, on every platform.
     pub fn validate_path(&self) -> crate::error::Result<()> {
         use crate::error::OxiArcError;
 
-        let path = std::path::Path::new(&self.name);
-
-        // Check for absolute paths
-        if path.is_absolute() {
+        if is_absolute_archive_path(&self.name) {
             return Err(OxiArcError::path_traversal(&self.name));
         }
 
-        // Check for parent directory references
-        for component in path.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    return Err(OxiArcError::path_traversal(&self.name));
-                }
-                std::path::Component::Normal(s) if s.to_string_lossy().contains('\0') => {
-                    return Err(OxiArcError::path_traversal(&self.name));
-                }
-                _ => {}
+        for component in archive_path_components(&self.name) {
+            if component == ".." || component.contains('\0') {
+                return Err(OxiArcError::path_traversal(&self.name));
             }
         }
 
@@ -381,25 +426,17 @@ impl Entry {
     pub fn sanitized_name(&self) -> String {
         let mut result = String::new();
 
-        for component in std::path::Path::new(&self.name).components() {
-            match component {
-                std::path::Component::Normal(s) => {
-                    if !result.is_empty() && !result.ends_with('/') {
-                        result.push('/');
-                    }
-                    // Remove null bytes
-                    result.push_str(&s.to_string_lossy().replace('\0', "_"));
-                }
-                std::path::Component::CurDir => {
-                    // Skip "."
-                }
-                std::path::Component::ParentDir => {
-                    // Skip ".."
-                }
-                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                    // Skip absolute path components
-                }
+        // Any root / drive prefix has already been dropped by
+        // `archive_path_components`, so only "." and ".." are filtered here.
+        for component in archive_path_components(&self.name) {
+            if component == "." || component == ".." {
+                continue;
             }
+            if !result.is_empty() {
+                result.push('/');
+            }
+            // Remove null bytes
+            result.push_str(&component.replace('\0', "_"));
         }
 
         result
@@ -682,6 +719,57 @@ mod tests {
     fn test_validate_path_absolute() {
         let entry = Entry::file("/etc/passwd", 100);
         assert!(entry.validate_path().is_err());
+    }
+
+    /// The same verdict must be reached on every target: `Path::is_absolute`
+    /// is `false` for a POSIX root on Windows and `true` for a lone `\` only
+    /// there, and `Path` never splits on `\` on Unix. All of these member
+    /// names are hostile everywhere, so all must be rejected everywhere.
+    #[test]
+    fn test_validate_path_absolute_is_platform_independent() {
+        for name in [
+            "/etc/passwd",
+            "\\windows\\system32\\evil.dll",
+            "C:\\windows\\evil.dll",
+            "c:evil.dll",
+            "\\\\server\\share\\evil.dll",
+            "//server/share/evil.dll",
+        ] {
+            let entry = Entry::file(name, 100);
+            assert!(
+                entry.validate_path().is_err(),
+                "absolute member name {name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_backslash_traversal_is_platform_independent() {
+        for name in [
+            "..\\etc\\passwd",
+            "subdir\\..\\..\\etc\\passwd",
+            "subdir/..\\../etc/passwd",
+        ] {
+            let entry = Entry::file(name, 100);
+            assert!(
+                entry.validate_path().is_err(),
+                "traversing member name {name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitized_name_strips_windows_prefixes_everywhere() {
+        let entry = Entry::file("C:\\windows\\system32\\evil.dll", 100);
+        assert_eq!(entry.sanitized_name(), "windows/system32/evil.dll");
+
+        let entry = Entry::file("..\\..\\etc\\passwd", 100);
+        assert_eq!(entry.sanitized_name(), "etc/passwd");
+
+        // Repeated and trailing separators collapse rather than producing
+        // empty components.
+        let entry = Entry::file("a//b\\\\c/", 100);
+        assert_eq!(entry.sanitized_name(), "a/b/c");
     }
 
     #[test]

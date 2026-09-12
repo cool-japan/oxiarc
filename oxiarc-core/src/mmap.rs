@@ -17,9 +17,9 @@
 //! use oxiarc_core::mmap::MmapReader;
 //! use std::io::Read;
 //!
-//! let mut reader = MmapReader::open("archive.zip").unwrap();
+//! let mut reader = MmapReader::open("archive.zip").expect("open archive.zip");
 //! let mut buffer = [0u8; 1024];
-//! let bytes_read = reader.read(&mut buffer).unwrap();
+//! let bytes_read = reader.read(&mut buffer).expect("read from mapped file");
 //! ```
 //!
 //! # Safety
@@ -64,18 +64,18 @@ use std::sync::Arc;
 /// use oxiarc_core::mmap::MmapReader;
 /// use std::io::{Read, Seek, SeekFrom};
 ///
-/// let mut reader = MmapReader::open("archive.zip").unwrap();
+/// let mut reader = MmapReader::open("archive.zip").expect("open archive.zip");
 ///
 /// // Read first 4 bytes (e.g., magic number)
 /// let mut magic = [0u8; 4];
-/// reader.read_exact(&mut magic).unwrap();
+/// reader.read_exact(&mut magic).expect("read magic bytes");
 ///
 /// // Seek to a specific position
-/// reader.seek(SeekFrom::Start(100)).unwrap();
+/// reader.seek(SeekFrom::Start(100)).expect("seek to offset 100");
 ///
 /// // Read more data
 /// let mut buffer = vec![0u8; 256];
-/// let bytes_read = reader.read(&mut buffer).unwrap();
+/// let bytes_read = reader.read(&mut buffer).expect("read from mapped file");
 /// ```
 #[derive(Debug)]
 pub struct MmapReader {
