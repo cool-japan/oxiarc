@@ -21,11 +21,28 @@ use std::process::{Command, Stdio};
 
 /// Locate the `zstd` binary via `which`; `None` means the tests self-skip.
 fn find_zstd() -> Option<PathBuf> {
-    let output = Command::new("which").arg("zstd").output().ok()?;
+    // Probe the bare name first and use it as-is when it spawns:
+    // `which` does not exist on Windows outside a POSIX shell (the
+    // oracle would silently self-skip there), and inside one — MSYS /
+    // Git Bash — it prints a POSIX path such as `/mingw64/bin/...`
+    // that `CreateProcess` cannot open (the oracle would then panic
+    // on spawn instead of running). Letting the OS resolve the name
+    // avoids both. Only spawnability is checked, not the exit status.
+    if Command::new("zstd").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("zstd"));
+    }
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("zstd").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if path.is_empty() {
         None
     } else {

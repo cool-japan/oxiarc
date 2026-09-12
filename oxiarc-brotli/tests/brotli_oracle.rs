@@ -25,13 +25,30 @@ use oxiarc_brotli::{
 };
 use oxiarc_core::traits::FlushMode;
 
-/// Locate the `brotli` binary via `which`. Returns `None` if not found.
+/// Locate the `brotli` binary. Returns `None` if it is not installed.
+///
+/// The bare name is probed first and, when spawnable, used as-is: `which` does
+/// not exist on Windows outside a POSIX shell (so the oracle would silently
+/// self-skip), and inside one — MSYS / Git Bash — it prints a POSIX path such
+/// as `/mingw64/bin/brotli` that `CreateProcess` cannot open, so the oracle
+/// would instead panic on spawn. Letting the OS resolve the name avoids both.
 fn find_brotli() -> Option<PathBuf> {
-    let output = Command::new("which").arg("brotli").output().ok()?;
+    if Command::new("brotli").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("brotli"));
+    }
+
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("brotli").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if path.is_empty() {
         None
     } else {

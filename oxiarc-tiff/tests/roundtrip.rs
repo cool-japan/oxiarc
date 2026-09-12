@@ -764,14 +764,31 @@ fn a_two_channel_jpeg_page_round_trips_chunky_through_jcs_unknown() {
 /// when the `jpeg` feature is off.
 #[cfg(feature = "jpeg")]
 fn which(name: &str) -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("which")
+    // The bare name first: `which` does not exist on Windows outside a POSIX
+    // shell, and inside one (MSYS / Git Bash) it prints a POSIX path that
+    // `CreateProcess` cannot open. Only spawnability is checked here.
+    if std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Some(std::path::PathBuf::from(name));
+    }
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(locator)
         .arg(name)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     (!path.is_empty()).then(|| std::path::PathBuf::from(path))
 }
 

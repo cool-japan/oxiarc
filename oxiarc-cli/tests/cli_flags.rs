@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use oxiarc_archive::{TarWriter, ZipCompressionLevel, ZipWriter};
 
@@ -396,7 +396,10 @@ fn test_extract_preserve_timestamps() {
 #[cfg(unix)]
 #[test]
 fn test_extract_preserve_permissions() {
+    // Unix-only, so both imports live here rather than at module scope where
+    // they would be dead code (a `-D warnings` error) on other targets.
     use std::os::unix::fs::PermissionsExt;
+    use std::time::SystemTime;
 
     let wd = workdir("preserve_mode");
     let archive = wd.join("modes.tar");

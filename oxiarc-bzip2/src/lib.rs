@@ -121,7 +121,7 @@ mod tests {
             original.len(),
             compressed.len()
         );
-        eprintln!("Compressed data: {:02x?}", &compressed);
+        eprintln!("Compressed data: {:02x?}", compressed);
         let decompressed = decompress(&compressed[..]).expect("decompress hello roundtrip");
         assert_eq!(decompressed, original.as_slice());
     }

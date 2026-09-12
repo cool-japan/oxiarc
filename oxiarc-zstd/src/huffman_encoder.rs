@@ -526,7 +526,7 @@ mod tests {
         assert!(decoder_table.max_bits() > 0);
 
         // Verify the encoder can produce codes for all active symbols
-        for sym in [b'A', b'B', b'C'] {
+        for sym in *b"ABC" {
             let (code, len) = encoder.get_code(sym);
             assert!(
                 len > 0,

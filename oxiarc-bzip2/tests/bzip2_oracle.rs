@@ -25,11 +25,28 @@ const RANDOMISED_REP_L1: &[u8] = include_bytes!("data/randomised_rep_l1.bz2");
 /// Locate the `bzip2` binary via `which`. Returns `None` if not found (or
 /// if `which` itself is unavailable), in which case callers must self-skip.
 fn find_bzip2() -> Option<PathBuf> {
-    let output = Command::new("which").arg("bzip2").output().ok()?;
+    // Probe the bare name first and use it as-is when it spawns:
+    // `which` does not exist on Windows outside a POSIX shell (the
+    // oracle would silently self-skip there), and inside one — MSYS /
+    // Git Bash — it prints a POSIX path such as `/mingw64/bin/...`
+    // that `CreateProcess` cannot open (the oracle would then panic
+    // on spawn instead of running). Letting the OS resolve the name
+    // avoids both. Only spawnability is checked, not the exit status.
+    if Command::new("bzip2").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("bzip2"));
+    }
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("bzip2").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if path.is_empty() {
         None
     } else {

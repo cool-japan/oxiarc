@@ -57,9 +57,12 @@ def encode_ref(dirpath):
         img = Image.frombytes("L", (width, height), raw)
         tif_path = os.path.join(dirpath, name + "_ref.tif")
         img.save(tif_path, format="TIFF", compression="tiff_lzw")
-        ref = Image.open(tif_path)
-        offsets = ref.tag_v2[273]
-        counts = ref.tag_v2[279]
+        # `Image.open` is lazy and keeps the file handle open; on Windows the
+        # `os.remove` below fails with WinError 32 unless it is closed first,
+        # so always read the tags inside a context manager.
+        with Image.open(tif_path) as ref:
+            offsets = ref.tag_v2[273]
+            counts = ref.tag_v2[279]
         if len(offsets) != 1:
             print(f"FAIL {name} expected 1 strip, got {len(offsets)}")
             sys.exit(1)
@@ -79,8 +82,8 @@ def check_oxiarc(dirpath):
             raw = f.read()
         tif_path = os.path.join(dirpath, name + "_oxiarc.tif")
         try:
-            img = Image.open(tif_path)
-            decoded = img.tobytes()
+            with Image.open(tif_path) as img:
+                decoded = img.tobytes()
         except Exception as exc:  # noqa: BLE001 - report any Pillow rejection
             print(f"FAIL {name} pillow-error {exc}")
             failures += 1
@@ -216,11 +219,28 @@ fn find_pillow_python() -> Option<PathBuf> {
 
 /// `tiffcp` on PATH, or `None`.
 fn find_tiffcp() -> Option<PathBuf> {
-    let output = Command::new("which").arg("tiffcp").output().ok()?;
+    // Probe the bare name first and use it as-is when it spawns:
+    // `which` does not exist on Windows outside a POSIX shell (the
+    // oracle would silently self-skip there), and inside one — MSYS /
+    // Git Bash — it prints a POSIX path such as `/mingw64/bin/...`
+    // that `CreateProcess` cannot open (the oracle would then panic
+    // on spawn instead of running). Letting the OS resolve the name
+    // avoids both. Only spawnability is checked, not the exit status.
+    if Command::new("tiffcp").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("tiffcp"));
+    }
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("tiffcp").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `where` can report several matches, one per line; take the first.
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if path.is_empty() {
         None
     } else {

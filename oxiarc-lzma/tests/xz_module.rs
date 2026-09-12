@@ -825,7 +825,11 @@ if __name__ == "__main__":
     /// straight into an exactly-sized row buffer.
     #[test]
     fn tiffcp_lzma_strips_decode_into_byte_identical() {
-        if !tool_available("which", &["tiffcp"]) {
+        // Probe the tool itself first — `which` does not exist on Windows
+        // outside a POSIX shell, so asking it alone would turn this into an
+        // unconditional skip there — and keep the `which` answer as the
+        // fallback for a `tiffcp` whose `-h` exits non-zero.
+        if !tool_available("tiffcp", &["-h"]) && !tool_available("which", &["tiffcp"]) {
             eprintln!("[xz-oracle] `tiffcp` not on PATH; skipping (self-skip, not a failure)");
             return;
         }

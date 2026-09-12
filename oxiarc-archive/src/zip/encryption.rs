@@ -597,7 +597,7 @@ impl AesExtraField {
     pub fn new(strength: AesStrength, compression_method: u16) -> Self {
         Self {
             version: 2, // AE-2
-            vendor_id: [b'A', b'E'],
+            vendor_id: *b"AE",
             strength,
             compression_method,
         }

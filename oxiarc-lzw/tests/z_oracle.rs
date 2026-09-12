@@ -36,8 +36,22 @@ use oxiarc_lzw::z::{ZHeader, compress, compress_with_block_mode, decompress};
 /// Locate `tool` on `PATH`, returning `None` when it is not installed.
 fn on_path(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // Windows can only launch PATHEXT-suffixed files. An extension-less POSIX
+    // script on PATH — Git for Windows ships `usr/bin/uncompress` as a
+    // `/bin/sh` script — is a file but not something `CreateProcess` can run,
+    // and the failed spawn would otherwise be read back as the reference tool
+    // *rejecting* the stream, i.e. a false oracle disagreement.
+    let suffixes: &[&str] = if cfg!(windows) {
+        &[".exe", ".com", ".bat", ".cmd"]
+    } else {
+        &[""]
+    };
     std::env::split_paths(&path)
-        .map(|dir| dir.join(tool))
+        .flat_map(|dir| {
+            suffixes
+                .iter()
+                .map(move |suffix| dir.join(format!("{tool}{suffix}")))
+        })
         .find(|candidate| candidate.is_file())
 }
 

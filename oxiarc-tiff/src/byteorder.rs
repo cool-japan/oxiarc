@@ -64,8 +64,8 @@ impl Endian {
     #[must_use]
     pub const fn magic(self) -> [u8; 2] {
         match self {
-            Self::Little => [b'I', b'I'],
-            Self::Big => [b'M', b'M'],
+            Self::Little => *b"II",
+            Self::Big => *b"MM",
         }
     }
 

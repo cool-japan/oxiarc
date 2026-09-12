@@ -734,12 +734,12 @@ mod tests {
 
         // Read crossing dict/data boundary.
         let val = combined.get_u64(2);
-        let expected = u64::from_le_bytes([b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J']);
+        let expected = u64::from_le_bytes(*b"CDEFGHIJ");
         assert_eq!(val, expected);
 
         // Read entirely in data.
         let val = combined.get_u64(4);
-        let expected = u64::from_le_bytes([b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L']);
+        let expected = u64::from_le_bytes(*b"EFGHIJKL");
         assert_eq!(val, expected);
     }
 

@@ -1,0 +1,15 @@
+# Byte-exactness of the test corpora is the whole point of the oracle /
+# fixture tests: several `*.expected` files are LF-terminated plaintext whose
+# decoded length is asserted against the archive header. With Git's
+# `core.autocrlf=true` (the Windows default) those files are rewritten to CRLF
+# on checkout, which silently changes their size and breaks the assertions.
+# Mark every fixture tree — and every fixture extension — as binary so no EOL
+# conversion is ever applied, on any platform.
+**/tests/data/**       -text
+**/tests/fixtures/**   -text
+**/benches/data/**     -text
+*.expected             -text
+*.lzh                  -text
+*.raw                  -text
+*.lzw                  -text
+*.bin                  -text

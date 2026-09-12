@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn test_mtf_with_alphabet() {
         let data = b"abab";
-        let alphabet = [b'a', b'b'];
+        let alphabet = *b"ab";
         let transformed = transform_with_alphabet(data, &alphabet).expect("transform");
 
         // 'a' at pos 0, 'b' at pos 1, 'a' at pos 1 (after 'b' moved front), 'b' at pos 1

@@ -111,7 +111,7 @@ pub(crate) fn guess_input_color_space(
                 }
             } else if component_ids == [1, 2, 3] {
                 ColorSpace::Ycbcr
-            } else if component_ids == [b'R', b'G', b'B'] {
+            } else if component_ids == *b"RGB" {
                 ColorSpace::Rgb
             } else {
                 ColorSpace::Ycbcr

@@ -11,7 +11,7 @@ use oxiarc_archive::{
     SevenZReader, SnappyReader, ZipReader, ZstdReader,
 };
 use oxiarc_core::{Entry, EntryType};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -152,8 +152,8 @@ fn apply_metadata(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let permissions = fs::Permissions::from_mode(mode);
-                fs::set_permissions(path, permissions)?;
+                let permissions = std::fs::Permissions::from_mode(mode);
+                std::fs::set_permissions(path, permissions)?;
             }
             #[cfg(not(unix))]
             {

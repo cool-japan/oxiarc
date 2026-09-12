@@ -160,7 +160,7 @@ fn tif5_component_ids_drive_the_colour_heuristic() {
         ColorSpace::Ycbcr
     );
 
-    let rgb = with_component_ids(&base, [b'R', b'G', b'B']);
+    let rgb = with_component_ids(&base, *b"RGB");
     let mut decoder = Decoder::new(rgb.as_slice());
     let info = decoder.read_info().expect("info");
     assert_eq!(info.input_color_space, ColorSpace::Rgb);
@@ -175,7 +175,7 @@ fn tif5_component_ids_drive_the_colour_heuristic() {
     );
 
     // JFIF beats the identifiers.
-    let jfif_rgb = with_component_ids(&sample::RGB_8X8_420, [b'R', b'G', b'B']);
+    let jfif_rgb = with_component_ids(&sample::RGB_8X8_420, *b"RGB");
     let mut decoder = Decoder::new(jfif_rgb.as_slice());
     assert_eq!(
         decoder.read_info().expect("info").input_color_space,
@@ -200,7 +200,7 @@ fn tif5_component_ids_drive_the_colour_heuristic() {
 
 #[test]
 fn tif6_raw_components_are_untransformed() {
-    let rgb_ids = with_component_ids(&without_jfif(&sample::RGB_8X8_420), [b'R', b'G', b'B']);
+    let rgb_ids = with_component_ids(&without_jfif(&sample::RGB_8X8_420), *b"RGB");
     let mut decoder = Decoder::with_options(rgb_ids.as_slice(), DecodeOptions::raw());
     let info = decoder.read_info().expect("info");
     assert_eq!(info.output_color_space, info.input_color_space);

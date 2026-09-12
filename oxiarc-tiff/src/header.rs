@@ -17,9 +17,9 @@ use crate::byteorder::Endian;
 use crate::error::{FormatError, Result, TiffError};
 
 /// Magic bytes for a little-endian file.
-pub const MAGIC_LE: [u8; 2] = [b'I', b'I'];
+pub const MAGIC_LE: [u8; 2] = *b"II";
 /// Magic bytes for a big-endian file.
-pub const MAGIC_BE: [u8; 2] = [b'M', b'M'];
+pub const MAGIC_BE: [u8; 2] = *b"MM";
 /// Version word of a classic TIFF.
 pub const VERSION_CLASSIC: u16 = 42;
 /// Version word of a BigTIFF.

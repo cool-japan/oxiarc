@@ -772,12 +772,17 @@ mod oracle {
         }
     }
 
+    /// Whether a spawnable `zstd` is on PATH.
+    ///
+    /// Asking the OS to resolve the bare name is the portable question:
+    /// `which` does not exist on Windows outside a POSIX shell, and inside
+    /// one it reports POSIX paths that `CreateProcess` cannot open. Only
+    /// spawnability matters here, not the probe's exit status.
     fn zstd_on_path() -> bool {
-        std::process::Command::new("which")
-            .arg("zstd")
+        std::process::Command::new("zstd")
+            .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok()
     }
 
     /// RFC 8878 §3.1.1.2.3 caps a block's regenerated size at
