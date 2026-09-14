@@ -13,6 +13,7 @@
 mod compress;
 mod decompress;
 mod frame_dict;
+mod io;
 mod streaming;
 mod types;
 
@@ -24,6 +25,7 @@ pub use frame_dict::{
     compress_frame_with_dict, compress_frame_with_dict_options, decompress_frame_with_dict,
     get_frame_dict_id,
 };
+pub use io::{Lz4FrameReader, Lz4FrameWriter};
 pub use streaming::{Lz4Compressor, Lz4Decompressor};
 pub use types::{BlockMaxSize, FrameDescriptor, LZ4_FRAME_MAGIC};
 

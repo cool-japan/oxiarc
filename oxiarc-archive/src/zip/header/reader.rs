@@ -55,6 +55,24 @@ impl<R: Read + Seek> ZipReader<R> {
         })
     }
 
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably borrow the underlying reader, e.g. to stream an entry's data
+    /// directly: seek to [`Entry::offset`] and read
+    /// [`Entry::compressed_size`] bytes. Its position is unspecified
+    /// afterwards; every `extract*` call seeks before reading.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Consume the archive, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     /// Attach a progress handle to this reader.
     #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
@@ -373,6 +391,20 @@ impl<R: Read + Seek> ZipReader<R> {
         let extra_len = u16::from_le_bytes([buf[30], buf[31]]) as usize;
         let comment_len = u16::from_le_bytes([buf[32], buf[33]]) as usize;
         let local_header_offset = u32::from_le_bytes([buf[42], buf[43], buf[44], buf[45]]);
+        // "Version made by" high byte = host system; external attributes
+        // carry Unix mode bits in their high half when that host is Unix (3)
+        // or macOS/Darwin (19), and the DOS attribute byte in the low byte.
+        let host_system = buf[5];
+        let external_attr = u32::from_le_bytes([buf[38], buf[39], buf[40], buf[41]]);
+        let attributes = FileAttributes {
+            unix_mode: if matches!(host_system, 3 | 19) && external_attr >> 16 != 0 {
+                Some(external_attr >> 16)
+            } else {
+                None
+            },
+            dos_attributes: Some((external_attr & 0xff) as u8),
+            ..FileAttributes::default()
+        };
 
         // Read variable-length fields. Names (and comments) are decoded
         // with the EFS-aware chain (strict UTF-8 -> Shift_JIS -> injective
@@ -503,7 +535,7 @@ impl<R: Read + Seek> ZipReader<R> {
             modified: Some(modified),
             created: None,
             accessed: None,
-            attributes: FileAttributes::default(),
+            attributes,
             crc32: Some(crc32),
             comment: if comment.is_empty() {
                 None

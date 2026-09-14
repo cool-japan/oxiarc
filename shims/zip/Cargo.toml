@@ -1,0 +1,50 @@
+[package]
+name = "zip"
+version = "8.6.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+description = "Local [patch.crates-io] shim: the `zip` 8.6.0 API re-exported from oxiarc-zip-compat (Pure Rust, COOLJAPAN OxiARC). NOT the upstream crate; never published."
+
+[dependencies]
+oxiarc-zip-compat = { path = "../../oxiarc-zip-compat" }
+
+# Every feature name of the upstream crate at this version (explicit and
+# implicit optional-dependency features), all no-ops: Cargo rejects a
+# [patch] whose package lacks a feature some dependent enables, and then
+# silently keeps the real crate.
+[features]
+default = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "ppmd", "time", "zstd", "xz"]
+_arbitrary = []
+_bzip2_any = []
+"_deflate-any" = []
+"aes-crypto" = []
+"bitstream-io" = []
+bzip2 = []
+"bzip2-rs" = []
+chrono = []
+deflate = []
+"deflate-flate2" = []
+"deflate-flate2-zlib" = []
+"deflate-flate2-zlib-ng" = []
+"deflate-flate2-zlib-ng-compat" = []
+"deflate-flate2-zlib-rs" = []
+"deflate-zopfli" = []
+deflate64 = []
+"deprecated-time" = []
+getrandom = []
+"jiff-02" = []
+"legacy-zip" = []
+lzma = []
+"nt-time" = []
+ppmd = []
+time = []
+unreserved = []
+xz = []
+zstd = []
+
+# Standalone workspace: keeps these same-name packages (banned names in
+# deny.toml) out of the oxiarc workspace and its Cargo.lock.
+[workspace]

@@ -1,0 +1,24 @@
+[package]
+name = "tar"
+version = "0.4.46"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+description = "Local [patch.crates-io] shim: the `tar` 0.4.46 API re-exported from oxiarc-tar-compat (Pure Rust, COOLJAPAN OxiARC). NOT the upstream crate; never published."
+
+[dependencies]
+oxiarc-tar-compat = { path = "../../oxiarc-tar-compat" }
+
+# Every feature name of the upstream crate at this version (explicit and
+# implicit optional-dependency features), all no-ops: Cargo rejects a
+# [patch] whose package lacks a feature some dependent enables, and then
+# silently keeps the real crate.
+[features]
+default = ["xattr"]
+xattr = []
+
+# Standalone workspace: keeps these same-name packages (banned names in
+# deny.toml) out of the oxiarc workspace and its Cargo.lock.
+[workspace]

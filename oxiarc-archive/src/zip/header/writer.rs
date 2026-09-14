@@ -130,6 +130,43 @@ impl<W: Write> ZipWriter<W> {
         data: &[u8],
         compression: ZipCompressionLevel,
     ) -> Result<()> {
+        self.add_file_with_attributes(name, data, compression, None, None)
+    }
+
+    /// Add a file with specific compression and explicit metadata.
+    ///
+    /// * `dos_date_time` — the MS-DOS `(time, date)` pair for the local and
+    ///   central headers; `None` uses the current time.
+    /// * `unix_mode` — Unix permission bits (e.g. `0o755`) stored in the
+    ///   high half of the external attributes; `None` uses `0o644`. File
+    ///   type bits other than a regular file are replaced by `S_IFREG`.
+    ///
+    /// As with [`ZipWriter::add_file_with_options`], deflate falls back to
+    /// Stored when compressing would not shrink the data.
+    ///
+    /// ```
+    /// use oxiarc_archive::zip::{ZipCompressionLevel, ZipReader, ZipWriter};
+    /// use std::io::Cursor;
+    ///
+    /// let mut w = ZipWriter::new(Cursor::new(Vec::new()));
+    /// // 2024-01-02 03:04:06 in DOS format.
+    /// let time = (3 << 11) | (4 << 5) | (6 / 2);
+    /// let date = ((2024 - 1980) << 9) | (1 << 5) | 2;
+    /// w.add_file_with_attributes("bin/tool", b"#!/bin/sh\n", ZipCompressionLevel::Store,
+    ///     Some((time, date)), Some(0o755))?;
+    /// let bytes = w.into_inner()?.into_inner();
+    /// let r = ZipReader::new(Cursor::new(bytes))?;
+    /// assert_eq!(r.entries()[0].name, "bin/tool");
+    /// # Ok::<(), oxiarc_core::error::OxiArcError>(())
+    /// ```
+    pub fn add_file_with_attributes(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        compression: ZipCompressionLevel,
+        dos_date_time: Option<(u16, u16)>,
+        unix_mode: Option<u32>,
+    ) -> Result<()> {
         // Progress: notify about entry start
         let file_index = self.entries.len() as u64;
         if let Some(ref handle) = self.progress {
@@ -138,8 +175,9 @@ impl<W: Write> ZipWriter<W> {
 
         let crc32 = Crc32::compute(data);
 
-        // Get current time for DOS format
-        let (mtime, mdate) = Self::current_dos_time();
+        // Explicit DOS time, or the current time.
+        let (mtime, mdate) = dos_date_time.unwrap_or_else(Self::current_dos_time);
+        let external_attr = (0o100000 | (unix_mode.unwrap_or(0o644) & 0o7777)) << 16;
 
         // Compress data
         let (compressed_data, method): (Vec<u8>, u16) = match compression {
@@ -272,7 +310,7 @@ impl<W: Write> ZipWriter<W> {
             comment: String::new(),
             disk_start: 0,
             internal_attr: 0,
-            external_attr: 0o100644 << 16, // Regular file, rw-r--r--
+            external_attr, // Regular file + permission bits
             local_header_offset,
         });
 

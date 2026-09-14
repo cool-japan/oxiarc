@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+# Same-name [patch.crates-io] shims (flate2, zip, tar, ...) are standalone
+# workspaces: their package names are banned in deny.toml and must not
+# enter this workspace or its Cargo.lock.
+exclude = ["shims"]
 members = [
     "oxiarc-core",
     "oxiarc-deflate",
@@ -19,6 +23,12 @@ members = [
     "oxiarc-jpeg",
     "oxiarc-tiff",
     "oxiarc-image",
+    "oxiarc-flate2-compat",
+    "oxiarc-miniz-compat",
+    "oxiarc-snap-compat",
+    "oxiarc-lz4flex-compat",
+    "oxiarc-zip-compat",
+    "oxiarc-tar-compat",
 ]
 
 [workspace.package]
@@ -52,6 +62,12 @@ oxiarc-png = { version = "0.4.3", path = "oxiarc-png" }
 oxiarc-jpeg = { version = "0.4.3", path = "oxiarc-jpeg" }
 oxiarc-tiff = { version = "0.4.3", path = "oxiarc-tiff" }
 oxiarc-image = { version = "0.4.3", path = "oxiarc-image" }
+oxiarc-flate2-compat = { version = "0.4.3", path = "oxiarc-flate2-compat" }
+oxiarc-miniz-compat = { version = "0.4.3", path = "oxiarc-miniz-compat" }
+oxiarc-snap-compat = { version = "0.4.3", path = "oxiarc-snap-compat" }
+oxiarc-lz4flex-compat = { version = "0.4.3", path = "oxiarc-lz4flex-compat" }
+oxiarc-zip-compat = { version = "0.4.3", path = "oxiarc-zip-compat" }
+oxiarc-tar-compat = { version = "0.4.3", path = "oxiarc-tar-compat" }
 
 # External dependencies
 thiserror = "2.0.18"

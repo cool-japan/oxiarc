@@ -1,0 +1,39 @@
+[package]
+name = "flate2"
+version = "1.1.10"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+description = "Local [patch.crates-io] shim: the `flate2` 1.1.10 API re-exported from oxiarc-flate2-compat (Pure Rust, COOLJAPAN OxiARC). NOT the upstream crate; never published."
+
+[dependencies]
+oxiarc-flate2-compat = { path = "../../oxiarc-flate2-compat" }
+
+# Every feature name of the upstream crate at this version (explicit and
+# implicit optional-dependency features), all no-ops: Cargo rejects a
+# [patch] whose package lacks a feature some dependent enables, and then
+# silently keeps the real crate.
+[features]
+default = ["rust_backend", "runtime_detection"]
+any_c_zlib = []
+any_impl = []
+any_zlib = []
+cloudflare_zlib = []
+"document-features" = []
+"libz-ng-sys" = []
+"libz-sys" = []
+"miniz-sys" = []
+miniz_oxide = []
+runtime_detection = []
+rust_backend = []
+zlib = []
+"zlib-default" = []
+"zlib-ng" = []
+"zlib-ng-compat" = []
+"zlib-rs" = []
+
+# Standalone workspace: keeps these same-name packages (banned names in
+# deny.toml) out of the oxiarc workspace and its Cargo.lock.
+[workspace]

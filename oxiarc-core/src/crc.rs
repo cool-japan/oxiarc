@@ -311,6 +311,94 @@ impl Crc32 {
         self.crc ^ 0xFFFFFFFF
     }
 
+    /// Resume a running CRC from a previously observed [`Crc32::value`].
+    ///
+    /// Feeding more data to the result gives the same CRC as feeding it to
+    /// the calculator `value` was read from.
+    ///
+    /// ```
+    /// use oxiarc_core::crc::Crc32;
+    ///
+    /// let mut a = Crc32::new();
+    /// a.update(b"Hello, ");
+    /// let mut resumed = Crc32::from_value(a.value());
+    /// resumed.update(b"World!");
+    /// assert_eq!(resumed.value(), Crc32::compute(b"Hello, World!"));
+    /// ```
+    #[inline]
+    pub fn from_value(value: u32) -> Self {
+        Self {
+            crc: value ^ 0xFFFFFFFF,
+        }
+    }
+
+    /// zlib's `crc32_combine`: the CRC-32 of `A || B` from `crc(A)`,
+    /// `crc(B)` and `len(B)`, in `O(log len(B))`.
+    ///
+    /// ```
+    /// use oxiarc_core::crc::Crc32;
+    ///
+    /// let a = Crc32::compute(b"The quick brown fox ");
+    /// let b = Crc32::compute(b"jumps over the lazy dog");
+    /// assert_eq!(
+    ///     Crc32::combine(a, b, 23),
+    ///     Crc32::compute(b"The quick brown fox jumps over the lazy dog"),
+    /// );
+    /// ```
+    pub fn combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
+        fn times(mat: &[u32; 32], mut vec: u32) -> u32 {
+            let mut sum = 0u32;
+            let mut i = 0usize;
+            while vec != 0 {
+                if vec & 1 != 0 {
+                    sum ^= mat[i];
+                }
+                vec >>= 1;
+                i += 1;
+            }
+            sum
+        }
+        fn square(out: &mut [u32; 32], mat: &[u32; 32]) {
+            for (n, slot) in out.iter_mut().enumerate() {
+                *slot = times(mat, mat[n]);
+            }
+        }
+        if len_b == 0 {
+            return crc_a;
+        }
+        let mut even = [0u32; 32];
+        let mut odd = [0u32; 32];
+        odd[0] = 0xEDB8_8320;
+        let mut row = 1u32;
+        for slot in odd.iter_mut().skip(1) {
+            *slot = row;
+            row <<= 1;
+        }
+        square(&mut even, &odd);
+        square(&mut odd, &even);
+        let mut crc = crc_a;
+        let mut len = len_b;
+        loop {
+            square(&mut even, &odd);
+            if len & 1 != 0 {
+                crc = times(&even, crc);
+            }
+            len >>= 1;
+            if len == 0 {
+                break;
+            }
+            square(&mut odd, &even);
+            if len & 1 != 0 {
+                crc = times(&odd, crc);
+            }
+            len >>= 1;
+            if len == 0 {
+                break;
+            }
+        }
+        crc ^ crc_b
+    }
+
     /// Compute CRC-32 for a slice in one call.
     #[inline]
     pub fn compute(data: &[u8]) -> u32 {

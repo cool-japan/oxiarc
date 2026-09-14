@@ -417,7 +417,13 @@ pub struct Lz4Decompressor {
     memory_budget: usize,
     /// Number of decompressed bytes emitted so far (for progress reporting).
     bytes_produced: u64,
+    /// Last 64 KiB of output, the prefix dictionary for the next block of a
+    /// linked-block (`lz4 -BD`, `block_independence == false`) frame.
+    prev_tail: Vec<u8>,
 }
+
+/// Window a linked LZ4 block may reference.
+const LINKED_WINDOW: usize = 64 * 1024;
 
 impl std::fmt::Debug for Lz4Decompressor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -447,7 +453,26 @@ impl Lz4Decompressor {
             content_hasher: XxHash32::new(),
             memory_budget: DECOMPRESSOR_DEFAULT_BUDGET,
             bytes_produced: 0,
+            prev_tail: Vec::new(),
         }
+    }
+
+    /// After the frame has ended, take the input bytes that were fed but lie
+    /// beyond the frame (a following frame, or trailing data).
+    ///
+    /// Returns an empty vector while the frame is still in progress.
+    pub fn take_remaining_input(&mut self) -> Vec<u8> {
+        if matches!(self.state, DecompressState::Done) {
+            std::mem::take(&mut self.input_buf)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether every byte of the frame has been parsed (the caller may still
+    /// have staged output to drain).
+    pub fn frame_complete(&self) -> bool {
+        matches!(self.state, DecompressState::Done)
     }
 
     /// Attach a progress sink.
@@ -657,11 +682,27 @@ impl Lz4Decompressor {
             .as_ref()
             .map_or(4 * 1024 * 1024, |d| d.block_max_size.size_bytes());
 
+        let linked = self.desc.as_ref().is_some_and(|d| !d.block_independence);
         let decompressed = if is_uncompressed {
             block_data
+        } else if linked && !self.prev_tail.is_empty() {
+            crate::block::decompress_block_dict(&block_data, &self.prev_tail, block_max)?
         } else {
             decompress_block(&block_data, block_max)?
         };
+        if linked {
+            if decompressed.len() >= LINKED_WINDOW {
+                self.prev_tail.clear();
+                self.prev_tail
+                    .extend_from_slice(&decompressed[decompressed.len() - LINKED_WINDOW..]);
+            } else {
+                self.prev_tail.extend_from_slice(&decompressed);
+                if self.prev_tail.len() > LINKED_WINDOW {
+                    let excess = self.prev_tail.len() - LINKED_WINDOW;
+                    self.prev_tail.drain(..excess);
+                }
+            }
+        }
 
         // Update content checksum.
         self.content_hasher.update(&decompressed);
@@ -805,6 +846,7 @@ impl Decompressor for Lz4Decompressor {
         self.desc = None;
         self.content_hasher = XxHash32::new();
         self.bytes_produced = 0;
+        self.prev_tail.clear();
     }
 
     fn is_finished(&self) -> bool {

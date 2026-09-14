@@ -1,0 +1,30 @@
+[package]
+name = "lz4_flex"
+version = "0.14.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+authors = ["COOLJAPAN OU (Team KitaSan)"]
+description = "Local [patch.crates-io] shim: the `lz4_flex` 0.14.0 API re-exported from oxiarc-lz4flex-compat (Pure Rust, COOLJAPAN OxiARC). NOT the upstream crate; never published."
+
+[dependencies]
+oxiarc-lz4flex-compat = { path = "../../oxiarc-lz4flex-compat" }
+
+# Every feature name of the upstream crate at this version (explicit and
+# implicit optional-dependency features), all no-ops: Cargo rejects a
+# [patch] whose package lacks a feature some dependent enables, and then
+# silently keeps the real crate.
+[features]
+default = ["std", "safe-encode", "safe-decode", "frame", "checked-decode"]
+alloc = []
+"checked-decode" = []
+frame = []
+nightly = []
+"safe-decode" = []
+"safe-encode" = []
+std = []
+
+# Standalone workspace: keeps these same-name packages (banned names in
+# deny.toml) out of the oxiarc workspace and its Cargo.lock.
+[workspace]

@@ -1,0 +1,21 @@
+[package]
+name = "oxiarc-snap-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "snap-compatible API (raw Encoder/Decoder, read/write framed streams) implemented in Pure Rust on top of oxiarc-snappy"
+keywords = ["snappy", "snap", "compression", "compat"]
+categories = ["compression", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+oxiarc-snappy = { workspace = true }
+
+[lints]
+workspace = true

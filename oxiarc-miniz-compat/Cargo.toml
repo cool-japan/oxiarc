@@ -1,0 +1,21 @@
+[package]
+name = "oxiarc-miniz-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "miniz_oxide-compatible API (inflate::core, inflate::stream, deflate::compress_to_vec) implemented in Pure Rust on top of oxiarc-deflate"
+keywords = ["miniz", "deflate", "inflate", "zlib", "compat"]
+categories = ["compression", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+oxiarc-flate2-compat = { workspace = true }
+
+[lints]
+workspace = true

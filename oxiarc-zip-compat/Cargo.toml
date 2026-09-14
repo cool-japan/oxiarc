@@ -1,0 +1,23 @@
+[package]
+name = "oxiarc-zip-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "zip-crate-compatible API (ZipArchive, ZipWriter, FileOptions, ZipError) implemented in Pure Rust on top of oxiarc-archive"
+keywords = ["zip", "archive", "compat"]
+categories = ["compression", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+oxiarc-core = { workspace = true }
+oxiarc-archive = { workspace = true }
+oxiarc-deflate = { workspace = true }
+
+[lints]
+workspace = true

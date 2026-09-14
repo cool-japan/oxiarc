@@ -47,8 +47,9 @@ pub use block::{
 };
 pub use frame::{
     BlockMaxSize, FrameDescriptor, LZ4_FRAME_MAGIC, Lz4Compressor, Lz4Decompressor,
-    Lz4DictCompressor, Lz4DictDecompressor, Lz4DictFrameDecoder, Lz4DictFrameEncoder, compress,
-    compress_frame_with_dict, compress_frame_with_dict_options, compress_with_options, decompress,
+    Lz4DictCompressor, Lz4DictDecompressor, Lz4DictFrameDecoder, Lz4DictFrameEncoder,
+    Lz4FrameReader, Lz4FrameWriter, compress, compress_frame_with_dict,
+    compress_frame_with_dict_options, compress_with_options, decompress,
     decompress_frame_with_dict, get_frame_dict_id,
 };
 pub use hc::{HcEncoder, HcLevel, compress_hc, compress_hc_level, compress_hc_with_dict};

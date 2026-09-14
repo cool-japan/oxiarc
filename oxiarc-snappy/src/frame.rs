@@ -403,6 +403,23 @@ impl<R: Read> FrameDecoder<R> {
         self
     }
 
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Mutably borrow the underlying reader. Reading from it directly
+    /// desynchronises the frame parser.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Consume the decoder, returning the underlying reader. Decoded bytes
+    /// not yet read are discarded.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     /// Read and validate the stream identifier chunk.
     fn validate_header(&mut self) -> io::Result<()> {
         if self.header_validated {
