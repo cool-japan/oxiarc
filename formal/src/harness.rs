@@ -18,7 +18,7 @@
 //! |---|---|---|
 //! | [`oxiarc_core::BitCache`] refill/peek/consume | bit-window arithmetic behind two undocumented-in-code preconditions | `proved`, `refuted` |
 //! | [`oxiarc_lz4::xxhash`] one-shot and streaming | 32-bit avalanche chains over attacker bytes | `proved`, `timeout`, `unsupported` |
-//! | [`oxiarc_deflate::HuffmanTree`] entry packing and table build | pure bit packing, and a table builder that reaches an unencodable callee | `proved`, `unsupported` |
+//! | [`oxiarc_deflate::HuffmanTree`] entry packing and table build | pure bit packing, and a table builder whose symbolic-index write L1 refuses | `proved`, `unsupported` |
 //!
 //! A decompressor is exactly the kind of code where this matters: all of it
 //! runs on attacker-supplied bytes.
@@ -68,7 +68,7 @@ pub const MAX_CODE_LENGTH: u8 = 15;
 /// taken, never fills the accumulator past 56 bits (so the next `<<` by
 /// `self.len` cannot leave the 64-bit word), and consumes nothing. The 63-bit
 /// ceiling the accumulator relies on is therefore never even approached from a
-/// fresh cache -- the loop guard `self.len <= 55` (`bitstream.rs:212`) is what
+/// fresh cache -- the loop guard `self.len <= 55` (`bitstream.rs:211`) is what
 /// enforces it, not the `debug_assert!`.
 ///
 /// Runtime-checks build: green, unmarked (measured: the randomized test
@@ -275,7 +275,7 @@ fn take_byte_is_some_iff_eight_bits_harness() {
 /// when it peeks more bits than are actually present.
 ///
 /// This harness also settles an open question from the harness inventory:
-/// `refill_bulk` reaches `slice::first_chunk::<8>()` (`bitstream.rs:185`),
+/// `refill_bulk` reaches `slice::first_chunk::<8>()` (`bitstream.rs:184`),
 /// which had no encoder rule when the package was designed and was predicted
 /// `unsupported`. It encodes.
 ///
@@ -368,21 +368,21 @@ fn xxhash32_one_shot_equals_streaming_harness() {
     assert(hasher.finish() == xxhash32_with_seed(&data, seed));
 }
 
-/// Property: `assert`. **Measured L1 verdict: timeout** (the solver did not
-/// finish within the 30 000 ms budget). Every other obligation of this harness
-/// is proved (190 of them, including the three `unwinding-assertion` rows).
+/// Property: `assert`. **Measured L1 verdict: timeout** -- the solver gave up
+/// after 30 505 ms against the manifest's 30 000 ms budget ("the solver did
+/// not finish within 30000 ms"). Every other obligation of this harness is
+/// proved (190 of them, including the three `unwinding-assertion` rows).
 ///
 /// The property is that the seedless entry point is the seed-zero one, and it
 /// is true by inspection: `xxhash32` is a one-line forwarder
 /// (`oxiarc-lz4/src/xxhash.rs:15`) to exactly the call the other side of the
 /// equation makes. That is what makes the measurement worth keeping. The
-/// encoder inlines the two calls into two structurally identical circuits and
-/// asks the solver whether they can differ; OxiZ 0.3.3 bit-blasts both and
-/// does not recognise the equivalence. Re-solving the same condition with a
-/// four-fold budget (120 000 ms) still returns `unknown`, so this is not a
-/// borderline 30-second miss: it is a missing structural-hashing/miter
-/// optimisation in the solver, and it is the strongest single argument in this
-/// package for hash-consing the bit-blaster.
+/// encoder inlines the two calls into a miter of two structurally identical
+/// bit-blasted circuits and asks whether they can differ; OxiZ 0.3.3 does not
+/// recognise the equivalence. A separate probe at a four-fold budget
+/// (120 000 ms) still returned `unknown`, so this is not a borderline
+/// 30-second miss: it is a missing structural-hashing/miter optimisation
+/// (OxiZ intake #P2b-14), and this package's strongest argument for it.
 ///
 /// Runtime-checks build: green, unmarked (measured).
 #[harness(unwind = 6)]
@@ -417,26 +417,34 @@ fn entry_round_trip_harness() {
 }
 
 /// Property: absence of a trap (the harness asserts nothing). **Measured L1
-/// verdict: unsupported**, reason `unsupported-callee`, at
-/// `oxiarc-core/src/error.rs:190:22` -- "no `From<&str> for
-/// std::string::String` implementation in the module set". No verification
-/// condition is generated.
+/// verdict: unsupported**, reason `aliasing`, at
+/// `oxiarc-deflate/src/huffman.rs:363:28` -- the callee is
+/// `<Vec<T, A> as IndexMut<I>>::index_mut`, which "takes a mutable borrow of
+/// a symbolically indexed element". No verification condition is generated.
 ///
-/// The refusal is *not* where the harness inventory predicted it. The
-/// predicted blockers were `Iterator::sum` (`huffman.rs:309`),
-/// `Vec::reserve_exact` and `Vec::resize`; all three now have encoder rules,
-/// and the symbolic execution walks past them into `build_into`'s error path,
-/// where `OxiArcError::invalid_header("...")` needs `String::from(&str)` --
-/// an allocation-and-copy the encoder has no logical model for. So the honest
-/// statement is: the DEFLATE table builder is now blocked on error
-/// *construction*, one rule short of encodable.
+/// Re-measured 2026-09-14 against a release CLI rebuilt from the cargo-formal
+/// tree carrying that day's encoder rules: the refusal **moved**. It used to
+/// be `unsupported-callee` at `oxiarc-core/src/error.rs:190:22`, which did
+/// *not* mean "one `From<&str> for String` rule short": the copy was refused
+/// on *length* -- `"Empty code lengths"` (`huffman.rs:272`) is 18 bytes
+/// against a sequence bound of 16 -- and the generic-conversion rule
+/// swallowed that error and reported a misleading fallback message. With the
+/// length check fixed the encoder walks the whole `impl Into<String>`
+/// constructor, the `1..=max_length` loop (`huffman.rs:302`), the `format!`
+/// in `invalid_header(format!(..))` (`huffman.rs:282`) and
+/// `code_lengths.len().next_power_of_two()` (`huffman.rs:332`), and stops
+/// deeper in, at `symbols[idx] = symbol as u16` whose `idx` is
+/// `symbol_offsets[len] + (current_code[len] - base_codes[len])`.
 ///
-/// The row is kept because every public constructor routes through
-/// `build_into` (`from_code_lengths` `:155`, `from_code_length_code` `:176`,
+/// A `&mut` borrow of an element at a symbolic index is out of scope for L1
+/// by design (cargo-formal TODO P3-26) -- the same limit that refuses
+/// `xxhash32_one_shot_equals_streaming_harness`. The counters did not move
+/// (bmc 505 proved / 2 refuted / 0 unknown / 1 timeout / 2 unsupported over
+/// 510 obligations). Every public constructor routes through `build_into`
+/// (`from_code_lengths` `:155`, `from_code_length_code` `:176`,
 /// `rebuild_from_code_lengths` `:207`, `rebuild_from_code_length_code`
-/// `:232`), and so does the private `reverse_bits` `:528`: the whole
-/// decode-table build currently has no verifiable public entry point.
-/// That is a finding about the encoder's string model, not about `oxiarc`.
+/// `:232`), and so does the private `reverse_bits` `:528`: the decode-table
+/// build still has no verifiable public entry point.
 ///
 /// Runtime-checks build: green, unmarked (measured).
 #[harness]
@@ -633,7 +641,7 @@ mod plain_tests {
     }
 
     /// The property `from_code_lengths_never_panics_harness` states but cannot
-    /// prove (`unsupported(unsupported-callee)`), exhausted over every pair
+    /// prove (`unsupported(aliasing)`), exhausted over every pair
     /// and a sample of quadruples of DEFLATE-legal lengths.
     #[test]
     fn from_code_lengths_never_panics_on_short_legal_inputs() {
