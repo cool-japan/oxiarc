@@ -29,7 +29,7 @@
 //!    `#[cfg(formal)]` nor `#[cfg(all(test, oxiformal_runtime_checks))]`
 //!    applies), so this only checks that the package and its three
 //!    dependencies type-check on stable. `cargo test` additionally runs
-//!    [`harness::plain_tests`], which holds a concrete witness for every
+//!    `harness::plain_tests`, which holds a concrete witness for every
 //!    `refuted` row below plus a handful of sanity checks -- ordinary Rust
 //!    tests, no solver involved.
 //! 2. **`RUSTFLAGS="--cfg oxiformal_runtime_checks" cargo test`**. Every

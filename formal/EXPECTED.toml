@@ -11,6 +11,17 @@
 # verification conditions. No verdict below was written before the run that
 # produced it.
 #
+# Re-measured 2026-09-14 with a release CLI **rebuilt from the cargo-formal
+# tree that carries that day's encoder rules** (the release driver, the OxiZ
+# 0.3.3 pin and rustc nightly-2026-06-20 are unchanged; wall time 36 s, exit
+# status 1 for the two intended refutations). Every row below, every layer
+# counter and both counterexamples came back unchanged. One thing did move:
+# the *reason and site* of `from_code_lengths_never_panics_harness`'s
+# whole-harness refusal, which is now `aliasing` at
+# `../oxiarc-deflate/src/huffman.rs:363:28` and no longer `unsupported-callee`
+# at `../oxiarc-core/src/error.rs:190:22`. The verdict -- and therefore the
+# row -- is the same; see that harness's row comment below.
+#
 # Naming. A property key is the word the **encoder actually mints**, never a
 # description:
 #
@@ -50,17 +61,23 @@
 # run: no such group disagrees in this package, so every row is also the
 # verdict of each of its sites.
 #
-# Measured tally (2026-09-08): 17 property rows over 13 harnesses --
-# 12 proved / 2 refuted / 1 timeout / 2 unsupported. The run's own layer
-# counters, which include the incidental `proved` rows this file does not
-# enumerate, are: bmc 505 proved / 2 refuted / 1 timeout / 0 unknown /
-# 2 unsupported / 0 unverifiable over 510 obligations (508 of them backed by a
-# `vc/NNNN.smt2` reproduction; the two `unsupported` ones generate none), and
-# contract 0 proved / 0 refuted. Hygiene passes with 0 errors, 0 warnings and
-# 0 notes over 2 files. The audit layer's `unverifiable` histogram over the
-# lowered dependency bodies is `raw-pointer` 12, `dyn-trait` 1, `float` 1 --
-# items of `oxiarc-core`/`oxiarc-lz4`/`oxiarc-deflate` that no harness here
-# reaches.
+# Measured tally (2026-09-08; re-measured 2026-09-14, unchanged): 17 property
+# rows over 13 harnesses -- 12 proved / 2 refuted / 1 timeout / 2 unsupported.
+# The run's own layer counters, which include the incidental `proved` rows this
+# file does not enumerate, are: bmc 505 proved / 2 refuted / 1 timeout /
+# 0 unknown / 2 unsupported / 0 unverifiable over 510 obligations (508 of them
+# backed by a `vc/NNNN.smt2` reproduction; the two `unsupported` ones generate
+# none), and contract 0 proved / 0 refuted. Hygiene passes with 0 errors,
+# 0 warnings and 0 notes over 2 files.
+#
+# The `audit` layer was *not* run in this invocation (`layers_run` is hygiene,
+# bmc, contract), so the histogram below is the one the run's `inventory.json`
+# actually records, not an audit-layer figure: `unverifiable_by_reason` is
+# `raw-pointer` 1, `dyn-trait` 1, `float` 1, all three on
+# `from_code_lengths_never_panics_harness` -- the only harness the inventory
+# marks `unverifiable` -- and the impurity histogram over the 13 harnesses is
+# `raw-pointer` 12, `dyn-dispatch` 1, `float` 1, the `raw-pointer` being the
+# `Vec` deref behind `any_vec` that 12 of the 13 harnesses reach.
 #
 # `solver-model-rejected` count: **0**. cargo-formal is pinned to OxiZ 0.3.3,
 # whose model gate (upstream item U-Z10) turns a solver model that does not
@@ -72,8 +89,11 @@
 # genuinely hard bit-blasting problem (see the row's comment).
 #
 # The two `unsupported` rows are statements about the encoder, not about
-# `oxiarc`: a symbolic-window `copy_from_slice` and a `String::from(&str)` in
-# an error constructor. `README.md` says what each would need.
+# `oxiarc`, and since the 2026-09-14 encoder rules landed they are the *same*
+# statement: a `&mut` borrow taken at an index the encoder knows only
+# symbolically -- `<[T; N] as IndexMut<I>>::index_mut` over a symbolic window,
+# and `<Vec<T, A> as IndexMut<I>>::index_mut` at a symbolically indexed
+# element. Both are cargo-formal TODO P3-26. `README.md` says what they need.
 
 [[harness]]
 name = "refill_bytes_never_overfills_harness"
@@ -139,18 +159,22 @@ name = "xxhash32_never_panics_on_a_short_input_harness"
 name = "xxhash32_one_shot_equals_streaming_harness"
 
 [harness.expected]
-# `unsupported(aliasing)` at `../oxiarc-lz4/src/xxhash.rs:156:24`:
-# `self.buffer[..remaining].copy_from_slice(..)` takes a mutable borrow of a
-# window whose bounds are symbolic. No verification condition is generated.
+# `unsupported(aliasing)` at `../oxiarc-lz4/src/xxhash.rs:156:24`: the callee
+# is `<[T; N] as IndexMut<I>>::index_mut`, which "takes a mutable borrow of a
+# window whose bounds are not constants". Column 24 is the `[..remaining]` of
+# `self.buffer[..remaining].copy_from_slice(&data[pos..])`, where
+# `self.buffer` is `[u8; 16]`. No verification condition is generated.
 "harness" = "unsupported"
 
 [[harness]]
 name = "xxhash32_agrees_with_seed_zero_harness"
 
 [harness.expected]
-# The solver did not finish within the 30 000 ms budget, and still returns
-# `unknown` at 120 000 ms: two structurally identical bit-blasted avalanche
-# circuits under a disequality. Not a model-gate `unknown`.
+# The solver gave up after a measured 30 505 ms against the 30 000 ms budget
+# ("the solver did not finish within 30000 ms"): a miter of two structurally
+# identical bit-blasted avalanche circuits under a disequality. Not a
+# model-gate `unknown`. A separate probe at a four-fold budget (120 000 ms)
+# still returned `unknown` -- OxiZ intake #P2b-14.
 "assert" = "timeout"
 "unwinding-assertion" = "proved" # 3 sites; the `unwind = 6` bound was enough
 
@@ -164,9 +188,32 @@ name = "entry_round_trip_harness"
 name = "from_code_lengths_never_panics_harness"
 
 [harness.expected]
-# `unsupported(unsupported-callee)` at `../oxiarc-core/src/error.rs:190:22`:
-# no `From<&str> for std::string::String` in the module set, reached through
-# `build_into`'s error path. The predicted blockers (`Iterator::sum`,
-# `Vec::resize`, `Vec::reserve_exact`) all have encoder rules now and are
-# walked past. No verification condition is generated.
+# `unsupported(aliasing)` at `../oxiarc-deflate/src/huffman.rs:363:28`: the
+# callee is `<Vec<T, A> as IndexMut<I>>::index_mut`, which "takes a mutable
+# borrow of a symbolically indexed element". Column 28 is the `[idx]` of
+# `symbols[idx] = symbol as u16` in `build_into`'s symbol-assignment loop,
+# whose index is
+# `symbol_offsets[len] + (current_code[len] - base_codes[len])` -- symbolic in
+# the code lengths the harness draws. That is the same design limit that
+# refuses `xxhash32_one_shot_equals_streaming_harness` (cargo-formal TODO
+# P3-26). No verification condition is generated.
+#
+# Measured 2026-09-14 with the rebuilt CLI. The refusal MOVED, and the older
+# explanation of it was wrong in an instructive way: it read
+# `unsupported-callee` at `../oxiarc-core/src/error.rs:190:22`, "no
+# `From<&str> for std::string::String` implementation in the module set", and
+# that did NOT mean the table builder was one `From<&str> for String` rule
+# short. The rule was there; the copy was refused on LENGTH, because the
+# literal `"Empty code lengths"` (`huffman.rs:272`) is 18 bytes against this
+# package's sequence bound of 16, and the generic-conversion path swallowed
+# that error and reported its own fallback message instead. With the length
+# check fixed, the encoder now walks the whole `impl Into<String>`
+# constructor, the `1..=max_length` loop (`huffman.rs:302`), the `format!`
+# inside `invalid_header(format!(..))` (`huffman.rs:282`) and
+# `code_lengths.len().next_power_of_two()` (`huffman.rs:332`) before stopping
+# at the write above. The blockers predicted before the first run
+# (`Iterator::sum` at `huffman.rs:311`, `Vec::resize`, `Vec::reserve_exact`)
+# are walked past as well. None of this moved a counter: the package is still
+# bmc 505 proved / 2 refuted / 0 unknown / 1 timeout / 2 unsupported over 510
+# obligations, and this harness still mints no verification condition.
 "harness" = "unsupported"

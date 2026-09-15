@@ -73,8 +73,24 @@ the intended state here: two of them are refuted on purpose (see below).
 on 2026-09-08 with the release CLI (`cargo-formal` 0.1.0), the release driver
 with dependency-body and monomorphic-instance lowering, OxiZ 0.3.3 and rustc
 `nightly-2026-06-20`. `EXPECTED.toml` is the machine-readable mirror of this
-table, and each harness's doc comment carries the same verdict. The run lowered
-**28 dependency bodies** (27 reachable) and **2 monomorphic instances**.
+table, and each harness's doc comment carries the same verdict. The run
+lowered **28 dependency bodies** (27 reachable) and **2 monomorphic instances**.
+
+Re-measured on **2026-09-14** with a release CLI **rebuilt from the
+cargo-formal tree that carries that day's encoder rules** (the release driver,
+the OxiZ 0.3.3 pin and rustc `nightly-2026-06-20` are unchanged; 36 s wall,
+exit status 1 for the two intended refutations). Every row below, every layer
+counter and both counterexamples came back **unchanged**. One thing did move:
+the *reason and site* of `from_code_lengths_never_panics_harness`'s
+whole-harness refusal — `aliasing` at
+`oxiarc-deflate/src/huffman.rs:363:28` now, no longer `unsupported-callee` at
+`oxiarc-core/src/error.rs:190:22`. The verdict, and therefore the row, is the
+same; the section "The two `unsupported` rows" below says what changed and why
+the old explanation was wrong. Note that the *rows* reproduce on either CLI,
+but the new refusal site does not: the `cargo formal check` invocation above
+run with a released `cargo-formal` 0.1.0 CLI still stops at the older
+`unsupported-callee` site, because the rules that walk past it are not in that
+release yet.
 
 | # | Harness | Property | Verdict |
 |---|---|---|---|
@@ -94,7 +110,7 @@ table, and each harness's doc comment carries the same verdict. The run lowered
 | 11 | `xxhash32_agrees_with_seed_zero_harness` | `assert` | **timeout** |
 | 11 | " | `unwinding-assertion` (3 sites) | **proved** |
 | 12 | `entry_round_trip_harness` | `assert` (2 sites) | **proved** |
-| 13 | `from_code_lengths_never_panics_harness` | whole harness | **unsupported** (`unsupported-callee`) |
+| 13 | `from_code_lengths_never_panics_harness` | whole harness | **unsupported** (`aliasing`) |
 
 17 property rows over 13 harnesses: **12 proved / 2 refuted / 1 timeout /
 2 unsupported**.
@@ -110,8 +126,17 @@ enumerate:
 | `bmc` | **505 proved / 2 refuted / 1 timeout / 0 unknown / 2 unsupported / 0 unverifiable** over 510 obligations (508 backed by a `vc/NNNN.smt2` reproduction; the 2 `unsupported` harnesses generate none) |
 | `contract` | 0 proved / 0 refuted (this package states no `#[requires]`/`#[ensures]` — see the contract candidates below) |
 | `theorem` | not run |
-| `audit` | `unverifiable` over the lowered dependency bodies: `raw-pointer` 12, `dyn-trait` 1, `float` 1 — all in `oxiarc` items no harness here reaches |
+| `audit` | **not run in this invocation** — `layers_run` is `hygiene`, `bmc`, `contract`; see the inventory note below |
 | coverage | 13 harnesses; `annotated/public` 0.0 % (the package has no public functions of its own; coverage counts *home* functions, and every function under test lives in a dependency) |
+
+The `audit` layer did not run, so the two histograms this package can quote come
+from the run's own `inventory.json` instead. Its `unverifiable_by_reason` is
+`raw-pointer` 1, `dyn-trait` 1, `float` 1 — all three on
+`from_code_lengths_never_panics_harness`, the only harness the inventory marks
+`unverifiable`. Its impurity histogram over the 13 harnesses is `raw-pointer`
+12, `dyn-dispatch` 1, `float` 1; the `raw-pointer` is the `Vec` deref behind
+`any_vec`, which 12 of the 13 harnesses reach (`entry_round_trip_harness` is the
+one that draws no `Vec`).
 
 ### `solver-model-rejected`: 0
 
@@ -124,11 +149,12 @@ row above moves when the pin advances to the OxiZ release that carries the fix.
 
 The one `timeout` is a different failure and does not move with the pin either:
 `xxhash32_agrees_with_seed_zero_harness` asks whether two structurally
-identical bit-blasted avalanche circuits can differ. Re-solving that condition
-with a four-fold budget (120 000 ms instead of 30 000 ms) still returns
-`unknown`, so it is not a borderline miss — it is a missing structural-hashing
-optimisation in the bit-blaster, and it is this package's strongest argument
-for hash-consing it.
+identical bit-blasted avalanche circuits can differ — a miter. The solver gave
+up after a measured **30 505 ms** against the manifest's 30 000 ms budget ("the
+solver did not finish within 30000 ms"). A separate probe at a four-fold budget
+(120 000 ms) still returns `unknown`, so it is not a borderline miss — it is a
+missing structural-hashing optimisation in the bit-blaster (OxiZ intake
+#P2b-14), and it is this package's strongest argument for hash-consing it.
 
 ### The two refutations
 
@@ -138,7 +164,7 @@ Both are unchecked preconditions of public functions, and both are stated as
 * `BitCache::refill_bytes` (`oxiarc-core/src/bitstream.rs:208`) asserts
   `want <= 56` and takes `want` straight from its caller. The assertion is
   **not** load-bearing: harness 1 proves the accumulator bound *without* the
-  `assume`, because the loop guard `self.len <= 55` (`:212`) caps it whatever
+  `assume`, because the loop guard `self.len <= 55` (`:211`) caps it whatever
   `want` is. So this is a contract candidate, not a defect.
 * `BitCache::peek_bits` (`:134`) asserts `count <= 32`, and here the bound
   **is** load-bearing: for `count` in `33..=63` the mask is wider than the
@@ -157,25 +183,55 @@ violating state. Harness 8 proves the four shifts inside `bulk_load`
 
 ### The two `unsupported` rows
 
-Both are statements about the encoder, not about `oxiarc`:
+Both are statements about the encoder, not about `oxiarc`, and since the
+2026-09-14 encoder rules landed they are the *same* statement: a `&mut` borrow
+taken at an index the encoder knows only symbolically. cargo-formal refuses
+that by design — it is its TODO P3-26 — and neither row is a finding about
+`oxiarc`.
 
 * `xxhash32_one_shot_equals_streaming_harness` — `aliasing` at
-  `oxiarc-lz4/src/xxhash.rs:156:24`. `XxHash32::update` does
-  `self.buffer[..remaining].copy_from_slice(&data[pos..])`, and a `&mut`
-  borrow of a window whose bounds are symbolic is refused by design. Needs a
-  symbolic-window `copy_from_slice`/`index_mut` rule.
-* `from_code_lengths_never_panics_harness` — `unsupported-callee` at
-  `oxiarc-core/src/error.rs:190:22`, "no `From<&str> for std::string::String`
-  implementation in the module set", reached through `build_into`'s error path
-  (`oxiarc-deflate/src/huffman.rs:272`). This is **not** where it was predicted
-  to stop: `Iterator::sum` (`huffman.rs:309`), `Vec::resize` and
-  `Vec::reserve_exact` all have encoder rules now and are walked past. The
-  DEFLATE table builder is one `String::from(&str)` rule short of encodable.
-  Every public constructor routes through `build_into`
-  (`from_code_lengths` `:155`, `from_code_length_code` `:176`,
-  `rebuild_from_code_lengths` `:207`, `rebuild_from_code_length_code` `:232`),
-  so the private `HuffmanTree::reverse_bits` (`:528`) currently has no
-  verifiable public entry point at all.
+  `oxiarc-lz4/src/xxhash.rs:156:24`. The refused callee is
+  `<[T; N] as IndexMut<I>>::index_mut`, which "takes a mutable borrow of a
+  window whose bounds are not constants": column 24 is the `[..remaining]` of
+  `self.buffer[..remaining].copy_from_slice(&data[pos..])` in
+  `XxHash32::update`, with `self.buffer: [u8; 16]`.
+* `from_code_lengths_never_panics_harness` — `aliasing` at
+  `oxiarc-deflate/src/huffman.rs:363:28`. The refused callee is
+  `<Vec<T, A> as IndexMut<I>>::index_mut`, which "takes a mutable borrow of a
+  symbolically indexed element": column 28 is the `[idx]` of
+  `symbols[idx] = symbol as u16` in `build_into`'s symbol-assignment loop,
+  whose index is `symbol_offsets[len] + (current_code[len] - base_codes[len])`
+  — symbolic in the code lengths the harness draws.
+
+**The second row moved on 2026-09-14, and its old explanation was wrong in an
+instructive way.** Until that day it read `unsupported-callee` at
+`oxiarc-core/src/error.rs:190:22`, "no `From<&str> for std::string::String`
+implementation in the module set", and the natural reading of that — "the
+DEFLATE table builder is one `From<&str> for String` rule short" — was **not**
+what the encoder was doing. The rule was there. The copy was
+refused on *length*: the literal `"Empty code lengths"`
+(`oxiarc-deflate/src/huffman.rs:272`) is 18 bytes against this package's
+sequence bound of 16, and the generic-conversion path swallowed that error and
+reported its own fallback message instead, which named the missing `From` impl
+and hid the real cause. With the length check fixed — an owned `String` built
+from a `&str` is an exact copy even when the source is longer than the
+destination's bound — the encoder now walks straight through the
+`impl Into<String>` constructor and on past the `1..=max_length` loop
+(`huffman.rs:302`), the `format!` inside `invalid_header(format!(..))`
+(`huffman.rs:282`) and `code_lengths.len().next_power_of_two()`
+(`huffman.rs:332`), stopping only at the symbol-assignment write above. The
+blockers predicted before the very first run (`Iterator::sum` at
+`huffman.rs:311`, `Vec::resize`, `Vec::reserve_exact`) are walked past as well.
+
+The measured effect on this package is **none**. The layer counters are
+unchanged at 505 proved / 2 refuted / 0 unknown / 1 timeout / 2 unsupported
+over 510 obligations, and the harness still mints no verification condition —
+what changed is the diagnosis, from a string model to a symbolic `IndexMut`
+write. Every public constructor routes through `build_into`
+(`from_code_lengths` `:155`, `from_code_length_code` `:176`,
+`rebuild_from_code_lengths` `:207`, `rebuild_from_code_length_code` `:232`), so
+the private `HuffmanTree::reverse_bits` (`:528`) still has no verifiable public
+entry point at all.
 
 ### A note on `unwind`
 
@@ -187,9 +243,9 @@ shorter than that for a source of at most four bytes: the 16-byte fast path
 The bound is not taken on trust — all six `unwinding-assertion` obligations of
 those harnesses came back **proved**, which is exactly the statement "six
 unrolls were enough"; had they not been, every verdict of the harness would
-have degraded to `unknown`. For comparison, at `unwind = 16` the package
-generates 1068 verification conditions instead of 508, and the
-`xxhash32_agrees_with_seed_zero_harness` ones take about 20 s each.
+have degraded to `unknown`. A separate probe at the manifest's `unwind = 16`
+generated 1068 verification conditions instead of this run's 508, and the
+`xxhash32_agrees_with_seed_zero_harness` ones took about 20 s each.
 
 ## In-source contract candidates
 
@@ -206,7 +262,7 @@ with the evidence that makes it a real finding rather than decoration.
 | `oxiarc-core/src/bitstream.rs:134` `BitCache::peek_bits` | `requires(count <= 32)` | measured `panic = refuted`, counterexample `count = 255`. Load-bearing: the mask is wrong for `33..=63` and the shift at `:136` is out of range from 64. The strongest candidate in `oxiarc`. |
 | `oxiarc-core/src/bitstream.rs:127` `peek_mask`, `:134` `peek_bits` | `ensures` "every bit above `available()` reads as zero" (doc `:123-125`) | measured `proved` in harness 8, in its `u32`-visible form |
 | `oxiarc-core/src/bitstream.rs:208` `BitCache::refill_bytes` | `requires(want <= 56)` | measured `panic = refuted`, counterexample `want = 128`; documentation-grade, since harness 1 proves the accumulator bound without it |
-| `oxiarc-core/src/bitstream.rs:265` `BitCache::take_byte` | `requires(self.available() % 8 == 0)` | the doc at `:257-260` states it ("the cache must already be byte-aligned") and nothing checks it. Harness 7 proves the arithmetic is total for *every* state, so this precondition is about stream semantics, not memory safety — which is precisely why a checked contract is the right home for it |
+| `oxiarc-core/src/bitstream.rs:265` `BitCache::take_byte` | `requires(self.available() % 8 == 0)` | the doc at `:249-251` states it ("the cache must already be byte-aligned") and nothing checks it. Harness 7 proves the arithmetic is total for *every* state, so this precondition is about stream semantics, not memory safety — which is precisely why a checked contract is the right home for it |
 | `oxiarc-core/src/bitstream.rs:70` `bulk_load` | `requires(*bits <= 55)` | existing `debug_assert!` `:71` and the doc `:60-62`. **Already discharged** by `refill_bulk`'s guard `:181-183`; harness 8 proves the four shifts at `:73-76`. Documentation-grade, not a defect |
 | `oxiarc-lz4/src/xxhash.rs:85` `read_u32_le` | `requires(data.len() >= 4)` | four unchecked indices at `:86`. Private; every public caller bounds it first, which is exactly what harness 9's 126 `proved` `bounds-check` obligations state |
 | `oxiarc-deflate/src/huffman.rs:599` `entry_length`, `:605` `entry_symbol` | `ensures` the packing round trip | measured `proved` in harness 12 |
