@@ -94,6 +94,39 @@
 # symbolically -- `<[T; N] as IndexMut<I>>::index_mut` over a symbolic window,
 # and `<Vec<T, A> as IndexMut<I>>::index_mut` at a symbolically indexed
 # element. Both are cargo-formal TODO P3-26. `README.md` says what they need.
+#
+# Re-measured 2026-09-15 with the Phase 3 release CLI (options: autoharness
+# off, modular on, vacuity check on; release cargo-formal 0621fc0, 0
+# uncommitted files, OxiZ 0.3.3, rustc nightly-2026-06-20, --jobs 4, fresh
+# --target-dir, two runs): every row, the `peek_bits_count_bound_is_necessary_harness`
+# counterexample (count = 255), the one timeout and both refusal sites
+# unchanged; bmc 505 proved / 2 refuted / 1 timeout / 2 unsupported over 510
+# obligations (508 with a reproduction record), contract 0 proved / 0
+# refuted, hygiene PASS, exit 1, 35 s and 34 s. run1<->run2 is
+# byte-identical. **One counterexample moved**: `refill_bytes_want_bound_is_asserted_harness#panic`
+# refutes at want = 57 now, not want = 128 (see that row's comment) -- still
+# a real, model-checked witness of the same violated property (want > 56),
+# reproduced identically in both 2026-09-15 runs; verified, not inferred --
+# `diff`-ing this item's own `vc/0117.smt2` against the 2026-09-14 target
+# dir's copy of the same ordinal shows the scripts are genuinely different
+# (107 lines then, 32 now; the 2026-09-14 script hand-unrolls ~14 `ite`-chained
+# byte comparisons the 2026-09-15 script does not), not merely re-ordered --
+# consistent with the encoder's hypothesis assembly having been rebuilt since
+# 2026-09-14 (design phase3.md waves 1-4). Against the 2026-09-14 report
+# (`compare_expected.py --prev`): 0 added/removed ids, 0 FLIPs, 504
+# message-only changes -- every harness that draws a sequence gains the
+# Phase 3 clause `bounded-sequence: sequences cut at N` on its
+# `arith-overflow`/`bounds-check`/`shift-overflow`/`unwinding-assertion`
+# conditions (e.g. `align_to_byte_leaves_whole_bytes_harness#arith-overflow@../oxiarc-core/src/bitstream.rs:150:9`:
+# `inlined at src/harness.rs:224:5` -> `bounded-sequence: sequences cut at
+# 16; inlined at src/harness.rs:224:5`); no verdict moved. The
+# `solver-model-rejected` count stays 0. `coverage.claim` now appears
+# (`claim unmet 505 of 505 proved`) where 2026-09-14 had none -- confirmed
+# from `crates/formal-config/src/resolved.rs`'s `defaults::claim_requires()`
+# to be an unconditional CLI default (`["lrat", "oxilean-verify",
+# "external-replay"]`) applied to every package that does not set
+# `claim-requires` in its manifest, regardless of `self_host` -- a new
+# Phase 3 default report surface for every package, not a verdict row.
 
 [[harness]]
 name = "refill_bytes_never_overfills_harness"
@@ -106,6 +139,15 @@ name = "refill_bytes_want_bound_is_asserted_harness"
 
 [harness.expected]
 "panic" = "refuted"  # `debug_assert!(want <= 56)`; counterexample want = 128
+# on 2026-09-08/09/14 (Phase 2b binaries); want = 57 on the 2026-09-15 Phase 3
+# binaries (`in17` in `vc/0117.model.json`, both runs agree), `in0` (the
+# unconstrained input buffer, `any_vec` at src/harness.rs:116:24) empty rather
+# than seven zero bytes. Both are real, model-checked witnesses of the same
+# violated property (want > 56); the concrete value moved because waves 1-4
+# rebuilt hypothesis assembly (design phase3.md, so the .smt2 script differs
+# byte-for-byte even though the formula is equisatisfiable -- see
+# docs/src/design/phase3.md section 8/D0-D4 "message changes"), not because
+# the property changed. Reproduced identically in both 2026-09-15 runs.
 
 [[harness]]
 name = "peek_bits_within_its_precondition_harness"
