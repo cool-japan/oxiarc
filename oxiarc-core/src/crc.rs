@@ -486,6 +486,9 @@ fn crc32_sw(crc: &mut u32, data: &[u8]) {
 fn crc32_slice8(crc: &mut u32, data: &[u8]) {
     let mut c = *crc;
     let mut ptr = data.as_ptr();
+    // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+    // the one-past-the-end address of the same slice, which `pointer::add`
+    // permits (a slice never spans more than `isize::MAX` bytes).
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
@@ -494,6 +497,11 @@ fn crc32_slice8(crc: &mut u32, data: &[u8]) {
     // of the allocation, even if the pointer is only compared and never dereferenced.
     while (end as usize) - (ptr as usize) >= 8 {
         // Read 8 bytes
+        // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+        // or 1 bytes a loop condition has just found before `end`, so it stays in
+        // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+        // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+        // needs no alignment, and every `[u8; 8]` is a valid value.
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
 
         // XOR the first 4 bytes with current CRC, then extract individual bytes
@@ -513,13 +521,20 @@ fn crc32_slice8(crc: &mut u32, data: &[u8]) {
             ^ CRC32_TABLE_SLICE[1][bytes[6] as usize]
             ^ CRC32_TABLE_SLICE[0][bytes[7] as usize];
 
+        // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+        // at the top of this iteration, so `ptr + 8` is at most `end`, the
+        // one-past-the-end address of `data`.
         ptr = unsafe { ptr.add(8) };
     }
 
     // Process remaining bytes one at a time
     while ptr < end {
+        // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+        // `data.as_ptr()`, so it points at a byte of `data`.
         let byte = unsafe { *ptr };
         c = CRC32_TABLE[((c ^ byte as u32) & 0xFF) as usize] ^ (c >> 8);
+        // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+        // most `end`.
         ptr = unsafe { ptr.add(1) };
     }
 
@@ -675,6 +690,9 @@ fn crc64_sw(crc: &mut u64, data: &[u8]) {
 fn crc64_slice8(crc: &mut u64, data: &[u8]) {
     let mut c = *crc;
     let mut ptr = data.as_ptr();
+    // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+    // the one-past-the-end address of the same slice, which `pointer::add`
+    // permits (a slice never spans more than `isize::MAX` bytes).
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
@@ -683,6 +701,11 @@ fn crc64_slice8(crc: &mut u64, data: &[u8]) {
     // of the allocation, even if the pointer is only compared and never dereferenced.
     while (end as usize) - (ptr as usize) >= 8 {
         // Read 8 bytes
+        // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+        // or 1 bytes a loop condition has just found before `end`, so it stays in
+        // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+        // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+        // needs no alignment, and every `[u8; 8]` is a valid value.
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
 
         // XOR the first 8 bytes with current CRC, then extract individual bytes
@@ -706,13 +729,20 @@ fn crc64_slice8(crc: &mut u64, data: &[u8]) {
             ^ CRC64_TABLE_SLICE[1][b6]
             ^ CRC64_TABLE_SLICE[0][b7];
 
+        // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+        // at the top of this iteration, so `ptr + 8` is at most `end`, the
+        // one-past-the-end address of `data`.
         ptr = unsafe { ptr.add(8) };
     }
 
     // Process remaining bytes one at a time
     while ptr < end {
+        // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+        // `data.as_ptr()`, so it points at a byte of `data`.
         let byte = unsafe { *ptr };
         c = CRC64_TABLE[((c ^ byte as u64) & 0xFF) as usize] ^ (c >> 8);
+        // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+        // most `end`.
         ptr = unsafe { ptr.add(1) };
     }
 

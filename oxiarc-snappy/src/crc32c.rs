@@ -109,6 +109,10 @@ static CRC32C_FN: std::sync::OnceLock<fn(&[u8]) -> u32> = std::sync::OnceLock::n
 fn get_crc32c_fn() -> fn(&[u8]) -> u32 {
     *CRC32C_FN.get_or_init(|| {
         if is_x86_feature_detected!("sse4.2") {
+            // SAFETY: this closure is stored in `CRC32C_FN`, and so can be called at
+            // all, only when `is_x86_feature_detected!("sse4.2")` has just returned
+            // true; a CPU's features do not change while the process runs, so SSE 4.2,
+            // `crc32c_sse42`'s one precondition, holds at every call.
             |data| unsafe { crc32c_sse42(data) }
         } else {
             crc32c_scalar
@@ -255,6 +259,9 @@ mod tests {
             let data = vec![0xABu8; 4097];
             for len in (0..=4096).step_by(17) {
                 let scalar = crc32c_scalar(&data[..len]);
+                // SAFETY: the early `return` at the top of this test leaves only CPUs on
+                // which `is_x86_feature_detected!("sse4.2")` is true, which is
+                // `crc32c_sse42`'s one precondition.
                 let simd = unsafe { crc32c_sse42(&data[..len]) };
                 assert_eq!(scalar, simd, "length {len} mismatch");
             }
@@ -276,6 +283,9 @@ mod tests {
                     .map(|i| ((state >> (i % 8)) & 0xFF) as u8)
                     .collect();
                 let scalar = crc32c_scalar(&data);
+                // SAFETY: the early `return` at the top of this test leaves only CPUs on
+                // which `is_x86_feature_detected!("sse4.2")` is true, which is
+                // `crc32c_sse42`'s one precondition.
                 let simd = unsafe { crc32c_sse42(&data) };
                 assert_eq!(scalar, simd, "random len {len} mismatch");
             }
@@ -292,6 +302,8 @@ mod tests {
             assert_eq!(crc32c_scalar(b"123456789"), 0xE306_9283);
 
             if is_x86_feature_detected!("sse4.2") {
+                // SAFETY: inside the `is_x86_feature_detected!("sse4.2")` branch, so
+                // `crc32c_sse42`'s one precondition holds for these three calls.
                 assert_eq!(unsafe { crc32c_sse42(&[]) }, 0x0000_0000);
                 assert_eq!(unsafe { crc32c_sse42(&[0x00]) }, 0x527D_5351);
                 assert_eq!(unsafe { crc32c_sse42(b"123456789") }, 0xE306_9283);

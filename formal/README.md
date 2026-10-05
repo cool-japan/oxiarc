@@ -7,7 +7,7 @@ and `oxiformal`.
 A decompressor reads attacker-controlled bytes and turns them into shift
 counts, masks and indices. That is exactly the code where "no test found a
 problem" is worth least and "no input violates this" is worth most. This
-package states thirteen such properties as `#[harness]` entry points over the
+package states fifteen such properties as `#[harness]` entry points over the
 **public** API of `oxiarc-core`, `oxiarc-lz4` and `oxiarc-deflate`, and records
 the verdict the solver actually returned for each of them.
 
@@ -28,13 +28,13 @@ a caller can only ever reach them that way.
 |---|---|---|
 | `BitCache::refill_bytes`, `peek_bits`, `consume`, `align_to_byte`, `take_byte`, `refill_bulk` | `oxiarc-core/src/bitstream.rs` | 8 |
 | `xxhash32`, `xxhash32_with_seed`, `XxHash32::{with_seed,update,finish}` | `oxiarc-lz4/src/xxhash.rs` | 3 |
-| `HuffmanTree::{entry_length, entry_symbol, from_code_lengths}` | `oxiarc-deflate/src/huffman.rs` | 2 |
+| `HuffmanTree::{entry_length, entry_symbol, from_code_lengths}` | `oxiarc-deflate/src/huffman.rs` | 4 |
 
 ## The three builds
 
 ```sh
 # 1. plain, stable: type-checks the package and runs `harness::plain_tests`
-#    (17 ordinary tests, including a concrete run of every counterexample the
+#    (20 ordinary tests, including a concrete run of every counterexample the
 #    solver reported).
 cargo build
 cargo test
@@ -92,10 +92,30 @@ run with a released `cargo-formal` 0.1.0 CLI still stops at the older
 `unsupported-callee` site, because the rules that walk past it are not in that
 release yet.
 
+Re-measured on **2026-10-05** with a release CLI and driver built from the
+cargo-formal tree at commit `cab6f97` plus that day's hygiene-scanner and
+conformance-suite changes (neither touches the encoder, the solver or the
+driver); OxiZ 0.3.3, rustc `nightly-2026-06-20`, `--jobs 2`, a fresh
+`--target-dir`, 34 s wall, exit status 1 for the two intended refutations.
+**Two harnesses were added** over the `HuffmanTree` entry accessors — rows 14
+and 15 below. Both are `proved`. Every 2026-09 row came back unchanged; the
+counters rose by the new harnesses' obligations only: bmc **513 proved /
+2 refuted / 1 timeout / 2 unsupported** over 518 obligations (516 with a
+reproduction), from 505 / 510 / 508. The run now lowers **39 dependency
+bodies** (27 reachable) rather than 28 — the encoder lowers more bodies since
+2026-09, with the 27 reachable and every verdict unchanged. The two new
+harnesses exercise `entry_length` / `entry_symbol` (`huffman.rs:599` / `:605`)
+directly: that they are total over every `u32`, read exactly the documented
+bit fields, and ignore the high byte that carries `ENTRY_SUBTABLE`. The two
+refutations reproduce with the model values `want = 57` and `count = 255`, each
+on an empty source (`want = 57` is the 2026-09-15 value too; the 2026-09-08
+run reported `want = 128` on a seven-byte source — both violate `want <= 56`,
+and `plain_tests` runs both).
+
 | # | Harness | Property | Verdict |
 |---|---|---|---|
 | 1 | `refill_bytes_never_overfills_harness` | `assert` (4 sites) | **proved** |
-| 2 | `refill_bytes_want_bound_is_asserted_harness` | `panic` | **refuted** — `want = 128` |
+| 2 | `refill_bytes_want_bound_is_asserted_harness` | `panic` | **refuted** — `want = 57` (2026-09-08: `128`) |
 | 3 | `peek_bits_within_its_precondition_harness` | `assert` (2 sites) | **proved** |
 | 4 | `peek_bits_count_bound_is_necessary_harness` | `panic` | **refuted** — `count = 255` |
 | 4 | " | `shift-overflow` (2 sites) | **proved** |
@@ -111,9 +131,37 @@ release yet.
 | 11 | " | `unwinding-assertion` (3 sites) | **proved** |
 | 12 | `entry_round_trip_harness` | `assert` (2 sites) | **proved** |
 | 13 | `from_code_lengths_never_panics_harness` | whole harness | **unsupported** (`aliasing`) |
+| 14 | `entry_accessors_match_the_bit_layout_harness` | `assert` (2 sites) | **proved** |
+| 15 | `entry_accessors_ignore_the_high_byte_harness` | `assert` (2 sites) | **proved** |
 
-17 property rows over 13 harnesses: **12 proved / 2 refuted / 1 timeout /
-2 unsupported**.
+19 property rows over 15 harnesses: **14 proved / 2 refuted / 1 timeout /
+2 unsupported**. Rows 14–15 are new in the 2026-10-05 re-measure: two
+`proved` harnesses over the `HuffmanTree` entry accessors (totality and the
+exact bit fields over every `u32`, and that neither accessor reads bits
+24..32), beside the `entry_round_trip_harness` the package already had. See the
+dated note under *Measured verdicts*.
+
+### Evidence grade
+
+Every `proved` row above is **reproduction only (claim unmet)** under
+cargo-formal's default `claim-requires` (`lrat`, `oxilean-verify`,
+`external-replay`): it is the pinned solver's `unsat`, reproduced under a fixed
+seed and conflict budget, not an independently checked proof, and the default
+run says so (`claim unmet 513 of 513 proved`). The same day's
+`cargo formal check --evidence lrat` (the same binaries, a fresh
+`--target-dir`, `--no-cache`; two runs, identical) raised **0 soundness
+incidents** and exited 1 for the two intended refutations. **74 of the 513**
+proved obligations carry an LRAT certificate from the bit-level engine, checked
+by `oxiz-proof` (8 of the 26 user-written `assert` obligations); in 83 more the
+bit-level encoder folded an assertion to the constant `false`, which leaves no
+clause set to certify; the other 356 carry no bit-level check at all, because
+the pinned solver answered their vacuity question `unsat` and the certificate
+pass skips a condition on that answer. OxiZ 0.3.3 has a documented
+wrong-`unsat` class (upstream U-Z19; cargo-formal's conformance fixture
+`u21_pinned_selector_two_define_funs`, reduced from a deliberately false
+assertion over `oxiarc-core`'s `BitCache` that a default run reported `proved`
+and `--evidence lrat` refuted), which is why a reproduction alone is not a
+proof.
 
 ### Layer counters
 
@@ -123,20 +171,26 @@ enumerate:
 | Layer | Counters |
 |---|---|
 | `hygiene` | PASS — 0 errors, 0 warnings, 0 notes, 2 files scanned, 0 `unsafe` sites |
-| `bmc` | **505 proved / 2 refuted / 1 timeout / 0 unknown / 2 unsupported / 0 unverifiable** over 510 obligations (508 backed by a `vc/NNNN.smt2` reproduction; the 2 `unsupported` harnesses generate none) |
+| `bmc` | **513 proved / 2 refuted / 1 timeout / 0 unknown / 2 unsupported / 0 unverifiable** over 518 obligations (516 backed by a `vc/NNNN.smt2` reproduction; the 2 `unsupported` harnesses generate none). *(Was 505 / 510 / 508 before the two entry-accessor harnesses; the +8 proved obligations are their four `assert`s and four incidental `shift-overflow`s.)* |
 | `contract` | 0 proved / 0 refuted (this package states no `#[requires]`/`#[ensures]` — see the contract candidates below) |
 | `theorem` | not run |
-| `audit` | **not run in this invocation** — `layers_run` is `hygiene`, `bmc`, `contract`; see the inventory note below |
-| coverage | 13 harnesses; `annotated/public` 0.0 % (the package has no public functions of its own; coverage counts *home* functions, and every function under test lives in a dependency) |
+| `audit` | **not run in this invocation** — `layers_run` is `hygiene`, `bmc`, `contract`; see the inventory note below. *(That is the 2026-09 runs. On 2026-10-05 cargo-formal runs it as part of every `check`: `layers_run` is `hygiene`, `bmc`, `contract`, `audit`, and `layers.audit` reads `trusted` 0, `uncovered_unsafe` 0 and `unverifiable_functions` `raw-pointer` 1, `dyn-trait` 1, `float` 1 — the three the inventory note below names.)* |
+| coverage | 15 harnesses; `annotated/public` 0.0 % (the package has no public functions of its own; coverage counts *home* functions, and every function under test lives in a dependency) |
 
-The `audit` layer did not run, so the two histograms this package can quote come
-from the run's own `inventory.json` instead. Its `unverifiable_by_reason` is
+The `audit` layer did not run in the 2026-09 runs, so the two histograms this
+package can quote come from the run's own `inventory.json` instead. Its
+`unverifiable_by_reason` is
 `raw-pointer` 1, `dyn-trait` 1, `float` 1 — all three on
 `from_code_lengths_never_panics_harness`, the only harness the inventory marks
-`unverifiable`. Its impurity histogram over the 13 harnesses is `raw-pointer`
-12, `dyn-dispatch` 1, `float` 1; the `raw-pointer` is the `Vec` deref behind
-`any_vec`, which 12 of the 13 harnesses reach (`entry_round_trip_harness` is the
-one that draws no `Vec`).
+`unverifiable`. Its impurity histogram over the 15 harnesses (2026-10-05) is
+`unknown-callee` 12 — the `oxiformal::any_vec` draw, which 12 of the 15
+harnesses make — and `dyn-dispatch` 1, `float` 1, `raw-pointer` 1, all three on
+`from_code_lengths_never_panics_harness`, beside the `impure-callee` entries
+that follow from the oxiarc bodies the harnesses call;
+`entry_round_trip_harness` and the two entry-accessor harnesses draw no `Vec`
+and are pure. (The 2026-09 runs recorded the `any_vec` draw as `raw-pointer`
+12, the `Vec` deref behind it; the purity analysis no longer counts that deref
+as a raw-pointer use.)
 
 ### `solver-model-rejected`: 0
 
@@ -261,11 +315,11 @@ with the evidence that makes it a real finding rather than decoration.
 |---|---|---|
 | `oxiarc-core/src/bitstream.rs:134` `BitCache::peek_bits` | `requires(count <= 32)` | measured `panic = refuted`, counterexample `count = 255`. Load-bearing: the mask is wrong for `33..=63` and the shift at `:136` is out of range from 64. The strongest candidate in `oxiarc`. |
 | `oxiarc-core/src/bitstream.rs:127` `peek_mask`, `:134` `peek_bits` | `ensures` "every bit above `available()` reads as zero" (doc `:123-125`) | measured `proved` in harness 8, in its `u32`-visible form |
-| `oxiarc-core/src/bitstream.rs:208` `BitCache::refill_bytes` | `requires(want <= 56)` | measured `panic = refuted`, counterexample `want = 128`; documentation-grade, since harness 1 proves the accumulator bound without it |
+| `oxiarc-core/src/bitstream.rs:208` `BitCache::refill_bytes` | `requires(want <= 56)` | measured `panic = refuted`, counterexample `want = 57` (2026-09-08: `128`); documentation-grade, since harness 1 proves the accumulator bound without it |
 | `oxiarc-core/src/bitstream.rs:265` `BitCache::take_byte` | `requires(self.available() % 8 == 0)` | the doc at `:249-251` states it ("the cache must already be byte-aligned") and nothing checks it. Harness 7 proves the arithmetic is total for *every* state, so this precondition is about stream semantics, not memory safety — which is precisely why a checked contract is the right home for it |
 | `oxiarc-core/src/bitstream.rs:70` `bulk_load` | `requires(*bits <= 55)` | existing `debug_assert!` `:71` and the doc `:60-62`. **Already discharged** by `refill_bulk`'s guard `:181-183`; harness 8 proves the four shifts at `:73-76`. Documentation-grade, not a defect |
 | `oxiarc-lz4/src/xxhash.rs:85` `read_u32_le` | `requires(data.len() >= 4)` | four unchecked indices at `:86`. Private; every public caller bounds it first, which is exactly what harness 9's 126 `proved` `bounds-check` obligations state |
-| `oxiarc-deflate/src/huffman.rs:599` `entry_length`, `:605` `entry_symbol` | `ensures` the packing round trip | measured `proved` in harness 12 |
+| `oxiarc-deflate/src/huffman.rs:599` `entry_length`, `:605` `entry_symbol` | `ensures` the packing round trip; `ensures(entry_length(e) == e & 0xFF)` and `ensures(entry_symbol(e) == (e >> 8) & 0xFFFF)` for every `e` | measured `proved` in harnesses 12, 14 and 15 (round trip for legal lengths; totality, the exact bit fields and high-byte independence over every `u32`) |
 
 **Real, but not harnessable in Phase 2**
 

@@ -51,42 +51,46 @@ pub fn fixed_distance_lengths() -> [u8; 30] {
 ///
 /// This tree is cached after first construction.
 ///
-/// # Panics (theoretical, unreachable)
+/// # Errors
 ///
-/// `fixed_litlen_lengths()` returns the RFC 1951 §3.2.6 fixed code lengths, a
-/// compile-time constant, and every stable release of `HuffmanTree` back to
-/// this crate's first version has accepted it. The `.expect` below cannot be
-/// replaced with `?` because [`OnceLock::get_or_init`]'s closure is
-/// infallible (`get_or_try_init` exists for that but is still unstable —
-/// `once_cell_try`, rust-lang/rust#109737 — as of this crate's MSRV); caching
-/// a `Result<HuffmanTree, _>` instead would require `OxiArcError: Clone` for
-/// no practical benefit, since this specific input can only ever be this
-/// specific compile-time array.
+/// Returns the error [`HuffmanTree::from_code_lengths`] reports for
+/// `fixed_litlen_lengths()`. That input is the RFC 1951 §3.2.6 fixed code
+/// lengths, a compile-time constant that `HuffmanTree` accepts (this module's
+/// tests build both fixed trees), so this does not happen; the error is still
+/// propagated rather than turned into a panic. Since
+/// [`OnceLock::get_or_init`]'s closure is infallible (and `get_or_try_init` is
+/// unstable — `once_cell_try`, rust-lang/rust#109737 — at this crate's MSRV),
+/// the tree is built outside the cell and only a successfully built tree is
+/// stored; a failed build caches nothing.
 pub fn fixed_litlen_tree() -> Result<&'static HuffmanTree> {
     static TREE: OnceLock<HuffmanTree> = OnceLock::new();
 
-    Ok(TREE.get_or_init(|| {
-        HuffmanTree::from_code_lengths(&fixed_litlen_lengths())
-            .expect("Fixed litlen tree construction should never fail")
-    }))
+    if let Some(tree) = TREE.get() {
+        return Ok(tree);
+    }
+    let tree = HuffmanTree::from_code_lengths(&fixed_litlen_lengths())?;
+    // A thread that lost a race to initialise the cell drops its own copy and
+    // returns the stored one, so every caller sees the same tree.
+    Ok(TREE.get_or_init(|| tree))
 }
 
 /// Get the fixed distance Huffman tree.
 ///
 /// This tree is cached after first construction.
 ///
-/// # Panics (theoretical, unreachable)
+/// # Errors
 ///
-/// See [`fixed_litlen_tree`]: the same "compile-time-constant input, blocked
-/// on unstable `get_or_try_init`" reasoning applies to
-/// `fixed_distance_lengths()`.
+/// As [`fixed_litlen_tree`], for `fixed_distance_lengths()` (RFC 1951
+/// §3.2.6): the error is propagated, never a panic, and a failed build caches
+/// nothing.
 pub fn fixed_distance_tree() -> Result<&'static HuffmanTree> {
     static TREE: OnceLock<HuffmanTree> = OnceLock::new();
 
-    Ok(TREE.get_or_init(|| {
-        HuffmanTree::from_code_lengths(&fixed_distance_lengths())
-            .expect("Fixed distance tree construction should never fail")
-    }))
+    if let Some(tree) = TREE.get() {
+        return Ok(tree);
+    }
+    let tree = HuffmanTree::from_code_lengths(&fixed_distance_lengths())?;
+    Ok(TREE.get_or_init(|| tree))
 }
 
 /// Length code base values (RFC 1951 Section 3.2.5).

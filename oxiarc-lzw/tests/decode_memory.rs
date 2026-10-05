@@ -44,8 +44,19 @@ static MEASURING: Mutex<()> = Mutex::new(());
 /// A pass-through allocator that records the peak live heap size.
 struct PeakTrackingAlloc;
 
+// SAFETY: `GlobalAlloc` requires that a returned block fits the requested
+// layout (or is null on failure) and that no method unwinds. Every method
+// below hands its arguments unchanged to `System`, which meets the first
+// part, and the bookkeeping beside each call is atomic counter updates
+// (which wrap rather than panic), subtractions guarded by the comparison
+// before them and the `saturating_add` in `record_growth`, none of which
+// can panic.
 unsafe impl GlobalAlloc for PeakTrackingAlloc {
+    // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (`layout`
+    // has a non-zero size); this implementation adds no requirement.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's, unchanged, so `System.alloc`'s
+        // identical precondition holds.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             record_growth(layout.size());
@@ -53,12 +64,23 @@ unsafe impl GlobalAlloc for PeakTrackingAlloc {
         ptr
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: every block this allocator returns is `System`'s, made for
+        // the layout the caller passed (`alloc` and `realloc` forward it
+        // unchanged), so `ptr` is a live `System` block of `layout`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`, and `new_size` is non-zero and
+    // does not overflow `isize` when rounded up to `layout.align()`.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as in `dealloc`, `ptr` is a live `System` block of `layout`,
+        // and `new_size` is the caller's, unchanged, so `System.realloc`'s
+        // preconditions are the ones the caller already met.
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             if new_size >= layout.size() {
@@ -73,7 +95,11 @@ unsafe impl GlobalAlloc for PeakTrackingAlloc {
 
 /// Add `bytes` to the live total and lift the high-water mark if needed.
 fn record_growth(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    // `saturating_add`, not `+`: this runs inside the global allocator, which
+    // must never unwind, so the sum must not be able to panic.
+    let live = LIVE
+        .fetch_add(bytes, Ordering::Relaxed)
+        .saturating_add(bytes);
     PEAK.fetch_max(live, Ordering::Relaxed);
 }
 

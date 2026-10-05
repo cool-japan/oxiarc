@@ -41,29 +41,55 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 /// to this test binary; the library itself is `#![forbid(unsafe_code)]`.
 struct Counting;
 
+// SAFETY: `GlobalAlloc` requires that a returned block fits the requested
+// layout (or is null on failure) and that no method unwinds. Every method
+// below hands its arguments unchanged to `System`, which meets the first
+// part, and the bookkeeping beside each call is atomic counter updates
+// (which wrap rather than panic), subtractions guarded by the comparison
+// before them and `saturating_add` for the running total, none of which can
+// panic.
 unsafe impl GlobalAlloc for Counting {
+    // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (`layout`
+    // has a non-zero size); this implementation adds no requirement.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's, unchanged, so `System.alloc`'s
+        // identical precondition holds.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            let live = LIVE
+                .fetch_add(layout.size(), Ordering::Relaxed)
+                .saturating_add(layout.size());
             PEAK.fetch_max(live, Ordering::Relaxed);
         }
         ptr
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: every block this allocator returns is `System`'s, made for
+        // the layout the caller passed (`alloc` and `realloc` forward it
+        // unchanged), so `ptr` is a live `System` block of `layout`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`, and `new_size` is non-zero and
+    // does not overflow `isize` when rounded up to `layout.align()`.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as in `dealloc`, `ptr` is a live `System` block of `layout`,
+        // and `new_size` is the caller's, unchanged, so `System.realloc`'s
+        // preconditions are the ones the caller already met.
         let out = unsafe { System.realloc(ptr, layout, new_size) };
         if !out.is_null() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             if new_size >= layout.size() {
-                let live = LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed) + new_size
-                    - layout.size();
+                let grown = new_size - layout.size();
+                let live = LIVE
+                    .fetch_add(grown, Ordering::Relaxed)
+                    .saturating_add(grown);
                 PEAK.fetch_max(live, Ordering::Relaxed);
             } else {
                 LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);

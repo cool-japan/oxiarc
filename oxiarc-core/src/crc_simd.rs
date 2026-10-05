@@ -109,11 +109,14 @@ pub mod x86 {
     /// Check if PCLMULQDQ is available at runtime
     #[inline]
     pub fn is_supported() -> bool {
-        #[cfg(target_feature = "pclmulqdq")]
+        // `crc32_pclmulqdq` is compiled with both PCLMULQDQ and SSE4.1, so the
+        // compile-time shortcut applies only when the build enables both; a
+        // build that enables PCLMULQDQ alone still asks the CPU about SSE4.1.
+        #[cfg(all(target_feature = "pclmulqdq", target_feature = "sse4.1"))]
         {
             true
         }
-        #[cfg(not(target_feature = "pclmulqdq"))]
+        #[cfg(not(all(target_feature = "pclmulqdq", target_feature = "sse4.1")))]
         {
             is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("sse4.1")
         }
@@ -190,6 +193,13 @@ pub mod x86 {
     ///
     /// Computes `result = (a_low × K3) XOR (a_high × K4) XOR b`, the SSE
     /// counterpart of `fold_128_arm`.
+    ///
+    /// # Safety
+    ///
+    /// The executing CPU must support PCLMULQDQ, which `#[target_feature]`
+    /// enables for this body. The only caller, `crc32_pclmulqdq`, is compiled
+    /// with the same feature, and its own `# Safety` contract makes its caller
+    /// check that feature at run time.
     #[inline]
     #[target_feature(enable = "pclmulqdq")]
     unsafe fn fold_128(a: __m128i, b: __m128i, k3k4: __m128i) -> __m128i {
@@ -210,6 +220,13 @@ pub mod x86 {
     /// t2 = t1[31:0] × P_X
     /// crc = extract_epi32(x XOR t2, 1)                 // bits [63:32]
     /// ```
+    ///
+    /// # Safety
+    ///
+    /// The executing CPU must support PCLMULQDQ and SSE4.1, which
+    /// `#[target_feature]` enables for this body. The only caller,
+    /// `crc32_pclmulqdq`, is compiled with both features, and its own
+    /// `# Safety` contract makes its caller check them at run time.
     #[inline]
     #[target_feature(enable = "pclmulqdq", enable = "sse4.1")]
     unsafe fn barrett_reduce(x: __m128i, k3k4: __m128i) -> u32 {
@@ -241,6 +258,9 @@ pub mod x86 {
     #[inline]
     fn crc32_slice8_fallback(mut crc: u32, data: &[u8]) -> u32 {
         let mut ptr = data.as_ptr();
+        // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+        // the one-past-the-end address of the same slice, which `pointer::add`
+        // permits (a slice never spans more than `isize::MAX` bytes).
         let end = unsafe { ptr.add(data.len()) };
 
         // Process 8 bytes at a time
@@ -249,6 +269,11 @@ pub mod x86 {
         // the end of the allocation, even if the pointer is only compared and never
         // dereferenced. Address subtraction avoids constructing an out-of-bounds pointer.
         while (end as usize) - (ptr as usize) >= 8 {
+            // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+            // or 1 bytes a loop condition has just found before `end`, so it stays in
+            // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+            // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+            // needs no alignment, and every `[u8; 8]` is a valid value.
             let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
             let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -261,13 +286,20 @@ pub mod x86 {
                 ^ CRC32_TABLE_SLICE[1][bytes[6] as usize]
                 ^ CRC32_TABLE_SLICE[0][bytes[7] as usize];
 
+            // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+            // at the top of this iteration, so `ptr + 8` is at most `end`, the
+            // one-past-the-end address of `data`.
             ptr = unsafe { ptr.add(8) };
         }
 
         // Process remaining bytes
         while ptr < end {
+            // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+            // `data.as_ptr()`, so it points at a byte of `data`.
             let byte = unsafe { *ptr };
             crc = CRC32_TABLE_SLICE[0][((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+            // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+            // most `end`.
             ptr = unsafe { ptr.add(1) };
         }
 
@@ -364,6 +396,13 @@ pub mod arm {
     ///
     /// This matches the PCLMULQDQ `reduce128(a, b, k3k4)` from crc32fast where
     /// K3 is the low-lane constant and K4 is the high-lane constant.
+    ///
+    /// # Safety
+    ///
+    /// The executing CPU must support NEON and the AES extension (which carries
+    /// `PMULL`), both enabled for this body by `#[target_feature]`. The only
+    /// caller, `crc32_pmull`, is compiled with the same features, and its own
+    /// `# Safety` contract makes its caller check them at run time.
     #[inline]
     #[target_feature(enable = "neon", enable = "aes")]
     unsafe fn fold_128_arm(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
@@ -403,6 +442,13 @@ pub mod arm {
     /// t2 = t1[31:0] × P_X             (low 32 of t1 × poly)
     /// result = extract_i32(x XOR t2, 1)  = bits [63:32]
     /// ```
+    ///
+    /// # Safety
+    ///
+    /// The executing CPU must support NEON and the AES extension (which carries
+    /// `PMULL`), both enabled for this body by `#[target_feature]`. The only
+    /// caller, `crc32_pmull`, is compiled with the same features, and its own
+    /// `# Safety` contract makes its caller check them at run time.
     #[inline]
     #[target_feature(enable = "neon", enable = "aes")]
     unsafe fn barrett_reduce_arm(x: uint8x16_t) -> u32 {
@@ -459,6 +505,9 @@ pub mod arm {
     #[inline]
     fn crc32_slice8_fallback(mut crc: u32, data: &[u8]) -> u32 {
         let mut ptr = data.as_ptr();
+        // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+        // the one-past-the-end address of the same slice, which `pointer::add`
+        // permits (a slice never spans more than `isize::MAX` bytes).
         let end = unsafe { ptr.add(data.len()) };
 
         // Process 8 bytes at a time
@@ -467,6 +516,11 @@ pub mod arm {
         // the end of the allocation, even if the pointer is only compared and never
         // dereferenced. Address subtraction avoids constructing an out-of-bounds pointer.
         while (end as usize) - (ptr as usize) >= 8 {
+            // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+            // or 1 bytes a loop condition has just found before `end`, so it stays in
+            // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+            // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+            // needs no alignment, and every `[u8; 8]` is a valid value.
             let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
             let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -479,13 +533,20 @@ pub mod arm {
                 ^ CRC32_TABLE_SLICE[1][bytes[6] as usize]
                 ^ CRC32_TABLE_SLICE[0][bytes[7] as usize];
 
+            // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+            // at the top of this iteration, so `ptr + 8` is at most `end`, the
+            // one-past-the-end address of `data`.
             ptr = unsafe { ptr.add(8) };
         }
 
         // Process remaining bytes
         while ptr < end {
+            // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+            // `data.as_ptr()`, so it points at a byte of `data`.
             let byte = unsafe { *ptr };
             crc = CRC32_TABLE_SLICE[0][((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+            // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+            // most `end`.
             ptr = unsafe { ptr.add(1) };
         }
 
@@ -639,11 +700,19 @@ impl Default for SimdCrc32Dispatcher {
 #[inline]
 pub fn software_crc32(mut crc: u32, data: &[u8]) -> u32 {
     let mut ptr = data.as_ptr();
+    // SAFETY: `ptr` is `data.as_ptr()`, and offsetting it by `data.len()` gives
+    // the one-past-the-end address of the same slice, which `pointer::add`
+    // permits (a slice never spans more than `isize::MAX` bytes).
     let end = unsafe { ptr.add(data.len()) };
 
     // Process 8 bytes at a time
     // SAFETY-FIX: see crc32_slice8_fallback above — avoid speculative ptr.add(8).
     while (end as usize) - (ptr as usize) >= 8 {
+        // SAFETY: `ptr` starts at `data.as_ptr()` and only ever advances by the 8
+        // or 1 bytes a loop condition has just found before `end`, so it stays in
+        // `data.as_ptr()..=end`; this loop's condition leaves at least 8 bytes from
+        // `ptr` to `end`, so all 8 bytes read lie inside `data`. `read_unaligned`
+        // needs no alignment, and every `[u8; 8]` is a valid value.
         let bytes = unsafe { (ptr as *const [u8; 8]).read_unaligned() };
         let crc_xor = crc ^ u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -656,13 +725,20 @@ pub fn software_crc32(mut crc: u32, data: &[u8]) -> u32 {
             ^ CRC32_TABLE_SLICE[1][bytes[6] as usize]
             ^ CRC32_TABLE_SLICE[0][bytes[7] as usize];
 
+        // SAFETY: the loop condition found at least 8 bytes between `ptr` and `end`
+        // at the top of this iteration, so `ptr + 8` is at most `end`, the
+        // one-past-the-end address of `data`.
         ptr = unsafe { ptr.add(8) };
     }
 
     // Process remaining bytes
     while ptr < end {
+        // SAFETY: `ptr < end` (the loop condition) and `ptr` never moves below
+        // `data.as_ptr()`, so it points at a byte of `data`.
         let byte = unsafe { *ptr };
         crc = CRC32_TABLE_SLICE[0][((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+        // SAFETY: `ptr < end` held at the top of this iteration, so `ptr + 1` is at
+        // most `end`.
         ptr = unsafe { ptr.add(1) };
     }
 

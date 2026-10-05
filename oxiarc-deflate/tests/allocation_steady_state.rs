@@ -29,8 +29,17 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 /// to this test binary; the crate itself contains no `unsafe`.
 struct Counting;
 
+// SAFETY: `GlobalAlloc` requires that a returned block fits the requested
+// layout (or is null on failure) and that no method unwinds. Every method
+// below hands its arguments unchanged to `System`, which meets the first
+// part, and the only bookkeeping is an atomic `fetch_add` (which wraps
+// rather than panics), so nothing here can unwind.
 unsafe impl GlobalAlloc for Counting {
+    // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (`layout`
+    // has a non-zero size); this implementation adds no requirement.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's, unchanged, so `System.alloc`'s
+        // identical precondition holds.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -38,11 +47,22 @@ unsafe impl GlobalAlloc for Counting {
         ptr
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: every block this allocator returns is `System`'s, made for
+        // the layout the caller passed (`alloc` and `realloc` forward it
+        // unchanged), so `ptr` is a live `System` block of `layout`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`, and `new_size` is non-zero and
+    // does not overflow `isize` when rounded up to `layout.align()`.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as in `dealloc`, `ptr` is a live `System` block of `layout`,
+        // and `new_size` is the caller's, unchanged, so `System.realloc`'s
+        // preconditions are the ones the caller already met.
         let out = unsafe { System.realloc(ptr, layout, new_size) };
         if !out.is_null() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);

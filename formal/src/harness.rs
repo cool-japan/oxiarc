@@ -4,8 +4,8 @@
 //! the real crates' public interface (`oxiarc_core::BitCache`,
 //! `oxiarc_lz4::xxhash`, `oxiarc_deflate::HuffmanTree`), and `cargo-formal`
 //! lowers the reachable bodies of those three crates into the verification
-//! condition (28 dependency bodies lowered, 27 of them reachable, plus 2
-//! monomorphic instances, in the run recorded in `README.md`). Private
+//! condition (39 dependency bodies lowered, 27 of them reachable, plus 2
+//! monomorphic instances, in the 2026-10-05 run recorded in `README.md`). Private
 //! helpers (`bulk_load`, `read_u32_le`, `round32`) are verified as inlined
 //! callees of the public entry points that reach them, which is the honest
 //! scope: a caller can only ever reach them that way.
@@ -90,9 +90,10 @@ fn refill_bytes_never_overfills_harness() {
 /// `oxiarc-core/src/bitstream.rs:209`; a bare `debug_assert!` with no format
 /// arguments lowers to `core::panicking::panic`, which the driver classifies
 /// as `PanicKind::Panic`, so the property is `panic` and not `assert`).
-/// **Measured L1 verdict: refuted**, counterexample `want = 128` on a
-/// seven-byte source. Every other obligation of this harness is proved (10 of
-/// them).
+/// **Measured L1 verdict: refuted**, counterexample `want = 57` on an empty
+/// source in the 2026-10-05 run (`want = 128` on a seven-byte source in the
+/// 2026-09-08 run; both violate `want <= 56`, and `plain_tests` runs both).
+/// Every other obligation of this harness is proved (10 of them).
 ///
 /// This is the reachable public counterpart of the private `bulk_load`
 /// precondition: `bulk_load`'s `debug_assert!(*bits <= 55)` cannot be violated
@@ -416,6 +417,41 @@ fn entry_round_trip_harness() {
     assert(HuffmanTree::entry_symbol(entry) == symbol);
 }
 
+/// Property: `assert`, two source sites. **Measured L1 verdict: proved.**
+///
+/// The two accessors are *total* over every `u32` and read exactly the
+/// documented bit fields (`huffman.rs:105`): `entry_length` is the low eight
+/// bits and `entry_symbol` is bits 8..24. This is the decode-table invariant a
+/// reader relies on for an entry it did not build itself (a sub-table pointer,
+/// or a slot of another tree), where `entry_round_trip_harness`'s
+/// `length <= 15`, freshly-packed assumption does not hold.
+///
+/// Runtime-checks build: green, unmarked (measured).
+#[harness]
+fn entry_accessors_match_the_bit_layout_harness() {
+    let entry: u32 = any();
+    assert(u32::from(HuffmanTree::entry_length(entry)) == entry & 0xFF);
+    assert(u32::from(HuffmanTree::entry_symbol(entry)) == (entry >> 8) & 0xFFFF);
+}
+
+/// Property: `assert`, two source sites. **Measured L1 verdict: proved.**
+///
+/// Neither accessor looks at bits 24..32 — the byte that carries
+/// `ENTRY_SUBTABLE` (bit 31) and is otherwise padding — so changing that byte
+/// never changes either result. A decoder may therefore read `entry_length` /
+/// `entry_symbol` off a raw table slot without first masking the sub-table
+/// flag away.
+///
+/// Runtime-checks build: green, unmarked (measured).
+#[harness]
+fn entry_accessors_ignore_the_high_byte_harness() {
+    let entry: u32 = any();
+    let high: u8 = any();
+    let masked = (entry & 0x00FF_FFFF) | (u32::from(high) << 24);
+    assert(HuffmanTree::entry_length(masked) == HuffmanTree::entry_length(entry));
+    assert(HuffmanTree::entry_symbol(masked) == HuffmanTree::entry_symbol(entry));
+}
+
 /// Property: absence of a trap (the harness asserts nothing). **Measured L1
 /// verdict: unsupported**, reason `aliasing`, at
 /// `oxiarc-deflate/src/huffman.rs:363:28` -- the callee is
@@ -478,7 +514,7 @@ mod plain_tests {
         assert_eq!(cache.available(), 16);
     }
 
-    /// The counterexample the L1 run reported for
+    /// The counterexample the 2026-09-08 L1 run reported for
     /// `refill_bytes_want_bound_is_asserted_harness`, run concretely:
     /// `want = 128` on a seven-byte source.
     #[test]
@@ -486,6 +522,16 @@ mod plain_tests {
     fn refill_bytes_rejects_the_reported_want_counterexample() {
         let mut cache = BitCache::default();
         let _ = cache.refill_bytes(&[0u8; 7], 128);
+    }
+
+    /// The counterexample the 2026-10-05 L1 run reports for the same harness,
+    /// run concretely: `want = 57` on an empty source. Both values violate
+    /// `want <= 56`, and both panic here.
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn refill_bytes_rejects_the_current_want_counterexample() {
+        let mut cache = BitCache::default();
+        let _ = cache.refill_bytes(&[], 57);
     }
 
     /// The same refutation at the boundary: one bit past the documented
@@ -636,6 +682,41 @@ mod plain_tests {
                 let entry = (u32::from(symbol) << 8) | u32::from(length);
                 assert_eq!(HuffmanTree::entry_length(entry), length);
                 assert_eq!(HuffmanTree::entry_symbol(entry), symbol);
+            }
+        }
+    }
+
+    #[test]
+    fn entry_accessors_match_the_bit_layout_on_a_sample() {
+        for entry in [
+            0u32,
+            0x0000_000F,
+            0x00FF_FF0F,
+            0x1234_5678,
+            0x8000_0000,
+            0xFFFF_FFFF,
+        ] {
+            assert_eq!(u32::from(HuffmanTree::entry_length(entry)), entry & 0xFF);
+            assert_eq!(
+                u32::from(HuffmanTree::entry_symbol(entry)),
+                (entry >> 8) & 0xFFFF
+            );
+        }
+    }
+
+    #[test]
+    fn entry_accessors_ignore_the_high_byte_on_a_sample() {
+        for entry in [0u32, 0x0012_3400, 0x00AB_CDEF, 0x00FF_FFFF] {
+            for high in [0u8, 1, 0x80, 0xFF] {
+                let masked = (entry & 0x00FF_FFFF) | (u32::from(high) << 24);
+                assert_eq!(
+                    HuffmanTree::entry_length(masked),
+                    HuffmanTree::entry_length(entry)
+                );
+                assert_eq!(
+                    HuffmanTree::entry_symbol(masked),
+                    HuffmanTree::entry_symbol(entry)
+                );
             }
         }
     }

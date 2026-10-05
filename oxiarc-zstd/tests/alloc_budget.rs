@@ -35,31 +35,50 @@ struct Counting;
 // SAFETY: every method forwards unchanged to the system allocator; the counters
 // are plain atomics and do not affect the returned pointers.
 unsafe impl GlobalAlloc for Counting {
+    // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (`layout`
+    // has a non-zero size); this implementation adds no requirement.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
+        // SAFETY: `layout` is the caller's, unchanged, so `System.alloc`'s
+        // identical precondition holds.
         unsafe { System.alloc(layout) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: every block this allocator returns is `System`'s, made for
+        // the layout the caller passed (`alloc`, `alloc_zeroed` and `realloc`
+        // forward it unchanged), so `ptr` is a live `System` block of `layout`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract: `ptr` was
+    // returned by this allocator for `layout`, and `new_size` is non-zero and
+    // does not overflow `isize` when rounded up to `layout.align()`.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
         }
+        // SAFETY: as in `dealloc`, `ptr` is a live `System` block of `layout`,
+        // and `new_size` is the caller's, unchanged, so `System.realloc`'s
+        // preconditions are the ones the caller already met.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
+    // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract
+    // (`layout` has a non-zero size); this implementation adds no requirement.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
+        // SAFETY: `layout` is the caller's, unchanged, so
+        // `System.alloc_zeroed`'s identical precondition holds.
         unsafe { System.alloc_zeroed(layout) }
     }
 }

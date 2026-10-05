@@ -100,6 +100,14 @@ mod imp {
     /// algorithm provider handle has to be opened first.
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
 
+    // SAFETY: the one declaration below matches `BCryptGenRandom` as `bcrypt.h`
+    // declares it, `NTSTATUS WINAPI BCryptGenRandom(BCRYPT_ALG_HANDLE
+    // hAlgorithm, PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags)`:
+    // `BCRYPT_ALG_HANDLE` is a `PVOID` (`*mut c_void`), `PUCHAR` is `*mut u8`,
+    // `ULONG` is 32-bit unsigned on every Windows target (`u32`), `NTSTATUS` is
+    // a 32-bit signed `LONG` (`i32`), and `WINAPI` is the `"system"` ABI. The
+    // function is exported by `bcrypt.dll`, which the `link` attribute names.
+    // It is not declared `safe`, so each call keeps its own `unsafe` block.
     #[link(name = "bcrypt")]
     unsafe extern "system" {
         #[link_name = "BCryptGenRandom"]
