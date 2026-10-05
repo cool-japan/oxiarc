@@ -163,6 +163,35 @@ assertion over `oxiarc-core`'s `BitCache` that a default run reported `proved`
 and `--evidence lrat` refuted), which is why a reproduction alone is not a
 proof.
 
+Re-measured 2026-10-06 with a release CLI and driver built from the
+cargo-formal tree at `e3a3053` plus that day's cross-check change (OxiZ 0.3.3,
+rustc nightly-2026-06-20, `--jobs 2`, a fresh `--target-dir`, `--no-cache`).
+A default `cargo formal check` now cross-checks every proved obligation at bit
+level — the obligation is bit-blasted, solved by `oxiz-sat`, and its proof
+checked by `oxiz-proof` — before the verdict is published: of the 513 proved
+obligations, **367 are confirmed** by that check and **146 folded** (the
+bit-level encoder reduced an assertion to the constant `false`, so the
+encoder itself agrees), **0 are contradicted** and **0 are not confirmed**.
+Every verdict, message and piece of evidence is identical to what the binaries
+built at `e3a3053` report for the same sources, and the evidence grade stated
+above is unchanged: a confirmed `unsat` is still
+reproduction only (claim unmet), because a default run attaches no
+certificate. `cargo formal check --evidence lrat` now also cross-checks every
+vacuity `unsat` at bit level before it relies on it: of the 353 obligations
+whose vacuity question the pinned solver answers `unsat`, 296 are confirmed
+and 32 folded, and **25 are satisfied at bit level by a model of the
+hypotheses that the evaluator accepts** — each is reported as a **soundness
+incident**, so the run **exits 5** (the two intended refutations alone would
+exit 1). Those 25 obligations are therefore not vacuous and are no longer
+labelled `proved vacuously` (328 are), and **89 of the 513** proved obligations
+carry an LRAT certificate checked by `oxiz-proof`: 13 of the 15 more than the
+earlier run follow those incidents, and 2 follow from every query now being
+solved on a solver context of its own (the earlier binaries attach those two
+as well when their harness runs alone). The incidents are the pinned OxiZ
+0.3.3's wrong-`unsat` class (upstream U-Z19), fixed in OxiZ 0.3.4, which
+answers all of them `sat`; this package will report them under
+`--evidence lrat` until cargo-formal's solver pin moves. No verdict moved.
+
 ### Layer counters
 
 Including the incidental MIR-inserted checks the table above does not
