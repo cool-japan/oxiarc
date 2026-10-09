@@ -1,5 +1,9 @@
 //! TAR archive writer.
 
+mod stream;
+
+pub use stream::TarStreamWriter;
+
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
 use std::io::Write;
@@ -116,7 +120,80 @@ impl<W: Write> TarWriter<W> {
     }
 
     /// Add a file with specific mode.
+    ///
+    /// Implemented on top of [`add_stream_with_mode`](Self::add_stream_with_mode),
+    /// so a buffered entry and a streamed one of the same name, size and mode
+    /// produce byte-identical archives.
     pub fn add_file_with_mode(&mut self, name: &str, data: &[u8], mode: u32) -> Result<()> {
+        let mut entry = self.add_stream_with_mode(name, data.len() as u64, mode)?;
+        entry.write_all(data)?;
+        entry.finish()
+    }
+
+    /// Begin a streamed entry of `size` bytes, using mode `0o644` and the
+    /// current time.
+    ///
+    /// Returns a [`TarStreamWriter`] the caller writes the entry's bytes into;
+    /// they go to the archive's underlying writer as they are produced, so an
+    /// entry of any size is archived with a bounded buffer. A `File` can be
+    /// piped in whole with `std::io::copy`.
+    ///
+    /// TAR has no data descriptor: the header records the size and is written
+    /// before the data, so the size is an input here and the caller must write
+    /// exactly that many bytes. See [`TarStreamWriter`] for the full contract.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxiarc_archive::TarWriter;
+    /// use std::io::Write;
+    ///
+    /// let mut buf = Vec::new();
+    /// {
+    ///     let mut writer = TarWriter::new(&mut buf);
+    ///     {
+    ///         let mut entry = writer.add_stream("a.txt", 5)?;
+    ///         entry.write_all(b"hello")?;
+    ///         entry.finish()?;
+    ///     }
+    ///     writer.finish()?;
+    /// }
+    /// # Ok::<(), oxiarc_core::error::OxiArcError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::Io`] if the entry's header cannot be written.
+    pub fn add_stream(&mut self, name: &str, size: u64) -> Result<TarStreamWriter<'_, W>> {
+        self.add_stream_with_metadata(name, size, 0o644, std::time::SystemTime::now())
+    }
+
+    /// Begin a streamed entry of `size` bytes with a specific mode and the
+    /// current time.
+    ///
+    /// See [`add_stream`](Self::add_stream).
+    pub fn add_stream_with_mode(
+        &mut self,
+        name: &str,
+        size: u64,
+        mode: u32,
+    ) -> Result<TarStreamWriter<'_, W>> {
+        self.add_stream_with_metadata(name, size, mode, std::time::SystemTime::now())
+    }
+
+    /// Begin a streamed entry of `size` bytes with an explicit mode and
+    /// modification time.
+    ///
+    /// See [`add_stream`](Self::add_stream) and
+    /// [`add_file_with_metadata`](Self::add_file_with_metadata); this is the
+    /// streaming counterpart of the latter.
+    pub fn add_stream_with_metadata(
+        &mut self,
+        name: &str,
+        size: u64,
+        mode: u32,
+        mtime: std::time::SystemTime,
+    ) -> Result<TarStreamWriter<'_, W>> {
         // Emit progress: entry start
         let idx = self.entry_index;
         if let Some(ref handle) = self.progress {
@@ -124,28 +201,12 @@ impl<W: Write> TarWriter<W> {
         }
         self.entry_index += 1;
 
-        // Check if we need PAX extended header for long filename
-        let needs_pax = name.len() > TAR_NAME_MAX;
-
-        if needs_pax {
-            self.write_pax_header(name, None)?;
-            // Use a char-boundary-safe truncated fallback name for the
-            // regular header; PAX-aware readers restore the full name.
-            let short_name = Self::tar_fallback_name(name);
-            let header = TarHeader::new_file(&short_name, data.len() as u64, mode);
-            self.write_header(&header)?;
-        } else {
-            let header = TarHeader::new_file(name, data.len() as u64, mode);
-            self.write_header(&header)?;
-        }
-        self.write_data(data)?;
-
-        // Emit progress: bytes written
-        if let Some(ref handle) = self.progress {
-            handle.on_progress(data.len() as u64, None);
-        }
-
-        Ok(())
+        // `open_stream_entry` emits the PAX extended header the name (and,
+        // for a size past 8 GiB, the size itself) needs, then the UStar
+        // header. Progress-wise only `on_entry` applies so far: a streaming
+        // writer learns the entry's size only once it has been written.
+        let (entry, _header_name) = stream::open_stream_entry(self, name, size, mode, mtime)?;
+        Ok(entry)
     }
 
     /// Add a file with an explicit unix mode and modification time.
@@ -177,36 +238,9 @@ impl<W: Write> TarWriter<W> {
         mode: u32,
         mtime: std::time::SystemTime,
     ) -> Result<()> {
-        let mtime_secs = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let idx = self.entry_index;
-        if let Some(ref handle) = self.progress {
-            handle.on_entry(name, idx);
-        }
-        self.entry_index += 1;
-
-        let needs_pax = name.len() > TAR_NAME_MAX;
-
-        if needs_pax {
-            self.write_pax_header(name, None)?;
-            let short_name = Self::tar_fallback_name(name);
-            let header =
-                TarHeader::new_file_with_mtime(&short_name, data.len() as u64, mode, mtime_secs);
-            self.write_header(&header)?;
-        } else {
-            let header = TarHeader::new_file_with_mtime(name, data.len() as u64, mode, mtime_secs);
-            self.write_header(&header)?;
-        }
-        self.write_data(data)?;
-
-        if let Some(ref handle) = self.progress {
-            handle.on_progress(data.len() as u64, None);
-        }
-
-        Ok(())
+        let mut entry = self.add_stream_with_metadata(name, data.len() as u64, mode, mtime)?;
+        entry.write_all(data)?;
+        entry.finish()
     }
 
     /// Add a directory with an explicit unix mode and modification time.
@@ -244,7 +278,6 @@ impl<W: Write> TarWriter<W> {
 
     /// Write a PAX extended header for long filenames/linknames.
     fn write_pax_header(&mut self, path: &str, linkpath: Option<&str>) -> Result<()> {
-        // Build PAX data
         let mut pax_data = Vec::new();
 
         if !path.is_empty() {
@@ -256,13 +289,40 @@ impl<W: Write> TarWriter<W> {
             pax_data.extend_from_slice(record.as_bytes());
         }
 
+        self.write_pax_data(&pax_data)
+    }
+
+    /// Write a PAX extended header carrying `path` and, optionally, a `size`
+    /// record.
+    ///
+    /// The `size` record exists for entries whose real size does not fit the
+    /// 12-byte octal field of a UStar header (it holds at most 8 GiB - 1);
+    /// PAX-aware readers, including this crate's, restore the record over the
+    /// truncated field.
+    fn write_pax_header_with_size(&mut self, path: &str, size: Option<u64>) -> Result<()> {
+        let mut pax_data = Vec::new();
+
+        if !path.is_empty() {
+            let record = Self::format_pax_record("path", path);
+            pax_data.extend_from_slice(record.as_bytes());
+        }
+        if let Some(size) = size {
+            let record = Self::format_pax_record("size", &size.to_string());
+            pax_data.extend_from_slice(record.as_bytes());
+        }
+
+        self.write_pax_data(&pax_data)
+    }
+
+    /// Emit a PAX extended-header block carrying already-formatted records.
+    fn write_pax_data(&mut self, pax_data: &[u8]) -> Result<()> {
         // Create PAX header
         let mut pax_header = TarHeader::new_file("PaxHeader", pax_data.len() as u64, 0o644);
         pax_header.typeflag = PAX_HEADER;
 
         // Write PAX header block
         self.write_header(&pax_header)?;
-        self.write_data(&pax_data)?;
+        self.write_data(pax_data)?;
 
         Ok(())
     }

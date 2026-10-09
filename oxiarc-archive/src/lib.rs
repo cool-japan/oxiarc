@@ -85,7 +85,7 @@ pub use repair::{
 };
 pub use sevenz::{SevenZEntry, SevenZReader};
 pub use snappy::{SnappyReader, SnappyWriter};
-pub use tar::{TarHeader, TarReader, TarStreamEntry, TarStreamReader, TarWriter};
+pub use tar::{TarHeader, TarReader, TarStreamEntry, TarStreamReader, TarStreamWriter, TarWriter};
 pub use xz::{XzReader, XzStreamWriter, XzWriter};
 pub use zip::{
     LocalFileHeader, ZipCompressionLevel, ZipReader, ZipStreamEntry, ZipStreamEntryMeta,
