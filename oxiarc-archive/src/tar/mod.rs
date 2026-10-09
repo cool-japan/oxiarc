@@ -40,7 +40,7 @@ pub mod writer;
 // Re-exports for public API compatibility
 pub use header::TarHeader;
 pub use reader::TarReader;
-pub use writer::TarWriter;
+pub use writer::{TarStreamWriter, TarWriter};
 
 // Re-export EntryType so test modules using `super::*` can access it.
 #[cfg(test)]

@@ -45,8 +45,9 @@ pub use encryption::{
     WINZIP_AUTH_CODE_LEN, ZipAesDecryptor, ZipAesEncryptor,
 };
 pub use header::{
-    CompressionMethod, LocalFileHeader, ZipCompressionLevel, ZipReader, ZipWriter,
-    get_entry_aes_encryption_info, is_entry_encrypted, is_entry_traditional_encrypted,
+    CompressionMethod, LocalFileHeader, ZipCompressionLevel, ZipReader, ZipStreamOptions,
+    ZipStreamWriter, ZipWriter, get_entry_aes_encryption_info, is_entry_encrypted,
+    is_entry_traditional_encrypted,
 };
 
 use oxiarc_core::error::Result;

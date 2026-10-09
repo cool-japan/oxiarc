@@ -9,7 +9,7 @@ pub use types::{
     CompressionMethod, LocalFileHeader, ZipCompressionLevel, get_entry_aes_encryption_info,
     is_entry_encrypted, is_entry_traditional_encrypted,
 };
-pub use writer::ZipWriter;
+pub use writer::{ZipStreamOptions, ZipStreamWriter, ZipWriter};
 
 #[cfg(test)]
 mod tests {
