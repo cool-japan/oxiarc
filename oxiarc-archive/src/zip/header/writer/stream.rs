@@ -160,6 +160,9 @@ pub struct ZipStreamWriter<'w, W: Write> {
     /// Version-needed written in the local header (and, unless ZIP64 forces a
     /// bump, in the central directory one).
     version_needed: u16,
+    /// General-purpose bit flags, identical in both headers: the
+    /// data-descriptor bit plus, for a non-ASCII name, EFS.
+    flags: u16,
     /// Whether the trailing data descriptor uses 64-bit sizes.
     zip64: bool,
     /// Deflate encoder, or `None` for a Stored entry.
@@ -209,13 +212,14 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
     ) -> Result<Self> {
         let zip64 = options.zip64;
         let version_needed = version_needed_for(method, zip64);
+        let flags = FLAG_DATA_DESCRIPTOR | utf8_name_flag(name);
         let local_header_offset = archive.offset;
         write_local_header(
             archive.writer_mut()?,
             &LocalHeaderFields {
                 name,
                 version_needed,
-                flags: FLAG_DATA_DESCRIPTOR | utf8_name_flag(name),
+                flags,
                 method,
                 mtime,
                 mdate,
@@ -242,6 +246,7 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
             name: name.to_string(),
             method,
             version_needed,
+            flags,
             zip64,
             deflater,
             scratch: Vec::new(),
@@ -349,7 +354,7 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
         self.archive.entries.push(CentralDirEntry {
             version_made_by: 0x031E, // Unix, version 3.0
             version_needed: self.version_needed,
-            flags: super::FLAG_DATA_DESCRIPTOR | super::utf8_name_flag(&self.name),
+            flags: self.flags,
             method: self.method,
             mtime: self.mtime,
             mdate: self.mdate,

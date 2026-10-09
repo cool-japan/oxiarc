@@ -240,14 +240,13 @@ fn to_io_error(err: OxiArcError) -> std::io::Error {
 /// for a size beyond the octal field, a PAX `size` record), then the regular
 /// UStar header carrying the declared size.
 ///
-/// Returns the writer plus the name the UStar header actually used.
 pub(super) fn open_stream_entry<'w, W: Write>(
     archive: &'w mut TarWriter<W>,
     name: &str,
     size: u64,
     mode: u32,
     mtime: SystemTime,
-) -> Result<(TarStreamWriter<'w, W>, String)> {
+) -> Result<TarStreamWriter<'w, W>> {
     let mtime_secs = mtime
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -272,8 +271,7 @@ pub(super) fn open_stream_entry<'w, W: Write>(
     let header = TarHeader::new_file_with_mtime(&header_name, size, mode, mtime_secs);
     archive.write_header(&header)?;
 
-    // Progress: the entry has been announced by `open_stream_entry`'s caller.
-    Ok((TarStreamWriter::new(archive, name, size), header_name))
+    Ok(TarStreamWriter::new(archive, name, size))
 }
 
 #[cfg(test)]

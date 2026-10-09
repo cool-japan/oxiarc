@@ -205,8 +205,7 @@ impl<W: Write> TarWriter<W> {
         // for a size past 8 GiB, the size itself) needs, then the UStar
         // header. Progress-wise only `on_entry` applies so far: a streaming
         // writer learns the entry's size only once it has been written.
-        let (entry, _header_name) = stream::open_stream_entry(self, name, size, mode, mtime)?;
-        Ok(entry)
+        stream::open_stream_entry(self, name, size, mode, mtime)
     }
 
     /// Add a file with an explicit unix mode and modification time.
