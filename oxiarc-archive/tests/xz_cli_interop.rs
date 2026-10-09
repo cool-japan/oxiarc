@@ -15,6 +15,7 @@
 
 use oxiarc_archive::xz;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,6 +127,44 @@ fn real_xz_multiblock_stream_decodes_byte_exact() {
     let decoded = xz::decompress(&mut std::io::Cursor::new(&compressed))
         .expect("decode real multi-block xz output");
     assert_eq!(decoded, original, "multi-block decode mismatch");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The streaming writer must produce `.xz` output the reference
+/// implementation accepts just as it does the one-shot `compress()`, and it
+/// must round-trip byte-exactly when fed the payload in ragged chunks (so the
+/// block boundaries -- and therefore the bytes -- are not an artefact of the
+/// caller's write sizes).
+#[test]
+fn oxiarc_streamed_xz_accepted_and_round_tripped_by_xz_cli() {
+    if !xz_available() {
+        return;
+    }
+    let dir = unique_temp_dir("oxi_stream_to_xz");
+    let original = mixed_payload(96 * 1024);
+
+    let mut compressed = Vec::new();
+    {
+        let mut writer = xz::XzStreamWriter::new(&mut compressed, oxiarc_lzma::LzmaLevel::FAST)
+            .expect("xz stream writer")
+            .with_block_size(16 * 1024);
+        for chunk in original.chunks(1000) {
+            writer.write_all(chunk).expect("stream write");
+        }
+        writer.finish().expect("finish stream");
+    }
+    fs::write(dir.join("streamed.xz"), &compressed).expect("write streamed.xz");
+
+    let out = run_in(&dir, "xz", &["-t", "streamed.xz"]);
+    assert!(
+        out.status.success(),
+        "xz -t rejected oxiarc's streamed output: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_in(&dir, "xz", &["-dc", "streamed.xz"]);
+    assert!(out.status.success(), "xz -dc failed: {out:?}");
+    assert_eq!(out.stdout, original, "xz -dc content mismatch");
     let _ = fs::remove_dir_all(&dir);
 }
 
