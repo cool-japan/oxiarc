@@ -582,20 +582,49 @@ impl<W: Write> XzStreamWriter<W> {
         self.writer.as_mut().ok_or_else(Self::writer_taken_error)
     }
 
-    /// Compress and emit one complete block, recording its index entry.
-    fn emit_block(&mut self, block: &[u8]) -> Result<()> {
-        if let Some(ref token) = self.cancel {
+    /// Compress and emit the buffered bytes as one block, then empty the
+    /// buffer without giving up its allocation.
+    ///
+    /// The obvious spelling — `mem::take` the buffer, emit the block it
+    /// holds, let the fresh `Vec` grow again — throws away a block-sized
+    /// allocation at every block boundary, so a stream of *n* blocks paid for
+    /// *n* re-growths of the buffer it was already holding (64 MiB by
+    /// default), each one a fresh allocation plus the amortised copies as it
+    /// climbs back. Emitting in place and `clear`ing afterwards keeps the
+    /// capacity, so only the first block ever grows it.
+    fn emit_buffered_block(&mut self) -> Result<()> {
+        // Disjoint field borrows: the block's bytes are read from `buffer`
+        // while the writer, the index records and the progress sink are all
+        // mutated. `write_block_to` borrows the sink while `buffer` is still
+        // borrowed immutably, so the two cannot both come from `self`
+        // directly.
+        let Self {
+            buffer,
+            writer,
+            level,
+            check_type,
+            records,
+            bytes_processed,
+            progress,
+            cancel,
+            ..
+        } = self;
+
+        if let Some(token) = cancel {
             token.check()?;
         }
 
-        let level = self.level;
-        let check_type = self.check_type;
-        let unpadded = write_block_to(self.writer_mut()?, level, check_type, block)?;
-        self.records.push((unpadded, block.len()));
-        self.bytes_processed += block.len() as u64;
-        if let Some(ref handle) = self.progress {
-            handle.on_progress(self.bytes_processed, None);
+        let writer = writer
+            .as_mut()
+            .ok_or_else(XzStreamWriter::<W>::writer_taken_error)?;
+        let unpadded = write_block_to(writer, *level, *check_type, buffer)?;
+        records.push((unpadded, buffer.len()));
+        *bytes_processed += buffer.len() as u64;
+        if let Some(handle) = progress {
+            handle.on_progress(*bytes_processed, None);
         }
+
+        buffer.clear();
         Ok(())
     }
 
@@ -618,9 +647,8 @@ impl<W: Write> XzStreamWriter<W> {
             return Ok(());
         }
 
-        let tail = std::mem::take(&mut self.buffer);
-        if self.records.is_empty() || !tail.is_empty() {
-            self.emit_block(&tail)?;
+        if !self.buffer.is_empty() || self.records.is_empty() {
+            self.emit_buffered_block()?;
         }
 
         let index = build_index(&self.records);
@@ -677,8 +705,7 @@ impl<W: Write> Write for XzStreamWriter<W> {
             self.buffer.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             if self.buffer.len() >= self.block_size {
-                let block = std::mem::take(&mut self.buffer);
-                self.emit_block(&block).map_err(to_io_error)?;
+                self.emit_buffered_block().map_err(to_io_error)?;
             }
         }
 
@@ -694,8 +721,7 @@ impl<W: Write> Write for XzStreamWriter<W> {
             return Err(std::io::Error::other("flush on a finished XzStreamWriter"));
         }
         if !self.buffer.is_empty() {
-            let block = std::mem::take(&mut self.buffer);
-            self.emit_block(&block).map_err(to_io_error)?;
+            self.emit_buffered_block().map_err(to_io_error)?;
         }
         self.writer_mut().map_err(to_io_error)?.flush()
     }
@@ -918,6 +944,53 @@ mod tests {
                 data.len()
             );
         }
+    }
+
+    /// The block buffer must survive a block boundary.
+    ///
+    /// Emitting a block used to hand the buffer on with `mem::take`, leaving a
+    /// fresh empty `Vec` to climb from zero back to a whole block — so a
+    /// stream of *n* blocks re-grew the buffer *n* times, and at the default
+    /// 64 MiB block size a multi-gigabyte `.xz` paid a 64 MiB re-allocation
+    /// every 64 MiB written. Emitting in place and `clear`ing keeps the
+    /// allocation, so the capacity has to survive the boundary intact.
+    #[test]
+    fn test_xz_stream_writer_keeps_its_block_buffer_across_blocks() {
+        const BLOCK: usize = 64 * 1024;
+        let data: Vec<u8> = (0..BLOCK * 5).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = XzStreamWriter::new(Vec::new(), LzmaLevel::FAST).expect("stream writer");
+        writer = writer.with_block_size(BLOCK as u64);
+
+        let mut capacities = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let end = (pos + 1000).min(data.len());
+            writer.write_all(&data[pos..end]).expect("stream write");
+            pos = end;
+            if writer.blocks_written() > 0 {
+                capacities.push(writer.buffer.capacity());
+            }
+        }
+        writer.finish().expect("finish");
+
+        // Five blocks, so at least four boundaries were crossed after the
+        // first emission; every one of them must have kept the buffer whole.
+        assert_eq!(
+            writer.blocks_written(),
+            5,
+            "expected exactly five blocks from {} bytes at a {BLOCK}-byte block size",
+            data.len(),
+        );
+        assert!(
+            capacities.len() >= 4,
+            "expected to observe at least four block boundaries, saw {}",
+            capacities.len()
+        );
+        assert!(
+            capacities.iter().all(|&capacity| capacity >= BLOCK),
+            "the block buffer lost its allocation at a block boundary: {capacities:?}",
+        );
     }
 
     /// Empty input still emits exactly one empty block, so the stream has a

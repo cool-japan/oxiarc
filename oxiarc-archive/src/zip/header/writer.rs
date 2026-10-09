@@ -39,6 +39,22 @@ fn utf8_name_flag(name: &str) -> u16 {
     if name.is_ascii() { 0 } else { FLAG_UTF8 }
 }
 
+/// The deflate level a compression option compresses at, or `None` for
+/// [`ZipCompressionLevel::Store`] (method 0, no encoder).
+///
+/// The single place the four variants map to levels, shared by
+/// [`ZipWriter::add_stream_with_options`] (which needs the encoder) and
+/// [`ZipStreamWriter`] (which needs the level again, to hand the encoder back
+/// to the same cache slot).
+fn deflate_level(compression: ZipCompressionLevel) -> Option<u8> {
+    match compression {
+        ZipCompressionLevel::Store => None,
+        ZipCompressionLevel::Fast => Some(1),
+        ZipCompressionLevel::Normal => Some(6),
+        ZipCompressionLevel::Best => Some(9),
+    }
+}
+
 /// LZMA method-14 version bytes written into the method-14 header.
 const LZMA_METHOD14_MAJOR_VER: u8 = 0x13;
 const LZMA_METHOD14_MINOR_VER: u8 = 0x00;
@@ -112,30 +128,38 @@ struct LocalHeaderFields<'a> {
 ///
 /// The caller accounts for [`LOCAL_FILE_HEADER_FIXED_LEN`] + name + extra
 /// bytes in its own running offset.
+///
+/// The fixed part is assembled in a stack buffer and written in one call
+/// rather than field by field: a sink that charges per call — a file, a
+/// socket, a JNI channel — used to see eleven writes of two to four bytes for
+/// every entry, which for a many-entry archive cost far more in per-call
+/// overhead than the header itself.
 fn write_local_header<W: Write>(writer: &mut W, header: &LocalHeaderFields<'_>) -> Result<()> {
     let filename_bytes = header.name.as_bytes();
     // Signature
-    writer.write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
+    let mut fixed = [0u8; LOCAL_FILE_HEADER_FIXED_LEN as usize];
+    fixed[0..4].copy_from_slice(&LOCAL_FILE_HEADER_SIG.to_le_bytes());
     // Version needed
-    writer.write_all(&header.version_needed.to_le_bytes())?;
+    fixed[4..6].copy_from_slice(&header.version_needed.to_le_bytes());
     // Flags (EFS bit for non-ASCII UTF-8 names, data descriptor for streamed)
-    writer.write_all(&header.flags.to_le_bytes())?;
+    fixed[6..8].copy_from_slice(&header.flags.to_le_bytes());
     // Compression method
-    writer.write_all(&header.method.to_le_bytes())?;
+    fixed[8..10].copy_from_slice(&header.method.to_le_bytes());
     // Modification time
-    writer.write_all(&header.mtime.to_le_bytes())?;
+    fixed[10..12].copy_from_slice(&header.mtime.to_le_bytes());
     // Modification date
-    writer.write_all(&header.mdate.to_le_bytes())?;
+    fixed[12..14].copy_from_slice(&header.mdate.to_le_bytes());
     // CRC-32
-    writer.write_all(&header.crc32.to_le_bytes())?;
+    fixed[14..18].copy_from_slice(&header.crc32.to_le_bytes());
     // Compressed size
-    writer.write_all(&header.compressed_size.to_le_bytes())?;
+    fixed[18..22].copy_from_slice(&header.compressed_size.to_le_bytes());
     // Uncompressed size
-    writer.write_all(&header.uncompressed_size.to_le_bytes())?;
+    fixed[22..26].copy_from_slice(&header.uncompressed_size.to_le_bytes());
     // Filename length
-    writer.write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+    fixed[26..28].copy_from_slice(&(filename_bytes.len() as u16).to_le_bytes());
     // Extra field length
-    writer.write_all(&(header.extra.len() as u16).to_le_bytes())?;
+    fixed[28..30].copy_from_slice(&(header.extra.len() as u16).to_le_bytes());
+    writer.write_all(&fixed)?;
     // Filename
     writer.write_all(filename_bytes)?;
     // Extra field
@@ -157,6 +181,21 @@ pub struct ZipWriter<W: Write> {
     compression: ZipCompressionLevel,
     finished: bool,
     progress: Option<ProgressHandle>,
+    /// One deflater per compression level a streamed entry has actually used,
+    /// parked here between entries.
+    ///
+    /// A deflate encoder allocates its window and hash tables up front —
+    /// about 270 KiB for a level-6 encoder — so building a fresh one per
+    /// entry costs several times what compressing a small file entry does,
+    /// and an archive of N small entries paid for it N times over.
+    /// [`ZipStreamWriter::finish`] hands the encoder back here and
+    /// [`ZipWriter::take_deflater`] resets and reissues it to the next entry,
+    /// which reproduces a fresh encoder's bytes exactly.
+    ///
+    /// Only the levels the caller actually streams are ever built (three at
+    /// most), so an archive written entirely at one level retains one encoder
+    /// — no more than the single live encoder it already held.
+    deflaters: Vec<(u8, Option<Deflater>)>,
 }
 
 impl<W: Write> ZipWriter<W> {
@@ -169,6 +208,7 @@ impl<W: Write> ZipWriter<W> {
             compression: ZipCompressionLevel::default(),
             finished: false,
             progress: None,
+            deflaters: Vec::new(),
         }
     }
 
@@ -195,6 +235,45 @@ impl<W: Write> ZipWriter<W> {
     #[inline]
     fn writer_mut(&mut self) -> Result<&mut W> {
         self.writer.as_mut().ok_or_else(Self::writer_taken_error)
+    }
+
+    /// Take the archive's deflater for `level`, or make one if it has not
+    /// compressed at this level before.
+    ///
+    /// A recycled encoder is [`Deflater::reset`] first, so it is
+    /// indistinguishable from a freshly constructed one: the window, the hash
+    /// tables and the Huffman state all start empty, and the bytes an entry
+    /// produces are the same either way. See the `deflaters` field for why
+    /// recycling is worth the lookup.
+    pub(super) fn take_deflater(&mut self, level: u8) -> Deflater {
+        let slot = self
+            .deflaters
+            .iter_mut()
+            .find(|(cached, _)| *cached == level)
+            .map(|(_, deflater)| deflater);
+        match slot.and_then(Option::take) {
+            Some(mut deflater) => {
+                deflater.reset();
+                deflater
+            }
+            None => Deflater::new(level),
+        }
+    }
+
+    /// Park a deflater returned by a finished entry for the next one to take.
+    ///
+    /// A slot for this level normally exists already, since the encoder being
+    /// returned came from one; only an archive whose levels alternate past the
+    /// three the writers offer grows the list, and never beyond three entries.
+    pub(super) fn return_deflater(&mut self, level: u8, deflater: Deflater) {
+        match self
+            .deflaters
+            .iter_mut()
+            .find(|(cached, _)| *cached == level)
+        {
+            Some((_, slot)) => *slot = Some(deflater),
+            None => self.deflaters.push((level, Some(deflater))),
+        }
     }
 
     /// Attach a progress handle to this writer.
@@ -292,11 +371,10 @@ impl<W: Write> ZipWriter<W> {
         // local file header carrying it is written here, so the buffered
         // path's "deflate produced something bigger, store it instead"
         // fallback has no streaming equivalent.
-        let (method, deflater): (u16, Option<Deflater>) = match options.compression {
-            ZipCompressionLevel::Store => (0, None),
-            ZipCompressionLevel::Fast => (8, Some(Deflater::new(1))),
-            ZipCompressionLevel::Normal => (8, Some(Deflater::new(6))),
-            ZipCompressionLevel::Best => (8, Some(Deflater::new(9))),
+        let level = deflate_level(options.compression);
+        let (method, deflater): (u16, Option<Deflater>) = match level {
+            None => (0, None),
+            Some(level) => (8, Some(self.take_deflater(level))),
         };
 
         ZipStreamWriter::new(self, name, options, method, deflater, mtime, mdate)

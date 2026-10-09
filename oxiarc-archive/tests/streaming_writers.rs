@@ -105,3 +105,93 @@ fn zip_entries_stream_into_a_bounded_archive_sink() {
         assert_eq!(reader.extract(entry).expect("extract"), *data);
     }
 }
+
+/// A sink that records the size of every `write` it receives, so the number
+/// of calls it takes to get a header onto the wire is an assertion rather
+/// than a guess.
+#[derive(Default)]
+struct CallCounter {
+    calls: Vec<usize>,
+}
+
+impl Write for CallCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls.push(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Headers must reach the sink as whole records, not field by field.
+///
+/// Both the local file header and the central directory entry used to be
+/// emitted one `write` per integer field — eleven and seventeen writes of two
+/// to four bytes respectively, thirty calls per entry before any payload.
+/// That is invisible behind a `BufWriter`, and expensive behind anything that
+/// charges per call: a file, a socket, or a JNI channel that crosses into
+/// another language and allocates a byte array for every one of them.
+///
+/// Asserted as a per-entry bound rather than an exact count, so an
+/// implementation that coalesces differently is still accepted; the previous
+/// behaviour blew past it by more than four times.
+#[test]
+fn zip_entry_headers_reach_the_sink_as_whole_records() {
+    const ENTRIES: usize = 200;
+    // Local header (1) + name (1) + payload (1) + descriptor (1) + central
+    // directory entry (1) + name (1), plus the archive's own trailer.
+    const MAX_CALLS_PER_ENTRY: usize = 8;
+
+    let data = payload(512);
+    let mut sink = CallCounter::default();
+    {
+        let mut writer = ZipWriter::new(&mut sink);
+        for i in 0..ENTRIES {
+            {
+                let mut entry = writer
+                    .add_stream(&format!("entry-{i}.bin"))
+                    .expect("add_stream");
+                entry.write_all(&data).expect("stream write");
+                entry.finish().expect("finish entry");
+            }
+        }
+        writer.finish().expect("finish archive");
+    }
+
+    assert!(
+        sink.calls.len() <= ENTRIES * MAX_CALLS_PER_ENTRY,
+        "{} entries cost {} writes to the sink ({:.1} per entry), more than the {MAX_CALLS_PER_ENTRY} \
+         the headers allow; the fixed parts of the local header and the central directory entry are \
+         meant to be assembled and written once each",
+        ENTRIES,
+        sink.calls.len(),
+        sink.calls.len() as f64 / ENTRIES as f64,
+    );
+}
+
+/// The same bound must hold for an archive of many tiny entries, where the
+/// per-entry cost is everything there is.
+#[test]
+fn zip_many_empty_entries_stay_cheap_to_sink() {
+    const ENTRIES: usize = 500;
+    const MAX_CALLS_PER_ENTRY: usize = 8;
+
+    let mut sink = CallCounter::default();
+    {
+        let mut writer = ZipWriter::new(&mut sink);
+        for i in 0..ENTRIES {
+            let mut entry = writer.add_stream(&format!("e{i}")).expect("add_stream");
+            entry.finish().expect("finish entry");
+        }
+        writer.finish().expect("finish archive");
+    }
+
+    assert!(
+        sink.calls.len() <= ENTRIES * MAX_CALLS_PER_ENTRY,
+        "{} empty entries cost {} writes ({:.1} per entry)",
+        ENTRIES,
+        sink.calls.len(),
+        sink.calls.len() as f64 / ENTRIES as f64,
+    );
+}

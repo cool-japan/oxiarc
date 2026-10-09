@@ -75,6 +75,9 @@ impl Default for ZipStreamOptions {
 /// immediately, so peak memory is one DEFLATE window plus the caller's own
 /// buffer, independent of the entry's size.
 ///
+/// On finish the encoder goes back to the archive, so the next entry resets
+/// and reuses it instead of allocating a fresh window and hash tables.
+///
 /// # Format contract
 ///
 /// A ZIP local file header must carry the CRC-32 and both sizes, which are
@@ -167,6 +170,10 @@ pub struct ZipStreamWriter<'w, W: Write> {
     zip64: bool,
     /// Deflate encoder, or `None` for a Stored entry.
     deflater: Option<Deflater>,
+    /// The level `deflater` was built at, so [`finish`](Self::finish) can
+    /// hand it back to the archive's cache under the same key. Always `Some`
+    /// exactly when `deflater` is.
+    deflate_level: Option<u8>,
     /// Scratch buffer the deflater's output for one call lands in, so the
     /// compressed byte count can be tallied before it reaches the archive.
     scratch: Vec<u8>,
@@ -211,6 +218,7 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
         mdate: u16,
     ) -> Result<Self> {
         let zip64 = options.zip64;
+        let deflate_level = super::deflate_level(options.compression);
         let version_needed = version_needed_for(method, zip64);
         let flags = FLAG_DATA_DESCRIPTOR | utf8_name_flag(name);
         let local_header_offset = archive.offset;
@@ -249,6 +257,7 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
             flags,
             zip64,
             deflater,
+            deflate_level,
             scratch: Vec::new(),
             crc32: Crc32::new(),
             uncompressed_size: 0,
@@ -319,6 +328,15 @@ impl<'w, W: Write> ZipStreamWriter<'w, W> {
             self.archive.writer_mut()?.write_all(&self.scratch)?;
             self.archive.offset += produced;
             self.compressed_size += produced;
+        }
+
+        // Hand the encoder back for the next entry to reset and reuse, rather
+        // than dropping a window and hash tables the archive is about to need
+        // again. Done after the stream is terminated above and regardless of
+        // whether the rest of the entry succeeds, so an error part-way through
+        // does not leave the archive permanently without an encoder.
+        if let (Some(level), Some(deflater)) = (self.deflate_level, self.deflater.take()) {
+            self.archive.return_deflater(level, deflater);
         }
 
         let crc32 = self.crc32.value();

@@ -14,6 +14,10 @@ pub const LOCAL_FILE_HEADER_SIG: u32 = 0x04034B50;
 /// ZIP central directory header signature.
 pub const CENTRAL_DIR_HEADER_SIG: u32 = 0x02014B50;
 
+/// Size of the fixed part of a ZIP central directory header (everything before
+/// the file name).
+const CENTRAL_DIR_HEADER_FIXED_LEN: usize = 46;
+
 /// ZIP end of central directory signature.
 pub const END_OF_CENTRAL_DIR_SIG: u32 = 0x06054B50;
 
@@ -714,40 +718,46 @@ impl CentralDirEntry {
             self.version_needed
         };
 
+        // The fixed 46-byte part is assembled in a stack buffer and written in
+        // one call rather than field by field: a sink that charges per call
+        // used to see seventeen writes of two to four bytes for every entry
+        // in the central directory, on top of the local header's eleven.
         // Signature
-        writer.write_all(&CENTRAL_DIR_HEADER_SIG.to_le_bytes())?;
+        let mut fixed = [0u8; CENTRAL_DIR_HEADER_FIXED_LEN];
+        fixed[0..4].copy_from_slice(&CENTRAL_DIR_HEADER_SIG.to_le_bytes());
         // Version made by
-        writer.write_all(&self.version_made_by.to_le_bytes())?;
+        fixed[4..6].copy_from_slice(&self.version_made_by.to_le_bytes());
         // Version needed
-        writer.write_all(&version_needed.to_le_bytes())?;
+        fixed[6..8].copy_from_slice(&version_needed.to_le_bytes());
         // Flags
-        writer.write_all(&self.flags.to_le_bytes())?;
+        fixed[8..10].copy_from_slice(&self.flags.to_le_bytes());
         // Compression method
-        writer.write_all(&self.method.to_le_bytes())?;
+        fixed[10..12].copy_from_slice(&self.method.to_le_bytes());
         // Modification time
-        writer.write_all(&self.mtime.to_le_bytes())?;
+        fixed[12..14].copy_from_slice(&self.mtime.to_le_bytes());
         // Modification date
-        writer.write_all(&self.mdate.to_le_bytes())?;
+        fixed[14..16].copy_from_slice(&self.mdate.to_le_bytes());
         // CRC-32
-        writer.write_all(&self.crc32.to_le_bytes())?;
+        fixed[16..20].copy_from_slice(&self.crc32.to_le_bytes());
         // Compressed size
-        writer.write_all(&compressed_size_32.to_le_bytes())?;
+        fixed[20..24].copy_from_slice(&compressed_size_32.to_le_bytes());
         // Uncompressed size
-        writer.write_all(&uncompressed_size_32.to_le_bytes())?;
+        fixed[24..28].copy_from_slice(&uncompressed_size_32.to_le_bytes());
         // Filename length
-        writer.write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
+        fixed[28..30].copy_from_slice(&(filename_bytes.len() as u16).to_le_bytes());
         // Extra field length
-        writer.write_all(&(total_extra_len as u16).to_le_bytes())?;
+        fixed[30..32].copy_from_slice(&(total_extra_len as u16).to_le_bytes());
         // Comment length
-        writer.write_all(&(comment_bytes.len() as u16).to_le_bytes())?;
+        fixed[32..34].copy_from_slice(&(comment_bytes.len() as u16).to_le_bytes());
         // Disk number start
-        writer.write_all(&self.disk_start.to_le_bytes())?;
+        fixed[34..36].copy_from_slice(&self.disk_start.to_le_bytes());
         // Internal file attributes
-        writer.write_all(&self.internal_attr.to_le_bytes())?;
+        fixed[36..38].copy_from_slice(&self.internal_attr.to_le_bytes());
         // External file attributes
-        writer.write_all(&self.external_attr.to_le_bytes())?;
+        fixed[38..42].copy_from_slice(&self.external_attr.to_le_bytes());
         // Relative offset of local header
-        writer.write_all(&local_header_offset_32.to_le_bytes())?;
+        fixed[42..46].copy_from_slice(&local_header_offset_32.to_le_bytes());
+        writer.write_all(&fixed)?;
         // Filename
         writer.write_all(filename_bytes)?;
         // Zip64 extra field (if needed)
@@ -763,7 +773,11 @@ impl CentralDirEntry {
     /// Get the size of this entry when written.
     pub fn written_size(&self) -> usize {
         let zip64_extra = self.build_zip64_extra();
-        46 + self.filename.len() + self.extra.len() + zip64_extra.len() + self.comment.len()
+        CENTRAL_DIR_HEADER_FIXED_LEN
+            + self.filename.len()
+            + self.extra.len()
+            + zip64_extra.len()
+            + self.comment.len()
     }
 }
 
