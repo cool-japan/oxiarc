@@ -112,4 +112,4 @@ pub use decoder::XzDecoder;
 pub use header::{
     CheckType, XzReader, compress, decompress, decompress_into, decompress_with_limit,
 };
-pub use writer::XzWriter;
+pub use writer::{XzStreamWriter, XzWriter};

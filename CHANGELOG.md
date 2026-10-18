@@ -5,6 +5,35 @@ All notable changes to the OxiArc project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Streaming ZIP, TAR and XZ writers.** `ZipWriter::add_stream`,
+  `ZipWriter::add_stream_with_options` and `TarWriter::add_stream` (plus
+  `_with_mode` / `_with_metadata`) return a writer that implements
+  `std::io::Write`, so an entry's bytes reach the archive as they are produced
+  and archiving a multi-gigabyte file no longer requires holding it in memory.
+  ZIP entries are written with a general-purpose-bit-3 data descriptor, whose
+  width (`ZipStreamOptions::zip64`) is chosen up front so entries of 4 GiB and
+  beyond stream correctly; the central directory records the same CRC-32 and
+  sizes as the descriptor. TAR entries take their size as an input (the format
+  has no data descriptor) and enforce it, and a size past the 12-byte octal
+  field now travels in a PAX `size` record instead of being truncated.
+  `XzStreamWriter` (`oxiarc_lzma::xz`, re-exported from `oxiarc_archive::xz`)
+  is a `std::io::Write` counterpart to `XzWriter::compress`: it buffers one
+  block, emits each block as it fills, and writes the index and stream footer
+  on `finish()`; at the same block size its output is byte-identical to
+  `compress()`. A `tar.xz` can now be produced by piping a `TarWriter` into an
+  `XzStreamWriter` without materialising either side.
+
+### Changed
+
+- `TarWriter::add_file_with_mode` / `add_file_with_metadata` are now implemented
+  on top of the streaming entry writer. Their output is byte-identical (pinned
+  by a test), and `ZipWriter`'s local-header writes were factored into a single
+  helper so the buffered and streamed paths cannot drift apart.
+
 ## [0.4.2] - 2026-09-12
 
 **The P2/P3 program: HTTP `Content-Encoding` decoding and three new image

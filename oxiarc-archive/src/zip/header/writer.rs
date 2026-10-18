@@ -1,19 +1,24 @@
 //! ZIP archive writer implementation.
 
+mod stream;
+
+pub use stream::{ZipStreamOptions, ZipStreamWriter};
+
 use super::super::crypto::{ENCRYPTION_HEADER_SIZE, FLAG_ENCRYPTED, ZipCrypto};
 use super::super::encryption::{
     AesExtraField, AesStrength, PASSWORD_VERIFICATION_LEN, WINZIP_AUTH_CODE_LEN, ZipAesEncryptor,
     generate_salt,
 };
 use super::types::{
-    CentralDirEntry, CompressionMethod, END_OF_CENTRAL_DIR_SIG, LOCAL_FILE_HEADER_SIG,
-    METHOD_AES_ENCRYPTED, ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG, ZIP64_END_OF_CENTRAL_DIR_SIG,
-    ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_16, ZIP64_MARKER_32, ZipCompressionLevel,
+    CentralDirEntry, CompressionMethod, END_OF_CENTRAL_DIR_SIG, FLAG_DATA_DESCRIPTOR,
+    LOCAL_FILE_HEADER_SIG, METHOD_AES_ENCRYPTED, ZIP64_END_OF_CENTRAL_DIR_LOCATOR_SIG,
+    ZIP64_END_OF_CENTRAL_DIR_SIG, ZIP64_EXTRA_FIELD_ID, ZIP64_MARKER_16, ZIP64_MARKER_32,
+    ZipCompressionLevel,
 };
 use oxiarc_core::Crc32;
 use oxiarc_core::error::{OxiArcError, Result};
 use oxiarc_core::progress::ProgressHandle;
-use oxiarc_deflate::deflate;
+use oxiarc_deflate::{Deflater, deflate};
 use oxiarc_lzma::{LzmaEncoder, LzmaLevel};
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +39,22 @@ fn utf8_name_flag(name: &str) -> u16 {
     if name.is_ascii() { 0 } else { FLAG_UTF8 }
 }
 
+/// The deflate level a compression option compresses at, or `None` for
+/// [`ZipCompressionLevel::Store`] (method 0, no encoder).
+///
+/// The single place the four variants map to levels, shared by
+/// [`ZipWriter::add_stream_with_options`] (which needs the encoder) and
+/// [`ZipStreamWriter`] (which needs the level again, to hand the encoder back
+/// to the same cache slot).
+fn deflate_level(compression: ZipCompressionLevel) -> Option<u8> {
+    match compression {
+        ZipCompressionLevel::Store => None,
+        ZipCompressionLevel::Fast => Some(1),
+        ZipCompressionLevel::Normal => Some(6),
+        ZipCompressionLevel::Best => Some(9),
+    }
+}
+
 /// LZMA method-14 version bytes written into the method-14 header.
 const LZMA_METHOD14_MAJOR_VER: u8 = 0x13;
 const LZMA_METHOD14_MINOR_VER: u8 = 0x00;
@@ -41,6 +62,110 @@ const LZMA_METHOD14_MINOR_VER: u8 = 0x00;
 /// Fixed dict_size for LZMA compression when writing ZIP entries.
 /// 16 MB — a good balance between speed and compression ratio.
 const LZMA_DICT_SIZE: u32 = 1 << 24;
+
+/// Size of the fixed part of a ZIP local file header (everything before the
+/// file name).
+const LOCAL_FILE_HEADER_FIXED_LEN: u64 = 30;
+
+/// Version-needed value for an entry written with a data descriptor and
+/// 64-bit (ZIP64) descriptor sizes.
+const VERSION_NEEDED_ZIP64: u16 = 45;
+
+/// Version-needed value for a deflate entry.
+const VERSION_NEEDED_DEFLATE: u16 = 20;
+
+/// Version-needed value for a stored (method 0) entry.
+const VERSION_NEEDED_STORE: u16 = 10;
+
+/// Build a ZIP64 extended-information extra field payload.
+///
+/// `uncompressed`/`compressed` may legitimately be zero for a *streamed*
+/// entry: the local header of an entry whose sizes are only known once the
+/// data has been written (APPNOTE general-purpose bit 3) carries the field
+/// with placeholder zeros purely to advertise that the trailing data
+/// descriptor uses 64-bit sizes — the real values follow in the descriptor
+/// and in the central directory.
+fn zip64_extra_bytes(uncompressed: u64, compressed: u64) -> Vec<u8> {
+    let mut extra = Vec::with_capacity(20);
+    extra.extend_from_slice(&ZIP64_EXTRA_FIELD_ID.to_le_bytes());
+    extra.extend_from_slice(&16u16.to_le_bytes()); // Data size
+    extra.extend_from_slice(&uncompressed.to_le_bytes());
+    extra.extend_from_slice(&compressed.to_le_bytes());
+    extra
+}
+
+/// The resolved fields of a ZIP local file header, ready to be written.
+struct LocalHeaderFields<'a> {
+    /// Entry name, written verbatim as UTF-8 bytes.
+    name: &'a str,
+    /// Minimum version needed to extract.
+    version_needed: u16,
+    /// General-purpose bit flags.
+    flags: u16,
+    /// Compression method.
+    method: u16,
+    /// DOS modification time word.
+    mtime: u16,
+    /// DOS modification date word.
+    mdate: u16,
+    /// CRC-32 of the uncompressed data, or zero for a streamed entry.
+    crc32: u32,
+    /// Compressed size, or the ZIP64 marker for a streamed ZIP64 entry.
+    compressed_size: u32,
+    /// Uncompressed size, or the ZIP64 marker for a streamed ZIP64 entry.
+    uncompressed_size: u32,
+    /// Extra field, written verbatim.
+    extra: &'a [u8],
+}
+
+/// Write a ZIP local file header: the fixed 30-byte part, the file name, then
+/// the extra field.
+///
+/// Every entry-writing method goes through this one helper so the field order
+/// cannot drift between the buffered methods and the streaming one. The
+/// caller supplies already-resolved values, so a streamed entry passes zeros
+/// (or the ZIP64 marker) and its real sizes follow in a data descriptor.
+///
+/// The caller accounts for [`LOCAL_FILE_HEADER_FIXED_LEN`] + name + extra
+/// bytes in its own running offset.
+///
+/// The fixed part is assembled in a stack buffer and written in one call
+/// rather than field by field: a sink that charges per call — a file, a
+/// socket, a JNI channel — used to see eleven writes of two to four bytes for
+/// every entry, which for a many-entry archive cost far more in per-call
+/// overhead than the header itself.
+fn write_local_header<W: Write>(writer: &mut W, header: &LocalHeaderFields<'_>) -> Result<()> {
+    let filename_bytes = header.name.as_bytes();
+    // Signature
+    let mut fixed = [0u8; LOCAL_FILE_HEADER_FIXED_LEN as usize];
+    fixed[0..4].copy_from_slice(&LOCAL_FILE_HEADER_SIG.to_le_bytes());
+    // Version needed
+    fixed[4..6].copy_from_slice(&header.version_needed.to_le_bytes());
+    // Flags (EFS bit for non-ASCII UTF-8 names, data descriptor for streamed)
+    fixed[6..8].copy_from_slice(&header.flags.to_le_bytes());
+    // Compression method
+    fixed[8..10].copy_from_slice(&header.method.to_le_bytes());
+    // Modification time
+    fixed[10..12].copy_from_slice(&header.mtime.to_le_bytes());
+    // Modification date
+    fixed[12..14].copy_from_slice(&header.mdate.to_le_bytes());
+    // CRC-32
+    fixed[14..18].copy_from_slice(&header.crc32.to_le_bytes());
+    // Compressed size
+    fixed[18..22].copy_from_slice(&header.compressed_size.to_le_bytes());
+    // Uncompressed size
+    fixed[22..26].copy_from_slice(&header.uncompressed_size.to_le_bytes());
+    // Filename length
+    fixed[26..28].copy_from_slice(&(filename_bytes.len() as u16).to_le_bytes());
+    // Extra field length
+    fixed[28..30].copy_from_slice(&(header.extra.len() as u16).to_le_bytes());
+    writer.write_all(&fixed)?;
+    // Filename
+    writer.write_all(filename_bytes)?;
+    // Extra field
+    writer.write_all(header.extra)?;
+    Ok(())
+}
 
 /// ZIP archive writer.
 pub struct ZipWriter<W: Write> {
@@ -56,6 +181,21 @@ pub struct ZipWriter<W: Write> {
     compression: ZipCompressionLevel,
     finished: bool,
     progress: Option<ProgressHandle>,
+    /// One deflater per compression level a streamed entry has actually used,
+    /// parked here between entries.
+    ///
+    /// A deflate encoder allocates its window and hash tables up front —
+    /// about 270 KiB for a level-6 encoder — so building a fresh one per
+    /// entry costs several times what compressing a small file entry does,
+    /// and an archive of N small entries paid for it N times over.
+    /// [`ZipStreamWriter::finish`] hands the encoder back here and
+    /// [`ZipWriter::take_deflater`] resets and reissues it to the next entry,
+    /// which reproduces a fresh encoder's bytes exactly.
+    ///
+    /// Only the levels the caller actually streams are ever built (three at
+    /// most), so an archive written entirely at one level retains one encoder
+    /// — no more than the single live encoder it already held.
+    deflaters: Vec<(u8, Option<Deflater>)>,
 }
 
 impl<W: Write> ZipWriter<W> {
@@ -68,6 +208,7 @@ impl<W: Write> ZipWriter<W> {
             compression: ZipCompressionLevel::default(),
             finished: false,
             progress: None,
+            deflaters: Vec::new(),
         }
     }
 
@@ -96,6 +237,45 @@ impl<W: Write> ZipWriter<W> {
         self.writer.as_mut().ok_or_else(Self::writer_taken_error)
     }
 
+    /// Take the archive's deflater for `level`, or make one if it has not
+    /// compressed at this level before.
+    ///
+    /// A recycled encoder is [`Deflater::reset`] first, so it is
+    /// indistinguishable from a freshly constructed one: the window, the hash
+    /// tables and the Huffman state all start empty, and the bytes an entry
+    /// produces are the same either way. See the `deflaters` field for why
+    /// recycling is worth the lookup.
+    pub(super) fn take_deflater(&mut self, level: u8) -> Deflater {
+        let slot = self
+            .deflaters
+            .iter_mut()
+            .find(|(cached, _)| *cached == level)
+            .map(|(_, deflater)| deflater);
+        match slot.and_then(Option::take) {
+            Some(mut deflater) => {
+                deflater.reset();
+                deflater
+            }
+            None => Deflater::new(level),
+        }
+    }
+
+    /// Park a deflater returned by a finished entry for the next one to take.
+    ///
+    /// A slot for this level normally exists already, since the encoder being
+    /// returned came from one; only an archive whose levels alternate past the
+    /// three the writers offer grows the list, and never beyond three entries.
+    pub(super) fn return_deflater(&mut self, level: u8, deflater: Deflater) {
+        match self
+            .deflaters
+            .iter_mut()
+            .find(|(cached, _)| *cached == level)
+        {
+            Some((_, slot)) => *slot = Some(deflater),
+            None => self.deflaters.push((level, Some(deflater))),
+        }
+    }
+
     /// Attach a progress handle to this writer.
     #[must_use]
     pub fn with_progress(mut self, handle: ProgressHandle) -> Self {
@@ -106,6 +286,98 @@ impl<W: Write> ZipWriter<W> {
     /// Set the compression level for subsequent files.
     pub fn set_compression(&mut self, level: ZipCompressionLevel) {
         self.compression = level;
+    }
+
+    /// Begin a streamed entry, writing entry bytes straight to the underlying
+    /// writer instead of buffering the whole payload.
+    ///
+    /// The returned [`ZipStreamWriter`] implements [`Write`]: the entry's CRC-32
+    /// and sizes are accumulated as the bytes go by, a data descriptor
+    /// (general-purpose bit flag bit 3) records them once the entry ends, and
+    /// the central directory entry is recorded then too. The borrow it holds on
+    /// this writer means at most one entry can be open at a time.
+    ///
+    /// Uses the writer's configured [`set_compression`](Self::set_compression)
+    /// level, the current time, and the classic 32-bit data descriptor — use
+    /// [`add_stream_with_options`](Self::add_stream_with_options) for entries
+    /// that may reach 4 GiB (`zip64: true`) or need a specific timestamp.
+    ///
+    /// Dropping the returned writer finishes the entry best-effort.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxiarc_archive::zip::ZipWriter;
+    /// use std::io::{Read, Write};
+    ///
+    /// let mut output = Vec::new();
+    /// {
+    ///     let mut writer = ZipWriter::new(&mut output);
+    ///     {
+    ///         let mut entry = writer.add_stream("notes.txt")?;
+    ///         entry.write_all(b"written ")?;
+    ///         entry.write_all(b"incrementally")?;
+    ///         entry.finish()?;
+    ///     }
+    ///     writer.finish()?;
+    /// }
+    ///
+    /// let mut reader = oxiarc_archive::zip::ZipReader::new(std::io::Cursor::new(&output))?;
+    /// let entries = reader.entries().to_vec();
+    /// assert_eq!(entries[0].size, 21);
+    /// assert_eq!(reader.extract(&entries[0])?, b"written incrementally");
+    /// # Ok::<(), oxiarc_core::error::OxiArcError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::Io`] if the entry's local file header cannot be
+    /// written.
+    pub fn add_stream(&mut self, name: &str) -> Result<ZipStreamWriter<'_, W>> {
+        let options = ZipStreamOptions {
+            compression: self.compression,
+            ..ZipStreamOptions::default()
+        };
+        self.add_stream_with_options(name, options)
+    }
+
+    /// Begin a streamed entry with explicit [`ZipStreamOptions`].
+    ///
+    /// See [`add_stream`](Self::add_stream) for the streaming contract; this
+    /// variant additionally selects the compression method, the data
+    /// descriptor's width (`zip64`) and the entry's modification time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxiArcError::Io`] if the entry's local file header cannot be
+    /// written.
+    pub fn add_stream_with_options(
+        &mut self,
+        name: &str,
+        options: ZipStreamOptions,
+    ) -> Result<ZipStreamWriter<'_, W>> {
+        // Progress: notify about entry start
+        let file_index = self.entries.len() as u64;
+        if let Some(ref handle) = self.progress {
+            handle.on_entry(name, file_index);
+        }
+
+        let (mtime, mdate) = match options.mtime {
+            Some(t) => Self::dos_time_from_systime(t),
+            None => Self::current_dos_time(),
+        };
+
+        // A streamed entry commits to its method before seeing any data: the
+        // local file header carrying it is written here, so the buffered
+        // path's "deflate produced something bigger, store it instead"
+        // fallback has no streaming equivalent.
+        let level = deflate_level(options.compression);
+        let (method, deflater): (u16, Option<Deflater>) = match level {
+            None => (0, None),
+            Some(level) => (8, Some(self.take_deflater(level))),
+        };
+
+        ZipStreamWriter::new(self, name, options, method, deflater, mtime, mdate)
     }
 
     /// Add a file to the archive.
@@ -214,44 +486,27 @@ impl<W: Write> ZipWriter<W> {
             uncompressed_size as u32
         };
 
-        // Signature
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        // Version needed
-        self.writer_mut()?
-            .write_all(&version_needed.to_le_bytes())?;
-        // Flags (EFS bit for non-ASCII UTF-8 names)
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
-        // Compression method
-        self.writer_mut()?.write_all(&method.to_le_bytes())?;
-        // Modification time
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        // Modification date
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        // CRC-32
-        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
-        // Compressed size
-        self.writer_mut()?
-            .write_all(&compressed_size_32.to_le_bytes())?;
-        // Uncompressed size
-        self.writer_mut()?
-            .write_all(&uncompressed_size_32.to_le_bytes())?;
-        // Filename length
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        // Extra field length
-        self.writer_mut()?
-            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        // Filename
-        self.writer_mut()?.write_all(filename_bytes)?;
-        // Extra field
-        self.writer_mut()?.write_all(&local_extra)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name,
+                version_needed,
+                flags,
+                method,
+                mtime,
+                mdate,
+                crc32,
+                compressed_size: compressed_size_32,
+                uncompressed_size: uncompressed_size_32,
+                extra: &local_extra,
+            },
+        )?;
 
         // Write file data
         self.writer_mut()?.write_all(&compressed_data)?;
 
-        // Update offset (30 = local header fixed size)
-        self.offset += 30
+        // Update offset
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN
             + filename_bytes.len() as u64
             + local_extra.len() as u64
             + compressed_data.len() as u64;
@@ -361,44 +616,29 @@ impl<W: Write> ZipWriter<W> {
         // Compression method 14 = LZMA
         let method: u16 = 14;
 
-        // Signature
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        // Version needed
-        self.writer_mut()?
-            .write_all(&version_needed.to_le_bytes())?;
-        // Flags (bit 1 = EOS marker present)
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
-        // Compression method (14 = LZMA)
-        self.writer_mut()?.write_all(&method.to_le_bytes())?;
-        // Modification time
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        // Modification date
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        // CRC-32
-        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
-        // Compressed size
-        self.writer_mut()?
-            .write_all(&compressed_size_32.to_le_bytes())?;
-        // Uncompressed size
-        self.writer_mut()?
-            .write_all(&uncompressed_size_32.to_le_bytes())?;
-        // Filename length
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        // Extra field length
-        self.writer_mut()?
-            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        // Filename
-        self.writer_mut()?.write_all(filename_bytes)?;
-        // Extra field
-        self.writer_mut()?.write_all(&local_extra)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name,
+                version_needed,
+                flags,
+                method,
+                mtime,
+                mdate,
+                crc32,
+                compressed_size: compressed_size_32,
+                uncompressed_size: uncompressed_size_32,
+                extra: &local_extra,
+            },
+        )?;
         // Compressed LZMA data (method-14 format)
         self.writer_mut()?.write_all(&method14_payload)?;
 
-        // Update offset (30 = local header fixed size)
-        self.offset +=
-            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + compressed_size;
+        // Update offset
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN
+            + filename_bytes.len() as u64
+            + local_extra.len() as u64
+            + compressed_size;
 
         // Store central directory entry
         self.entries.push(CentralDirEntry {
@@ -576,39 +816,21 @@ impl<W: Write> ZipWriter<W> {
         let filename_bytes = name.as_bytes();
         let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
-        // Signature
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        // Version needed
-        self.writer_mut()?
-            .write_all(&version_needed.to_le_bytes())?;
-        // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
-        // Compression method (99 = AES encrypted)
-        self.writer_mut()?
-            .write_all(&METHOD_AES_ENCRYPTED.to_le_bytes())?;
-        // Modification time
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        // Modification date
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        // CRC-32 (always 0 for AE-2; only AE-1 stores the plaintext CRC)
-        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
-        // Compressed size (includes encryption overhead)
-        self.writer_mut()?
-            .write_all(&compressed_size_32.to_le_bytes())?;
-        // Uncompressed size
-        self.writer_mut()?
-            .write_all(&uncompressed_size_32.to_le_bytes())?;
-        // Filename length
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        // Extra field length
-        self.writer_mut()?
-            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        // Filename
-        self.writer_mut()?.write_all(filename_bytes)?;
-        // Extra field
-        self.writer_mut()?.write_all(&local_extra)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name,
+                version_needed,
+                flags,
+                method: METHOD_AES_ENCRYPTED,
+                mtime,
+                mdate,
+                crc32,
+                compressed_size: compressed_size_32,
+                uncompressed_size: uncompressed_size_32,
+                extra: &local_extra,
+            },
+        )?;
 
         // Write encrypted data: salt + pw_verification + encrypted_data + auth_code
         self.writer_mut()?.write_all(&salt)?;
@@ -617,8 +839,10 @@ impl<W: Write> ZipWriter<W> {
         self.writer_mut()?.write_all(&auth_code)?;
 
         // Update offset
-        self.offset +=
-            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + encrypted_payload_size;
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN
+            + filename_bytes.len() as u64
+            + local_extra.len() as u64
+            + encrypted_payload_size;
 
         // Store central directory entry
         self.entries.push(CentralDirEntry {
@@ -779,38 +1003,21 @@ impl<W: Write> ZipWriter<W> {
         let filename_bytes = name.as_bytes();
         let flags = FLAG_ENCRYPTED | utf8_name_flag(name);
 
-        // Signature
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        // Version needed
-        self.writer_mut()?
-            .write_all(&version_needed.to_le_bytes())?;
-        // Flags (bit 0 = encrypted, EFS bit for non-ASCII UTF-8 names)
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
-        // Compression method
-        self.writer_mut()?.write_all(&method.to_le_bytes())?;
-        // Modification time
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        // Modification date
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        // CRC-32
-        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
-        // Compressed size (includes encryption header)
-        self.writer_mut()?
-            .write_all(&compressed_size_32.to_le_bytes())?;
-        // Uncompressed size
-        self.writer_mut()?
-            .write_all(&uncompressed_size_32.to_le_bytes())?;
-        // Filename length
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        // Extra field length
-        self.writer_mut()?
-            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        // Filename
-        self.writer_mut()?.write_all(filename_bytes)?;
-        // Extra field
-        self.writer_mut()?.write_all(&local_extra)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name,
+                version_needed,
+                flags,
+                method,
+                mtime,
+                mdate,
+                crc32,
+                compressed_size: compressed_size_32,
+                uncompressed_size: uncompressed_size_32,
+                extra: &local_extra,
+            },
+        )?;
 
         // Write encryption header
         self.writer_mut()?.write_all(&header)?;
@@ -819,8 +1026,10 @@ impl<W: Write> ZipWriter<W> {
         self.writer_mut()?.write_all(&encrypted_data)?;
 
         // Update offset
-        self.offset +=
-            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + total_encrypted_size;
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN
+            + filename_bytes.len() as u64
+            + local_extra.len() as u64
+            + total_encrypted_size;
 
         // Store central directory entry (encryption is signalled by the
         // general-purpose bit 0 in `flags`, not by any private marker)
@@ -934,32 +1143,30 @@ impl<W: Write> ZipWriter<W> {
         };
 
         // Write local file header
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        self.writer_mut()?
-            .write_all(&version_needed.to_le_bytes())?;
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?;
-        self.writer_mut()?.write_all(&method_u16.to_le_bytes())?;
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        self.writer_mut()?.write_all(&crc32.to_le_bytes())?;
-        self.writer_mut()?
-            .write_all(&compressed_size_32.to_le_bytes())?;
-        self.writer_mut()?
-            .write_all(&uncompressed_size_32.to_le_bytes())?;
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        self.writer_mut()?
-            .write_all(&(local_extra.len() as u16).to_le_bytes())?;
-        self.writer_mut()?.write_all(filename_bytes)?;
-        self.writer_mut()?.write_all(&local_extra)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name,
+                version_needed,
+                flags,
+                method: method_u16,
+                mtime,
+                mdate,
+                crc32,
+                compressed_size: compressed_size_32,
+                uncompressed_size: uncompressed_size_32,
+                extra: &local_extra,
+            },
+        )?;
 
         // Write pre-compressed data verbatim
         self.writer_mut()?.write_all(compressed_data)?;
 
-        // Update offset (30 = fixed local header size)
-        self.offset +=
-            30 + filename_bytes.len() as u64 + local_extra.len() as u64 + compressed_size;
+        // Update offset
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN
+            + filename_bytes.len() as u64
+            + local_extra.len() as u64
+            + compressed_size;
 
         // Store central directory entry
         self.entries.push(CentralDirEntry {
@@ -1004,22 +1211,23 @@ impl<W: Write> ZipWriter<W> {
         let flags = utf8_name_flag(&dir_name);
 
         // Write local file header for directory
-        self.writer_mut()?
-            .write_all(&LOCAL_FILE_HEADER_SIG.to_le_bytes())?;
-        self.writer_mut()?.write_all(&10u16.to_le_bytes())?; // Version needed
-        self.writer_mut()?.write_all(&flags.to_le_bytes())?; // Flags (EFS bit if non-ASCII)
-        self.writer_mut()?.write_all(&0u16.to_le_bytes())?; // Method (stored)
-        self.writer_mut()?.write_all(&mtime.to_le_bytes())?;
-        self.writer_mut()?.write_all(&mdate.to_le_bytes())?;
-        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // CRC-32
-        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // Compressed size
-        self.writer_mut()?.write_all(&0u32.to_le_bytes())?; // Uncompressed size
-        self.writer_mut()?
-            .write_all(&(filename_bytes.len() as u16).to_le_bytes())?;
-        self.writer_mut()?.write_all(&0u16.to_le_bytes())?; // Extra field length
-        self.writer_mut()?.write_all(filename_bytes)?;
+        write_local_header(
+            self.writer_mut()?,
+            &LocalHeaderFields {
+                name: &dir_name,
+                version_needed: VERSION_NEEDED_STORE,
+                flags,
+                method: 0,
+                mtime,
+                mdate,
+                crc32: 0,
+                compressed_size: 0,
+                uncompressed_size: 0,
+                extra: &[],
+            },
+        )?;
 
-        self.offset += 30 + filename_bytes.len() as u64;
+        self.offset += LOCAL_FILE_HEADER_FIXED_LEN + filename_bytes.len() as u64;
 
         // Store central directory entry
         self.entries.push(CentralDirEntry {

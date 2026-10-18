@@ -41,6 +41,7 @@
 //! ```
 
 // `CheckType` is re-exported because it appears in the public signature of
-// [`XzWriter::with_check_type`]; without this the parameter type would be
+// [`XzWriter::with_check_type`] and
+// [`XzStreamWriter::with_check_type`]; without this the parameter type would be
 // reachable but unnameable by downstream crates (rustc's `unnameable_types`).
-pub use oxiarc_lzma::xz::{CheckType, XzReader, XzWriter, compress, decompress};
+pub use oxiarc_lzma::xz::{CheckType, XzReader, XzStreamWriter, XzWriter, compress, decompress};

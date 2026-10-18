@@ -59,5 +59,8 @@ oxiarc-snappy.workspace = true
 encoding_rs.workspace = true
 tokio = { workspace = true, optional = true }
 
+[dev-dependencies]
+oxiarc-deflate.workspace = true
+
 [lints]
 workspace = true

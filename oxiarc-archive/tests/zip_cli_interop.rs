@@ -8,7 +8,8 @@
 //!   read correctly, with encryption *detected from the general-purpose
 //!   bit flags* (ZIP-01) and ZipCrypto extraction accepting the Info-ZIP
 //!   DOS-mtime check byte for streamed entries (ZIP-04).
-//! * oxiarc-written archives must pass `unzip -t` (plain and ZipCrypto),
+//! * oxiarc-written archives — buffered *and* streamed (data descriptor,
+//!   classic and ZIP64) — must pass `unzip -t` (plain and ZipCrypto),
 //!   carry the correct calendar date (ZIP-05), and — for AES — list in
 //!   Python with the encryption flag set and CRC = 0 (AE-2, ZIP-03).
 //!
@@ -20,9 +21,11 @@
 #![cfg(feature = "zip-oracle")]
 
 use oxiarc_archive::zip::{
-    ZipCompressionLevel, ZipReader, ZipWriter, is_entry_encrypted, is_entry_traditional_encrypted,
+    ZipCompressionLevel, ZipReader, ZipStreamOptions, ZipWriter, is_entry_encrypted,
+    is_entry_traditional_encrypted,
 };
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -291,6 +294,94 @@ sys.exit(0 if delta <= 1 else 1)
     assert!(
         out.status.success(),
         "oxiarc-written DOS date is wrong: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A streamed (data-descriptor) archive — the shape
+/// `ZipWriter::add_stream` produces, with entries written incrementally
+/// instead of from a buffer — must be accepted by third-party tools just like
+/// a buffered one, in both the classic 32-bit and the ZIP64 (64-bit
+/// descriptor sizes) forms.
+#[test]
+fn oxiarc_streamed_zip_passes_unzip_t_and_python_crc() {
+    if !require_tools(&[("unzip", &["-v"]), ("python3", &["-c", "import zipfile"])]) {
+        return;
+    }
+    let dir = unique_temp_dir("oxi_stream");
+    let payload = xorshift_bytes(0x0F0F_C0DE_1234_5678, 64 * 1024);
+
+    let path = dir.join("streamed.zip");
+    {
+        let file = fs::File::create(&path).expect("create archive");
+        let mut writer = ZipWriter::new(file);
+        {
+            let mut entry = writer.add_stream("deflated.bin").expect("add_stream");
+            // Ragged writes: the entry must not care how the caller chops it.
+            for chunk in payload.chunks(4093) {
+                entry.write_all(chunk).expect("stream write");
+            }
+            entry.finish().expect("finish entry");
+        }
+        {
+            let mut entry = writer
+                .add_stream_with_options(
+                    "zip64.bin",
+                    ZipStreamOptions {
+                        zip64: true,
+                        ..ZipStreamOptions::default()
+                    },
+                )
+                .expect("add_stream zip64");
+            entry.write_all(&payload).expect("stream write");
+            entry.finish().expect("finish entry");
+        }
+        {
+            let mut entry = writer
+                .add_stream_with_options(
+                    "stored.bin",
+                    ZipStreamOptions {
+                        compression: ZipCompressionLevel::Store,
+                        ..ZipStreamOptions::default()
+                    },
+                )
+                .expect("add_stream stored");
+            entry.write_all(&payload).expect("stream write");
+            entry.finish().expect("finish entry");
+        }
+        writer.finish().expect("finish");
+    }
+
+    // Independent integrity check by Info-ZIP (uses the central directory).
+    let out = run_in(&dir, "unzip", &["-t", "streamed.zip"]);
+    assert!(
+        out.status.success(),
+        "unzip -t rejected the streamed archive: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Python must validate the CRCs from the central directory and hand back
+    // exactly the payload for every entry, streamed or not.
+    let check = r#"
+import hashlib, sys, zipfile
+expected = open("payload.bin", "rb").read()
+z = zipfile.ZipFile("streamed.zip")
+if z.testzip() is not None:
+    print("testzip reported a bad entry")
+    sys.exit(1)
+for name in ("deflated.bin", "zip64.bin", "stored.bin"):
+    got = z.read(name)
+    if got != expected:
+        print(f"{name}: payload mismatch ({len(got)} vs {len(expected)})")
+        sys.exit(1)
+print("ok", hashlib.sha256(expected).hexdigest()[:16])
+"#;
+    fs::write(dir.join("payload.bin"), &payload).expect("write reference payload");
+    let out = run_in(&dir, "python3", &["-c", check]);
+    assert!(
+        out.status.success(),
+        "python zipfile rejected the streamed archive: {}",
         String::from_utf8_lossy(&out.stdout)
     );
     let _ = fs::remove_dir_all(&dir);
