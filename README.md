@@ -1204,7 +1204,7 @@ When adding new formats or algorithms:
 
 ## Sponsorship
 
-OxiARC is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+OxiARC is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find OxiARC useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
 

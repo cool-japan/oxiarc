@@ -237,4 +237,4 @@ AEC/SZIP is specifically optimised for uniformly sampled integer data (e.g., sen
 
 Apache-2.0
 
-Copyright © COOLJAPAN OU (Team Kitasan). Repository: <https://github.com/cool-japan/oxiarc>
+Copyright © COOLJAPAN OU (Team KitaSan). Repository: <https://github.com/cool-japan/oxiarc>
